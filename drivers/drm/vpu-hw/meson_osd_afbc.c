@@ -578,7 +578,7 @@ static int osd_afbc_check_state(struct meson_vpu_block *vblk,
 	state->checked = true;
 	ret = osd_afbc_check_uhd_count(plane_info, mvps, afbc->num_of_4k_osd);
 	if (ret < 0) {
-		DRM_INFO("plane%d,uhd osd plane is greater than upper limit,return!\n",
+		DRM_DEBUG("plane%d,uhd osd plane is greater than upper limit,return!\n",
 			 osd_index);
 	}
 	MESON_DRM_BLOCK("%s check_state called.\n", afbc->base.name);
