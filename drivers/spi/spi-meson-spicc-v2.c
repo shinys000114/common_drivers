@@ -26,6 +26,12 @@
 #include <asm/cacheflush.h>
 #include <linux/amlogic/aml_spi.h>
 #include <linux/pinctrl/devinfo.h>
+
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+#undef __initdata
+#define __initdata
+#endif
+
 #ifdef CONFIG_SPICC_TEST
 #include "spicc_test.h"
 #endif
