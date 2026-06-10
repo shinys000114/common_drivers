@@ -115,6 +115,12 @@ struct meson_drm_param {
 
 extern struct meson_drm_param am_drm_param;
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+void meson_drm_logo_reserved_enable_handoff(bool enable);
+void meson_drm_logo_reserved_mark_committed(void);
+void meson_drm_logo_reserved_release_if_committed(void);
+#endif
+
 struct meson_drm {
 	struct device *dev;
 

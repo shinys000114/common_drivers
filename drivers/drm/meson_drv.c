@@ -14,6 +14,12 @@
 #include <linux/init.h>
 #include <linux/amlogic/gki_module.h>
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+#include <linux/aperture.h>
+#include <linux/of_address.h>
+#include <linux/amlogic/aml_free_reserved.h>
+#endif
+
 #include <uapi/linux/sched/types.h>
 
 #include <drm/drmP.h>
@@ -63,6 +69,104 @@
 static int skip_logo;
 int recovery_mode;
 struct meson_drm_param am_drm_param;
+
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+static DEFINE_MUTEX(meson_drm_logo_reserved_lock);
+static bool meson_drm_logo_reserved_handoff_enabled;
+static bool meson_drm_logo_reserved_committed;
+static bool meson_drm_logo_reserved_released;
+
+static int meson_drm_logo_reserved_get(struct resource *res)
+{
+	struct device_node *np;
+	int ret;
+
+	np = of_find_node_by_path("/reserved-memory/linux,meson-fb");
+	if (!np)
+		return -ENODEV;
+
+	if (of_property_read_bool(np, "no-map")) {
+		of_node_put(np);
+		return -EINVAL;
+	}
+
+	ret = of_address_to_resource(np, 0, res);
+	of_node_put(np);
+
+	return ret;
+}
+
+static int meson_drm_logo_reserved_release_locked(void)
+{
+	struct resource res;
+	unsigned long start, end;
+	int intersects;
+	int ret;
+
+	if (meson_drm_logo_reserved_released)
+		return 0;
+
+	ret = meson_drm_logo_reserved_get(&res);
+	if (ret) {
+		DRM_WARN("failed to get logo framebuffer memory: %d\n",
+			 ret);
+		return ret;
+	}
+
+	intersects = region_intersects(res.start, resource_size(&res),
+				      IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE);
+	if (intersects != REGION_INTERSECTS) {
+		DRM_WARN("logo framebuffer memory %pR is not plain System RAM\n",
+			 &res);
+		return -EINVAL;
+	}
+
+	ret = aperture_remove_conflicting_devices(res.start, resource_size(&res),
+						 DRIVER_NAME);
+	if (ret) {
+		DRM_WARN("failed to remove logo framebuffer owner %pR: %d\n",
+			 &res, ret);
+		return ret;
+	}
+
+	start = PAGE_ALIGN(res.start);
+	end = PAGE_ALIGN(res.end + 1);
+	aml_free_reserved_area(__va(start), __va(end), 0, "logo-fb");
+	meson_drm_logo_reserved_released = true;
+
+	DRM_INFO("released logo framebuffer memory %pR\n", &res);
+
+	return 0;
+}
+
+void meson_drm_logo_reserved_enable_handoff(bool enable)
+{
+	mutex_lock(&meson_drm_logo_reserved_lock);
+	meson_drm_logo_reserved_handoff_enabled = enable;
+	mutex_unlock(&meson_drm_logo_reserved_lock);
+}
+
+void meson_drm_logo_reserved_mark_committed(void)
+{
+	mutex_lock(&meson_drm_logo_reserved_lock);
+	if (meson_drm_logo_reserved_handoff_enabled &&
+	    !meson_drm_logo_reserved_released &&
+	    !meson_drm_logo_reserved_committed) {
+		meson_drm_logo_reserved_committed = true;
+		DRM_INFO("logo framebuffer handoff committed\n");
+	}
+	mutex_unlock(&meson_drm_logo_reserved_lock);
+}
+
+void meson_drm_logo_reserved_release_if_committed(void)
+{
+	mutex_lock(&meson_drm_logo_reserved_lock);
+	if (meson_drm_logo_reserved_handoff_enabled &&
+	    meson_drm_logo_reserved_committed)
+		meson_drm_logo_reserved_release_locked();
+	mutex_unlock(&meson_drm_logo_reserved_lock);
+}
+#endif
 
 #ifndef MODULE
 static int check_reboot_mode(char *str)
@@ -497,6 +601,10 @@ static int am_meson_drm_bind(struct device *dev)
 
 	logo_skip = 0;
 	ret = of_property_read_u32(dev->of_node, "logo_skip", &logo_skip);
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	meson_drm_logo_reserved_enable_handoff((!ret && logo_skip == 1) ||
+					       skip_logo);
+#endif
 	if ((!ret && logo_skip == 1) || skip_logo)
 		DRM_INFO("skip logo commit.logo_skip:%d,skip_logo:%d,ret:%d\n",
 				logo_skip, skip_logo, ret);

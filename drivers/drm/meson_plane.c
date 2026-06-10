@@ -2083,6 +2083,16 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
 	else
 		osd_enable[plane_info->plane_index] = 0;
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	if (plane_info->enable == 1 && plane->state->fb) {
+		struct am_meson_fb *meson_fb =
+			container_of(plane->state->fb, struct am_meson_fb, base);
+
+		if (meson_fb->bufp[0] && !meson_fb->logo)
+			meson_drm_logo_reserved_mark_committed();
+	}
+#endif
+
 	DRM_DEBUG_DRIVER("plane_index=%d, osd_status=%d\n",
 		plane_info->plane_index, osd_enable[plane_info->plane_index]);
 }

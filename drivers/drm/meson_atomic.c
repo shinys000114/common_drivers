@@ -686,6 +686,10 @@ void meson_atomic_state_free(struct drm_atomic_state *state)
 		priv->logo->plane_has_fb)
 		am_meson_free_logo_memory();
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	meson_drm_logo_reserved_release_if_committed();
+#endif
+
 	drm_atomic_state_default_release(state);
 	kfree(state);
 }
