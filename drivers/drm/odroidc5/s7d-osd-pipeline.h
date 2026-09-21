@@ -8,7 +8,7 @@
 
 #define S7D_OSD_REV_B 0x0b
 #define S7D_OSD_SETUP_REG_COUNT 26
-#define S7D_OSD_UPDATE_REG_COUNT 4
+#define S7D_OSD_UPDATE_REG_COUNT 5
 
 struct s7d_osd_pipeline_state {
 	struct s7d_rdma_entry setup[S7D_OSD_SETUP_REG_COUNT];
@@ -16,7 +16,7 @@ struct s7d_osd_pipeline_state {
 };
 
 /*
- * Pure calculation for S7D Rev.B, an opaque XRGB8888 primary at (0, 0),
+ * Pure calculation for S7D Rev.B, an opaque RGB primary at (0, 0),
  * without scaling. layout must come from s7d_osd_build_state(): this does
  * not establish GEM ownership, fences or DMA bounds. Unknown revisions
  * fail; obtain the revision before entering atomic_check, without assuming
@@ -27,7 +27,7 @@ struct s7d_osd_pipeline_state {
  * ownership. It does NOT prepare SRAM, arbitration, GFCD/scaler bypass,
  * colour processing, postblend, ENCP, clocks or the HDMI bridge.
  *
- * update is for a frame change at unchanged output dimensions/format on an
+ * update is for a frame change at unchanged output dimensions on an
  * already configured pipeline, via the CRTC's synchronized RDMA path.
  * Neither list proves completion or authorizes releasing the old framebuffer.
  * The destination is unchanged on error. No registers are read or written.

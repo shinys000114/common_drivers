@@ -122,7 +122,10 @@ bool s7d_plane_is_primary(const struct drm_plane *plane)
 struct drm_plane *s7d_plane_create(struct drm_device *drm,
 				 unsigned int possible_crtcs, u64 dma_mask)
 {
-	static const u32 formats[] = { DRM_FORMAT_XRGB8888 };
+	static const u32 formats[] = {
+		DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888,
+		DRM_FORMAT_RGBX8888, DRM_FORMAT_BGRX8888,
+	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	struct s7d_plane *plane;
 
