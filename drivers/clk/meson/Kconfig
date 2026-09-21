@@ -356,4 +356,25 @@ config AMLOGIC_COMMON_CLK_T6X
         help
           Support for the clock controller on Amlogic T6X
           devices, aka T6X. Say Y if you want peripherals to work.
+
+config AMLOGIC_C5_DISPLAY_RESOURCES
+	bool "ODROID-C5 display clock and power resources (experimental)"
+	depends on ARCH_MESON_ODROID_COMMON && ARM64 && OF
+	depends on PM && COMMON_CLK
+	depends on AMLOGIC_COMMON_CLK_S7D
+	depends on PM_GENERIC_DOMAINS && AMLOGIC_POWER
+	depends on AMLOGIC_RESET_MESON
+	depends on AMLOGIC_DRM = n
+	depends on !AMLOGIC_HDMITX21 && !AMLOGIC_HDMITX
+	depends on !AMLOGIC_HDMITX21_MODERN && !AMLOGIC_HDMITX_MODERN
+	depends on !AMLOGIC_VPU && !AMLOGIC_VOUT_CLK_SERVE
+	depends on !AMLOGIC_BYPASS_CCF_CLK
+	help
+	  Provide the HDMI PLL, display clock route and shared analog regmap
+	  used by the HDMI PHY. Requires a device tree with the legacy
+	  display consumers disabled. This alone does not provide a KMS device.
+	  S7D genpd validates firmware errors and state, retains always-on
+	  domains, and disables direct power sysfs and legacy SRAM switching.
+	  Keep disabled in the original vendor display configuration.
+
 endmenu

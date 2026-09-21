@@ -380,26 +380,34 @@ const struct clk_ops clk_regmap_mux_ro_ops = {
 };
 EXPORT_SYMBOL_GPL(clk_regmap_mux_ro_ops);
 
-static struct regmap_config clkc_regmap_config = {
-	.reg_bits       = 32,
-	.val_bits       = 32,
-	.reg_stride     = 4,
-};
-
-struct regmap *meson_clk_regmap_resource(struct platform_device *pdev, struct device *dev,
-					unsigned int index)
+struct regmap *meson_clk_regmap_resource_named(struct platform_device *pdev,
+		struct device *dev, unsigned int index, const char *name)
 {
+	const struct regmap_config config = {
+		.reg_bits = 32,
+		.val_bits = 32,
+		.reg_stride = 4,
+		.name = name,
+	};
 	void __iomem *base;
-	struct device_node *node = dev->of_node;
 
 	base = devm_platform_ioremap_resource(pdev, index);
 	if (IS_ERR(base))
 		return ERR_CAST(base);
 
-	clkc_regmap_config.name = devm_kasprintf(dev, GFP_KERNEL,
-						 "%s-%d", node->name, index);
+	return devm_regmap_init_mmio(dev, base, &config);
+}
+EXPORT_SYMBOL_GPL(meson_clk_regmap_resource_named);
 
-	return devm_regmap_init_mmio(dev, base, &clkc_regmap_config);
+struct regmap *meson_clk_regmap_resource(struct platform_device *pdev, struct device *dev,
+					unsigned int index)
+{
+	const char *name = devm_kasprintf(dev, GFP_KERNEL, "%s-%d",
+					dev->of_node->name, index);
+
+	if (!name)
+		return ERR_PTR(-ENOMEM);
+	return meson_clk_regmap_resource_named(pdev, dev, index, name);
 }
 EXPORT_SYMBOL_GPL(meson_clk_regmap_resource);
 

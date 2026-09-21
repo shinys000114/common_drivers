@@ -261,4 +261,7 @@
 #define CLKID_AXI_RAMA                            252
 #define CLKID_AXI_DEV0_MMC                        253
 
+/* C5 display resource provider; existing IDs are ABI. */
+#define CLKID_HDMI_PLL                         254
+
 #endif /* _DT_BINDINGS_CLOCK_AMLOGIC_S7D_CLKC_H */
