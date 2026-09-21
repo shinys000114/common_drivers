@@ -12,6 +12,7 @@
 #endif
 #include <linux/of_address.h>
 #include <linux/of_device.h>
+#include <linux/of_platform.h>
 #include <linux/syscore_ops.h>
 #include <linux/suspend.h>
 
@@ -21,6 +22,7 @@
 #include "clk-cpu-dyndiv.h"
 #include "clk-dualdiv.h"
 #include "s7d.h"
+#include "s7d-hdmi-pll.h"
 #include <dt-bindings/clock/amlogic,s7d-clkc.h>
 
 #include <linux/amlogic/cpu_version.h>
@@ -834,8 +836,79 @@ static struct clk_regmap cdac = {
 	},
 };
 
-static u32 video_src_01_parent_table[] = { 1, 2, 4, 5, 6, 7 };
+/* Keep rate requests on the explicitly selected display route. */
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+#define S7D_DISPLAY_MUX_FLAGS (CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT)
+#define S7D_DISPLAY_GATE_FLAGS CLK_SET_RATE_PARENT
+#else
+#define S7D_DISPLAY_MUX_FLAGS 0
+#define S7D_DISPLAY_GATE_FLAGS (CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED)
+#endif
+
+static u32 video_src_01_parent_table[] = {
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+	/* Datasheet table 7-95: analogue vid_pix_clk, NOT digital vid_pll_clk. */
+	3,
+#endif
+	1, 2, 4, 5, 6, 7
+};
+
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+/*
+ * The input gates are ORed: VID_CLK_DIV[16] | VID_CLK_CTRL[19:20].
+ * Firmware can leave DIV[16] clear while CLK_EN0 supplies a live ENCP.
+ * Keep the input's own request bit for normal CCF enable/disable, but
+ * report the effective hardware gate when adopting the boot clock tree.
+ */
+static int s7d_video_input_is_enabled(struct clk_hw *hw)
+{
+	struct clk_regmap *clk = to_clk_regmap(hw);
+	u32 div, ctrl;
+	int ret;
+
+	ret = regmap_read(clk->map, CLKCTRL_VID_CLK_DIV, &div);
+	if (ret)
+		return ret;
+	ret = regmap_read(clk->map, CLKCTRL_VID_CLK_CTRL, &ctrl);
+	if (ret)
+		return ret;
+	return !!((div & BIT(16)) | (ctrl & GENMASK(20, 19)));
+}
+
+static int s7d_video_input_enable(struct clk_hw *hw)
+{
+	return clk_regmap_gate_ops.enable(hw);
+}
+
+static void s7d_video_input_disable(struct clk_hw *hw)
+{
+	clk_regmap_gate_ops.disable(hw);
+}
+
+static int s7d_video_input_save(struct clk_hw *hw)
+{
+	/* Save the request bit, not the OR of downstream requests. */
+	return clk_regmap_gate_ops.save_context(hw);
+}
+
+static void s7d_video_input_restore(struct clk_hw *hw)
+{
+	clk_regmap_gate_ops.restore_context(hw);
+}
+
+static const struct clk_ops s7d_video_input_ops = {
+	.enable = s7d_video_input_enable,
+	.disable = s7d_video_input_disable,
+	.is_enabled = s7d_video_input_is_enabled,
+	.save_context = s7d_video_input_save,
+	.restore_context = s7d_video_input_restore,
+};
+#endif
 static const struct clk_parent_data video_src_01_parent_data[] = {
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+	/* A zero index would resolve DT clocks[0] (xtal) before this name. */
+	{ .name = "s7d_hdmi_pll", .index = -1 },
+#endif
 	{ .fw_name = "gp1_pll" },
 	{ .hw = &hifi_pll.hw },
 	{ .hw = &fclk_div3.hw },
@@ -856,6 +929,7 @@ static struct clk_regmap video_src0_in_mux = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_data = video_src_01_parent_data,
 		.num_parents = ARRAY_SIZE(video_src_01_parent_data),
+		.flags = S7D_DISPLAY_MUX_FLAGS,
 	},
 };
 
@@ -866,13 +940,16 @@ static struct clk_regmap video_src0_in = {
 	},
 	.hw.init = &(struct clk_init_data) {
 		.name = "video_src0_in",
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+		.ops = &s7d_video_input_ops,
+#else
 		.ops = &clk_regmap_gate_ops,
+#endif
 		.parent_hws = (const struct clk_hw *[]) {
 			&video_src0_in_mux.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT |
-			 CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -905,8 +982,7 @@ static struct clk_regmap video_src0 = {
 			&video_src0_div.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT |
-			 CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -988,8 +1064,7 @@ static struct clk_regmap video0_div1 = {
 			&video_src0.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT |
-			 CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -1005,8 +1080,7 @@ static struct clk_regmap video0_div2_gate = {
 			&video_src0.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT |
-			 CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -1036,8 +1110,7 @@ static struct clk_regmap video0_div4_gate = {
 			&video_src0.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT |
-			 CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -1067,8 +1140,7 @@ static struct clk_regmap video0_div6_gate = {
 			&video_src0.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT |
-			 CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -1098,8 +1170,7 @@ static struct clk_regmap video0_div12_gate = {
 			&video_src0.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT |
-			 CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -1382,6 +1453,7 @@ static struct clk_regmap encp_mux = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_data = hdmitx_parent_data,
 		.num_parents = ARRAY_SIZE(hdmitx_parent_data),
+		.flags = S7D_DISPLAY_MUX_FLAGS,
 	},
 };
 
@@ -1397,7 +1469,7 @@ static struct clk_regmap encp = {
 			&encp_mux.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -1475,6 +1547,7 @@ static struct clk_regmap hdmitx_pixel_mux = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_data = hdmitx_parent_data,
 		.num_parents = ARRAY_SIZE(hdmitx_parent_data),
+		.flags = S7D_DISPLAY_MUX_FLAGS,
 	},
 };
 
@@ -1490,7 +1563,7 @@ static struct clk_regmap hdmitx_pixel = {
 			&hdmitx_pixel_mux.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -1506,6 +1579,7 @@ static struct clk_regmap hdmitx_fe_mux = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_data = hdmitx_parent_data,
 		.num_parents = ARRAY_SIZE(hdmitx_parent_data),
+		.flags = S7D_DISPLAY_MUX_FLAGS,
 	},
 };
 
@@ -1521,7 +1595,7 @@ static struct clk_regmap hdmitx_fe = {
 			&hdmitx_fe_mux.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
+		.flags = S7D_DISPLAY_GATE_FLAGS,
 	},
 };
 
@@ -4539,7 +4613,10 @@ static int meson_s7d_probe(struct platform_device *pdev)
 		return PTR_ERR(basic_map);
 	}
 
-	pll_map = meson_clk_regmap_resource(pdev, dev, 1);
+	if (IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES))
+		pll_map = meson_clk_regmap_resource_named(pdev, dev, 1, "analog");
+	else
+		pll_map = meson_clk_regmap_resource(pdev, dev, 1);
 	if (IS_ERR(pll_map)) {
 		dev_err(dev, "pll clk registers not found\n");
 		return PTR_ERR(pll_map);
@@ -4583,10 +4660,30 @@ static int meson_s7d_probe(struct platform_device *pdev)
 #endif
 	}
 
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	data->num = CLKID_HDMI_PLL + 1;
+	data->hws = devm_kcalloc(dev, data->num, sizeof(*data->hws), GFP_KERNEL);
+	if (!data->hws)
+		return -ENOMEM;
+	memcpy(data->hws, s7d_clks.hws, sizeof(s7d_hw_clks));
+	ret = s7d_hdmi_clocks_register(dev, pll_map, data);
+	if (ret)
+		return ret;
+#endif
+
 	ret = devm_of_clk_add_hw_provider(dev, meson_clk_hw_get,
 					   (void *)data);
 	if (ret)
 		return ret;
+
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+	ret = devm_of_platform_populate(dev);
+	if (ret)
+		return ret;
+#endif
 
 	/* register syscore ops to save clk status at std */
 	register_syscore_ops(&meson_s7d_syscore_ops);
@@ -4613,6 +4710,9 @@ static struct platform_driver s7d_driver = {
 		.name		= "s7d-clkc",
 		.of_match_table	= clkc_match_table,
 		.pm		= &meson_s7d_pm_ops,
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+		.sync_state	= clk_sync_state,
+#endif
 	},
 };
 
