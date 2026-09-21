@@ -75,8 +75,11 @@ static int clk_regmap_gate_is_enabled(struct clk_hw *hw)
 	struct clk_regmap *clk = to_clk_regmap(hw);
 	struct clk_regmap_gate_data *gate = clk_get_regmap_gate_data(clk);
 	unsigned int val;
+	int ret;
 
-	regmap_read(clk->map, gate->offset, &val);
+	ret = regmap_read(clk->map, gate->offset, &val);
+	if (ret)
+		return ret;
 	if (gate->flags & CLK_GATE_SET_TO_DISABLE)
 		val ^= BIT(gate->bit_idx);
 
@@ -89,8 +92,12 @@ static int clk_regmap_gate_save_context(struct clk_hw *hw)
 {
 	struct clk_regmap *clk = to_clk_regmap(hw);
 	struct clk_regmap_gate_data *gate = clk_get_regmap_gate_data(clk);
+	int enabled;
 
-	gate->saved_is_enabled = clk_regmap_gate_is_enabled(hw);
+	enabled = clk_regmap_gate_is_enabled(hw);
+	if (enabled < 0)
+		return enabled;
+	gate->saved_is_enabled = enabled;
 
 	return 0;
 }
@@ -301,7 +308,7 @@ static int clk_regmap_mux_set_parent(struct clk_hw *hw, u8 index)
 			      mux->mask << mux->shift, val << mux->shift,
 			      0, 0, 0, 0, &res);
 	else
-		regmap_update_bits(clk->map, mux->offset,
+		return regmap_update_bits(clk->map, mux->offset,
 				   mux->mask << mux->shift,
 				   val << mux->shift);
 
