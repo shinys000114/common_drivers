@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config AMLOGIC_C5_NATIVE_DISPLAY
+	bool "C5 native VPU/HDMI integration (experimental)"
+	depends on AMLOGIC_C5_DISPLAY_RESOURCES
+	depends on DRM = y && I2C = y && AMLOGIC_CPU_INFO = y
+	depends on DMA_CMA
+	depends on !AMLOGIC_MEDIA_ENABLE
+	select PHY_MESON_S7D_HDMI
+	select DRM_KMS_HELPER
+	select DRM_GEM_DMA_HELPER
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_HDMI_HELPER
+	select DRM_BRIDGE_CONNECTOR
+	help
+	  Build the S7D VPU execution path and native RGB8 TMDS bridge, with
+	  DRM EDID/SCDC helpers, CCF consumers and generic PHY ownership.
+	  Static device trees and built-in drivers only; unbind is suppressed.
+	  Register a single CRTC with a linear XRGB8888 plane and HDMI connector.
+	  Requires retained firmware output on S7D revision B, up to SDR 1080p60.
+	  Do not enable with legacy media/display writers. PCM, system sleep
+	  and cold initialization of HDMI SRAM are not supported.
