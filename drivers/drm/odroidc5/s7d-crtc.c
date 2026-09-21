@@ -175,11 +175,11 @@ static int s7d_crtc_arm_event(struct s7d_crtc *c, struct drm_crtc_state *state,
 	unsigned long timeout;
 	int ret = 0;
 
-	/* Allow six frames, including low-refresh custom modes. */
-	timeout = msecs_to_jiffies(max_t(u64, 500,
+	/* Keep recovery below the atomic helpers' ten-second wait limit. */
+	timeout = msecs_to_jiffies(clamp_t(u64,
 		DIV_ROUND_UP_ULL((u64)state->adjusted_mode.htotal *
 				 state->adjusted_mode.vtotal * 6,
-				 state->adjusted_mode.clock)));
+				 state->adjusted_mode.clock), 500, 9000));
 	spin_lock_irqsave(&c->base.dev->event_lock, flags);
 	if (c->awaiting_frame) {
 		ret = -EBUSY;
