@@ -131,8 +131,11 @@ int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 		return -EINVAL;
 	for (i = 0; i < count; i++) {
 		u32 reg = le32_to_cpu(entries[i].reg);
+		u32 value = le32_to_cpu(entries[i].value);
 
 		/* Replays before CPU masking must be idempotent linear OSD writes. */
+		if (reg == 0x1a1b && (value & ~0xcU) == 0x8500)
+			continue;
 		if (reg != 0x1a14 && reg != 0x1a15 &&
 		    reg != 0x1a1c && reg != 0x1a1d)
 			return -EINVAL;
