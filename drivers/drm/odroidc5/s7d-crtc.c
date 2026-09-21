@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/dma-fence.h>
+#include <linux/jiffies.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 
@@ -26,6 +27,7 @@ struct s7d_crtc {
 	/* Serializes commit callbacks, recovery work and shutdown. */
 	struct mutex mutex;
 	struct work_struct error_work;
+	struct delayed_work timeout_work;
 	bool prepared;
 	bool vblank_on;
 	bool vblank_ref;
@@ -34,6 +36,8 @@ struct s7d_crtc {
 	struct drm_pending_vblank_event *event;
 	bool starting;
 	bool completed_while_starting;
+	bool awaiting_frame;
+	unsigned long deadline;
 };
 
 #define to_s7d_crtc(c) container_of(c, struct s7d_crtc, base)
@@ -159,6 +163,7 @@ static void s7d_crtc_abort_pending(struct s7d_crtc *c, int error)
 	c->event = NULL;
 	c->starting = false;
 	c->completed_while_starting = false;
+	c->awaiting_frame = false;
 	spin_unlock_irqrestore(&c->base.dev->event_lock, flags);
 	s7d_crtc_abort_event(&c->base, event, error);
 }
@@ -167,16 +172,25 @@ static int s7d_crtc_arm_event(struct s7d_crtc *c, struct drm_crtc_state *state,
 			      bool starting)
 {
 	unsigned long flags;
+	unsigned long timeout;
 	int ret = 0;
 
+	/* Allow six frames, including low-refresh custom modes. */
+	timeout = msecs_to_jiffies(max_t(u64, 500,
+		DIV_ROUND_UP_ULL((u64)state->adjusted_mode.htotal *
+				 state->adjusted_mode.vtotal * 6,
+				 state->adjusted_mode.clock)));
 	spin_lock_irqsave(&c->base.dev->event_lock, flags);
-	if (c->event) {
+	if (c->awaiting_frame) {
 		ret = -EBUSY;
 	} else {
 		c->event = state->event;
 		state->event = NULL;
 		c->starting = starting;
 		c->completed_while_starting = false;
+		c->awaiting_frame = true;
+		c->deadline = jiffies + timeout;
+		mod_delayed_work(system_wq, &c->timeout_work, timeout);
 	}
 	spin_unlock_irqrestore(&c->base.dev->event_lock, flags);
 	return ret;
@@ -244,6 +258,32 @@ static void s7d_crtc_fail(struct s7d_crtc *c, int error, struct drm_crtc_state *
 		s7d_crtc_abort_event(&c->base, event, error);
 	}
 	schedule_work(&c->error_work);
+}
+
+static void s7d_crtc_timeout_work(struct work_struct *work)
+{
+	struct s7d_crtc *c = container_of(to_delayed_work(work),
+					struct s7d_crtc, timeout_work);
+	unsigned long flags, now;
+	bool expired = false;
+
+	mutex_lock(&c->mutex);
+	spin_lock_irqsave(&c->base.dev->event_lock, flags);
+	now = jiffies;
+	if (c->awaiting_frame && !c->last_error) {
+		if (time_before(now, c->deadline)) {
+			mod_delayed_work(system_wq, &c->timeout_work,
+					 c->deadline - now);
+		} else {
+			WRITE_ONCE(c->last_error, -ETIMEDOUT);
+			s7d_scanout_fail(c->scanout);
+			expired = true;
+		}
+	}
+	spin_unlock_irqrestore(&c->base.dev->event_lock, flags);
+	mutex_unlock(&c->mutex);
+	if (expired)
+		schedule_work(&c->error_work);
 }
 
 static void s7d_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
@@ -375,9 +415,12 @@ void s7d_crtc_irq(struct drm_crtc *crtc, bool vblank, enum s7d_rdma_result resul
 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
 	if (c->starting) {
 		c->completed_while_starting = true;
-	} else if (!READ_ONCE(c->last_error) && c->event) {
-		drm_crtc_send_vblank_event(crtc, c->event);
-		c->event = NULL;
+	} else if (!READ_ONCE(c->last_error)) {
+		c->awaiting_frame = false;
+		if (c->event) {
+			drm_crtc_send_vblank_event(crtc, c->event);
+			c->event = NULL;
+		}
 	}
 	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
 }
@@ -407,9 +450,12 @@ void s7d_crtc_link_ready(struct drm_crtc *crtc)
 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
 	if (READ_ONCE(c->prepared) && !READ_ONCE(c->last_error) && c->starting) {
 		c->starting = false;
-		if (c->completed_while_starting && c->event) {
-			drm_crtc_send_vblank_event(crtc, c->event);
-			c->event = NULL;
+		if (c->completed_while_starting) {
+			c->awaiting_frame = false;
+			if (c->event) {
+				drm_crtc_send_vblank_event(crtc, c->event);
+				c->event = NULL;
+			}
 		}
 		c->completed_while_starting = false;
 	}
@@ -436,8 +482,10 @@ int s7d_crtc_shutdown(struct drm_crtc *crtc)
 	ret = s7d_crtc_stop(c);
 	s7d_crtc_abort_pending(c, ret ? ret : -ECANCELED);
 	mutex_unlock(&c->mutex);
-	if (!ret)
+	if (!ret) {
+		cancel_delayed_work_sync(&c->timeout_work);
 		cancel_work_sync(&c->error_work);
+	}
 	return ret;
 }
 
@@ -446,6 +494,7 @@ static void s7d_crtc_cleanup(struct drm_device *drm, void *data)
 	struct s7d_crtc *c = data;
 
 	/* Parent must successfully shut down before releasing backend resources. */
+	cancel_delayed_work_sync(&c->timeout_work);
 	cancel_work_sync(&c->error_work);
 	drm_WARN_ON(drm, c->prepared || c->event);
 	mutex_destroy(&c->mutex);
@@ -498,6 +547,7 @@ struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *prima
 	c->revision = revision;
 	mutex_init(&c->mutex);
 	INIT_WORK(&c->error_work, s7d_crtc_error_work);
+	INIT_DELAYED_WORK(&c->timeout_work, s7d_crtc_timeout_work);
 	ret = drmm_add_action_or_reset(drm, s7d_crtc_cleanup, c);
 	if (ret)
 		return ERR_PTR(ret);
