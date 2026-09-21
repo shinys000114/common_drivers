@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/* Copyright (c) 2026 Hardkernel Co., Ltd. */
+
+&gpu {
+	status = "disabled";
+};
+
+&reset {
+	compatible = "amlogic,s7d-reset";
+};
+
+/* GPU cooling is registered by devfreq, without the vendor global lookup. */
+&meson_cooldev {
+	status = "disabled";
+};
+
+/ {
+	c5_gpu_opp: gpu-opp-table {
+		compatible = "operating-points-v2";
+
+		/* Fixed board supply; do not interpret vendor millivolts as uV. */
+		opp-285714285 {
+			opp-hz = /bits/ 64 <285714285>;
+		};
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+		};
+	};
+
+	c5_gpu: gpu@fd000000 {
+		compatible = "amlogic,s7d-mali", "arm,mali-valhall-csf";
+		reg = <0 0xfd000000 0 0x800000>;
+		interrupts = <GIC_SPI 144 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 145 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 146 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "gpu", "mmu", "job";
+		clocks = <&clkc CLKID_MALI>, <&clkc CLKID_MALI_STACK>;
+		clock-names = "core", "stacks";
+		assigned-clocks = <&clkc CLKID_MALI>, <&clkc CLKID_MALI_STACK>;
+		assigned-clock-rates = <400000000>, <400000000>;
+		resets = <&reset RESET_MALI_CAPB3>, <&reset RESET_MALI>;
+		reset-names = "bus", "core";
+		operating-points-v2 = <&c5_gpu_opp>;
+		#cooling-cells = <2>;
+		status = "okay";
+	};
+};
+
+&soc_thermal {
+	cooling-maps {
+		cooling_map {
+			cooling-device = <&CPU0 0 8>, <&c5_gpu 0 1>;
+		};
+	};
+};
+
+#include <dt-bindings/clock/amlogic,s7d-clkc.h>
+#include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
+#include <dt-bindings/power/s7d-pd.h>
+
+/* Keep the pwrdm label: all inherited power-domain references follow it. */
+/delete-node/ &pwrdm;
+
+/ {
+	pwrdm: power-controller@fe00c054 {
+		compatible = "amlogic,s7d-power-domain";
+		reg = <0 0xfe00c054 0 0x14>;
+		reg-names = "vpu-sram";
+		#power-domain-cells = <1>;
+	};
+};
+
+&clkc {
+	c5_hdmi_phy: hdmi-phy {
+		compatible = "amlogic,s7d-hdmi-phy";
+		#phy-cells = <0>;
+		clocks = <&clkc CLKID_HDMI_PLL>;
+		clock-names = "pixel";
+		resets = <&reset RESET_HDMITXPHY>;
+		reset-names = "phy";
+		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
+	};
+};
+
+&vpu {
+	status = "disabled";
+};
+&drm_vpu {
+	status = "disabled";
+};
+&drm_subsystem {
+	status = "disabled";
+};
+&amhdmitx {
+	status = "disabled";
+};
+&fb {
+	status = "disabled";
+};
+&amlvecm {
+	status = "disabled";
+};
+&vout_sys {
+	status = "disabled";
+};
+&vout {
+	status = "disabled";
+};
+&vout_mux {
+	status = "disabled";
+};
+&dummy_venc {
+	status = "disabled";
+};
+&{/rdma} {
+	status = "disabled";
+};
+&{/videodisplay} {
+	status = "disabled";
+};
+&{/video_composer} {
+	status = "disabled";
+};
+&{/vpu_security} {
+	status = "disabled";
+};
+
+/ {
+	reserved-memory {
+		c5_display_cma: display-cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0 0x4000000>;
+			alignment = <0 0x400000>;
+			/* Coherent RDMA descriptors and GEM DMA must fit below 4 GiB. */
+			alloc-ranges = <0 0 1 0>;
+		};
+	};
+
+	c5_native_vpu: display-controller@ff000000 {
+		compatible = "amlogic,s7d-vpu-native";
+		reg = <0 0xff000000 0 0x10000>;
+		reg-names = "vcbus";
+		interrupts = <GIC_SPI 197 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 215 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "vsync", "rdma";
+		clocks = <&clkc CLKID_VPU>, <&clkc CLKID_VAPB>,
+			 <&clkc CLKID_SYS_VPU_INTR>, <&clkc CLKID_ENCP>, <&xtal>;
+		clock-names = "vpu", "vapb", "intr", "encp", "xtal";
+		resets = <&reset RESET_VIU>, <&reset RESET_VENC>,
+			 <&reset RESET_VENCP>, <&reset RESET_RDMA>;
+		reset-names = "viu", "venc", "vencp", "rdma";
+		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
+		/* Retain the firmware reservation; the driver does not free this RAM. */
+		memory-region = <&c5_display_cma>, <&logo_reserved>;
+		memory-region-names = "scanout", "boot-logo";
+		port {
+			c5_vpu_out: endpoint {
+				remote-endpoint = <&c5_hdmi_in>;
+			};
+		};
+	};
+
+	c5_native_hdmi: hdmi@fe300000 {
+		compatible = "amlogic,s7d-hdmi-native";
+		reg = <0 0xfe300000 0 0x10000>, <0 0xfe310000 0 0x10000>;
+		reg-names = "top", "core";
+		interrupts = <GIC_SPI 204 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&hdmitx_hpd &hdmitx_ddc>;
+		clocks = <&clkc CLKID_SYS_HDMITX_APB>, <&clkc CLKID_HDMITX_SYS>,
+			 <&clkc CLKID_HDMITX_PRIF>, <&clkc CLKID_HDMITX_200M>,
+			 <&clkc CLKID_HDMITX_PIXEL>, <&clkc CLKID_HDMITX_FE>;
+		clock-names = "apb", "sys", "prif", "200m", "pixel", "fe";
+		resets = <&reset RESET_HDMI_TX>, <&reset RESET_HDMITX_CAPB3>;
+		reset-names = "tx", "apb";
+		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
+		phys = <&c5_hdmi_phy>;
+		phy-names = "hdmi";
+		port {
+			c5_hdmi_in: endpoint {
+				remote-endpoint = <&c5_vpu_out>;
+			};
+		};
+	};
+};
