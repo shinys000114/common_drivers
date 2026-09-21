@@ -88,3 +88,5 @@ modules_install:
 
 clean:
 	$(MAKE) -C $(KERNEL_SRC) M=$(M) clean
+
+obj-$(CONFIG_DMABUF_HEAPS_C5_SCANOUT) += dma-buf/heaps/
