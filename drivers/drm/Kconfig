@@ -114,3 +114,5 @@ config AMLOGIC_DRM_EMULATE_FBDEV
 	help
 		Emulate framebuffer device for device
 		which need use fbdev api.
+
+source "$(COMMON_DRIVERS_DIR)/drivers/drm/odroidc5/Kconfig"
