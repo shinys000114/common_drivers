@@ -12,6 +12,7 @@ struct drm_rect;
 #define S7D_OSD_PITCH_ALIGN 64
 
 struct s7d_osd_state {
+	u32 block_config;
 	u32 frame_addr;
 	u32 stride;
 	u32 scope_x;

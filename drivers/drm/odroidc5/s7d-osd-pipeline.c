@@ -50,7 +50,8 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 	/* W3/W4 destination fields are 12 bits; source fields are 13 bits. */
 	if (!width || !height || width > 4096 || height > 4096 ||
 	    ((layout->scope_x | layout->scope_y) & 0xe000e000) ||
-	    !layout->stride || layout->stride > 0xfff || (layout->stride & 3))
+	    !layout->stride || layout->stride > 0xfff || (layout->stride & 3) ||
+	    (layout->block_config & ~0xcU) != 0x8500)
 		return -EINVAL;
 	x_start = layout->scope_x & 0x1fff;
 	x_end = layout->scope_x >> 16;
@@ -71,8 +72,8 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 			REG(OSD1_PROT_CTRL, 0x80620200),
 			/* Replace X with opaque alpha; never copy read-only status. */
 			REG(OSD1_CTRL_STAT2, 0x7fc0),
-			/* Little endian, 32-bit block, ARGB8888, no canvas/AFBC. */
-			REG(OSD1_BLK0_CFG_W0, 0x8504),
+			/* Little endian, 32-bit linear RGB. */
+			REG(OSD1_BLK0_CFG_W0, layout->block_config),
 			REG(OSD1_FRAME_ADDR, layout->frame_addr),
 			REG(OSD1_LINE_STRIDE, layout->stride),
 			REG(OSD1_BLK0_CFG_W1, layout->scope_x),
@@ -102,6 +103,7 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 			REG(OSD1_CTRL_STAT, 0x00100005),
 		},
 		.update = {
+			REG(OSD1_BLK0_CFG_W0, layout->block_config),
 			REG(OSD1_FRAME_ADDR, layout->frame_addr),
 			REG(OSD1_LINE_STRIDE, layout->stride),
 			REG(OSD1_BLK0_CFG_W1, layout->scope_x),
