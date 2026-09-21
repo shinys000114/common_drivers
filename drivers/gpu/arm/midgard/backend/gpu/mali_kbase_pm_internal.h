@@ -513,7 +513,7 @@ void kbase_pm_runtime_term(struct kbase_device *kbdev);
  * configuration to get called to turn on power and/or clocks to the GPU. See
  * kbase_pm_callback_conf.
  */
-void kbase_pm_register_access_enable(struct kbase_device *kbdev);
+int kbase_pm_register_access_enable(struct kbase_device *kbdev);
 
 /**
  * kbase_pm_register_access_disable - Disable early register access

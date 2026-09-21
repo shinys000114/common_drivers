@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+mali_kbase-y += platform/c5/mali_kbase_c5.o
+# Reuse the CCF adapter for IPA counter normalization and rate notifications.
+mali_kbase-y += platform/devicetree/mali_kbase_clk_rate_trace.o

@@ -309,7 +309,9 @@ void kbase_pm_get_dvfs_action(struct kbase_device *kbdev)
 	 * protected mode is already added to busy-time at this point, though,
 	 * so we should be good.
 	 */
-	kbase_platform_dvfs_event(kbdev, utilisation);
+	/* C5 frequency selection belongs to the devfreq governor. */
+	if (!IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE))
+		kbase_platform_dvfs_event(kbdev, utilisation);
 }
 
 bool kbase_pm_metrics_is_active(struct kbase_device *kbdev)
