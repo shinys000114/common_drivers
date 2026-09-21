@@ -19,6 +19,7 @@ obj-$(CONFIG_AMLOGIC_SECMON)		+= secmon/
 obj-y					+= memory_ext/
 obj-$(CONFIG_AMLOGIC_MEMORY_DEBUG)	+= memory_debug/
 obj-y					+= clk/
+obj-$(CONFIG_PHY_MESON_S7D_HDMI) += phy/amlogic/
 obj-$(CONFIG_AMLOGIC_GPIO)		+= gpio/
 obj-$(CONFIG_MAILBOX)			+= mailbox/
 obj-y					+= pwm/
