@@ -15,6 +15,11 @@
 };
 
 / {
+	c5_scanout_heap: graphics-heap {
+		compatible = "hardkernel,odroidc5-scanout-heap";
+		memory-region = <&dmaheap_cma_reserved>;
+	};
+
 	c5_gpu_opp: gpu-opp-table {
 		compatible = "operating-points-v2";
 
