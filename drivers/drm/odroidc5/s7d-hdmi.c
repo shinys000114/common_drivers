@@ -11,6 +11,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_state_helper.h>
@@ -82,6 +83,8 @@ struct s7d_hdmi {
 	bool video_on;
 	bool prepared;
 	bool hpd_enabled;
+	bool stopping;
+	struct delayed_work hpd_recovery;
 };
 
 static struct s7d_hdmi *to_s7d_hdmi(struct drm_bridge *bridge)
@@ -524,39 +527,82 @@ int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link)
 	return 0;
 }
 
+static int s7d_hdmi_ack_hpd(struct s7d_hdmi *h)
+{
+	unsigned int status;
+	bool pending = false;
+	int ret;
+
+	for (unsigned int retry = 0; retry < 4; retry++) {
+		ret = regmap_read(h->top, TOP_STATUS, &status);
+		if (ret)
+			return ret;
+		if (status & ~TOP_STATUS_VALID)
+			return -EIO;
+		if (!(status & HPD_IRQS))
+			return pending;
+		pending = true;
+		ret = regmap_write(h->top, TOP_CLEAR, status & HPD_IRQS);
+		if (ret)
+			return ret;
+	}
+	return -EIO;
+}
+
+static void s7d_hdmi_hpd_recovery(struct work_struct *work)
+{
+	struct s7d_hdmi *h = container_of(to_delayed_work(work),
+					struct s7d_hdmi, hpd_recovery);
+	int ret;
+
+	mutex_lock(&h->lock);
+	if (h->stopping) {
+		mutex_unlock(&h->lock);
+		return;
+	}
+	ret = s7d_hdmi_ack_hpd(h);
+	if (ret < 0) {
+		mod_delayed_work(system_wq, &h->hpd_recovery, HZ);
+		mutex_unlock(&h->lock);
+		return;
+	}
+	enable_irq(h->irq);
+	mutex_unlock(&h->lock);
+	if (READ_ONCE(h->hpd_enabled))
+		drm_bridge_hpd_notify(&h->bridge, s7d_hdmi_detect(&h->bridge));
+}
+
 static irqreturn_t s7d_hdmi_irq(int irq, void *data)
 {
 	struct s7d_hdmi *h = data;
-	unsigned int status = 0;
-	int ret;
+	int ret = s7d_hdmi_ack_hpd(h);
 
-	ret = regmap_read(h->top, TOP_STATUS, &status);
-	if (ret || (status & ~TOP_STATUS_VALID))
-		goto fault;
-	if (!(status & HPD_IRQS))
+	if (!ret)
 		return IRQ_NONE;
-	/* SMC writes have no status ABI: bound retries and verify W1C completion. */
-	for (unsigned int retry = 0; retry < 4; retry++) {
-		ret = regmap_write(h->top, TOP_CLEAR, status & HPD_IRQS);
-		if (ret)
-			goto fault;
-		ret = regmap_read(h->top, TOP_STATUS, &status);
-		if (ret || (status & ~TOP_STATUS_VALID))
-			goto fault;
-		if (!(status & HPD_IRQS)) {
-			if (READ_ONCE(h->hpd_enabled))
-				drm_bridge_hpd_notify(&h->bridge, s7d_hdmi_detect(&h->bridge));
-			return IRQ_HANDLED;
-		}
+	if (ret < 0) {
+		disable_irq_nosync(irq);
+		dev_err_ratelimited(h->dev, "HPD acknowledgement failed: %d; retrying with IRQ masked\n",
+				    ret);
+		if (!READ_ONCE(h->stopping))
+			mod_delayed_work(system_wq, &h->hpd_recovery, HZ);
 	}
-fault:
-	/* Do not let a rejected secure write cause an unbounded level IRQ storm. */
-	disable_irq_nosync(irq);
-	dev_err(h->dev, "HPD interrupt not acknowledged (%d, status %#x); IRQ disabled\n",
-		ret, status);
 	if (READ_ONCE(h->hpd_enabled))
-		drm_bridge_hpd_notify(&h->bridge, connector_status_unknown);
+		drm_bridge_hpd_notify(&h->bridge, ret < 0 ? connector_status_unknown :
+				      s7d_hdmi_detect(&h->bridge));
 	return IRQ_HANDLED;
+}
+
+static void s7d_hdmi_shutdown(struct platform_device *pdev)
+{
+	struct s7d_hdmi *h = platform_get_drvdata(pdev);
+
+	mutex_lock(&h->lock);
+	WRITE_ONCE(h->stopping, true);
+	WRITE_ONCE(h->hpd_enabled, false);
+	disable_irq_nosync(h->irq);
+	mutex_unlock(&h->lock);
+	synchronize_irq(h->irq);
+	cancel_delayed_work_sync(&h->hpd_recovery);
 }
 
 static int s7d_hdmi_probe(struct platform_device *pdev)
@@ -571,6 +617,7 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	h->dev = dev;
 	mutex_init(&h->lock);
+	INIT_DELAYED_WORK(&h->hpd_recovery, s7d_hdmi_hpd_recovery);
 	ret = s7d_hdmi_init_regmaps(pdev, &h->core, &h->top);
 	if (ret)
 		return dev_err_probe(dev, ret, "TX register resources\n");
@@ -707,6 +754,7 @@ MODULE_DEVICE_TABLE(of, s7d_hdmi_match);
 
 static struct platform_driver s7d_hdmi_driver = {
 	.probe = s7d_hdmi_probe,
+	.shutdown = s7d_hdmi_shutdown,
 	.driver = {
 		.name = "s7d-hdmi-native",
 		.of_match_table = s7d_hdmi_match,
