@@ -83,16 +83,21 @@ void kbase_pm_runtime_term(struct kbase_device *kbdev)
 		kbdev->pm.callback_power_runtime_term(kbdev);
 }
 
-void kbase_pm_register_access_enable(struct kbase_device *kbdev)
+int kbase_pm_register_access_enable(struct kbase_device *kbdev)
 {
 	struct kbase_pm_callback_conf *callbacks;
+	int ret;
 
 	callbacks = (struct kbase_pm_callback_conf *)POWER_MANAGEMENT_CALLBACKS;
 
-	if (callbacks)
-		callbacks->power_on_callback(kbdev);
+	if (callbacks && callbacks->power_on_callback) {
+		ret = callbacks->power_on_callback(kbdev);
+		if (ret < 0)
+			return ret;
+	}
 
 	kbase_io_clear_status(kbdev->io, KBASE_IO_STATUS_GPU_OFF);
+	return 0;
 }
 
 void kbase_pm_register_access_disable(struct kbase_device *kbdev)
@@ -219,6 +224,8 @@ void kbase_pm_do_poweron(struct kbase_device *kbdev, bool is_resume)
 	 * kbase_pm_clock_off()
 	 */
 	kbase_pm_clock_on(kbdev, is_resume);
+	if (!kbase_io_is_gpu_powered(kbdev))
+		return;
 
 	if (!is_resume) {
 		unsigned long flags;

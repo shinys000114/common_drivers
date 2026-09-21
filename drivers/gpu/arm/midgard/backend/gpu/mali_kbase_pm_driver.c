@@ -3161,6 +3161,10 @@ void kbase_pm_clock_on(struct kbase_device *kbdev, bool is_resume)
 	} else if (backend->callback_power_on) {
 		ret = backend->callback_power_on(kbdev);
 	}
+	if (ret < 0) {
+		dev_err(kbdev->dev, "GPU power-on failed: %d\n", ret);
+		return;
+	}
 
 	spin_lock_irqsave(&kbdev->hwaccess_lock, flags);
 	kbase_io_clear_status(kbdev->io, KBASE_IO_STATUS_GPU_OFF);
@@ -3739,8 +3743,12 @@ int kbase_pm_init_hw(struct kbase_device *kbdev, unsigned int flags)
 
 	/* Ensure the clock is on before attempting to access the hardware */
 	if (!kbase_io_is_gpu_powered(kbdev)) {
-		if (kbdev->pm.backend.callback_power_on)
-			kbdev->pm.backend.callback_power_on(kbdev);
+		if (kbdev->pm.backend.callback_power_on) {
+			err = kbdev->pm.backend.callback_power_on(kbdev);
+			if (err < 0)
+				return err;
+			err = 0;
+		}
 
 		kbase_io_clear_status(kbdev->io, KBASE_IO_STATUS_GPU_OFF);
 	}

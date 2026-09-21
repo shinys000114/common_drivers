@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config AMLOGIC_C5_GPU_KBASE
+	bool "ODROID-C5 vendor Mali platform"
+	depends on ARCH_MESON_ODROID_COMMON && ARM64 && OF
+	depends on PM && COMMON_CLK
+	depends on DRM_PANTHOR = n
+	select RESET_CONTROLLER
+	help
+	  Use the C5 clock, reset and runtime PM consumers with vendor kbase.
+	  Preserves the CSF userspace ABI for the matching libMali and firmware.

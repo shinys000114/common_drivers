@@ -26,7 +26,7 @@
 #include <linux/of.h>
 #include <linux/clk.h>
 #include <linux/devfreq.h>
-#if IS_ENABLED(CONFIG_DEVFREQ_THERMAL) && !defined(CONFIG_AMLOGIC_MODIFY)
+#if IS_ENABLED(CONFIG_DEVFREQ_THERMAL)
 #include <linux/devfreq_cooling.h>
 #endif
 #include <linux/pm_domain.h>
@@ -34,7 +34,7 @@
 #include <linux/version.h>
 #include <linux/pm_opp.h>
 #include "mali_kbase_devfreq.h"
-#ifdef CONFIG_AMLOGIC_MODIFY
+#if defined(CONFIG_AMLOGIC_MODIFY) && !IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
 #include <platform/devicetree/mali_scaling.h>
 
 struct devfreq_simple_ondemand_data data;
@@ -126,13 +126,13 @@ static int kbase_devfreq_target(struct device *dev, unsigned long *target_freq, 
 	unsigned int i;
 	int err;
 	u64 core_mask;
-#ifdef CONFIG_AMLOGIC_MODIFY
+#if defined(CONFIG_AMLOGIC_MODIFY) && !IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
 	struct devfreq_dev_profile *dp;
 	mali_plat_info_t* pmali_plat = get_mali_plat_data();
 #endif
 
 	nominal_freq = *target_freq;
-#ifdef CONFIG_AMLOGIC_MODIFY
+#if defined(CONFIG_AMLOGIC_MODIFY) && !IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
 	dp = &kbdev->devfreq_profile;
 	switch (pmali_plat->status) {
 		case PREHEAT_NULL:
@@ -685,7 +685,7 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
 	dp->get_dev_status = kbase_devfreq_status;
 	dp->get_cur_freq = kbase_devfreq_cur_freq;
 	dp->exit = kbase_devfreq_exit;
-#ifdef CONFIG_AMLOGIC_MODIFY
+#if defined(CONFIG_AMLOGIC_MODIFY) && !IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
 	data.upthreshold = 30;
 	data.downdifferential = 5;
 #endif
@@ -710,7 +710,18 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
 	if (err)
 		goto init_core_mask_table_failed;
 
-#ifdef CONFIG_AMLOGIC_MODIFY
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
+	/*
+	 * Firmware can leave a non-OPP rate, and CCF reports the rounded rate
+	 * rather than the nominal OPP value. Start at a supported OPP before
+	 * devfreq records previous_freq for its transition statistics.
+	 */
+	err = kbase_devfreq_target(kbdev->dev, &dp->initial_freq, 0);
+	if (err)
+		goto devfreq_add_dev_failed;
+#endif
+
+#if defined(CONFIG_AMLOGIC_MODIFY) && !IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
 	kbdev->devfreq = devfreq_add_device(kbdev->dev, dp, "simple_ondemand", &data);
 #else
 	kbdev->devfreq = devfreq_add_device(kbdev->dev, dp, "simple_ondemand", NULL);
@@ -743,7 +754,15 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
 		goto opp_notifier_failed;
 	}
 
-#if IS_ENABLED(CONFIG_DEVFREQ_THERMAL) && !defined(CONFIG_AMLOGIC_MODIFY)
+#if IS_ENABLED(CONFIG_DEVFREQ_THERMAL) && IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
+	kbdev->devfreq_cooling = of_devfreq_cooling_register(kbdev->dev->of_node,
+							  kbdev->devfreq);
+	if (IS_ERR(kbdev->devfreq_cooling)) {
+		err = PTR_ERR(kbdev->devfreq_cooling);
+		kbdev->devfreq_cooling = NULL;
+		goto cooling_reg_failed;
+	}
+#elif IS_ENABLED(CONFIG_DEVFREQ_THERMAL) && !defined(CONFIG_AMLOGIC_MODIFY)
 	kbdev->devfreq_cooling = of_devfreq_cooling_register_power(
 		kbdev->dev->of_node, kbdev->devfreq, &kbase_ipa_power_model_ops);
 	if (IS_ERR_OR_NULL(kbdev->devfreq_cooling)) {
@@ -756,7 +775,8 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
 
 	return 0;
 
-#if IS_ENABLED(CONFIG_DEVFREQ_THERMAL) && !defined(CONFIG_AMLOGIC_MODIFY)
+#if IS_ENABLED(CONFIG_DEVFREQ_THERMAL) && \
+	(!defined(CONFIG_AMLOGIC_MODIFY) || IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE))
 cooling_reg_failed:
 	devfreq_unregister_opp_notifier(kbdev->dev, kbdev->devfreq);
 #endif /* CONFIG_DEVFREQ_THERMAL */
@@ -790,7 +810,8 @@ void kbase_devfreq_term(struct kbase_device *kbdev)
 
 	dev_dbg(kbdev->dev, "Term Mali devfreq\n");
 
-#if IS_ENABLED(CONFIG_DEVFREQ_THERMAL) && !defined(CONFIG_AMLOGIC_MODIFY)
+#if IS_ENABLED(CONFIG_DEVFREQ_THERMAL) && \
+	(!defined(CONFIG_AMLOGIC_MODIFY) || IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE))
 	if (kbdev->devfreq_cooling)
 		devfreq_cooling_unregister(kbdev->devfreq_cooling);
 #endif
