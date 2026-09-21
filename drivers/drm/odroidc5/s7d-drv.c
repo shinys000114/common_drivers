@@ -10,7 +10,9 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
 #include <drm/drm_drv.h>
@@ -48,6 +50,24 @@ static const struct drm_mode_config_funcs s7d_mode_config_funcs = {
 	.fb_create = drm_gem_fb_create,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
+};
+
+static void s7d_atomic_commit_tail(struct drm_atomic_state *state)
+{
+	struct drm_device *drm = state->dev;
+
+	drm_atomic_helper_commit_modeset_disables(drm, state);
+	drm_atomic_helper_commit_planes(drm, state, 0);
+	drm_atomic_helper_commit_modeset_enables(drm, state);
+	drm_atomic_helper_fake_vblank(state);
+	drm_atomic_helper_commit_hw_done(state);
+	/* RDMA completion and buffer retirement can span several vblanks. */
+	drm_atomic_helper_wait_for_flip_done(drm, state);
+	drm_atomic_helper_cleanup_planes(drm, state);
+}
+
+static const struct drm_mode_config_helper_funcs s7d_mode_config_helper_funcs = {
+	.atomic_commit_tail = s7d_atomic_commit_tail,
 };
 
 static void s7d_release_dma_pool(void *dev)
@@ -107,6 +127,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	drm->mode_config.funcs = &s7d_mode_config_funcs;
+	drm->mode_config.helper_private = &s7d_mode_config_helper_funcs;
 	drm->mode_config.min_width = 1;
 	drm->mode_config.min_height = 1;
 	drm->mode_config.max_width = 1920;
