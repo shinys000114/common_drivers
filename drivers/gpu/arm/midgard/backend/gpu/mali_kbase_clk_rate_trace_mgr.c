@@ -151,6 +151,7 @@ static int gpu_clk_data_init(struct kbase_device *kbdev, void *gpu_clk_handle, u
 		dev_err(kbdev->dev, "Failed to register notifier for clock enumerated at index %u",
 			index);
 		kfree(clk_data);
+		clk_rtm->clks[index] = NULL;
 	}
 
 	return ret;
@@ -201,10 +202,13 @@ int kbase_clk_rate_trace_manager_init(struct kbase_device *kbdev)
 
 error:
 	while (i--) {
-		clk_rtm->clk_rate_trace_ops->gpu_clk_notifier_unregister(
-			kbdev, clk_rtm->clks[i]->gpu_clk_handle,
-			&clk_rtm->clks[i]->clk_rate_change_nb);
+		/* clk_rate_trace_ops is published only after all clocks succeed. */
+		if (callbacks->gpu_clk_notifier_unregister)
+			callbacks->gpu_clk_notifier_unregister(
+				kbdev, clk_rtm->clks[i]->gpu_clk_handle,
+				&clk_rtm->clks[i]->clk_rate_change_nb);
 		kfree(clk_rtm->clks[i]);
+		clk_rtm->clks[i] = NULL;
 	}
 
 	return ret;
