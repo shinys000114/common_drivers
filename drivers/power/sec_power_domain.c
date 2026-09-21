@@ -35,6 +35,10 @@
 #include <dt-bindings/power/t6w-pd.h>
 #include <dt-bindings/power/t6x-pd.h>
 #include <linux/kallsyms.h>
+#include <linux/iopoll.h>
+
+#include "sec-pwrc-status.h"
+#include "s7d-display-sram.h"
 
 struct sec_pm_private_domain {
 	const char *name;
@@ -49,7 +53,17 @@ struct sec_pm_domain {
 	struct sec_pm_private_domain *private_domain;
 	u32 *unused_domains;
 	int unused_domain_count;
+	bool strict;
+	void __iomem *display_sram;
 };
+
+/* Published by the provider, independent of optional diagnostic sysfs. */
+static int mempd_domain_base = -EPROBE_DEFER;
+
+int get_max_id(void)
+{
+	return READ_ONCE(mempd_domain_base);
+}
 
 struct sec_pm_domain_data {
 	struct sec_pm_private_domain *domains;
@@ -62,22 +76,33 @@ to_sec_pm_domain(struct generic_pm_domain *genpd)
 	return container_of(genpd, struct sec_pm_domain, base);
 }
 
-static int sec_pm_domain_power_off(struct generic_pm_domain *genpd)
+static int sec_pm_domain_set(struct generic_pm_domain *genpd, bool on)
 {
 	struct sec_pm_domain *pd = to_sec_pm_domain(genpd);
+	unsigned long result;
+	int ret, status;
 
-	pwr_ctrl_psci_smc(pd->private_domain->pd_index, PWR_OFF);
+	result = pwr_ctrl_psci_smc(pd->private_domain->pd_index, on);
+	if (!pd->strict)
+		return 0;
+	ret = meson_pwrc_set_result(result);
+	if (ret)
+		return ret;
+	ret = read_poll_timeout(pwr_ctrl_status_psci_smc, result,
+				meson_pwrc_get_result(result) < 0 || result == !on,
+				10, 10000, false, pd->private_domain->pd_index);
+	status = meson_pwrc_get_result(result);
+	return status < 0 ? status : ret;
+}
 
-	return 0;
+static int sec_pm_domain_power_off(struct generic_pm_domain *genpd)
+{
+	return sec_pm_domain_set(genpd, PWR_OFF);
 }
 
 static int sec_pm_domain_power_on(struct generic_pm_domain *genpd)
 {
-	struct sec_pm_domain *pd = to_sec_pm_domain(genpd);
-
-	pwr_ctrl_psci_smc(pd->private_domain->pd_index, PWR_ON);
-
-	return 0;
+	return sec_pm_domain_set(genpd, PWR_ON);
 }
 
 #define TOP_DOMAIN(_name, index, status, flag, parent)		\
@@ -1036,20 +1061,61 @@ static struct notifier_block pd_pm_nb = {
 	.notifier_call = pd_pm_notify,
 };
 
+static int s7d_display_attach(struct generic_pm_domain *genpd, struct device *dev)
+{
+	struct sec_pm_domain *pd = to_sec_pm_domain(genpd);
+	unsigned int failed = 0;
+	int ret;
+
+	/* Domain ON alone does not establish that scanout SRAM is usable. */
+	ret = meson_pwrc_get_result(pwr_ctrl_status_psci_smc(pd->private_domain->pd_index));
+	if (ret)
+		return dev_err_probe(dev, ret < 0 ? ret : -EIO,
+				     "VPU/HDMI domain is not confirmed ON\n");
+	ret = s7d_display_sram_check(pd->display_sram, &failed);
+	if (ret == -ENODEV)
+		return dev_err_probe(dev, ret, "missing genpd vpu-sram DT resource\n");
+	if (ret)
+		return dev_err_probe(dev, ret,
+			"VPU SRAM unavailable (MEM_PD%u); retaining memory-power state\n",
+			failed);
+	return 0;
+}
+
 static int sec_pd_probe(struct platform_device *pdev)
 {
 	int ret, i, j;
+	unsigned int initialized = 0;
 	struct device_node *np = pdev->dev.of_node;
 	struct sec_pm_private_domain *private_pd, *pri_pd;
 	struct sec_pm_domain *pd;
 	int init_status;
 	const struct sec_pm_domain_data *match;
 	bool is_unused_domain;
+	void __iomem *display_sram = NULL;
+	struct resource *res;
+	bool strict = IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES) &&
+		of_device_is_compatible(np, "amlogic,s7d-power-domain");
 
 	match = of_device_get_match_data(&pdev->dev);
 	if (!match) {
 		dev_err(&pdev->dev, "failed to get match data\n");
 		return -ENODEV;
+	}
+	if (strict && of_find_property(np, "unused_domain", NULL))
+		return dev_err_probe(&pdev->dev, -EINVAL,
+			"unused_domain bypass is incompatible with C5 genpd ownership\n");
+	if (strict) {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vpu-sram");
+		if (res) {
+			if (resource_size(res) != S7D_VPU_SRAM_BYTES)
+				return dev_err_probe(&pdev->dev, -EINVAL,
+						"vpu-sram must cover MEM_PD5..9 only\n");
+			display_sram = devm_ioremap_resource(&pdev->dev, res);
+			if (IS_ERR(display_sram))
+				return PTR_ERR(display_sram);
+		}
+		/* Without this resource new display consumers fail attach explicitly. */
 	}
 
 	sec_pd_onecell_data = devm_kzalloc(&pdev->dev, sizeof(*sec_pd_onecell_data), GFP_KERNEL);
@@ -1103,17 +1169,42 @@ static int sec_pd_probe(struct platform_device *pdev)
 		pd[i].base.name = private_pd->name;
 		pd[i].base.power_on = sec_pm_domain_power_on;
 
-		if (!bypass_power_off)
+		if (strict || !bypass_power_off)
 			pd[i].base.power_off = sec_pm_domain_power_off;
 		else
 			pr_info_once("blacklist pd power off operation\n");
 
 		pd[i].base.flags = private_pd->flags;
+		pd[i].strict = strict;
 		pd[i].private_domain = &pri_pd[i];
 		pri_pd[i].pd_index = private_pd->pd_index;
 		pri_pd[i].pd_status = private_pd->pd_status;
 		pri_pd[i].pd_parent = private_pd->pd_parent;
+		if (strict && private_pd->pd_index == PDID_S7D_VPU_HDMI) {
+			pd[i].display_sram = display_sram;
+			pd[i].base.attach_dev = s7d_display_attach;
+		}
 
+		if (strict) {
+			init_status = meson_pwrc_get_result(
+				pwr_ctrl_status_psci_smc(private_pd->pd_index));
+			if (init_status < 0) {
+				ret = dev_err_probe(&pdev->dev, init_status,
+					"cannot read domain %s state\n", private_pd->name);
+				goto remove_domains;
+			}
+			if (init_status == DOMAIN_INIT_OFF &&
+			    (private_pd->flags & GENPD_FLAG_ALWAYS_ON)) {
+				ret = sec_pm_domain_power_on(&pd[i].base);
+				if (ret) {
+					dev_err_probe(&pdev->dev, ret,
+						"cannot power domain %s\n", private_pd->name);
+					goto remove_domains;
+				}
+				init_status = DOMAIN_INIT_ON;
+			}
+			goto init_domain;
+		}
 		init_status = pwr_ctrl_status_psci_smc(private_pd->pd_index);
 
 		if (is_unused_domain && init_status == DOMAIN_INIT_ON) {
@@ -1130,13 +1221,14 @@ static int sec_pd_probe(struct platform_device *pdev)
 		if (init_status == -1 || pd[i].base.flags == GENPD_FLAG_ALWAYS_ON)
 			init_status = private_pd->pd_status;
 
-		/* Initialize based on pd_status */
+init_domain:
 		ret = pm_genpd_init(&pd[i].base, NULL, init_status);
 		if (ret) {
 			dev_err(&pdev->dev, "failed to init domain %s\n", pd[i].base.name);
-			return ret;
+			goto remove_domains;
 		}
 		sec_pd_onecell_data->domains[i] = &pd[i].base;
+		initialized = i + 1;
 	}
 
 	for (i = 0; i < match->domains_count; i++) {
@@ -1149,12 +1241,13 @@ static int sec_pd_probe(struct platform_device *pdev)
 		if (ret) {
 			dev_err(&pdev->dev, "failed to add %s subdomain to parent %s\n",
 				pd[i].base.name, pd[private_pd->pd_parent].base.name);
-			return ret;
+			goto remove_links;
 		}
 	}
 
-	pd_dev_create_file(&pdev->dev, 0, sec_pd_onecell_data->num_domains,
-			   sec_pd_onecell_data->domains);
+	if (!strict)
+		pd_dev_create_file(&pdev->dev, 0, sec_pd_onecell_data->num_domains,
+				   sec_pd_onecell_data->domains);
 
 	ret = of_genpd_add_provider_onecell(pdev->dev.of_node,
 					    sec_pd_onecell_data);
@@ -1162,19 +1255,41 @@ static int sec_pd_probe(struct platform_device *pdev)
 		goto out;
 
 	/* register syscore ops to restore domain status at std */
-	register_syscore_ops(&pd_syscore_ops);
+	/* C5 uses genpd device PM; the legacy syscore callback cannot sleep. */
+	if (!strict)
+		register_syscore_ops(&pd_syscore_ops);
 	/*
 	 * register pm notify, distinguish between std and str, and ensure
 	 * that syscore_ops is called only when std is used.
 	 */
-	ret = register_pm_notifier(&pd_pm_nb);
-	if (unlikely(ret))
-		return ret;
+	if (!strict) {
+		ret = register_pm_notifier(&pd_pm_nb);
+		if (ret) {
+			unregister_syscore_ops(&pd_syscore_ops);
+			of_genpd_del_provider(pdev->dev.of_node);
+			goto out;
+		}
+	}
+	/* Unverified SRAM IDs are deliberately unavailable to legacy callers. */
+	WRITE_ONCE(mempd_domain_base, strict ? -EOPNOTSUPP : match->domains_count);
 
 	return 0;
 
 out:
-	pd_dev_remove_file(&pdev->dev);
+	if (!strict)
+		pd_dev_remove_file(&pdev->dev);
+	i = match->domains_count;
+remove_links:
+	while (i--) {
+		private_pd = &match->domains[i];
+		if (private_pd->name && private_pd->pd_parent)
+			pm_genpd_remove_subdomain(&pd[private_pd->pd_parent].base,
+						 &pd[i].base);
+	}
+remove_domains:
+	while (initialized--)
+		if (sec_pd_onecell_data->domains[initialized])
+			pm_genpd_remove(sec_pd_onecell_data->domains[initialized]);
 	return ret;
 }
 
