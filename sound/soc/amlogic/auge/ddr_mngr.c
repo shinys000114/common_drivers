@@ -2625,23 +2625,18 @@ static char *ddr_get_frddr_name_by_idx(int idx)
 static int aml_ddr_mngr_platform_probe(struct platform_device *pdev)
 {
 	struct device_node *node = pdev->dev.of_node;
-	struct device_node *node_prt = NULL;
-	struct platform_device *pdev_parent;
 	struct aml_audio_controller *actrl = NULL;
 	struct ddr_chipinfo *p_ddr_chipinfo;
 	int i, ret;
 	void __iomem *regs;
 	struct resource *res_mem;
 
-	/* get audio controller */
-	node_prt = of_get_parent(node);
-	if (!node_prt)
+	if (!pdev->dev.parent)
 		return -ENXIO;
-
-	pdev_parent = of_find_device_by_node(node_prt);
-	of_node_put(node_prt);
-	actrl = (struct aml_audio_controller *)
-				platform_get_drvdata(pdev_parent);
+	actrl = dev_get_drvdata(pdev->dev.parent);
+	if (!actrl)
+		return dev_err_probe(&pdev->dev, -EPROBE_DEFER,
+				     "audio controller is not ready\n");
 
 	p_ddr_chipinfo = (struct ddr_chipinfo *)
 		of_device_get_match_data(&pdev->dev);
