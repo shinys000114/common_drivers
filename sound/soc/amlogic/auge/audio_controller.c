@@ -75,7 +75,7 @@ struct aml_audio_ctrl_ops aml_actrl_mmio_ops = {
 	.update_bits	= aml_audio_mmio_update_bits,
 };
 
-static struct regmap_config aml_audio_regmap_config = {
+static const struct regmap_config aml_audio_regmap_config = {
 	.reg_bits = 32,
 	.val_bits = 32,
 	.reg_stride = 4,
@@ -111,33 +111,47 @@ static int register_audio_controller(struct platform_device *pdev,
 	struct resource *res_mem;
 	void __iomem *regs;
 	struct regmap *regmap;
+	struct regmap_config config = aml_audio_regmap_config;
+	resource_size_t size;
 	struct gate_info *info = (struct gate_info *)of_device_get_match_data(&pdev->dev);
+	int ret;
 
 	/* get platform res from dtb */
 	res_mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res_mem)
 		return -ENOENT;
 
-	regs = ioremap(res_mem->start, resource_size(res_mem));
-	if (IS_ERR(regs))
-		return PTR_ERR(regs);
+	size = resource_size(res_mem);
+	if (size < 4 || size > U32_MAX || !IS_ALIGNED(size, 4) ||
+	    !IS_ALIGNED(res_mem->start, 4))
+		return -EINVAL;
+	regs = devm_ioremap(&pdev->dev, res_mem->start, size);
+	if (!regs)
+		return -ENOMEM;
 
-	aml_audio_regmap_config.max_register = 4 * resource_size(res_mem);
+	config.max_register = size - 4;
+	config.max_register_is_0 = true;
 
 	regmap = devm_regmap_init_mmio(&pdev->dev, regs,
-				       &aml_audio_regmap_config);
+				       &config);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
 	/* init aml audio bus mmio controller */
 	aml_init_audio_controller(actrl, regmap, &aml_actrl_mmio_ops);
-	platform_set_drvdata(pdev, actrl);
 
 	/* gate on all clks on bringup stage, need gate separately */
-	aml_audiobus_write(actrl, EE_AUDIO_CLK_GATE_EN0, 0xffffffff);
+	ret = aml_audiobus_write(actrl, EE_AUDIO_CLK_GATE_EN0, 0xffffffff);
+	if (ret)
+		return ret;
 
-	if (info && !info->clk1_gate_off)
-		aml_audiobus_update_bits(actrl, EE_AUDIO_CLK_GATE_EN1, 0xffffffff, 0xffffffff);
+	if (info && !info->clk1_gate_off) {
+		ret = aml_audiobus_update_bits(actrl, EE_AUDIO_CLK_GATE_EN1,
+					      0xffffffff, 0xffffffff);
+		if (ret)
+			return ret;
+	}
+	platform_set_drvdata(pdev, actrl);
 	return 0;
 }
 
