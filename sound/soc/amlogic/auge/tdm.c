@@ -2810,8 +2810,6 @@ static int aml_tdm_clock_notifier(struct notifier_block *nb,
 static int aml_tdm_platform_probe(struct platform_device *pdev)
 {
 	struct device_node *node = pdev->dev.of_node;
-	struct device_node *node_prt = NULL;
-	struct platform_device *pdev_parent;
 	struct device *dev = &pdev->dev;
 	struct aml_audio_controller *actrl = NULL;
 	struct aml_tdm *p_tdm = NULL;
@@ -2841,15 +2839,12 @@ static int aml_tdm_platform_probe(struct platform_device *pdev)
 	pr_debug("%s, tdm ID = %u, lane_cnt = %d\n", __func__,
 			p_tdm->id, p_tdm->lane_cnt);
 
-	/* get audio controller */
-	node_prt = of_get_parent(node);
-	if (!node_prt)
+	if (!dev->parent)
 		return -ENXIO;
-
-	pdev_parent = of_find_device_by_node(node_prt);
-	of_node_put(node_prt);
-	actrl = (struct aml_audio_controller *)
-				platform_get_drvdata(pdev_parent);
+	actrl = dev_get_drvdata(dev->parent);
+	if (!actrl)
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				     "audio controller is not ready\n");
 	p_tdm->actrl = actrl;
 	np_src = of_parse_phandle(node, "pcpd_monitor_src", 0);
 	if (np_src) {
