@@ -223,9 +223,16 @@ struct aml_card_data {
 #define aml_card_init_mic(card, sjack, prefix)\
 	aml_card_init_jack(card, sjack, 0, prefix)
 
+static struct platform_driver aml_card;
+
 enum hdmitx_src get_hdmitx_audio_src(struct snd_soc_card *card)
 {
-	struct aml_card_data *priv = aml_card_to_priv(card);
+	struct aml_card_data *priv;
+
+	/* Standard machine drivers do not embed aml_card_data. */
+	if (!card->dev || card->dev->driver != &aml_card.driver)
+		return HDMITX_SRC_NONE;
+	priv = aml_card_to_priv(card);
 
 	return priv->hdmitx_src;
 }

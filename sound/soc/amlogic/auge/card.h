@@ -11,7 +11,8 @@
 #include "../common/iec_info.h"
 
 enum hdmitx_src {
-	HDMITX_SRC_SPDIF,
+	HDMITX_SRC_NONE = -1,
+	HDMITX_SRC_SPDIF = 0,
 	HDMITX_SRC_SPDIF_B,
 	HDMITX_SRC_TDM_A,
 	HDMITX_SRC_TDM_B,
