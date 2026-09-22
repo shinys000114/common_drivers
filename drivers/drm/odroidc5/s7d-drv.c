@@ -9,10 +9,12 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_modeset_helper.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
 #include <drm/drm_drv.h>
@@ -204,16 +206,49 @@ static void s7d_drm_shutdown(struct platform_device *pdev)
 	/* No devres/DMA release here: failed stop is never permission to free. */
 }
 
-/* Suspend needs coordinated bridge/DDC/PHY restoration, not implicit power loss. */
 static int s7d_drm_suspend(struct device *dev)
 {
+	struct s7d_drm *display = dev_get_drvdata(dev);
+	int ret, restore;
+
+	/* Only s2idle retains the shared domain and DDC/HPD clock context. */
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE || display->vpu.boot_held)
+		return -EBUSY;
+	ret = drm_mode_config_helper_suspend(&display->drm);
+	if (ret)
+		return ret;
+	/* Atomic disable cannot return its hardware-stop error to the helper. */
+	ret = s7d_crtc_last_error(display->vpu.crtc);
+	if (!ret)
+		return 0;
+	restore = drm_mode_config_helper_resume(&display->drm);
+	if (!restore)
+		restore = s7d_crtc_last_error(display->vpu.crtc);
+	if (restore)
+		dev_err(dev, "failed to restore display after aborted suspend: %d\n", restore);
+	return ret;
+}
+
+static int s7d_drm_resume(struct device *dev)
+{
+	struct s7d_drm *display = dev_get_drvdata(dev);
+	int ret;
+
+	ret = drm_mode_config_helper_resume(&display->drm);
+	return ret ? ret : s7d_crtc_last_error(display->vpu.crtc);
+}
+
+static int s7d_drm_freeze(struct device *dev)
+{
+	/* Hibernation needs restoration of context lost across power removal. */
 	return -EBUSY;
 }
 
 static const struct dev_pm_ops s7d_drm_pm_ops = {
 	.suspend = s7d_drm_suspend,
-	.freeze = s7d_drm_suspend,
-	.poweroff = s7d_drm_suspend,
+	.resume = s7d_drm_resume,
+	.freeze = s7d_drm_freeze,
+	.poweroff = s7d_drm_freeze,
 };
 
 static const struct of_device_id s7d_drm_match[] = {
