@@ -29,6 +29,28 @@ TRACE_EVENT(s7d_frame,
 		  __entry->encp & 0x1fff, __entry->encp >> 29,
 		  __entry->sequence, __entry->result)
 );
+
+TRACE_EVENT(s7d_frame_idle,
+	TP_PROTO(u32 before, u32 after, u32 fifo, u32 arbiter, bool vblank),
+	TP_ARGS(before, after, fifo, arbiter, vblank),
+	TP_STRUCT__entry(
+		__field(u32, before)
+		__field(u32, after)
+		__field(u32, fifo)
+		__field(u32, arbiter)
+		__field(bool, vblank)
+	),
+	TP_fast_assign(
+		__entry->before = before;
+		__entry->after = after;
+		__entry->fifo = fifo;
+		__entry->arbiter = arbiter;
+		__entry->vblank = vblank;
+	),
+	TP_printk("before=%#x after=%#x fifo=%#x arbiter=%#x vblank=%u",
+		  __entry->before, __entry->after, __entry->fifo,
+		  __entry->arbiter, __entry->vblank)
+);
 #endif
 
 #undef TRACE_INCLUDE_PATH

@@ -395,7 +395,8 @@ static void s7d_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_sta
 	mutex_unlock(&c->mutex);
 }
 
-void s7d_crtc_irq(struct drm_crtc *crtc, bool vblank, enum s7d_rdma_result result)
+void s7d_crtc_irq(struct drm_crtc *crtc, bool vblank, enum s7d_rdma_result result,
+		  const struct s7d_frame_state *frame)
 {
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	enum s7d_scanout_result scanout;
@@ -405,7 +406,7 @@ void s7d_crtc_irq(struct drm_crtc *crtc, bool vblank, enum s7d_rdma_result resul
 		return;
 	if (vblank)
 		drm_crtc_handle_vblank(crtc);
-	scanout = s7d_scanout_irq(c->scanout, vblank, result);
+	scanout = s7d_scanout_irq(c->scanout, vblank, result, frame);
 	if (scanout == S7D_SCANOUT_FAULT) {
 		s7d_crtc_fail(c, -EIO, NULL);
 		return;

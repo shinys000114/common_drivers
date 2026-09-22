@@ -65,7 +65,8 @@ struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *prima
 			       const struct s7d_crtc_ops *ops, void *data);
 
 /* Account each real acknowledged vblank/RDMA result exactly once. */
-void s7d_crtc_irq(struct drm_crtc *crtc, bool vblank, enum s7d_rdma_result result);
+void s7d_crtc_irq(struct drm_crtc *crtc, bool vblank, enum s7d_rdma_result result,
+		  const struct s7d_frame_state *frame);
 bool s7d_crtc_is_native(const struct drm_crtc *crtc);
 int s7d_crtc_last_error(struct drm_crtc *crtc);
 /* Bridge completion/error, after atomic_enable; never used from atomic_check. */

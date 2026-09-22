@@ -62,7 +62,7 @@ int s7d_scanout_initial_ready(struct s7d_scanout *s)
 		ret = -EINVAL;
 	} else {
 		/* Caller has not enabled VENC yet; its first vblank is sufficient. */
-		s->vblanks_left = 1;
+		s->wait_field = false;
 		s->phase = S7D_SCANOUT_VBLANK;
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
@@ -112,7 +112,8 @@ out:
 }
 
 enum s7d_scanout_result
-s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_result)
+s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_result,
+		const struct s7d_frame_state *frame)
 {
 	enum s7d_scanout_result result = S7D_SCANOUT_NO_CHANGE;
 	unsigned long flags;
@@ -129,13 +130,14 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 	}
 	if (rdma_result == S7D_RDMA_COMPLETE) {
 		s->phase = S7D_SCANOUT_VBLANK;
-		s->vblanks_left = 2;
+		s->applied_field = frame->field;
+		s->wait_field = true;
 		/* A vblank supplied in this call belongs to the completion frame. */
 		goto out;
 	}
 	if (!vblank || s->phase != S7D_SCANOUT_VBLANK)
 		goto out;
-	if (--s->vblanks_left)
+	if (s->wait_field && (!frame->idle || frame->field == s->applied_field))
 		goto out;
 	if (!s->pending_fb || s->retired_fb) {
 		s->fault = true;
@@ -181,7 +183,7 @@ int s7d_scanout_quiesce(struct s7d_scanout *s)
 	s->active_fb = NULL;
 	s->pending_fb = NULL;
 	s->phase = S7D_SCANOUT_STOPPED;
-	s->vblanks_left = 0;
+	s->wait_field = false;
 	s->fault = false;
 	spin_unlock_irqrestore(&s->lock, flags);
 	if (active_fb)

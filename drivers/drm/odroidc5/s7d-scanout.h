@@ -9,6 +9,11 @@
 
 struct drm_framebuffer;
 
+struct s7d_frame_state {
+	u8 field;
+	bool idle;
+};
+
 enum s7d_scanout_phase {
 	S7D_SCANOUT_STOPPED,
 	S7D_SCANOUT_INITIAL,
@@ -27,7 +32,8 @@ struct s7d_scanout {
 	struct drm_framebuffer *retired_fb;
 	enum s7d_scanout_phase phase;
 	u64 vblank_seq;
-	unsigned int vblanks_left;
+	u8 applied_field;
+	bool wait_field;
 	bool fault;
 };
 
@@ -63,16 +69,14 @@ int s7d_scanout_submit(struct s7d_scanout *scanout, struct drm_framebuffer *fb,
  * delivered together or on separate IRQs. No framebuffer is put in IRQ.
  * The CRTC sends its event only on FRAME_COMPLETE. RDMA FAULT is sticky.
  *
- * Wait two observed vblanks after RDMA completion because separate IRQs can
- * be serviced in either order for the same physical vsync. This deliberately
- * delays retirement/events until a later frame; it is not a hardware DMA
- * drain proof. The RDMA backend must first stop triggers and verify reset
- * in threaded IRQ context before reporting COMPLETE. OSD latch/fetch timing
- * still needs silicon validation.
+ * Caller serializes sampling with delivery across all display IRQs. After
+ * RDMA reset, require a different ENCP field and idle OSD/arbiter reads before
+ * returning the previous framebuffer. Counter wrap may delay completion but
+ * must never let a same-field late IRQ retire it.
  */
 enum s7d_scanout_result
 s7d_scanout_irq(struct s7d_scanout *scanout, bool vblank,
-		enum s7d_rdma_result rdma_result);
+		enum s7d_rdma_result rdma_result, const struct s7d_frame_state *frame);
 void s7d_scanout_fail(struct s7d_scanout *scanout);
 
 /*
