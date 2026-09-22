@@ -28,6 +28,7 @@ struct s7d_vpu {
 	struct s7d_rdma rdma;
 	struct s7d_scanout scanout;
 	struct drm_crtc *crtc;
+	spinlock_t frame_lock;
 	int vsync_irq;
 	int rdma_irq;
 	atomic_t vsync_enabled;

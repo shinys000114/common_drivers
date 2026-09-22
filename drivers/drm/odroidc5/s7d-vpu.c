@@ -423,13 +423,34 @@ static void s7d_vpu_trace_frame(struct s7d_vpu *v, unsigned int kind, int result
 			       drm_crtc_vblank_count(v->crtc), result);
 }
 
+static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
+			      enum s7d_rdma_result result)
+{
+	struct s7d_frame_state frame;
+	unsigned long flags;
+	u32 before, after, fifo, arbiter;
+
+	/* An older IRQ sample must not overtake the threaded RDMA completion. */
+	spin_lock_irqsave(&v->frame_lock, flags);
+	before = vpu_read(v, ENCP_INFO_READ);
+	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
+	arbiter = vpu_read(v, ASYNC_STAT);
+	after = vpu_read(v, ENCP_INFO_READ);
+	frame.field = after >> 29;
+	frame.idle = (before >> 29) == frame.field &&
+		     !(fifo & OSD_FIFO_STATE) && (arbiter & ASYNC_IDLE);
+	trace_s7d_frame_idle(before, after, fifo, arbiter, vblank);
+	s7d_crtc_irq(v->crtc, vblank, result, &frame);
+	spin_unlock_irqrestore(&v->frame_lock, flags);
+}
+
 static irqreturn_t s7d_vpu_vsync_irq(int irq, void *data)
 {
 	struct s7d_vpu *v = data;
 
 	s7d_vpu_trace_frame(v, 0, 0);
 	/* VIU1 VSYNC is a GIC edge, not the legacy VENC_INTFLAG interrupt. */
-	s7d_crtc_irq(v->crtc, true, S7D_RDMA_NO_IRQ);
+	s7d_vpu_frame_irq(v, true, S7D_RDMA_NO_IRQ);
 	return IRQ_HANDLED;
 }
 
@@ -444,7 +465,7 @@ static irqreturn_t s7d_vpu_rdma_irq(int irq, void *data)
 		s7d_vpu_trace_frame(v, 1, result);
 		return IRQ_WAKE_THREAD;
 	}
-	s7d_crtc_irq(v->crtc, false, result);
+	s7d_vpu_frame_irq(v, false, result);
 	return IRQ_HANDLED;
 }
 
@@ -455,7 +476,7 @@ static irqreturn_t s7d_vpu_rdma_thread(int irq, void *data)
 
 	s7d_vpu_trace_frame(v, 2, ret);
 	/* No framebuffer retirement/event until reset has drained DMA reads. */
-	s7d_crtc_irq(v->crtc, false, ret ? S7D_RDMA_FAULT : S7D_RDMA_COMPLETE);
+	s7d_vpu_frame_irq(v, false, ret ? S7D_RDMA_FAULT : S7D_RDMA_COMPLETE);
 	return IRQ_HANDLED;
 }
 
@@ -471,6 +492,7 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 		return -EINVAL;
 	v->link = *link;
 	v->dev = dev;
+	spin_lock_init(&v->frame_lock);
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vcbus");
 	if (!res || resource_size(res) != SZ_64K)
 		return -EINVAL;
