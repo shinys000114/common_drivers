@@ -12,4 +12,11 @@ config AMLOGIC_DOS_RESET_MESON
 	help
 	  This enables the reset driver for Amlogic Dos Meson SoCs.
 
+config RESET_MESON_S7D_AUDIO
+	tristate "Amlogic S7D audio block resets"
+	depends on MFD_MESON_S7D_AUDIO
+	help
+	  Provide the audio block reset lines through the audio controller's
+	  regmap, without resetting unrelated audio engines at probe time.
+
 endif
