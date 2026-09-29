@@ -377,4 +377,16 @@ config AMLOGIC_C5_DISPLAY_RESOURCES
 	  domains, and disables direct power sysfs and legacy SRAM switching.
 	  Keep disabled in the original vendor display configuration.
 
+config COMMON_CLK_MESON_S7D_AUDIO
+	tristate "Amlogic S7D native audio clocks"
+	depends on MFD_MESON_S7D_AUDIO && AMLOGIC_COMMON_CLK
+	depends on AMLOGIC_COMMON_CLK_MESON_REGMAP
+	depends on AMLOGIC_COMMON_CLK_MESON_SCLK_DIV
+	depends on AMLOGIC_COMMON_CLK_MESON_PHASE
+	depends on !AMLOGIC_BYPASS_CCF_CLK
+	help
+	  Provide audio DMA and TDM gates, MCLK generators, the master B
+	  bit/sample clocks and the HDMI MCLK route through the audio parent's
+	  regmap. Clocks are enabled by their consumers, without global gating.
+
 endmenu
