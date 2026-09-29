@@ -62,6 +62,7 @@
 #include <dt-bindings/clock/amlogic,s7d-clkc.h>
 #include <dt-bindings/clock/amlogic,s7d-audio-clkc.h>
 #include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
+#include <dt-bindings/reset/amlogic,s7d-audio-reset.h>
 #include <dt-bindings/power/s7d-pd.h>
 
 &audiobus {
@@ -102,6 +103,24 @@
 					      "fclk-div4", "xtal";
 				assigned-clocks = <&c5_audio_clkc S7D_AUDIO_CLK_HDMI_MCLK_SEL>;
 				assigned-clock-parents = <&c5_audio_clkc CLKID_AUDIO_MCLK_B>;
+			};
+
+			c5_hdmi_audio: hdmi-audio {
+				compatible = "amlogic,s7d-hdmi-audio";
+				#sound-dai-cells = <0>;
+				interrupts = <GIC_SPI 36 IRQ_TYPE_EDGE_RISING>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_DDR_ARB>,
+					 <&c5_audio_clkc CLKID_AUDIO_GATE_FRDDRA>,
+					 <&c5_audio_clkc CLKID_AUDIO_GATE_TDMOUTB>,
+					 <&c5_audio_clkc CLKID_AUDIO_MCLK_B>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_MST_B_SCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_MST_B_LRCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_HDMI_MCLK>;
+				clock-names = "arb", "fifo", "tdm", "mclk", "bclk",
+					      "lrclk", "hdmi-mclk";
+				resets = <&c5_audio_reset S7D_AUDIO_RESET_FRDDRA>,
+					 <&c5_audio_reset S7D_AUDIO_RESET_TDMOUTB>;
+				reset-names = "fifo", "tdm";
 			};
 
 			c5_audio_reset: reset-controller {
