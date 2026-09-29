@@ -13,3 +13,5 @@ obj-$(CONFIG_AMLOGIC_MFD)		+= $(MODULE_NAME).o
 $(MODULE_NAME)-y += main.o
 
 $(MODULE_NAME)-$(CONFIG_AMLOGIC_MFD_PMIC6B) += meson_pmic6b.o
+
+obj-$(CONFIG_MFD_MESON_S7D_AUDIO) += meson-s7d-audio.o

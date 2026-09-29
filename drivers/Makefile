@@ -69,7 +69,11 @@ obj-$(CONFIG_AMLOGIC_FREERTOS)		+= freertos/
 obj-$(CONFIG_AMLOGIC_JTAG_MESON)	+= jtag/
 obj-y					+= android/
 obj-$(CONFIG_AMLOGIC_YAFFS_FS)		+= yaffs2/
+ifneq ($(CONFIG_MFD_MESON_S7D_AUDIO),)
+obj-y					+= mfd/
+else
 obj-$(CONFIG_AMLOGIC_MFD_PMIC6B)	+= mfd/
+endif
 obj-$(CONFIG_AMLOGIC_AUDIO_BRIDGE)	+= audiobridge/
 obj-$(CONFIG_AMLOGIC_MEDIA_ALGORITHM)	+= algorithm/
 obj-$(CONFIG_AMLOGIC_SOC_TIMESTAMP)	+= timestamp/
