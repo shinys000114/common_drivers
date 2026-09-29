@@ -63,6 +63,41 @@
 #include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
 #include <dt-bindings/power/s7d-pd.h>
 
+&audiobus {
+	status = "disabled";
+};
+
+&amlogic_codec {
+	status = "disabled";
+};
+
+&{/soc/aml_snd_iomap} {
+	status = "disabled";
+};
+
+&{/auge_sound} {
+	status = "disabled";
+};
+
+/ {
+	soc {
+		c5_audio: audio-controller@fe330000 {
+			compatible = "amlogic,s7d-audio";
+			reg = <0 0xfe330000 0 0x1000>;
+			clocks = <&clkc CLKID_SYS_AUDIO>;
+			clock-names = "pclk";
+			resets = <&reset RESET_AUDIO>;
+			reset-names = "audio";
+			power-domains = <&pwrdm PDID_S7D_AUDIO>;
+
+			c5_audio_reset: reset-controller {
+				compatible = "amlogic,s7d-audio-reset";
+				#reset-cells = <1>;
+			};
+		};
+	};
+};
+
 /* Keep the pwrdm label: all inherited power-domain references follow it. */
 /delete-node/ &pwrdm;
 
