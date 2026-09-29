@@ -279,7 +279,8 @@ static int check_handoff(struct s7d_vpu *v)
 
 static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 {
-	u32 setting = BIT(1) | (state->encp.hsync_positive ? BIT(2) : 0) |
+	/* S7D VENC supplies BRG; rotate to RGB before the HDMI formatter. */
+	u32 setting = BIT(16) | BIT(1) | (state->encp.hsync_positive ? BIT(2) : 0) |
 				(state->encp.vsync_positive ? BIT(3) : 0);
 	unsigned int i;
 	int ret;
