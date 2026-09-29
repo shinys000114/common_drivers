@@ -29,3 +29,14 @@ config AMLOGIC_MFD_PMIC6B
 	  functionality of the device.
 
 endif
+
+config MFD_MESON_S7D_AUDIO
+	tristate "Amlogic S7D audio resource controller"
+	depends on ARM64 && OF && COMMON_CLK && RESET_CONTROLLER && PM
+	depends on AMLOGIC_SND_SOC = n
+	select REGMAP_MMIO
+	help
+	  Own the audio register bank and provide a shared regmap to its
+	  clock, reset and ASoC children. The bus clock and power domain stay
+	  referenced while the children are registered. Requires a device tree
+	  with the overlapping vendor audio devices disabled.
