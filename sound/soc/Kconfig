@@ -4,4 +4,5 @@ if SND_SOC
 source "$(COMMON_DRIVERS_DIR)/sound/soc/codecs/Kconfig"
 source "$(COMMON_DRIVERS_DIR)/sound/soc/amlogic/Kconfig"
 source "$(COMMON_DRIVERS_DIR)/sound/soc/amlogic/auge/vad/Kconfig"
+source "$(COMMON_DRIVERS_DIR)/sound/soc/meson/Kconfig"
 endif   # SND_SOC

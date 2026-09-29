@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+config SND_SOC_MESON_S7D_HDMI_AUDIO
+	tristate "Amlogic S7D native HDMI audio transport"
+	depends on MFD_MESON_S7D_AUDIO && COMMON_CLK_MESON_S7D_AUDIO
+	depends on RESET_MESON_S7D_AUDIO
+	help
+	  Standard ASoC PCM and I2S playback through FRDDR A and TDM B.
+	  Uses the native audio clock and reset providers and shared regmap.
+	  Connect this CPU DAI to an HDMI codec through an ASoC sound card.
