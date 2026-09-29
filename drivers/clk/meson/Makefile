@@ -3,6 +3,7 @@
 
 MODULE_NAME = amlogic-clk
 obj-$(CONFIG_AMLOGIC_COMMON_CLK) = $(MODULE_NAME).o
+obj-$(CONFIG_COMMON_CLK_MESON_S7D_AUDIO) += s7d-audio.o
 
 ccflags-y += -I$(srctree)/$(COMMON_DRIVERS_DIR)/drivers/clk/meson
 
