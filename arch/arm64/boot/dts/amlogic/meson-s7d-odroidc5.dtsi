@@ -60,6 +60,7 @@
 };
 
 #include <dt-bindings/clock/amlogic,s7d-clkc.h>
+#include <dt-bindings/clock/amlogic,s7d-audio-clkc.h>
 #include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
 #include <dt-bindings/power/s7d-pd.h>
 
@@ -89,6 +90,19 @@
 			resets = <&reset RESET_AUDIO>;
 			reset-names = "audio";
 			power-domains = <&pwrdm PDID_S7D_AUDIO>;
+
+			c5_audio_clkc: clock-controller {
+				compatible = "amlogic,s7d-audio-clkc";
+				#clock-cells = <1>;
+				clocks = <&clkc CLKID_SYS_AUDIO>,
+					 <&clkc CLKID_HIFI1_PLL>, <&clkc CLKID_HIFI_PLL>,
+					 <&clkc CLKID_FCLK_DIV3>, <&clkc CLKID_FCLK_DIV4>,
+					 <&xtal>;
+				clock-names = "pclk", "hifi1", "hifi0", "fclk-div3",
+					      "fclk-div4", "xtal";
+				assigned-clocks = <&c5_audio_clkc S7D_AUDIO_CLK_HDMI_MCLK_SEL>;
+				assigned-clock-parents = <&c5_audio_clkc CLKID_AUDIO_MCLK_B>;
+			};
 
 			c5_audio_reset: reset-controller {
 				compatible = "amlogic,s7d-audio-reset";
