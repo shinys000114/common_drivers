@@ -37,6 +37,7 @@ struct s7d_vpu {
 	bool boot_held;
 	bool touched;
 	bool pixel_protected;
+	bool core_protected;
 	u32 failed_reg;
 };
 

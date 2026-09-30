@@ -150,8 +150,8 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	drm->mode_config.helper_private = &s7d_mode_config_helper_funcs;
 	drm->mode_config.min_width = 1;
 	drm->mode_config.min_height = 1;
-	drm->mode_config.max_width = 1920;
-	drm->mode_config.max_height = 1080;
+	drm->mode_config.max_width = 4096;
+	drm->mode_config.max_height = 2160;
 	ret = s7d_vpu_init(pdev, &display->vpu, &link);
 	if (ret)
 		return dev_err_probe(dev, ret, "VPU resources\n");
