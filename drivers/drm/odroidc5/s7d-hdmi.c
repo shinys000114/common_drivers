@@ -468,13 +468,13 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 		{ 0x010b, 1 }, /* SOC_FUNC_SEL */
 		{ 0x02ca, 2 }, /* TEST_TXCTRL */
 		{ 0x0235, 0x8a }, /* CLKRATIO */
-		{ 0x0b44, 0x40 }, /* VP_OUTPUT_MAPPING: identity lanes */
-		{ 0x0b45, 4 },
 		{ 0x0b46, 0 }, /* VP_OUTPUT_MASK */
 		{ 0x06ed, 4 }, /* VTEM disabled */
 		{ 0x06f7, 4 }, /* GEN5 disabled */
 		{ 0x06e1, 0 }, /* GCP non-merge for 8 bpc */
 	};
+	const u8 mapping[] = { 0x40, 0x04 };
+	u8 actual[sizeof(mapping)];
 	unsigned int i;
 	int ret;
 
@@ -505,6 +505,18 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 		ret = core_write(h, config[i].reg, config[i].def);
 		if (ret)
 			return ret;
+	}
+	/* Write the complete two-byte mapping before checking its readback. */
+	ret = regmap_bulk_write(h->core, 0x0b44, mapping, sizeof(mapping));
+	if (ret)
+		return ret;
+	ret = regmap_bulk_read(h->core, 0x0b44, actual, sizeof(actual));
+	if (ret)
+		return ret;
+	if (memcmp(actual, mapping, sizeof(mapping))) {
+		dev_err(h->dev, "HDMI output mapping readback %#x%02x, expected 0x0440\n",
+			actual[1], actual[0]);
+		return -EIO;
 	}
 	ret = s7d_hdmi_write_checked(h, h->core, 0x012a, 3, 0); /* Original DE */
 	if (ret)
