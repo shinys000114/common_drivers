@@ -194,18 +194,18 @@ static int s7d_ddc_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int n
 	if (num < 1 || num > 3)
 		return -EOPNOTSUPP;
 	if (num == 3) {
-		if (msgs[0].addr != 0x30 || msgs[0].flags || msgs[0].len != 1)
+		if (msgs[0].addr != 0x30 || (msgs[0].flags & ~I2C_M_DMA_SAFE) || msgs[0].len != 1)
 			return -EOPNOTSUPP;
 		segment = msgs[0].buf[0];
 		first = 1;
 	}
 	write = num == 1;
 	if (write) {
-		if (msgs[0].addr != 0x54 || msgs[0].flags || msgs[0].len != 2)
+		if (msgs[0].addr != 0x54 || (msgs[0].flags & ~I2C_M_DMA_SAFE) || msgs[0].len != 2)
 			return -EOPNOTSUPP;
 	} else {
-		if (msgs[first].flags || msgs[first].len != 1 ||
-		    msgs[first + 1].flags != I2C_M_RD ||
+		if ((msgs[first].flags & ~I2C_M_DMA_SAFE) || msgs[first].len != 1 ||
+		    (msgs[first + 1].flags & ~I2C_M_DMA_SAFE) != I2C_M_RD ||
 		    msgs[first].addr != msgs[first + 1].addr ||
 		    (msgs[first].addr != 0x50 && msgs[first].addr != 0x54) ||
 		    !msgs[first + 1].len || msgs[first + 1].len > 128 ||
