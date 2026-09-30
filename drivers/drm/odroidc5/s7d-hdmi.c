@@ -350,6 +350,7 @@ static int s7d_hdmi_quiesce(void *data)
 		if (ret) {
 			h->audio_error = ret;
 			dev_err(h->dev, "HDMI audio stop before modeset failed: %d\n", ret);
+			goto out;
 		}
 	}
 	if (h->phy_on) {
