@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/hdmi.h>
 #include <linux/interrupt.h>
 #include <linux/media-bus-format.h>
@@ -64,8 +65,11 @@ struct s7d_hdmi_state {
 	struct drm_bridge_state base;
 	struct drm_display_mode mode;
 	u8 avi[HDMI_INFOFRAME_HEADER_SIZE + HDMI_AVI_INFOFRAME_SIZE];
+	u8 vendor[HDMI_INFOFRAME_SIZE(MAX)];
+	u8 vendor_len;
 	bool hdmi;
 	bool scdc;
+	bool high_tmds;
 	bool valid;
 };
 
@@ -423,9 +427,27 @@ out:
 	return ret;
 }
 
+static int s7d_hdmi_packet(struct s7d_hdmi *h, unsigned int bank,
+			   const u8 *packet, unsigned int len)
+{
+	unsigned int i;
+	int ret;
+
+	ret = core_write(h, CORE_INFO_SELECT, bank);
+	if (ret)
+		return ret;
+	for (i = 0; i < 31; i++) {
+		ret = core_write(h, CORE_INFO_DATA + i, i < len ? packet[i] : 0);
+		if (ret)
+			return ret;
+	}
+	return s7d_hdmi_write_checked(h, h->core, CORE_INFO_ENABLE,
+				      CORE_INFO_TRANSMIT, CORE_INFO_TRANSMIT);
+}
+
 static int s7d_hdmi_packets(struct s7d_hdmi *h, const struct s7d_hdmi_state *state)
 {
-	unsigned int bank, i;
+	unsigned int bank;
 	int ret;
 
 	/* All eleven TPI banks: discard inherited audio/vendor/HDR/EMP packets. */
@@ -441,18 +463,10 @@ static int s7d_hdmi_packets(struct s7d_hdmi *h, const struct s7d_hdmi_state *sta
 	}
 	if (!state->hdmi)
 		return 0;
-	ret = core_write(h, CORE_INFO_SELECT, 0); /* AVI */
-	if (ret)
+	ret = s7d_hdmi_packet(h, 0, state->avi, sizeof(state->avi));
+	if (ret || !state->vendor_len)
 		return ret;
-	/* Read back the packet RAM: inaccessible retained SRAM is a hard error. */
-	for (i = 0; i < 31; i++) {
-		ret = core_write(h, CORE_INFO_DATA + i,
-				 i < sizeof(state->avi) ? state->avi[i] : 0);
-		if (ret)
-			return ret;
-	}
-	return s7d_hdmi_write_checked(h, h->core, CORE_INFO_ENABLE,
-				      CORE_INFO_TRANSMIT, CORE_INFO_TRANSMIT);
+	return s7d_hdmi_packet(h, 5, state->vendor, state->vendor_len);
 }
 
 static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *state)
@@ -460,7 +474,6 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 	/* S7D branch of config_hdmi21_tx: progressive RGB8, no FRL/deep colour. */
 	static const struct reg_sequence config[] = {
 		{ 0x0236, 0 }, /* P2T_CTRL: 8 bpc, TMDS */
-		{ 0x0900, 0x20 }, /* SCRCTL: HDMI2 block, scrambling disabled */
 		{ 0x029d, 0 }, /* FRL_LINK_RATE_CONFIG */
 		{ 0x0319, 0 }, /* SW_RST */
 		{ 0x012f, 1 }, /* CLK_DIV_CNTRL: TMDS */
@@ -481,10 +494,12 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 	ret = top_write(h, TOP_CLK, 7, 7);
 	if (ret)
 		return ret;
-	ret = top_write(h, TOP_PATTERN0, U32_MAX, 0x001f001f);
+	ret = top_write(h, TOP_PATTERN0, U32_MAX,
+			state->high_tmds ? 0 : 0x001f001f);
 	if (ret)
 		return ret;
-	ret = top_write(h, TOP_PATTERN1, U32_MAX, 0x001f001f);
+	ret = top_write(h, TOP_PATTERN1, U32_MAX,
+			state->high_tmds ? 0x03ff03ff : 0x001f001f);
 	if (ret)
 		return ret;
 	ret = top_write(h, TOP_PATTERN_CTRL, BIT(1), 0);
@@ -496,6 +511,12 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 	ret = regmap_write(h->top, TOP_PATTERN_CTRL, BIT(0));
 	if (READ_ONCE(trace_tx))
 		dev_info(h->dev, "TX TMDS pattern load end: %d\n", ret);
+	if (ret)
+		return ret;
+	ret = top_write(h, TOP_PATTERN_CTRL, BIT(1), state->high_tmds ? BIT(1) : 0);
+	if (ret)
+		return ret;
+	ret = core_write(h, 0x0900, BIT(5) | state->high_tmds); /* SCRCTL */
 	if (ret)
 		return ret;
 	ret = top_write(h, TOP_BIST, GENMASK(14, 12) | GENMASK(11, 0), BIT(12));
@@ -563,7 +584,6 @@ static int s7d_hdmi_prepare(void *data, unsigned long pixel_rate)
 	struct s7d_hdmi *h = data;
 	struct s7d_hdmi_state *state;
 	unsigned int i;
-	u8 scdc;
 	int ret;
 
 	if (!h->bridge.base.state)
@@ -571,17 +591,6 @@ static int s7d_hdmi_prepare(void *data, unsigned long pixel_rate)
 	state = to_s7d_hdmi_state(drm_priv_to_bridge_state(h->bridge.base.state));
 	if (!state->valid)
 		return -EINVAL;
-	/* SCDC is a separate DDC transaction; never nest its lock under itself. */
-	if (state->scdc) {
-		ret = drm_scdc_writeb(&h->ddc.adapter, SCDC_TMDS_CONFIG, 0);
-		if (ret)
-			return ret;
-		ret = drm_scdc_readb(&h->ddc.adapter, SCDC_TMDS_CONFIG, &scdc);
-		if (ret)
-			return ret;
-		if (scdc & 3)
-			return -EIO;
-	}
 	mutex_lock(&h->lock);
 	ret = -EBUSY;
 	if (h->phy_on || h->video_on)
@@ -641,7 +650,15 @@ static enum drm_mode_status s7d_hdmi_mode_valid(struct drm_bridge *bridge,
 {
 	struct s7d_encp_state state;
 
-	if (mode->clock > 148500 || mode->hdisplay > 1920 || mode->vdisplay > 1080)
+	if (mode->clock > 594000 || mode->hdisplay > 4096 || mode->vdisplay > 2160)
+		return MODE_CLOCK_HIGH;
+	if (drm_mode_is_420_only(info, mode))
+		return MODE_NO_420;
+	if (!info->is_hdmi && mode->clock > 165000)
+		return MODE_CLOCK_HIGH;
+	if (mode->clock > 340000 &&
+	    (!info->is_hdmi || !info->hdmi.scdc.supported ||
+	     !info->hdmi.scdc.scrambling.supported))
 		return MODE_CLOCK_HIGH;
 	if (info->max_tmds_clock && mode->clock > info->max_tmds_clock)
 		return MODE_CLOCK_HIGH;
@@ -655,6 +672,7 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 	struct s7d_hdmi_state *state = to_s7d_hdmi_state(base);
 	struct drm_connector *connector = conn_state->connector;
 	struct hdmi_avi_infoframe avi;
+	struct hdmi_vendor_infoframe vendor;
 	int ret;
 
 	state->valid = false;
@@ -667,7 +685,9 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 		return -EINVAL;
 	state->mode = crtc_state->adjusted_mode;
 	state->hdmi = connector->display_info.is_hdmi;
-	state->scdc = connector->display_info.hdmi.scdc.supported;
+	state->scdc = state->hdmi && connector->display_info.hdmi.scdc.supported;
+	state->high_tmds = state->mode.clock > 340000;
+	state->vendor_len = 0;
 	if (state->hdmi) {
 		ret = drm_hdmi_avi_infoframe_from_display_mode(&avi, connector, &state->mode);
 		if (ret)
@@ -677,6 +697,15 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 		ret = hdmi_avi_infoframe_pack(&avi, state->avi, sizeof(state->avi));
 		if (ret < 0)
 			return ret;
+	}
+	if (state->hdmi && connector->display_info.has_hdmi_infoframe) {
+		ret = drm_hdmi_vendor_infoframe_from_display_mode(&vendor, connector, &state->mode);
+		if (ret)
+			return ret;
+		ret = hdmi_vendor_infoframe_pack(&vendor, state->vendor, sizeof(state->vendor));
+		if (ret < 0)
+			return ret;
+		state->vendor_len = ret;
 	}
 	base->input_bus_cfg.format = MEDIA_BUS_FMT_RGB888_1X24;
 	state->valid = true;
@@ -737,9 +766,40 @@ static void s7d_hdmi_detach(struct drm_bridge *bridge)
 	schedule_work(&h->audio_notify);
 }
 
+static int s7d_hdmi_setup_scdc(struct s7d_hdmi *h, const struct s7d_hdmi_state *state)
+{
+	u8 config = state->high_tmds ? SCDC_SCRAMBLING_ENABLE |
+		SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 : 0;
+	u8 value;
+	int ret;
+
+	if (!state->scdc)
+		return state->high_tmds ? -EINVAL : 0;
+	ret = drm_scdc_readb(&h->ddc.adapter, SCDC_SINK_VERSION, &value);
+	if (ret)
+		return ret;
+	if (!value)
+		return -EINVAL;
+	ret = drm_scdc_writeb(&h->ddc.adapter, SCDC_SOURCE_VERSION, 1);
+	if (ret)
+		return ret;
+	ret = drm_scdc_writeb(&h->ddc.adapter, SCDC_TMDS_CONFIG, config);
+	if (ret)
+		return ret;
+	ret = drm_scdc_readb(&h->ddc.adapter, SCDC_TMDS_CONFIG, &value);
+	if (ret)
+		return ret;
+	if ((value & (SCDC_SCRAMBLING_ENABLE | SCDC_TMDS_BIT_CLOCK_RATIO_BY_40)) != config)
+		return -EIO;
+	/* Change the sink ratio with PHY off, at least 1 ms before transmission. */
+	usleep_range(1000, 2000);
+	return 0;
+}
+
 static void s7d_hdmi_enable(struct drm_bridge *bridge, struct drm_bridge_state *old_state)
 {
 	struct s7d_hdmi *h = to_s7d_hdmi(bridge);
+	struct s7d_hdmi_state *state;
 	int ret;
 
 	mutex_lock(&h->lock);
@@ -748,6 +808,10 @@ static void s7d_hdmi_enable(struct drm_bridge *bridge, struct drm_bridge_state *
 		goto out;
 	ret = -EIO;
 	if (!h->prepared)
+		goto out;
+	state = to_s7d_hdmi_state(drm_priv_to_bridge_state(h->bridge.base.state));
+	ret = s7d_hdmi_setup_scdc(h, state);
+	if (ret)
 		goto out;
 	ret = phy_power_on(h->phy);
 	if (!ret) {
