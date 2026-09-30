@@ -12,16 +12,19 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/workqueue.h>
+#include <sound/hdmi-codec.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_eld.h>
 #include <drm/display/drm_scdc_helper.h>
 
 #include "s7d-hdmi.h"
 #include "s7d-hdmi-io.h"
 #include "s7d-hdmi-ddc.h"
+#include "s7d-hdmi-audio.h"
 #include "s7d-vpu.h"
 
 /* TOP offsets are bytes; core offsets address 8-bit registers. */
@@ -85,6 +88,20 @@ struct s7d_hdmi {
 	bool hpd_enabled;
 	bool stopping;
 	struct delayed_work hpd_recovery;
+	u8 eld[MAX_ELD_BYTES];
+	struct platform_device *codec;
+	struct clk *audio_clk;
+	struct hdmi_codec_params audio_params;
+	bool audio_clock_on;
+	bool audio_valid;
+	bool audio_muted;
+	bool eld_valid;
+	int audio_error;
+	/* Serializes callback registration against notification. */
+	struct mutex audio_callback_lock;
+	hdmi_codec_plugged_cb audio_plugged;
+	struct device *codec_dev;
+	struct work_struct audio_notify;
 };
 
 static struct s7d_hdmi *to_s7d_hdmi(struct drm_bridge *bridge)
@@ -104,6 +121,188 @@ static int s7d_hdmi_ddc_clock_check(unsigned long rate)
 	if (!rate)
 		return -EPROBE_DEFER;
 	return rate >= 199980000 && rate <= 200020000 ? 0 : -ERANGE;
+}
+
+static int s7d_hdmi_audio_get_eld(struct device *dev, void *data, u8 *buf, size_t len)
+{
+	struct s7d_hdmi *h = data;
+	int ret = -ENODEV;
+
+	memset(buf, 0, len);
+	mutex_lock(&h->lock);
+	if (!h->eld_valid)
+		goto out;
+	memcpy(buf, h->eld, min(sizeof(h->eld), len));
+	ret = 0;
+out:
+	mutex_unlock(&h->lock);
+	return ret;
+}
+
+void s7d_hdmi_bridge_eld_updated(struct drm_bridge *bridge, struct drm_connector *connector)
+{
+	struct s7d_hdmi *h = to_s7d_hdmi(bridge);
+	u8 eld[MAX_ELD_BYTES];
+	bool valid;
+
+	mutex_lock(&connector->eld_mutex);
+	memcpy(eld, connector->eld, sizeof(eld));
+	mutex_unlock(&connector->eld_mutex);
+	valid = connector->display_info.is_hdmi && connector->display_info.has_audio &&
+		eld[0] && drm_eld_sad_count(eld) && drm_eld_size(eld) <= sizeof(eld);
+	mutex_lock(&h->lock);
+	memcpy(h->eld, eld, sizeof(eld));
+	h->eld_valid = valid;
+	mutex_unlock(&h->lock);
+	schedule_work(&h->audio_notify);
+}
+
+static void s7d_hdmi_audio_notify(struct work_struct *work)
+{
+	struct s7d_hdmi *h = container_of(work, struct s7d_hdmi, audio_notify);
+	u8 eld[MAX_ELD_BYTES];
+	bool plugged;
+
+	mutex_lock(&h->audio_callback_lock);
+	plugged = !s7d_hdmi_audio_get_eld(h->dev, h, eld, sizeof(eld));
+	if (h->audio_plugged)
+		h->audio_plugged(h->codec_dev, plugged);
+	mutex_unlock(&h->audio_callback_lock);
+}
+
+static int s7d_hdmi_audio_hook(struct device *dev, void *data,
+			     hdmi_codec_plugged_cb fn, struct device *codec_dev)
+{
+	struct s7d_hdmi *h = data;
+
+	mutex_lock(&h->audio_callback_lock);
+	h->audio_plugged = fn;
+	h->codec_dev = codec_dev;
+	mutex_unlock(&h->audio_callback_lock);
+	if (fn)
+		schedule_work(&h->audio_notify);
+	return 0;
+}
+
+static int s7d_hdmi_audio_apply(struct s7d_hdmi *h)
+{
+	int ret;
+
+	ret = s7d_hdmi_audio_configure(h->core, h->top, &h->audio_params);
+	if (!ret)
+		ret = s7d_hdmi_audio_mute(h->core, h->audio_muted);
+	if (ret) {
+		s7d_hdmi_audio_disable(h->core);
+		h->audio_error = ret;
+		dev_err(h->dev, "HDMI audio setup failed: %d\n", ret);
+	}
+	return ret;
+}
+
+static int s7d_hdmi_audio_prepare(struct device *dev, void *data,
+				struct hdmi_codec_daifmt *fmt,
+				struct hdmi_codec_params *params)
+{
+	struct s7d_hdmi *h = data;
+	int ret;
+
+	if (fmt->fmt != HDMI_I2S || fmt->bit_clk_inv || fmt->frame_clk_inv ||
+	    fmt->bit_clk_provider || fmt->frame_clk_provider ||
+	    (fmt->bit_fmt != SNDRV_PCM_FORMAT_S16_LE &&
+	     fmt->bit_fmt != SNDRV_PCM_FORMAT_S24_LE))
+		return -EINVAL;
+	mutex_lock(&h->lock);
+	if (!h->eld_valid || !h->prepared || !h->phy_on) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!s7d_hdmi_audio_supported(h->eld, params)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (!h->audio_clock_on) {
+		ret = clk_set_rate(h->audio_clk, 200000000);
+		if (ret)
+			goto out;
+		ret = s7d_hdmi_ddc_clock_check(clk_get_rate(h->audio_clk));
+		if (ret)
+			goto out;
+		ret = clk_prepare_enable(h->audio_clk);
+		if (ret)
+			goto out;
+		h->audio_clock_on = true;
+	}
+	h->audio_params = *params;
+	h->audio_error = 0;
+	h->audio_muted = true;
+	ret = s7d_hdmi_audio_apply(h);
+	h->audio_valid = !ret;
+	if (ret) {
+		clk_disable_unprepare(h->audio_clk);
+		h->audio_clock_on = false;
+	}
+out:
+	mutex_unlock(&h->lock);
+	return ret;
+}
+
+static int s7d_hdmi_audio_set_mute(struct device *dev, void *data, bool mute, int direction)
+{
+	struct s7d_hdmi *h = data;
+	int ret = 0;
+
+	if (direction != SNDRV_PCM_STREAM_PLAYBACK)
+		return -EINVAL;
+	mutex_lock(&h->lock);
+	h->audio_muted = mute;
+	if (!mute && h->audio_error)
+		ret = h->audio_error;
+	else if (h->prepared && h->audio_valid)
+		ret = s7d_hdmi_audio_mute(h->core, mute);
+	else if (!mute)
+		ret = -ENODEV;
+	if (ret && h->audio_valid) {
+		h->audio_error = ret;
+		s7d_hdmi_audio_disable(h->core);
+		schedule_work(&h->audio_notify);
+	}
+	mutex_unlock(&h->lock);
+	return ret;
+}
+
+static void s7d_hdmi_audio_shutdown(struct device *dev, void *data)
+{
+	struct s7d_hdmi *h = data;
+	int ret;
+
+	mutex_lock(&h->lock);
+	h->audio_valid = false;
+	h->audio_muted = true;
+	ret = s7d_hdmi_audio_disable(h->core);
+	if (ret)
+		dev_err(h->dev, "HDMI audio shutdown failed: %d\n", ret);
+	if (h->audio_clock_on) {
+		clk_disable_unprepare(h->audio_clk);
+		h->audio_clock_on = false;
+	}
+	mutex_unlock(&h->lock);
+}
+
+static const struct hdmi_codec_ops s7d_hdmi_codec_ops = {
+	.prepare = s7d_hdmi_audio_prepare,
+	.audio_shutdown = s7d_hdmi_audio_shutdown,
+	.mute_stream = s7d_hdmi_audio_set_mute,
+	.get_eld = s7d_hdmi_audio_get_eld,
+	.hook_plugged_cb = s7d_hdmi_audio_hook,
+	.no_capture_mute = 1,
+};
+
+static void s7d_hdmi_codec_unregister(void *data)
+{
+	struct s7d_hdmi *h = data;
+
+	platform_device_unregister(h->codec);
+	cancel_work_sync(&h->audio_notify);
 }
 
 static int s7d_hdmi_write_checked(struct s7d_hdmi *h, struct regmap *map,
@@ -146,6 +345,13 @@ static int s7d_hdmi_quiesce(void *data)
 
 	mutex_lock(&h->lock);
 	h->prepared = false;
+	if (h->audio_valid) {
+		ret = s7d_hdmi_audio_disable(h->core);
+		if (ret) {
+			h->audio_error = ret;
+			dev_err(h->dev, "HDMI audio stop before modeset failed: %d\n", ret);
+		}
+	}
 	if (h->phy_on) {
 		ret = phy_power_off(h->phy);
 		if (ret)
@@ -454,7 +660,11 @@ static void s7d_hdmi_detach(struct drm_bridge *bridge)
 	struct s7d_hdmi *h = to_s7d_hdmi(bridge);
 
 	WRITE_ONCE(h->hpd_enabled, false);
+	mutex_lock(&h->lock);
+	h->eld_valid = false;
 	h->crtc = NULL;
+	mutex_unlock(&h->lock);
+	schedule_work(&h->audio_notify);
 }
 
 static void s7d_hdmi_enable(struct drm_bridge *bridge, struct drm_bridge_state *old_state)
@@ -472,7 +682,11 @@ static void s7d_hdmi_enable(struct drm_bridge *bridge, struct drm_bridge_state *
 	ret = phy_power_on(h->phy);
 	if (!ret) {
 		h->phy_on = true;
+		h->audio_error = 0;
+		if (h->audio_valid && h->eld_valid)
+			s7d_hdmi_audio_apply(h);
 		s7d_crtc_link_ready(h->crtc);
+		schedule_work(&h->audio_notify);
 	}
 out:
 	mutex_unlock(&h->lock);
@@ -549,6 +763,24 @@ static int s7d_hdmi_ack_hpd(struct s7d_hdmi *h)
 	return -EIO;
 }
 
+static void s7d_hdmi_audio_hpd(struct s7d_hdmi *h)
+{
+	int ret;
+
+	mutex_lock(&h->lock);
+	h->eld_valid = false;
+	h->audio_valid = false;
+	if (h->audio_clock_on) {
+		ret = s7d_hdmi_audio_disable(h->core);
+		if (ret) {
+			h->audio_error = ret;
+			dev_err_ratelimited(h->dev, "HDMI audio stop on HPD failed: %d\n", ret);
+		}
+	}
+	mutex_unlock(&h->lock);
+	schedule_work(&h->audio_notify);
+}
+
 static void s7d_hdmi_hpd_recovery(struct work_struct *work)
 {
 	struct s7d_hdmi *h = container_of(to_delayed_work(work),
@@ -568,6 +800,7 @@ static void s7d_hdmi_hpd_recovery(struct work_struct *work)
 	}
 	enable_irq(h->irq);
 	mutex_unlock(&h->lock);
+	s7d_hdmi_audio_hpd(h);
 	if (READ_ONCE(h->hpd_enabled))
 		drm_bridge_hpd_notify(&h->bridge, s7d_hdmi_detect(&h->bridge));
 }
@@ -579,6 +812,7 @@ static irqreturn_t s7d_hdmi_irq(int irq, void *data)
 
 	if (!ret)
 		return IRQ_NONE;
+	s7d_hdmi_audio_hpd(h);
 	if (ret < 0) {
 		disable_irq_nosync(irq);
 		dev_err_ratelimited(h->dev, "HPD acknowledgement failed: %d; retrying with IRQ masked\n",
@@ -603,12 +837,20 @@ static void s7d_hdmi_shutdown(struct platform_device *pdev)
 	mutex_unlock(&h->lock);
 	synchronize_irq(h->irq);
 	cancel_delayed_work_sync(&h->hpd_recovery);
+	cancel_work_sync(&h->audio_notify);
+	s7d_hdmi_audio_shutdown(h->dev, h);
 }
 
 static int s7d_hdmi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct s7d_hdmi *h;
+	struct hdmi_codec_pdata audio = {
+		.ops = &s7d_hdmi_codec_ops,
+		.i2s = 1,
+		.no_i2s_capture = 1,
+		.max_i2s_channels = 2,
+	};
 	unsigned int value, i;
 	int ret;
 
@@ -617,6 +859,9 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	h->dev = dev;
 	mutex_init(&h->lock);
+	mutex_init(&h->audio_callback_lock);
+	INIT_WORK(&h->audio_notify, s7d_hdmi_audio_notify);
+	h->audio_muted = true;
 	INIT_DELAYED_WORK(&h->hpd_recovery, s7d_hdmi_hpd_recovery);
 	ret = s7d_hdmi_init_regmaps(pdev, &h->core, &h->top);
 	if (ret)
@@ -628,6 +873,9 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(h->basic), h->basic);
 	if (ret)
 		return dev_err_probe(dev, ret, "DDC/HPD clocks\n");
+	h->audio_clk = devm_clk_get(dev, "aud");
+	if (IS_ERR(h->audio_clk))
+		return dev_err_probe(dev, PTR_ERR(h->audio_clk), "audio clock\n");
 	h->video[0].id = "pixel";
 	h->video[1].id = "fe";
 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(h->video), h->video);
@@ -720,6 +968,16 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	ret = top_write(h, TOP_MASK, 0x1ff, HPD_IRQS);
 	if (ret)
 		goto remove_ddc;
+	audio.data = h;
+	h->codec = platform_device_register_data(dev, HDMI_CODEC_DRV_NAME,
+					      PLATFORM_DEVID_AUTO, &audio, sizeof(audio));
+	if (IS_ERR(h->codec)) {
+		ret = PTR_ERR(h->codec);
+		goto remove_ddc;
+	}
+	ret = devm_add_action_or_reset(dev, s7d_hdmi_codec_unregister, h);
+	if (ret)
+		goto remove_ddc;
 	/* Last fallible steps: no probe unwind may free an adopted live PHY. */
 	ret = phy_init(h->phy);
 	if (ret)
@@ -735,6 +993,7 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	enable_irq(h->irq);
 	return 0;
 remove_ddc:
+	cancel_work_sync(&h->audio_notify);
 	s7d_hdmi_ddc_unregister(&h->ddc);
 disable_video:
 	clk_bulk_disable_unprepare(ARRAY_SIZE(h->video), h->video);

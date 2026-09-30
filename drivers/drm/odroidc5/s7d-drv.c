@@ -34,7 +34,20 @@
 struct s7d_drm {
 	struct drm_device drm;
 	struct s7d_vpu vpu;
+	struct drm_bridge *bridge;
+	struct drm_connector_helper_funcs connector_helpers;
+	int (*get_modes)(struct drm_connector *connector);
 };
+
+static int s7d_connector_get_modes(struct drm_connector *connector)
+{
+	struct s7d_drm *display = container_of(connector->dev, struct s7d_drm, drm);
+	int count;
+
+	count = display->get_modes(connector);
+	s7d_hdmi_bridge_eld_updated(display->bridge, connector);
+	return count;
+}
 
 DEFINE_DRM_GEM_DMA_FOPS(s7d_drm_fops);
 
@@ -165,6 +178,11 @@ static int s7d_drm_probe(struct platform_device *pdev)
 		ret = PTR_ERR(connector);
 		goto fini_vpu;
 	}
+	display->bridge = bridge;
+	display->connector_helpers = *connector->helper_private;
+	display->get_modes = display->connector_helpers.get_modes;
+	display->connector_helpers.get_modes = s7d_connector_get_modes;
+	drm_connector_helper_add(connector, &display->connector_helpers);
 	ret = drm_connector_attach_encoder(connector, encoder);
 	if (ret)
 		goto fini_vpu;
