@@ -10,12 +10,17 @@ use the kernel's DRM/KMS, CCF, reset, generic PHY, runtime PM and ASoC framework
 The implementation lives in `common_drivers`; using upstream kernel interfaces
 does not mean that these drivers have been accepted upstream.
 
-**Current result:** native SDR HDMI output, a framebuffer console, vendor Mali
-rendering and an isolated Weston desktop session work on the test board. The
-replacement is not yet feature-complete. HDMI PCM, 4K, full-rate page flips,
-GNOME integration and independent cold display initialization remain open.
+**Current result:** native RGB8 SDR HDMI output now reaches **3840×2160 at
+60 Hz**, with GNOME/GDM using the existing vendor Mali driver and DMA-BUF
+scanout. Native HDMI stereo PCM has audible left/right confirmation. Tests also
+cover fractional 4K modes, PCM across modesets and recovery of an open PCM
+stream after suspend-to-idle. These results do not establish full vendor parity,
+60 fps presentation, or initialization without retained firmware state.
 
-Status below reflects the source and recorded tests as of **2026-09-22**.
+Status below reflects the source and recorded tests as of **2026-09-30**,
+including kernel **#59**. Analog audio and overlay-enabled external SPDIF remain
+to be connected to the native audio framework. A stalled normal reboot is under
+investigation; the board recovered after a forced reboot.
 
 ## Problems being addressed
 
@@ -179,7 +184,7 @@ framework has been implemented or tested.
 flowchart TB
     subgraph new_users[User space]
         new_client["Wayland clients / EGL applications"]
-        new_weston["Weston<br/>GL composition + atomic DRM backend"]
+        new_weston["GNOME / GDM / Weston<br/>GL composition + atomic DRM backend"]
         new_libmali["Existing r54p1 libMali<br/>EGL / GBM / GLES"]
         new_dumb["DRM dumb-buffer application"]
     end
@@ -200,7 +205,7 @@ flowchart TB
         new_vpu["s7d-vpu execution<br/>s7d-osd / s7d-vpp / s7d-encp / pipeline setup"]
         new_rdma["s7d-rdma<br/>Checked display register lists and DMA drain"]
         new_irq["Vblank + RDMA IRQ handling<br/>Field/idle checks and timeout recovery"]
-        new_bridge["s7d-hdmi DRM bridge<br/>TX setup, AVI packets, HPD recovery"]
+        new_bridge["s7d-hdmi DRM bridge<br/>TX setup, AVI / HDMI VSIF, HPD recovery"]
         new_ddc["s7d-hdmi-ddc + DRM EDID/SCDC helpers"]
         new_io["s7d-hdmi-io<br/>Device-scoped SMC-backed regmaps"]
     end
@@ -263,7 +268,7 @@ flowchart TB
     rphy -->|"Explicit parent regmap access"| analog
     analog --> analoghw["Shared analog register window<br/>PLL fields owned by CCF; PHY fields by PHY"]
 
-    rvpu -->|"VIU / VENC / VENCP / RDMA"| reset["S7D reset controller<br/>MASK, LEVEL, LOCK and PROT handling"]
+    rvpu -->|"VIU / VENC / VENCP / RDMA"| reset["S7D reset controller<br/>MASK / LEVEL status and checked writes"]
     rtx -->|"TX / APB"| reset
     rphy -->|"PHY reset"| reset
     rgpu -->|"GPU bus / core"| reset
@@ -276,9 +281,16 @@ flowchart TB
 ```
 
 The clock provider and PHY share a named parent regmap, not independently
-mapped copies of the same analog window. Reset register reservations exclude
-the watchdog window. The S7D genpd path validates firmware failures and avoids
-the legacy direct power-control bypasses.
+mapped copies of the same analog window. Reset and watchdog reservations do
+not overlap. The reduced S7D reset change preserves MASK, rejects masked
+assertions and checks LEVEL writes; it does not map LOCK/PROT registers or
+rewrite the legacy pulse-reset path. The S7D genpd path validates firmware
+failures and avoids the legacy direct power-control bypasses.
+
+The VPU holds an exclusive core-clock rate reference during active scanout and
+checks that the rate can sustain the requested pixel clock. The current board
+retains a 666.7 MHz VPU core clock. Complete clock-path independence, including
+PNX routing, and qualification under memory-bandwidth contention remain open.
 
 DDC and HPD retain their basic clock/power references independently of the
 video PLL/PHY lifetime. Keeping the shared domain on does not prove that every
@@ -314,46 +326,69 @@ sequenceDiagram
 This describes a running-plane update. Initial enable and full modesets have
 separate stop/start paths. Current retirement remains conservative: it requires
 a different ENCP field after RDMA drain and idle OSD/read-arbiter observations.
-The tested serial update rate is about **30 fps on a 60 Hz output**, improved
-from about 20 fps. Same-field latch safety and 60 fps updates are not yet proven.
+The earlier measured serial update rate was about **30 fps on a 60 Hz output**,
+improved from about 20 fps. The newer 4K tests establish working page flips,
+not one new framebuffer per refresh. Same-field latch safety and sustained
+60 fps presentation are not yet proven.
 
-## HDMI PCM: preparation completed, connection still pending
+## Native audio: HDMI connected, analog and SPDIF pending
 
-The bridge currently disables audio transmission. There is **no working native
-HDMI PCM path yet**. Three preparatory fixes are implemented:
+The C5 has **three output targets**: HDMI, onboard analog, and external SPDIF A
+selected through the existing `spdif_a` overlay. The native card currently
+exposes HDMI only. The monolithic vendor audio bus/card and T9015 codec are
+disabled in this configuration; enabling the overlay alone does not yet provide
+a working native SPDIF path.
 
-1. Standard ASoC cards no longer enter vendor HDMI routing through an invalid
-   cast to the vendor machine-card structure.
-2. The audio controller validates mapping boundaries and failures, and publishes
-   its resources only after initialization succeeds.
-3. TDM and the DDR manager use their parent device and defer probing while the
-   controller is unavailable.
+The implemented HDMI path uses a single audio-bank regmap, child CCF/reset
+providers, a native FRDDR A / TDM B transport, the ODROID-C5 ASoC card and
+`hdmi-codec`. It does not use the vendor card-private structure or HDMI notifier
+for PCM routing. The MFD parent keeps the register interface available to its
+children; each stream owns its transport and sample-clock references.
 
-The target connection is shown below. **All dashed arrows are planned wiring,
-not a report of working audio.**
+Solid arrows below are implemented. Dashed arrows describe pending audio links.
 
 ```mermaid
 flowchart TB
-    pcm_app["ALSA PCM application"] -.-> pcm_card["Standard ASoC machine/card link"]
-    pcm_card -.-> pcm_dma["FRDDR PCM buffer / DMA engine<br/>Reuse and adapt existing hardware code"]
-    pcm_dma -.-> pcm_tdm["TDMB CPU DAI<br/>I2S samples and serial clocks"]
-    pcm_tdm -.-> pcm_route["ASoC HDMI route owner<br/>Data, BCLK, LRCLK and MCLK selection"]
-    pcm_route -.-> pcm_tx["HDMI TX audio input and packets"]
-    pcm_card -.-> pcm_codec["hdmi-codec<br/>Prepare, mute, shutdown and ELD"]
-    pcm_codec -.-> pcm_bridge["Native HDMI bridge audio callbacks<br/>Serialize with modeset and HPD"]
-    pcm_bridge -.-> pcm_tx
-    pcm_bridge -.-> pcm_eld["DRM connector ELD / sink capabilities"]
-    pcm_tx -.-> pcm_sink["HDMI monitor / receiver"]
-    pcm_dma -.-> pcm_res["Audio CCF / reset / PM consumers<br/>One register owner"]
-    pcm_tdm -.-> pcm_res
-    pcm_route -.-> pcm_res
+    pcm_app["ALSA / PipeWire applications"] --> pcm_card["odroidc5-card<br/>HDMI DAI link, ELD constraints and jack"]
+    pcm_card --> pcm_dma["s7d-hdmi-audio<br/>FRDDR A DMA buffer / IRQ / PCM lifecycle"]
+    pcm_dma --> pcm_tdm["TDM B CPU DAI<br/>I2S data, BCLK, LRCLK and MCLK"]
+    pcm_tdm --> pcm_route["HDMI audio input routing"]
+    pcm_route --> pcm_tx["HDMI TX audio input / ACR / packet bank 2"]
+    pcm_card --> pcm_codec["hdmi-codec<br/>Prepare, mute, shutdown, ELD and jack"]
+    pcm_codec --> pcm_bridge["s7d-hdmi-audio in DRM bridge<br/>Serialize with modeset and HPD"]
+    pcm_bridge --> pcm_tx
+    pcm_bridge --> pcm_eld["DRM EDID / ELD refresh<br/>HPD generation check"]
+    pcm_tx --> pcm_sink["HDMI monitor / receiver"]
+    pcm_card -->|"PM supplier link"| pcm_display["Native display device<br/>Resume before sound card"]
+
+    pcm_parent["meson-s7d-audio MFD<br/>Single audio-bank regmap, bus clock/reset and PM"]
+    pcm_parent --> pcm_clocks["s7d-audio CCF<br/>FIFO gates, sample-clock muxes and dividers"]
+    pcm_parent --> pcm_reset["S7D audio reset controller"]
+    pcm_parent --> pcm_dma
+    pcm_dma -->|"FIFO / sample clocks"| pcm_clocks
+    pcm_tdm -->|"Block resets"| pcm_reset
+    pcm_bridge --> pcm_txclock["S7D CCF hdmitx_aud clock"]
+
+    pcm_card -.-> pcm_analog["Pending analog link<br/>TDM C / shared TO_ACODEC route / T9015"]
+    pcm_card -.-> pcm_spdif["Pending external SPDIF A link<br/>spdif_a overlay, independent FIFO / clocks / pins"]
+    pcm_analog -.-> pcm_parent
+    pcm_spdif -.-> pcm_parent
 ```
 
-Remaining audio work includes eliminating the legacy all-gates-on policy and
-overlapping/global register ownership in the new path, implementing the route
-and bridge callbacks, and testing two-channel LPCM at 44.1/48 kHz with 16/24-bit
-samples. Mode changes, cable removal, reconnect and close must have defined
-mute/recovery and resource-release behavior.
+HDMI supports two-channel LPCM at 44.1/48 kHz with 16/24-bit samples, restricted
+by the connected sink's ELD. Format and rate constraints are applied together
+at PCM startup, so PipeWire can negotiate a supported format. The AOC test
+monitor advertised 16-bit audio only: 16-bit playback passed and 24-bit requests
+were rejected. Physical 24-bit output remains unqualified.
+
+Basic left/right sound was confirmed on the board. Zero-sample streams also
+passed modesets, display DPMS and RTC-woken suspend-to-idle. Sleep recovery
+uses ALSA prepare/restart on the same open handle; it is not sample-continuous
+DMA through sleep. Kernel-owned ELD refresh allows recovery before a compositor
+queries modes. On close, transport and TX audio clocks stop and the PCM runtime
+PM reference returns to zero; the shared register-bank parent remains available.
+Audible continuity through transitions and physical cable unplug/replug still
+need qualification.
 
 ## Progress and validation
 
@@ -362,33 +397,63 @@ configuration and test; it is not a claim of complete vendor feature parity.
 
 | Area | Current status | Evidence and limits |
 | --- | --- | --- |
-| Reset / watchdog | Implemented; board deployment tested | Split resource reservations and S7D reset semantics. Fault cases also covered with simulated MMIO. |
-| Display CCF / PHY / genpd | Implemented for the current native path | Native output uses these consumers; shared display power remains on. Cold SRAM initialization and full power-off recovery remain open. |
-| DRM/KMS SDR output | Board-tested | One CRTC, one opaque primary plane; 1080p60 and 59.94 Hz modes and repeated page flips. |
-| Linear RGB layouts | Implemented and board-tested | XRGB8888, XBGR8888, RGBX8888 and BGRX8888. No scaling, alpha composition or compressed KMS scanout yet. |
-| EDID and mode validation | Implemented | DRM EDID parsing, timing validation and sink/driver clock limits replace the vendor name/VIC selection route. Arbitrary timing interoperability is not fully qualified. |
-| RDMA / framebuffer lifetime | Implemented and exercised on board | Kernel #44 completed 240 flips across four 60/59.94 Hz runs and 60 more after s2idle. Host tests cover ordering, wrap, busy DMA and faults. |
-| Server framebuffer console | Board-tested | Native fbcon/login output and return from graphics applications; visual confirmation received. |
-| Vendor GPU / libMali | Board-tested for the tested binary | Mali-G310 rendering, visible rotating cube, DMA-BUF export/import, pixel readback and native fences. |
-| Weston | Board-tested in an isolated root session | Cursor, window movement, terminal launch and keyboard input confirmed. Kernel #44 sustained about 30 fps. Non-root seat/login and VT handling remain to be qualified. |
-| Suspend-to-idle | Board-tested for the retained-domain configuration | RTC-woken resume, restored KMS, subsequent flips and GPU buffer/fence tests. Deep sleep and hibernation are rejected. |
-| HDMI PCM foundations | Source/build-tested only | Card ownership, controller registration and TDM/DDR probe fixes. AUGE relocatable-object compilation is not a final module-load or audio-output test. |
-| GNOME / GDM | Pending | Weston success does not establish Mutter, GDM, user-session or desktop-login compatibility. |
-| 4K / HDR / additional planes | Pending | Current mode limits are 1920×1080 and 148.5 MHz, RGB8 SDR. |
-| Boot continuity / simpledrm | Deferred | Existing reservations are preserved; end-to-end logo-to-login continuity is not implemented. |
-| New V4L2 / amstream integration | Deferred | Decoder migration and shared-core design must include `media_modules`. |
+| Reset / watchdog | Minimal S7D provider change; board boots | MASK/LEVEL status and checked writes; separate register reservations. Host fault tests cover all 192 reset IDs. Booting is not a watchdog-expiry test. |
+| Display CCF / PHY / genpd | Implemented for the current native path | Native clock/PHY consumers, firmware error handling and high-rate PHY profiles; shared display power stays on. Cold SRAM initialization and full power-off recovery remain open. |
+| DRM/KMS SDR output | Board-tested through 4K60 | One CRTC and one opaque primary plane. #59 completed 60 page flips per run at 1080p60 and 4K30/29.97/60/59.94, then returned to 1080p60. |
+| Linear RGB layouts | Implemented and board-tested | XRGB8888, XBGR8888, RGBX8888 and BGRX8888. S7D VENC component mapping was corrected; the user confirmed normal GNOME colors on #46. No scaling, alpha composition or compressed KMS scanout yet. |
+| EDID / HDMI link | Implemented; selected modes board-tested | DRM timing and sink checks, RGB8 TMDS up to 594 MHz, SCDC scrambling above 340 MHz and HDMI VSIF packets. High-rate tests read back scrambling and channel-lock status. DVI and broader sink coverage remain to be qualified. |
+| Fractional clocks | Board-tested with updated clock module | CCF divider rounding now accepts the PLL's nearest rate for 4K59.94. The loaded #59 module build ID and installed initramfs were verified after reboot. |
+| RDMA / framebuffer lifetime | Implemented and exercised on board | #59 display CMA use was unchanged across the flip sequence. Display CMA is 192 MiB for 4K buffers. Conservative retirement remains; sustained 60 fps is not established. |
+| Framebuffer console | Board-tested | Native fbcon/login output and return from graphics applications; visual confirmation received. |
+| Vendor GPU / libMali | Board-tested for the deployed binary | Mali-G310 rendering, DMA-BUF import/export, pixel readback and fences. GNOME and Weston use the native KMS scanout path. |
+| Weston | Board-tested | Cursor, window movement, terminal launch and keyboard input confirmed. The earlier #44 run sustained about 30 fps. |
+| GNOME / GDM | Board-tested on Ubuntu 26.04 / GNOME 50.1 | Non-root desktop login, terminal, cursor and window dragging confirmed with vendor Mali. The user confirmed a correct 4K60 picture on #58; #59 restores GDM at 4K60 with imported GPU scanout. Smoothness is not qualified. |
+| HDMI PCM | Board-tested; audible stereo confirmed | 44.1/48 kHz S16 transfers, PipeWire negotiation and close-time PM/clock release. 24-bit support is implemented but needs a capable sink and physical validation. |
+| PCM during modesets / DPMS | Board-tested using silence | #55 lower-resolution mode and DPMS tests; #59 PCM remained open through 4K30/29.97, 2560×1440, 4K59.94 and 4K60. No reported underrun; audible continuity is not established. |
+| Suspend-to-idle | Board-tested with retained display domain | #56 recovered open 44.1/48 kHz PCM streams even while GNOME was stopped, using fresh ELD and ordered device resume. 4K sleep recovery, deep sleep and hibernation are not qualified. |
+| Analog / external SPDIF | Pending | Preserve three distinct output targets. Native TDM C/T9015 and overlay-controlled SPDIF A links are not yet implemented. |
+| Boot continuity / simpledrm | Deferred | Retained-state checks and reservations remain; independent cold initialization and seamless logo-to-login continuity are unfinished. |
+| HDR / additional planes / new media APIs | Deferred | Current scanout is RGB8 SDR. HDR, YUV, scaling, compressed scanout and decoder API migration remain outside the working path. |
 
 The tested userspace GPU package is
 `libmali-valhall-g310-r54p1-wayland-gbm`, version `26.03+202605111356`.
 The current experiment keeps vendor kbase as its GPU path; Panthor/Panfrost
-integration is outside the active scope.
+integration is outside the active scope. The test image's `libmali-setup` script
+was adjusted to recognize `fd000000.gpu` in addition to its old node name; the
+libMali binary was unchanged. That packaging adjustment still needs integration
+into the distribution package source. Mutter uses implicit synchronization in
+this setup; its explicit syncobj path was not activated. There is no hardware
+cursor plane.
 
-The #44 log results above include normal compositor exit, console state
-restoration and no recorded display stop/timeout errors. Visual confirmation
-for that exact build was still pending when this status was written. Earlier
-builds have explicit visual confirmations for the native console and GPU/Weston
-output. TEST_ONLY smoke tests checked reported CRTC state; a complete hardware
-register/resource audit is still required.
+### Source/build checks versus board evidence
+
+ARM64 kernel Image, modules and the standard board DTB build successfully.
+Local tests exercise production timing/PLL calculations, divider rounding,
+HDMI packet and SCDC programming, DMA-safe DDC transfers, audio/ELD rules,
+framebuffer lifetime and failure handling. These simulated fault tests do not
+prove how silicon behaves under the same faults.
+
+The #59 board tests verified the new KMS path, not the legacy vendor output.
+TEST_ONLY smoke tests checked unchanged reported CRTC state; a complete hardware
+register/resource audit is still required. The fractional-mode flip tests did
+not obtain a separate visual confirmation for every mode. User-confirmed 4K60
+picture quality applies to #58, while the recorded #59 tests verify fractional
+rates, link status and PCM/modeset operation after the clock module update.
+
+### Known operational issues
+
+A normal reboot stalled after the #59 clock-module/initramfs update; the user
+forced a reboot and the subsequent display/audio tests passed. The old boot's
+journal ends during service shutdown, with no surviving pstore evidence that
+identifies the cause. The new clock module was not yet loaded in that boot,
+so its divider change is not an established cause. Capture the shutdown over
+UART before assigning the failure to a driver. UART was unavailable on the host
+at the latest check.
+
+The test image has also shown an intermittent Ethernet/networkd startup race,
+and its root filesystem was nearly full at the last check. Neither observation
+has been established as the cause of the reboot stall. Repeated unattended
+reboot and long-running desktop qualification remain open.
 
 ## Source layout and build integration
 
@@ -401,7 +466,12 @@ register/resource audit is still required.
 | [`drivers/power/sec_power_domain.c`](drivers/power/sec_power_domain.c) | Firmware-backed power domains and S7D error handling. |
 | [`drivers/gpu/arm/midgard/platform/c5`](drivers/gpu/arm/midgard/platform/c5) | C5 platform integration for the existing vendor kbase driver. |
 | [`drivers/dma-buf/heaps/c5-scanout-heap.c`](drivers/dma-buf/heaps/c5-scanout-heap.c) | Standard DMA-BUF heap preserving the `heap-gfx` name required by libMali. |
-| [`sound/soc/amlogic/auge`](sound/soc/amlogic/auge) | Existing audio hardware implementation and initial decoupling fixes. Native PCM integration is unfinished. |
+| [`drivers/mfd/meson-s7d-audio.c`](drivers/mfd/meson-s7d-audio.c) | Single audio-bank mapping, parent bus resources and child devices. |
+| [`drivers/clk/meson/s7d-audio.c`](drivers/clk/meson/s7d-audio.c) and [`drivers/reset/reset-meson-s7d-audio.c`](drivers/reset/reset-meson-s7d-audio.c) | Shared audio clock and reset providers. |
+| [`sound/soc/meson/s7d-hdmi-audio.c`](sound/soc/meson/s7d-hdmi-audio.c) | Native FRDDR A / TDM B PCM transport and HDMI input routing. |
+| [`sound/soc/meson/odroidc5-card.c`](sound/soc/meson/odroidc5-card.c) | Board DAI links, HDMI sink constraints, jack and display/audio sleep ordering. |
+| [`drivers/drm/odroidc5/s7d-hdmi-audio.c`](drivers/drm/odroidc5/s7d-hdmi-audio.c) | HDMI codec callbacks, ACR/audio packets, mute and ELD recovery. |
+| [`sound/soc/amlogic/auge`](sound/soc/amlogic/auge) | Vendor reference implementation and limited existing-driver fixes; not the native PCM transport. |
 | [`meson-s7d-odroidc5.dtsi`](arch/arm64/boot/dts/amlogic/meson-s7d-odroidc5.dtsi) | C5 native resources, GPU, memory reservations and display graph. |
 | [`s7d_s905x5m_odroidc5.dts`](arch/arm64/boot/dts/amlogic/s7d_s905x5m_odroidc5.dts) | Board entry point; produces the standard `s7d_s905x5m_odroidc5.dtb`. |
 
@@ -413,8 +483,16 @@ There is no separate native-display board DTB in the intended configuration.
 The principal native options are `CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES`,
 `CONFIG_AMLOGIC_C5_NATIVE_DISPLAY`, `CONFIG_AMLOGIC_C5_GPU_KBASE` and
 `CONFIG_DMABUF_HEAPS_C5_SCANOUT`. Their Kconfig definitions live with their
-respective drivers. Kconfig exclusions and the C5 DT disable competing legacy
-display owners; the native VPU and vendor display writers must not run together.
+respective drivers. Native audio adds `CONFIG_MFD_MESON_S7D_AUDIO`,
+`CONFIG_RESET_MESON_S7D_AUDIO`, `CONFIG_COMMON_CLK_MESON_S7D_AUDIO`,
+`CONFIG_SND_SOC_MESON_S7D_HDMI_AUDIO` and `CONFIG_SND_SOC_ODROIDC5`.
+Kconfig exclusions and the C5 DT disable competing legacy display and audio
+owners; the native and vendor paths must not program the same blocks together.
+
+Deploy the matching modules as well as Image and DTB. In the tested configuration
+`CONFIG_AMLOGIC_COMMON_CLK_S7D=m`, and the clock module is included in initramfs.
+Replacing Image alone leaves that clock implementation unchanged; verify the
+loaded module when testing a CCF change.
 
 Local test programs, logs and working notes are kept outside the committed
 driver series. Their absence from a checkout must not be interpreted as an
@@ -422,25 +500,32 @@ automated or reproducible hardware certification suite.
 
 ## Remaining work
 
-1. **Complete the native display and desktop path.** Establish safe 60 fps
-   updates, validate long-running flips, IRQ recovery and TEST_ONLY isolation,
-   and qualify GNOME/GDM, non-root sessions, VT switching and hotplug behavior.
-2. **Connect HDMI PCM through ASoC.** Finish audio register ownership,
-   clock/reset/PM consumers, FRDDR/TDMB routing, `hdmi-codec`, ELD and recovery
-   during playback and display transitions.
-3. **Extend display feature coverage.** Add 4K30/60, additional planes,
-   scaling/blending, supported YUV paths and compressed modifiers according to
-   the actual S7D topology and bandwidth limits. Validate RGB range and color
-   conversion rather than merely exposing properties.
-4. **Remove remaining initialization assumptions.** Resolve the conflicting
-   HDMI SRAM power descriptions, verify cold initialization and restore lost
-   state before enabling domain power-off, deep sleep or hibernation. Do not
-   guess a memory-power bit or claim that domain ON guarantees usable SRAM.
-5. **Return to boot continuity after the native path is complete.** Analyze
-   U-Boot's retained scanout and reservations, integrate the existing kernel
+1. **Stabilize the working display path.** Diagnose the reboot stall with UART,
+   qualify repeated modesets/reboots, long-running GNOME, VT transitions and
+   physical HDMI unplug/replug, and complete TEST_ONLY resource isolation and
+   IRQ/failure recovery checks. Establish safe full-rate presentation separately
+   from a 60 Hz link.
+2. **Complete the three audio outputs.** Add the analog TDM C/T9015 route and
+   external SPDIF A overlay support using the shared providers and separate
+   per-port resources. Extend HDMI testing to audible recovery, 24-bit sinks,
+   cable reconnect and 4K suspend/resume; do not impose HDMI ELD constraints on
+   analog or SPDIF links.
+3. **Broaden display and sink coverage.** Qualify 4K and fractional timings on
+   more sinks, DVI, custom EDID timings, link failures and memory contention.
+   Then add planes, scaling/blending, YUV and compressed modifiers according to
+   the actual S7D topology. Validate color conversion and bandwidth rather than
+   merely exposing properties or accepting a mode.
+4. **Remove remaining initialization assumptions.** Complete clock-path
+   ownership, including PNX; resolve the conflicting HDMI SRAM power descriptions
+   and verify cold initialization. Restore lost state before enabling shared
+   domain power-off, deep sleep or hibernation. Do not guess a memory-power bit
+   or claim that domain ON guarantees usable SRAM.
+5. **Return to boot continuity after the native path is stable.** Analyze
+   U-Boot's retained scanout and reservations, integrate the kernel's
    simpledrm/simple-framebuffer mechanism, and verify ownership transfer through
-   logo, kernel console or Plymouth, and server/desktop login. Release reserved
-   memory only after all scanout/RDMA references and memory ownership permit it.
+   logo, console or Plymouth, and login. Release reserved memory only after all
+   scanout/RDMA references and memory ownership permit it. U-Boot modification
+   remains outside the current scope.
 6. **Add HDR and revisit media integration.** Evaluate HDR10/HLG as complete
    10-bit, color-processing, metadata and packet paths. Separately design a
    common decoder core for stateful V4L2 M2M, vendor V4L2 extensions and amstream,
