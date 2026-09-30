@@ -85,8 +85,8 @@ static int s7d_phy_power_on(struct phy *phy)
 	if (ret)
 		goto disable_clock;
 
-	ctrl0 = rate >= 370000000 ? 0x3cafb :
-		rate >= 297000000 ? 0x380dd : 0x2038088;
+	ctrl0 = rate > 300000000 ? 0x3cafb :
+		rate > 150000000 ? 0x380dd : 0x2038088;
 	ret = regmap_write(priv->map, PHY_CTRL0, ctrl0 | priv->rterm);
 	if (ret)
 		goto stop;
