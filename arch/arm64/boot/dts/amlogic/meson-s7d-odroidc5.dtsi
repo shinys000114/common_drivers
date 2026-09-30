@@ -216,7 +216,8 @@
 		c5_display_cma: display-cma {
 			compatible = "shared-dma-pool";
 			reusable;
-			size = <0 0x4000000>;
+			/* Console plus old/new 4K scanout buffer pairs. */
+			size = <0 0xc000000>;
 			alignment = <0 0x400000>;
 			/* Coherent RDMA descriptors and GEM DMA must fit below 4 GiB. */
 			alloc-ranges = <0 0 1 0>;
