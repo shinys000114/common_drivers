@@ -49,6 +49,11 @@ static int s7d_connector_get_modes(struct drm_connector *connector)
 	return count;
 }
 
+static void s7d_connector_clear(struct drm_device *drm, void *data)
+{
+	s7d_hdmi_bridge_set_connector(data, NULL);
+}
+
 DEFINE_DRM_GEM_DMA_FOPS(s7d_drm_fops);
 
 static const struct drm_driver s7d_drm_driver = {
@@ -183,6 +188,10 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	display->get_modes = display->connector_helpers.get_modes;
 	display->connector_helpers.get_modes = s7d_connector_get_modes;
 	drm_connector_helper_add(connector, &display->connector_helpers);
+	ret = drmm_add_action_or_reset(drm, s7d_connector_clear, bridge);
+	if (ret)
+		goto fini_vpu;
+	s7d_hdmi_bridge_set_connector(bridge, connector);
 	ret = drm_connector_attach_encoder(connector, encoder);
 	if (ret)
 		goto fini_vpu;
@@ -206,6 +215,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	return 0;
 
 fini_vpu:
+	s7d_hdmi_bridge_set_connector(bridge, NULL);
 	/* No commit can have started before a successful drm_dev_register(). */
 	WARN_ON(s7d_vpu_fini(&display->vpu));
 	return dev_err_probe(dev, ret, "DRM initialization\n");

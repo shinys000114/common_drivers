@@ -19,6 +19,7 @@
 #include <drm/drm_bridge.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_eld.h>
+#include <drm/drm_probe_helper.h>
 #include <drm/display/drm_scdc_helper.h>
 
 #include "s7d-hdmi.h"
@@ -102,6 +103,10 @@ struct s7d_hdmi {
 	hdmi_codec_plugged_cb audio_plugged;
 	struct device *codec_dev;
 	struct work_struct audio_notify;
+	struct mutex connector_lock;
+	struct drm_connector *connector;
+	unsigned int sink_generation;
+	unsigned int edid_generation;
 };
 
 static struct s7d_hdmi *to_s7d_hdmi(struct drm_bridge *bridge)
@@ -123,11 +128,47 @@ static int s7d_hdmi_ddc_clock_check(unsigned long rate)
 	return rate >= 199980000 && rate <= 200020000 ? 0 : -ERANGE;
 }
 
+static int s7d_hdmi_audio_apply(struct s7d_hdmi *h);
+
+static void s7d_hdmi_refresh_eld(struct s7d_hdmi *h)
+{
+	struct drm_connector *connector;
+	struct drm_device *drm;
+	bool valid;
+
+	mutex_lock(&h->lock);
+	valid = h->eld_valid || h->stopping;
+	mutex_unlock(&h->lock);
+	if (valid)
+		return;
+	mutex_lock(&h->connector_lock);
+	connector = h->connector;
+	if (connector) {
+		drm = connector->dev;
+		mutex_lock(&drm->mode_config.mutex);
+		drm_helper_probe_single_connector_modes(connector, drm->mode_config.max_width,
+						      drm->mode_config.max_height);
+		mutex_unlock(&drm->mode_config.mutex);
+	}
+	mutex_unlock(&h->connector_lock);
+}
+
+void s7d_hdmi_bridge_set_connector(struct drm_bridge *bridge, struct drm_connector *connector)
+{
+	struct s7d_hdmi *h = to_s7d_hdmi(bridge);
+
+	/* DRM clears this pointer before its managed connector cleanup. */
+	mutex_lock(&h->connector_lock);
+	h->connector = connector;
+	mutex_unlock(&h->connector_lock);
+}
+
 static int s7d_hdmi_audio_get_eld(struct device *dev, void *data, u8 *buf, size_t len)
 {
 	struct s7d_hdmi *h = data;
 	int ret = -ENODEV;
 
+	s7d_hdmi_refresh_eld(h);
 	memset(buf, 0, len);
 	mutex_lock(&h->lock);
 	if (!h->eld_valid)
@@ -143,7 +184,7 @@ void s7d_hdmi_bridge_eld_updated(struct drm_bridge *bridge, struct drm_connector
 {
 	struct s7d_hdmi *h = to_s7d_hdmi(bridge);
 	u8 eld[MAX_ELD_BYTES];
-	bool valid;
+	bool valid, changed;
 
 	mutex_lock(&connector->eld_mutex);
 	memcpy(eld, connector->eld, sizeof(eld));
@@ -151,10 +192,20 @@ void s7d_hdmi_bridge_eld_updated(struct drm_bridge *bridge, struct drm_connector
 	valid = connector->display_info.is_hdmi && connector->display_info.has_audio &&
 		eld[0] && drm_eld_sad_count(eld) && drm_eld_size(eld) <= sizeof(eld);
 	mutex_lock(&h->lock);
+	valid = valid && h->edid_generation == h->sink_generation;
+	changed = h->eld_valid != valid || memcmp(h->eld, eld, sizeof(eld));
 	memcpy(h->eld, eld, sizeof(eld));
 	h->eld_valid = valid;
+	if (valid && !h->audio_valid && h->audio_clock_on && h->prepared && h->phy_on &&
+	    !h->audio_error) {
+		if (s7d_hdmi_audio_supported(eld, &h->audio_params))
+			h->audio_valid = !s7d_hdmi_audio_apply(h);
+		else
+			h->audio_error = -EINVAL;
+	}
 	mutex_unlock(&h->lock);
-	schedule_work(&h->audio_notify);
+	if (changed)
+		schedule_work(&h->audio_notify);
 }
 
 static void s7d_hdmi_audio_notify(struct work_struct *work)
@@ -211,6 +262,7 @@ static int s7d_hdmi_audio_prepare(struct device *dev, void *data,
 	    (fmt->bit_fmt != SNDRV_PCM_FORMAT_S16_LE &&
 	     fmt->bit_fmt != SNDRV_PCM_FORMAT_S24_LE))
 		return -EINVAL;
+	s7d_hdmi_refresh_eld(h);
 	mutex_lock(&h->lock);
 	if (!h->eld_valid || !h->prepared || !h->phy_on) {
 		ret = -ENODEV;
@@ -253,6 +305,8 @@ static int s7d_hdmi_audio_set_mute(struct device *dev, void *data, bool mute, in
 
 	if (direction != SNDRV_PCM_STREAM_PLAYBACK)
 		return -EINVAL;
+	if (!mute)
+		s7d_hdmi_refresh_eld(h);
 	mutex_lock(&h->lock);
 	h->audio_muted = mute;
 	if (!mute && h->audio_error)
@@ -561,6 +615,9 @@ static const struct drm_edid *s7d_hdmi_get_edid(struct drm_bridge *bridge,
 {
 	struct s7d_hdmi *h = to_s7d_hdmi(bridge);
 
+	mutex_lock(&h->lock);
+	h->edid_generation = h->sink_generation;
+	mutex_unlock(&h->lock);
 	if (s7d_hdmi_detect(bridge) != connector_status_connected)
 		return NULL;
 	return drm_edid_read_ddc(connector, &h->ddc.adapter);
@@ -769,6 +826,7 @@ static void s7d_hdmi_audio_hpd(struct s7d_hdmi *h)
 	int ret;
 
 	mutex_lock(&h->lock);
+	h->sink_generation++;
 	h->eld_valid = false;
 	h->audio_valid = false;
 	if (h->audio_clock_on) {
@@ -860,6 +918,7 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	h->dev = dev;
 	mutex_init(&h->lock);
+	mutex_init(&h->connector_lock);
 	mutex_init(&h->audio_callback_lock);
 	INIT_WORK(&h->audio_notify, s7d_hdmi_audio_notify);
 	h->audio_muted = true;
