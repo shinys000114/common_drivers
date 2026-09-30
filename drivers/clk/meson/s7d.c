@@ -845,6 +845,12 @@ static struct clk_regmap cdac = {
 #define S7D_DISPLAY_GATE_FLAGS (CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED)
 #endif
 
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_NATIVE_DISPLAY)
+#define S7D_AUDIO_GATE_FLAGS (CLK_SET_RATE_PARENT | CLK_DONT_HOLD_STATE)
+#else
+#define S7D_AUDIO_GATE_FLAGS (CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED)
+#endif
+
 static u32 video_src_01_parent_table[] = {
 #if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
 	/* Datasheet table 7-95: analogue vid_pix_clk, NOT digital vid_pll_clk. */
@@ -2928,7 +2934,7 @@ static struct clk_regmap hdmitx_aud = {
 			&hdmitx_aud_div.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
+		.flags = S7D_AUDIO_GATE_FLAGS,
 	},
 };
 
