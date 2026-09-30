@@ -2,6 +2,8 @@
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_graph.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_edid.h>
@@ -138,6 +140,32 @@ static int c5_card_dai(struct device *dev, struct device_node *link, const char 
 	return snd_soc_get_dai_name(&args, &dlc->dai_name);
 }
 
+static void c5_card_unlink_display(void *data)
+{
+	device_link_del(data);
+}
+
+static int c5_card_link_display(struct device *dev, struct device_node *hdmi)
+{
+	struct platform_device *display;
+	struct device_node *node;
+	struct device_link *link;
+
+	node = of_graph_get_remote_node(hdmi, 0, 0);
+	if (!node)
+		return -EINVAL;
+	display = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!display)
+		return -EPROBE_DEFER;
+	/* The DRM resume callback restores the HDMI video clocks and PHY. */
+	link = device_link_add(dev, &display->dev, DL_FLAG_STATELESS);
+	put_device(&display->dev);
+	if (!link)
+		return -EINVAL;
+	return devm_add_action_or_reset(dev, c5_card_unlink_display, link);
+}
+
 static int c5_card_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -157,6 +185,9 @@ static int c5_card_probe(struct platform_device *pdev)
 	of_node_put(link);
 	if (ret)
 		return dev_err_probe(dev, ret, "HDMI DAI link\n");
+	ret = c5_card_link_display(dev, priv->codec.of_node);
+	if (ret)
+		return dev_err_probe(dev, ret, "HDMI display dependency\n");
 	priv->platform.of_node = priv->cpu.of_node;
 	priv->hdmi = (struct snd_soc_dai_link) {
 		.name = "HDMI", .stream_name = "HDMI PCM",
