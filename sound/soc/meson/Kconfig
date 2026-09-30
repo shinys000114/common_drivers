@@ -8,3 +8,11 @@ config SND_SOC_MESON_S7D_HDMI_AUDIO
 	  Standard ASoC PCM and I2S playback through FRDDR A and TDM B.
 	  Uses the native audio clock and reset providers and shared regmap.
 	  Connect this CPU DAI to an HDMI codec through an ASoC sound card.
+
+config SND_SOC_ODROIDC5
+	tristate "ODROID-C5 sound card"
+	depends on AMLOGIC_C5_NATIVE_DISPLAY && SND_SOC_MESON_S7D_HDMI_AUDIO
+	select SND_SOC_HDMI_CODEC
+	help
+	  Board audio links, HDMI sink constraints and jack reporting.
+	  The initial link connects the native TDM B DAI to the HDMI codec.
