@@ -964,6 +964,9 @@ static struct clk_regmap video_src0_div = {
 		.offset = CLKCTRL_VID_CLK_DIV,
 		.shift = 0,
 		.width = 8,
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES)
+		.flags = CLK_DIVIDER_ROUND_CLOSEST,
+#endif
 	},
 	.hw.init = &(struct clk_init_data) {
 		.name = "video_src0_div",
