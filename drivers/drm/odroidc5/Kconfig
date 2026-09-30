@@ -19,7 +19,7 @@ config AMLOGIC_C5_NATIVE_DISPLAY
 	  DRM EDID/SCDC helpers, CCF consumers and generic PHY ownership.
 	  Static device trees and built-in drivers only; unbind is suppressed.
 	  Register a single CRTC with a linear 32-bit RGB plane and HDMI connector.
-	  Requires retained firmware output on S7D revision B, up to SDR 1080p60.
+	  Requires retained firmware output on S7D revision B, with SDR RGB8 TMDS up to 594 MHz.
 	  Do not enable with legacy media/display writers. System sleep supports
 	  s2idle after native takeover, retaining the shared display domain.
 	  HDMI PCM uses SND_SOC_HDMI_CODEC with SND_SOC_MESON_S7D_HDMI_AUDIO
