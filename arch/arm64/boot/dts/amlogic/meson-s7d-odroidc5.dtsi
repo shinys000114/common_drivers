@@ -82,6 +82,19 @@
 };
 
 / {
+	c5_sound: sound {
+		compatible = "hardkernel,odroidc5-audio";
+
+		hdmi {
+			cpu {
+				sound-dai = <&c5_hdmi_audio>;
+			};
+			codec {
+				sound-dai = <&c5_native_hdmi>;
+			};
+		};
+	};
+
 	soc {
 		c5_audio: audio-controller@fe330000 {
 			compatible = "amlogic,s7d-audio";
@@ -236,6 +249,7 @@
 
 	c5_native_hdmi: hdmi@fe300000 {
 		compatible = "amlogic,s7d-hdmi-native";
+		#sound-dai-cells = <0>;
 		reg = <0 0xfe300000 0 0x10000>, <0 0xfe310000 0 0x10000>;
 		reg-names = "top", "core";
 		interrupts = <GIC_SPI 204 IRQ_TYPE_LEVEL_HIGH>;
@@ -243,8 +257,11 @@
 		pinctrl-0 = <&hdmitx_hpd &hdmitx_ddc>;
 		clocks = <&clkc CLKID_SYS_HDMITX_APB>, <&clkc CLKID_HDMITX_SYS>,
 			 <&clkc CLKID_HDMITX_PRIF>, <&clkc CLKID_HDMITX_200M>,
-			 <&clkc CLKID_HDMITX_PIXEL>, <&clkc CLKID_HDMITX_FE>;
-		clock-names = "apb", "sys", "prif", "200m", "pixel", "fe";
+			 <&clkc CLKID_HDMITX_PIXEL>, <&clkc CLKID_HDMITX_FE>,
+			 <&clkc CLKID_HDMITX_AUD>;
+		clock-names = "apb", "sys", "prif", "200m", "pixel", "fe", "aud";
+		assigned-clocks = <&clkc CLKID_HDMITX_AUD_MUX>;
+		assigned-clock-parents = <&clkc CLKID_FCLK_DIV5>;
 		resets = <&reset RESET_HDMI_TX>, <&reset RESET_HDMITX_CAPB3>;
 		reset-names = "tx", "apb";
 		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
