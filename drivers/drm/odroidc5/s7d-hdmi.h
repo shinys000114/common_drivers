@@ -10,5 +10,6 @@ struct s7d_vpu_link;
 /* Obtain the native bridge's VPU handoff/prepare callbacks before attaching it. */
 int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link);
 void s7d_hdmi_bridge_eld_updated(struct drm_bridge *bridge, struct drm_connector *connector);
+void s7d_hdmi_bridge_set_connector(struct drm_bridge *bridge, struct drm_connector *connector);
 
 #endif
