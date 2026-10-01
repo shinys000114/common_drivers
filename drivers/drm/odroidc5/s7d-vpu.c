@@ -516,7 +516,7 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	v->dev = dev;
 	spin_lock_init(&v->frame_lock);
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vcbus");
-	if (!res || resource_size(res) != SZ_64K)
+	if (!res || resource_size(res) != SZ_256K)
 		return -EINVAL;
 	v->regs = devm_ioremap_resource(dev, res);
 	if (IS_ERR(v->regs))
