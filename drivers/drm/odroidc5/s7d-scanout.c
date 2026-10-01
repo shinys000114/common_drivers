@@ -6,18 +6,45 @@
 
 #include "s7d-scanout.h"
 
+static bool buffers_present(const struct s7d_scanout_buffers *buffers)
+{
+	unsigned int i;
+
+	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
+		if (buffers->fb[i])
+			return true;
+	return false;
+}
+
+static void buffers_get(const struct s7d_scanout_buffers *buffers)
+{
+	unsigned int i;
+
+	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
+		if (buffers->fb[i])
+			drm_framebuffer_get(buffers->fb[i]);
+}
+
+static void buffers_put(const struct s7d_scanout_buffers *buffers)
+{
+	unsigned int i;
+
+	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
+		if (buffers->fb[i])
+			drm_framebuffer_put(buffers->fb[i]);
+}
+
 static void s7d_scanout_retire(struct work_struct *work)
 {
 	struct s7d_scanout *s = container_of(work, struct s7d_scanout, retire_work);
-	struct drm_framebuffer *fb;
+	struct s7d_scanout_buffers retired;
 	unsigned long flags;
 
 	spin_lock_irqsave(&s->lock, flags);
-	fb = s->retired_fb;
-	s->retired_fb = NULL;
+	retired = s->retired;
+	s->retired = (struct s7d_scanout_buffers) {0};
 	spin_unlock_irqrestore(&s->lock, flags);
-	if (fb)
-		drm_framebuffer_put(fb);
+	buffers_put(&retired);
 }
 
 void s7d_scanout_init(struct s7d_scanout *s, struct s7d_rdma *rdma)
@@ -27,23 +54,25 @@ void s7d_scanout_init(struct s7d_scanout *s, struct s7d_rdma *rdma)
 	INIT_WORK(&s->retire_work, s7d_scanout_retire);
 }
 
-int s7d_scanout_begin_initial(struct s7d_scanout *s, struct drm_framebuffer *fb)
+int s7d_scanout_begin_initial(struct s7d_scanout *s,
+			      const struct s7d_scanout_buffers *buffers)
 {
 	unsigned long flags;
 	int ret = 0;
 
-	if (!fb)
+	if (!buffers || !buffers_present(buffers))
 		return -EINVAL;
 	flush_work(&s->retire_work);
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->fault) {
 		ret = -EIO;
 	} else if (s->phase != S7D_SCANOUT_STOPPED ||
-		   s->active_fb || s->pending_fb || s->retired_fb) {
+		   buffers_present(&s->active) || buffers_present(&s->pending) ||
+		   buffers_present(&s->retired)) {
 		ret = -EBUSY;
 	} else {
-		drm_framebuffer_get(fb);
-		s->pending_fb = fb;
+		buffers_get(buffers);
+		s->pending = *buffers;
 		s->phase = S7D_SCANOUT_INITIAL;
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
@@ -58,7 +87,7 @@ int s7d_scanout_initial_ready(struct s7d_scanout *s)
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->fault) {
 		ret = -EIO;
-	} else if (s->phase != S7D_SCANOUT_INITIAL || !s->pending_fb) {
+	} else if (s->phase != S7D_SCANOUT_INITIAL || !buffers_present(&s->pending)) {
 		ret = -EINVAL;
 	} else {
 		/* Caller has not enabled VENC yet; its first vblank is sufficient. */
@@ -69,14 +98,15 @@ int s7d_scanout_initial_ready(struct s7d_scanout *s)
 	return ret;
 }
 
-int s7d_scanout_submit(struct s7d_scanout *s, struct drm_framebuffer *fb,
+int s7d_scanout_submit(struct s7d_scanout *s,
+			const struct s7d_scanout_buffers *buffers,
 			const struct s7d_rdma_entry *entries, unsigned int count)
 {
 	unsigned long flags;
 	bool put = false;
 	int ret;
 
-	if (!fb)
+	if (!buffers || !buffers_present(buffers))
 		return -EINVAL;
 	/* The previous IRQ may already have scheduled a sleeping GEM release. */
 	flush_work(&s->retire_work);
@@ -85,11 +115,12 @@ int s7d_scanout_submit(struct s7d_scanout *s, struct drm_framebuffer *fb,
 		ret = -EIO;
 		goto out;
 	}
-	if (s->phase != S7D_SCANOUT_IDLE || !s->active_fb || s->pending_fb || s->retired_fb) {
+	if (s->phase != S7D_SCANOUT_IDLE || !buffers_present(&s->active) ||
+	    buffers_present(&s->pending) || buffers_present(&s->retired)) {
 		ret = -EBUSY;
 		goto out;
 	}
-	drm_framebuffer_get(fb);
+	buffers_get(buffers);
 	/*
 	 * Nest owner -> RDMA lock. IRQ must release the RDMA lock before calling
 	 * s7d_scanout_irq. Publishing pending and arming are serialized vs IRQ.
@@ -102,14 +133,14 @@ int s7d_scanout_submit(struct s7d_scanout *s, struct drm_framebuffer *fb,
 			s->fault = true;
 		goto out;
 	}
-	s->pending_fb = fb;
+	s->pending = *buffers;
 	s->phase = S7D_SCANOUT_RDMA;
 	s->vblank_valid = false;
 	s->early_complete = false;
 out:
 	spin_unlock_irqrestore(&s->lock, flags);
 	if (put)
-		drm_framebuffer_put(fb);
+		buffers_put(buffers);
 	return ret;
 }
 
@@ -151,16 +182,16 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 	} else if (!vblank) {
 		goto out;
 	}
-	if (!s->pending_fb || s->retired_fb) {
+	if (!buffers_present(&s->pending) || buffers_present(&s->retired)) {
 		s->fault = true;
 		result = S7D_SCANOUT_FAULT;
 		goto out;
 	}
-	s->retired_fb = s->active_fb;
-	s->active_fb = s->pending_fb;
-	s->pending_fb = NULL;
+	s->retired = s->active;
+	s->active = s->pending;
+	s->pending = (struct s7d_scanout_buffers) {0};
 	s->phase = S7D_SCANOUT_IDLE;
-	if (s->retired_fb)
+	if (buffers_present(&s->retired))
 		schedule_work(&s->retire_work);
 	result = S7D_SCANOUT_FRAME_COMPLETE;
 out:
@@ -179,7 +210,7 @@ void s7d_scanout_fail(struct s7d_scanout *s)
 
 int s7d_scanout_quiesce(struct s7d_scanout *s)
 {
-	struct drm_framebuffer *active_fb, *pending;
+	struct s7d_scanout_buffers active, pending;
 	unsigned long flags;
 	int ret;
 
@@ -190,18 +221,16 @@ int s7d_scanout_quiesce(struct s7d_scanout *s)
 		return ret;
 	flush_work(&s->retire_work);
 	spin_lock_irqsave(&s->lock, flags);
-	active_fb = s->active_fb;
-	pending = s->pending_fb;
-	s->active_fb = NULL;
-	s->pending_fb = NULL;
+	active = s->active;
+	pending = s->pending;
+	s->active = (struct s7d_scanout_buffers) {0};
+	s->pending = (struct s7d_scanout_buffers) {0};
 	s->phase = S7D_SCANOUT_STOPPED;
 	s->wait_field = false;
 	s->fault = false;
 	spin_unlock_irqrestore(&s->lock, flags);
-	if (active_fb)
-		drm_framebuffer_put(active_fb);
-	if (pending)
-		drm_framebuffer_put(pending);
+	buffers_put(&active);
+	buffers_put(&pending);
 	return 0;
 }
 
@@ -210,7 +239,8 @@ int s7d_scanout_fini(struct s7d_scanout *s)
 	/* Caller has synchronized IRQs and serialized against new commits. */
 	flush_work(&s->retire_work);
 	if (s->phase != S7D_SCANOUT_STOPPED || s->fault ||
-	    s->active_fb || s->pending_fb || s->retired_fb)
+	    buffers_present(&s->active) || buffers_present(&s->pending) ||
+	    buffers_present(&s->retired))
 		return -EBUSY;
 	return 0;
 }

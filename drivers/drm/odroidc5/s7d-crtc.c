@@ -89,6 +89,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	int ret;
 
 	state->valid = false;
+	state->buffers = (struct s7d_scanout_buffers) {0};
 	if (!base->active)
 		return 0;
 	if (!base->enable || base->vrr_enabled || base->self_refresh_active ||
@@ -115,6 +116,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	plane = to_s7d_plane_state(ps);
 	if (ps->crtc != crtc || !ps->fb || !ps->visible || !plane->osd_valid)
 		return -EINVAL;
+	state->buffers.fb[0] = ps->fb;
 	if (base->mode.hdisplay != base->adjusted_mode.hdisplay ||
 	    base->mode.vdisplay != base->adjusted_mode.vdisplay)
 		return -EINVAL;
@@ -290,12 +292,11 @@ static void s7d_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_stat
 {
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct s7d_crtc_state *state = to_s7d_crtc_state(crtc->state);
-	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(atomic, crtc->primary);
 	int ret;
 
 	mutex_lock(&c->mutex);
 	ret = -EINVAL;
-	if (!state->valid || !ps || !ps->fb)
+	if (!state->valid || !state->buffers.fb[0])
 		goto fail;
 	ret = -EBUSY;
 	if (c->prepared)
@@ -303,7 +304,7 @@ static void s7d_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_stat
 	ret = c->ops->acquire(c->data);
 	if (ret)
 		goto fail;
-	ret = s7d_scanout_begin_initial(c->scanout, ps->fb);
+	ret = s7d_scanout_begin_initial(c->scanout, &state->buffers);
 	if (ret) {
 		c->ops->release(c->data);
 		goto fail;
@@ -343,23 +344,21 @@ static void s7d_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_state
 {
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct s7d_crtc_state *state = to_s7d_crtc_state(crtc->state);
-	struct drm_plane_state *ps;
 	int ret;
 
 	if (!state->base.active || drm_atomic_crtc_needs_modeset(&state->base))
 		return;
 	mutex_lock(&c->mutex);
-	ps = drm_atomic_get_new_plane_state(atomic, crtc->primary);
 	ret = -EIO;
 	if (READ_ONCE(c->last_error))
 		goto fail;
 	ret = -EINVAL;
-	if (!state->valid || !ps || !ps->fb)
+	if (!state->valid || !state->buffers.fb[0])
 		goto fail;
 	ret = s7d_crtc_arm_event(c, &state->base, false);
 	if (ret)
 		goto fail;
-	ret = s7d_scanout_submit(c->scanout, ps->fb, state->osd.update,
+	ret = s7d_scanout_submit(c->scanout, &state->buffers, state->osd.update,
 				 S7D_OSD_UPDATE_REG_COUNT);
 	if (ret)
 		goto fail;

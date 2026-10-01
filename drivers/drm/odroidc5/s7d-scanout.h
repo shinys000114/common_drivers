@@ -9,6 +9,12 @@
 
 struct drm_framebuffer;
 
+#define S7D_SCANOUT_MAX_PLANES 4
+
+struct s7d_scanout_buffers {
+	struct drm_framebuffer *fb[S7D_SCANOUT_MAX_PLANES];
+};
+
 struct s7d_frame_state {
 	u8 field;
 	bool idle;
@@ -25,12 +31,12 @@ enum s7d_scanout_phase {
 
 struct s7d_scanout {
 	struct s7d_rdma *rdma;
-	/* Protects framebuffer pointers, phase and fault against IRQ/work. */
+	/* Protects buffer sets, phase and fault against IRQ/work. */
 	spinlock_t lock;
 	struct work_struct retire_work;
-	struct drm_framebuffer *active_fb;
-	struct drm_framebuffer *pending_fb;
-	struct drm_framebuffer *retired_fb;
+	struct s7d_scanout_buffers active;
+	struct s7d_scanout_buffers pending;
+	struct s7d_scanout_buffers retired;
 	enum s7d_scanout_phase phase;
 	u64 vblank_seq;
 	u8 applied_field;
@@ -51,7 +57,7 @@ void s7d_scanout_init(struct s7d_scanout *scanout, struct s7d_rdma *rdma);
 
 /*
  * Serialize all process-context calls in the CRTC commit path, after waiting
- * for the plane's fences. Only IRQ handling may run concurrently. This owner
+ * for every plane's fences. Only IRQ handling may run concurrently. This owner
  * is for GEM DMA framebuffers: framebuffer references retain their backing
  * objects/import mappings. It does not replace any future pin/unpin API.
  *
@@ -61,11 +67,12 @@ void s7d_scanout_init(struct s7d_scanout *scanout, struct s7d_rdma *rdma);
  * Firmware scanout reservations are owned by the parent, not adopted here.
  */
 int s7d_scanout_begin_initial(struct s7d_scanout *scanout,
-			      struct drm_framebuffer *fb);
+			      const struct s7d_scanout_buffers *buffers);
 int s7d_scanout_initial_ready(struct s7d_scanout *scanout);
 
 /* One pending flip only. RDMA submit errors never arm the new list. */
-int s7d_scanout_submit(struct s7d_scanout *scanout, struct drm_framebuffer *fb,
+int s7d_scanout_submit(struct s7d_scanout *scanout,
+			const struct s7d_scanout_buffers *buffers,
 			const struct s7d_rdma_entry *entries, unsigned int count);
 
 /*

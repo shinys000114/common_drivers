@@ -13,6 +13,8 @@ struct s7d_crtc_state {
 	struct drm_crtc_state base;
 	struct s7d_encp_state encp;
 	struct s7d_osd_pipeline_state osd;
+	/* Borrowed from the checked atomic plane states until scanout takes refs. */
+	struct s7d_scanout_buffers buffers;
 	unsigned long pixel_rate;
 	bool valid;
 };
