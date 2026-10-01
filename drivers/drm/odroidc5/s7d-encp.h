@@ -16,6 +16,9 @@ struct s7d_reg_value {
 
 struct s7d_encp_state {
 	struct s7d_reg_value regs[S7D_ENCP_REG_COUNT];
+	u16 flip_start;
+	u16 flip_end;
+	u8 fifo_hold_lines;
 	bool hsync_positive;
 	bool vsync_positive;
 };

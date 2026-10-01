@@ -38,6 +38,8 @@ struct s7d_vpu {
 	bool touched;
 	bool pixel_protected;
 	bool core_protected;
+	u16 flip_start;
+	u16 flip_end;
 	u32 failed_reg;
 };
 

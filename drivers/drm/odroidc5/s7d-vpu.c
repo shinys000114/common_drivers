@@ -320,6 +320,9 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		u32 expected = le32_to_cpu(state->osd.setup[i].value);
 		u32 mask = U32_MAX;
 
+		if (reg == OSD1_CTRL + OSD_FIFO_OFFSET)
+			expected = (expected & ~GENMASK(9, 5)) |
+				   (state->encp.fifo_hold_lines << 5);
 		writel(expected, v->regs + reg * 4);
 		/* Mixed status/config and Rev.B's documented alpha encoding. */
 		if (reg == OSD1_CTRL)
@@ -374,6 +377,8 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = program_output(v, state);
 	if (ret)
 		return ret;
+	v->flip_start = state->encp.flip_start;
+	v->flip_end = state->encp.flip_end;
 	/* RDMA done was acknowledged by prepare; clear stale GIC edge state. */
 	ret = irq_set_irqchip_state(v->rdma_irq, IRQCHIP_STATE_PENDING, false);
 	if (ret)
@@ -451,6 +456,11 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	frame.field = after >> 29;
 	frame.idle = (before >> 29) == frame.field &&
 		     !(fifo & OSD_FIFO_STATE) && (arbiter & ASYNC_IDLE);
+	/* HOLD_FIFO_LINES prevents new OSD reads throughout this window. */
+	frame.early = frame.idle &&
+		      ((before >> 16) & 0x1fff) >= v->flip_start &&
+		      ((before >> 16) & 0x1fff) <= ((after >> 16) & 0x1fff) &&
+		      ((after >> 16) & 0x1fff) < v->flip_end;
 	trace_s7d_frame_idle(before, after, fifo, arbiter, vblank);
 	s7d_crtc_irq(v->crtc, vblank, result, &frame);
 	spin_unlock_irqrestore(&v->frame_lock, flags);

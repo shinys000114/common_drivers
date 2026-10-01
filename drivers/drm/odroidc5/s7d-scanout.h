@@ -12,6 +12,7 @@ struct drm_framebuffer;
 struct s7d_frame_state {
 	u8 field;
 	bool idle;
+	bool early;
 };
 
 enum s7d_scanout_phase {
@@ -33,6 +34,9 @@ struct s7d_scanout {
 	enum s7d_scanout_phase phase;
 	u64 vblank_seq;
 	u8 applied_field;
+	u8 vblank_field;
+	bool vblank_valid;
+	bool early_complete;
 	bool wait_field;
 	bool fault;
 };
@@ -70,9 +74,9 @@ int s7d_scanout_submit(struct s7d_scanout *scanout, struct drm_framebuffer *fb,
  * The CRTC sends its event only on FRAME_COMPLETE. RDMA FAULT is sticky.
  *
  * Caller serializes sampling with delivery across all display IRQs. After
- * RDMA reset, require a different ENCP field and idle OSD/arbiter reads before
- * returning the previous framebuffer. Counter wrap may delay completion but
- * must never let a same-field late IRQ retire it.
+ * RDMA reset may finish inside the programmed FIFO hold window. Complete in
+ * that field only with idle fetchers and an accounted matching vblank.
+ * Otherwise require a different field and idle OSD/arbiter observations.
  */
 enum s7d_scanout_result
 s7d_scanout_irq(struct s7d_scanout *scanout, bool vblank,

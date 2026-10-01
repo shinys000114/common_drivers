@@ -88,7 +88,7 @@ enum drm_mode_status
 s7d_encp_build_state(const struct drm_display_mode *m, struct s7d_encp_state *state)
 {
 	const u32 latency = 2, vs = 1;
-	u32 hs, de_h_begin, de_h_end, de_v_begin, de_v_end, hsync, vsync;
+	u32 hs, de_h_begin, de_h_end, de_v_begin, de_v_end, hsync, vsync, hold = 8;
 	enum drm_mode_status status;
 
 	if (!m || !state)
@@ -104,6 +104,9 @@ s7d_encp_build_state(const struct drm_display_mode *m, struct s7d_encp_state *st
 	de_h_begin = de_h_end - m->hdisplay;
 	de_v_end = m->vtotal - (m->vsync_start - m->vdisplay) + vs;
 	de_v_begin = de_v_end - m->vdisplay;
+	/* Leave eight lines to fill the FIFO before the active display window. */
+	if (de_v_begin >= vs + 16)
+		hold = min_t(u32, 31, de_v_begin - vs - 8);
 
 	*state = (struct s7d_encp_state) {
 		.regs = {
@@ -132,6 +135,9 @@ s7d_encp_build_state(const struct drm_display_mode *m, struct s7d_encp_state *st
 			{ ENCP_VIDEO_MAX_PXCNT, m->htotal - 1 },
 			{ ENCP_VIDEO_MAX_LNCNT, m->vtotal - 1 },
 		},
+		.flip_start = vs,
+		.flip_end = de_v_begin >= vs + hold + 8 ? vs + hold - 2 : 0,
+		.fifo_hold_lines = hold,
 		.hsync_positive = m->flags & DRM_MODE_FLAG_PHSYNC,
 		.vsync_positive = m->flags & DRM_MODE_FLAG_PVSYNC,
 	};
