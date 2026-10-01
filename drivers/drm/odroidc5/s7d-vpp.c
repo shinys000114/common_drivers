@@ -12,6 +12,7 @@
 #define ENCL_VIDEO_EN		0x1ca0
 #define OSD1_CTRL_STAT		0x1a10
 #define OSD2_CTRL_STAT		0x1a30
+#define VD1_GEN_REG		0x4800
 
 struct s7d_vpp_setting {
 	u32 reg;
@@ -50,6 +51,10 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x3d05, BIT(22), 0 },
 		{ 0x1df1, 0x1fff1fff, (height << 16) | width },
 		/* Disable HDR and its independent matrix-only bypass path. */
+		{ 0x3800, GENMASK(20, 13) | GENMASK(7, 2), 0 },
+		{ 0x383b, GENMASK(1, 0), 0 },
+		{ 0x383c, GENMASK(1, 0), 0 },
+		{ 0x329d, GENMASK(1, 0), 0 }, /* VD1 matrix */
 		{ 0x38a0, GENMASK(20, 13) | GENMASK(7, 2), 0 },
 		/* Clear enable_sync_sel too: no VSYNC is running at this point. */
 		{ 0x38db, GENMASK(1, 0), 0 }, /* HDR input matrix */
@@ -107,6 +112,8 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 	     readl(vcbus + ENCL_VIDEO_EN * 4) |
 	     readl(vcbus + OSD1_CTRL_STAT * 4) |
 	     readl(vcbus + OSD2_CTRL_STAT * 4)) & BIT(0))
+		return -EBUSY;
+	if (readl(vcbus + VD1_GEN_REG * 4) & (BIT(17) | BIT(0)))
 		return -EBUSY;
 
 	for (i = 0; i < ARRAY_SIZE(settings); i++) {

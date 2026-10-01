@@ -29,6 +29,10 @@
 #define OSD_PATH		0x1a0e
 #define VD1_BLEND		0x1dfb
 #define VD2_BLEND		0x1dfc
+#define VD1_PATH		0x1a0a
+#define VD1_GEN			0x4800
+#define VD1_BUSY		BIT(17)
+#define VD1_FREE_CLK		BIT(31)
 #define VENC_MUX		0x271a
 #define ENCP_INFO_READ		0x271d
 #define HDMI_SETTING		0x271b
@@ -205,6 +209,20 @@ static int s7d_vpu_stop(void *data)
 	ret = s7d_rdma_quiesce(&v->rdma);
 	if (ret)
 		return ret;
+	if (!v->vd1_draining) {
+		v->vd1_free_clk = vpu_read(v, VD1_GEN) & VD1_FREE_CLK;
+		v->vd1_draining = true;
+	}
+	/* Keep VD1 running until its state machines and READ0 have drained. */
+	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK | BIT(30) | BIT(0), VD1_FREE_CLK);
+	if (ret)
+		return ret;
+	ret = readl_poll_timeout(v->regs + VD1_GEN * 4, value,
+				!(value & VD1_BUSY), 10, 50000);
+	if (ret) {
+		v->failed_reg = VD1_GEN;
+		return ret;
+	}
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		/*
 		 * Keep the local OSD clock running until disable reaches OSD_ENABLE and DMA
@@ -238,6 +256,10 @@ static int s7d_vpu_stop(void *data)
 	ret = stop_encoders(v);
 	if (ret)
 		return ret;
+	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK, v->vd1_free_clk);
+	if (ret)
+		return ret;
+	v->vd1_draining = false;
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		ret = vpu_update(v, osds[i], OSD_FREE_CLK, free_clk[i]);
 		if (ret)
@@ -271,6 +293,7 @@ static int check_handoff(struct s7d_vpu *v)
 	 * The provider profile excludes Linux video/capture and legacy writers.
 	 */
 	if ((vpu_read(v, OSD_PATH) & (BIT(14) | GENMASK(12, 9) | GENMASK(7, 0))) ||
+	    (vpu_read(v, VD1_PATH) & GENMASK(15, 8)) ||
 	    ((vpu_read(v, VD1_BLEND) | vpu_read(v, VD2_BLEND)) & 0x0f0f))
 		return -EOPNOTSUPP;
 	/* ENCP FIFO must use cts_vpu_clk, not an unowned vpu_clkc route. */
@@ -446,24 +469,26 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 {
 	struct s7d_frame_state frame;
 	unsigned long flags;
-	u32 before, after, fifo, fifo2, arbiter;
+	u32 before, after, fifo, fifo2, vd1, arbiter;
 
 	/* An older IRQ sample must not overtake the threaded RDMA completion. */
 	spin_lock_irqsave(&v->frame_lock, flags);
 	before = vpu_read(v, ENCP_INFO_READ);
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
 	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
+	vd1 = vpu_read(v, VD1_GEN);
 	arbiter = vpu_read(v, ASYNC_STAT);
 	after = vpu_read(v, ENCP_INFO_READ);
 	frame.field = after >> 29;
 	frame.idle = (before >> 29) == frame.field &&
-		     !((fifo | fifo2) & OSD_FIFO_STATE) && (arbiter & ASYNC_IDLE);
+		     !((fifo | fifo2) & OSD_FIFO_STATE) && !(vd1 & VD1_BUSY) &&
+		     (arbiter & ASYNC_IDLE);
 	/* HOLD_FIFO_LINES prevents new OSD reads throughout this window. */
-	frame.early = frame.idle &&
+	frame.early = frame.idle && !(vd1 & BIT(0)) &&
 		      ((before >> 16) & 0x1fff) >= v->flip_start &&
 		      ((before >> 16) & 0x1fff) <= ((after >> 16) & 0x1fff) &&
 		      ((after >> 16) & 0x1fff) < v->flip_end;
-	trace_s7d_frame_idle(before, after, fifo, fifo2, arbiter, vblank);
+	trace_s7d_frame_idle(before, after, fifo, fifo2, vd1, arbiter, vblank);
 	s7d_crtc_irq(v->crtc, vblank, result, &frame);
 	spin_unlock_irqrestore(&v->frame_lock, flags);
 }
