@@ -152,7 +152,10 @@ static bool osd_write_valid(u32 reg, u32 value)
 		       (value >> 20) <= 256 && ((value >> 11) & 0x1ff) <= 256;
 	case 0x39b0:
 		value |= BIT(17) | BIT(19);
-		return value == 0x807f4413 || value == 0x80ff2413;
+		return value == (0x807f4413 | BIT(25)) ||
+		       value == (0x80ff2413 | BIT(25));
+	case 0x1dfe:
+		return value == BIT(20) || value == (BIT(20) | (4 << 8));
 	default:
 		return false;
 	}
@@ -171,7 +174,7 @@ int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 		u32 reg = le32_to_cpu(entries[i].reg);
 		u32 value = le32_to_cpu(entries[i].value);
 
-		/* Replays before CPU masking must be idempotent linear OSD writes. */
+		/* Replays before CPU masking must be idempotent OSD/postblend writes. */
 		if (!osd_write_valid(reg, value))
 			return -EINVAL;
 	}

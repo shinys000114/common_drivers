@@ -49,6 +49,9 @@
 #define OSD_BLEND0_SIZE		0x39bb
 #define OSD_BLEND1_SIZE		0x39bc
 #define OSD_BLEND_CTRL1		0x39c0
+#define VPP_OSD2_SCOPE_H		0x1df7
+#define VPP_OSD2_SCOPE_V		0x1df8
+#define VPP_OSD2_SRC		0x1dfe
 
 #define REG(r, v) { .reg = cpu_to_le32(r), .value = cpu_to_le32(v) }
 
@@ -88,7 +91,8 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 	};
 	const struct s7d_osd_state *primary;
 	u32 h_scope, v_scope, secondary_h = 0x1fff1fff, secondary_v = 0x043a0439;
-	u32 size, blend = 0x807f4413, alpha, secondary_ctrl = 0x00100004;
+	u32 size, blend = 0x807f4413 | BIT(25), alpha, secondary_ctrl = 0x00100004;
+	u32 secondary_src = BIT(20);
 
 	if (!layers || !state)
 		return -EINVAL;
@@ -112,6 +116,7 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 		secondary_h = ((layers[1].dst.x2 - 1) << 16) | layers[1].dst.x1;
 		secondary_v = ((layers[1].dst.y2 - 1) << 16) | layers[1].dst.y1;
 		secondary_ctrl |= BIT(0);
+		secondary_src |= 4 << 8;
 		/* Rev.B routes OSD2 through DIN3, with OSD4 as its alpha input. */
 		blend = (blend & ~GENMASK(15, 12)) | (2 << 12) | BIT(23);
 		if (!layers[1].premult)
@@ -159,6 +164,9 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 			REG(OSD_BLEND1_SIZE, size),
 			REG(OSD_BLEND_CTRL1, 0x31031),
 			REG(OSD_BLEND_CTRL, blend),
+			REG(VPP_OSD2_SCOPE_H, width - 1),
+			REG(VPP_OSD2_SCOPE_V, height - 1),
+			REG(VPP_OSD2_SRC, secondary_src),
 			REG(OSD2_CTRL_STAT, secondary_ctrl),
 			REG(OSD1_CTRL_STAT, 0x00100005),
 		},
@@ -181,6 +189,7 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 			REG(OSD_BLEND_DIN1_V, secondary_v),
 			REG(OSD_BLEND_DUMMY_ALPHA, alpha),
 			REG(OSD_BLEND_CTRL, blend),
+			REG(VPP_OSD2_SRC, secondary_src),
 			REG(OSD2_CTRL_STAT, secondary_ctrl),
 		},
 	};
