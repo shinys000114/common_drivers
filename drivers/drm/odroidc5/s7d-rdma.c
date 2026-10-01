@@ -120,6 +120,44 @@ int s7d_rdma_prepare(struct s7d_rdma *r)
 	return ret;
 }
 
+static bool osd_write_valid(u32 reg, u32 value)
+{
+	switch (reg) {
+	case 0x1a1b:
+	case 0x1a3b:
+		return (value & ~0xcU) == 0x8500;
+	case 0x1a14:
+	case 0x1a65:
+		return true;
+	case 0x1a15:
+	case 0x1a66:
+		return value && value <= 0xfff && !(value & 3);
+	case 0x1a1c:
+	case 0x1a1d:
+	case 0x1a3c:
+	case 0x1a3d:
+	case 0x39b3:
+	case 0x39b4:
+		return !(value & ~0x1fff1fffU);
+	case 0x1a3e:
+	case 0x1a64:
+		return !(value & ~0x0fff0fffU);
+	case 0x1a2d:
+	case 0x1a4d:
+		return value == 0x7fc0 || value == BIT(2);
+	case 0x1a30:
+		return value == 0x00100004 || value == 0x00100005;
+	case 0x39ba:
+		return !(value & ~GENMASK(28, 11)) &&
+		       (value >> 20) <= 256 && ((value >> 11) & 0x1ff) <= 256;
+	case 0x39b0:
+		value |= BIT(17) | BIT(19);
+		return value == 0x807f4413 || value == 0x80ff2413;
+	default:
+		return false;
+	}
+}
+
 int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 		    unsigned int count)
 {
@@ -134,10 +172,7 @@ int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 		u32 value = le32_to_cpu(entries[i].value);
 
 		/* Replays before CPU masking must be idempotent linear OSD writes. */
-		if (reg == 0x1a1b && (value & ~0xcU) == 0x8500)
-			continue;
-		if (reg != 0x1a14 && reg != 0x1a15 &&
-		    reg != 0x1a1c && reg != 0x1a1d)
+		if (!osd_write_valid(reg, value))
 			return -EINVAL;
 	}
 

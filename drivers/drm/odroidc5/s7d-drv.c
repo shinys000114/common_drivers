@@ -66,9 +66,16 @@ static const struct drm_driver s7d_drm_driver = {
 	.minor = 0,
 };
 
+static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *state)
+{
+	/* Cursor updates also require VSYNC RDMA completion and buffer retirement. */
+	state->legacy_cursor_update = false;
+	return drm_atomic_helper_check(drm, state);
+}
+
 static const struct drm_mode_config_funcs s7d_mode_config_funcs = {
 	.fb_create = drm_gem_fb_create,
-	.atomic_check = drm_atomic_helper_check,
+	.atomic_check = s7d_atomic_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
@@ -102,7 +109,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	struct drm_encoder *encoder;
 	struct drm_bridge *bridge;
 	struct s7d_vpu_link link;
-	struct drm_plane *primary;
+	struct drm_plane *primary, *cursor, *overlay;
 	struct drm_device *drm;
 	struct s7d_drm *display;
 	u8 major, revision;
@@ -152,15 +159,27 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	drm->mode_config.min_height = 1;
 	drm->mode_config.max_width = 4096;
 	drm->mode_config.max_height = 2160;
+	drm->mode_config.cursor_width = 256;
+	drm->mode_config.cursor_height = 256;
 	ret = s7d_vpu_init(pdev, &display->vpu, &link);
 	if (ret)
 		return dev_err_probe(dev, ret, "VPU resources\n");
-	primary = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36));
+	primary = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_PRIMARY);
 	if (IS_ERR(primary)) {
 		ret = PTR_ERR(primary);
 		goto fini_vpu;
 	}
-	display->vpu.crtc = s7d_crtc_create(drm, primary, revision, &display->vpu.scanout,
+	cursor = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_CURSOR);
+	if (IS_ERR(cursor)) {
+		ret = PTR_ERR(cursor);
+		goto fini_vpu;
+	}
+	overlay = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_RGB);
+	if (IS_ERR(overlay)) {
+		ret = PTR_ERR(overlay);
+		goto fini_vpu;
+	}
+	display->vpu.crtc = s7d_crtc_create(drm, primary, cursor, revision, &display->vpu.scanout,
 					    &s7d_vpu_crtc_ops, &display->vpu);
 	if (IS_ERR(display->vpu.crtc)) {
 		ret = PTR_ERR(display->vpu.crtc);

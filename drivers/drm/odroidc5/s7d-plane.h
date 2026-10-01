@@ -6,10 +6,18 @@
 #include <drm/drm_plane.h>
 
 #include "s7d-osd.h"
+#include "s7d-osd-pipeline.h"
+
+enum s7d_plane_slot {
+	S7D_PLANE_PRIMARY,
+	S7D_PLANE_RGB,
+	S7D_PLANE_VIDEO,
+	S7D_PLANE_CURSOR,
+};
 
 struct s7d_plane_state {
 	struct drm_plane_state base;
-	struct s7d_osd_state osd;
+	struct s7d_osd_layer layer;
 	bool osd_valid;
 };
 
@@ -24,7 +32,10 @@ to_s7d_plane_state(struct drm_plane_state *state)
  * completion and scanout retirement. Plane callbacks never access hardware.
  */
 struct drm_plane *s7d_plane_create(struct drm_device *drm,
-				 unsigned int possible_crtcs, u64 dma_mask);
+				 unsigned int possible_crtcs, u64 dma_mask,
+				 enum s7d_plane_slot slot);
+bool s7d_plane_is_native(const struct drm_plane *plane);
+enum s7d_plane_slot s7d_plane_slot(const struct drm_plane *plane);
 bool s7d_plane_is_primary(const struct drm_plane *plane);
 
 #endif

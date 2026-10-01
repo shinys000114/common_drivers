@@ -320,17 +320,18 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		u32 expected = le32_to_cpu(state->osd.setup[i].value);
 		u32 mask = U32_MAX;
 
-		if (reg == OSD1_CTRL + OSD_FIFO_OFFSET)
+		if (reg == OSD1_CTRL + OSD_FIFO_OFFSET ||
+		    reg == OSD2_CTRL + OSD_FIFO_OFFSET)
 			expected = (expected & ~GENMASK(9, 5)) |
 				   (state->encp.fifo_hold_lines << 5);
 		writel(expected, v->regs + reg * 4);
 		/* Mixed status/config and Rev.B's documented alpha encoding. */
-		if (reg == OSD1_CTRL)
+		if (reg == OSD1_CTRL || reg == OSD2_CTRL)
 			mask = OSD_CFG_SYNC | GENMASK(20, 12) | GENMASK(3, 0);
-		else if (reg == 0x1a2d)
+		else if (reg == 0x1a2d || reg == 0x1a4d)
 			mask = GENMASK(15, 0);
 		else if (reg == 0x39ba)
-			expected = 0x04020000;
+			expected >>= 2;
 		if ((vpu_read(v, reg) & mask) != (expected & mask)) {
 			v->failed_reg = reg;
 			return -EIO;
@@ -445,23 +446,24 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 {
 	struct s7d_frame_state frame;
 	unsigned long flags;
-	u32 before, after, fifo, arbiter;
+	u32 before, after, fifo, fifo2, arbiter;
 
 	/* An older IRQ sample must not overtake the threaded RDMA completion. */
 	spin_lock_irqsave(&v->frame_lock, flags);
 	before = vpu_read(v, ENCP_INFO_READ);
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
+	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
 	arbiter = vpu_read(v, ASYNC_STAT);
 	after = vpu_read(v, ENCP_INFO_READ);
 	frame.field = after >> 29;
 	frame.idle = (before >> 29) == frame.field &&
-		     !(fifo & OSD_FIFO_STATE) && (arbiter & ASYNC_IDLE);
+		     !((fifo | fifo2) & OSD_FIFO_STATE) && (arbiter & ASYNC_IDLE);
 	/* HOLD_FIFO_LINES prevents new OSD reads throughout this window. */
 	frame.early = frame.idle &&
 		      ((before >> 16) & 0x1fff) >= v->flip_start &&
 		      ((before >> 16) & 0x1fff) <= ((after >> 16) & 0x1fff) &&
 		      ((after >> 16) & 0x1fff) < v->flip_end;
-	trace_s7d_frame_idle(before, after, fifo, arbiter, vblank);
+	trace_s7d_frame_idle(before, after, fifo, fifo2, arbiter, vblank);
 	s7d_crtc_irq(v->crtc, vblank, result, &frame);
 	spin_unlock_irqrestore(&v->frame_lock, flags);
 }

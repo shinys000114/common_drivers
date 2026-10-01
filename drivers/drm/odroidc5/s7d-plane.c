@@ -7,6 +7,7 @@
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_blend.h>
 #include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_plane_helper.h>
 
@@ -15,6 +16,7 @@
 struct s7d_plane {
 	struct drm_plane base;
 	u64 dma_mask;
+	enum s7d_plane_slot slot;
 };
 
 static void s7d_plane_destroy_state(struct drm_plane *plane,
@@ -54,23 +56,34 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	int ret;
 
 	state->osd_valid = false;
+	state->layer.enabled = false;
 	if (!base->crtc) {
 		base->visible = false;
 		return base->fb ? -EINVAL : 0;
 	}
-	if (base->rotation != DRM_MODE_ROTATE_0 ||
-	    base->alpha != DRM_BLEND_ALPHA_OPAQUE)
+	if (base->rotation != DRM_MODE_ROTATE_0)
+		return -EINVAL;
+	if (plane->slot == S7D_PLANE_CURSOR && base->fb &&
+	    (base->fb->width > 256 || base->fb->height > 256))
 		return -EINVAL;
 
 	ret = drm_atomic_helper_check_plane_state(base, crtc_state,
 						 DRM_PLANE_NO_SCALING,
 						 DRM_PLANE_NO_SCALING,
-						 false, false);
+						 plane->slot != S7D_PLANE_PRIMARY, false);
 	if (ret || !base->visible)
 		return ret;
-	ret = s7d_osd_build_state(base->fb, &base->src, plane->dma_mask, &state->osd);
-	if (!ret)
+	ret = s7d_osd_build_state(base->fb, &base->src, plane->dma_mask,
+				&state->layer.layout);
+	if (!ret) {
+		if (base->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE)
+			state->layer.layout.alpha_config = 0x7fc0;
+		state->layer.dst = base->dst;
+		state->layer.alpha = DIV_ROUND_CLOSEST(base->alpha, 256);
+		state->layer.premult = base->pixel_blend_mode != DRM_MODE_BLEND_COVERAGE;
+		state->layer.enabled = true;
 		state->osd_valid = true;
+	}
 	return ret;
 }
 
@@ -113,29 +126,78 @@ static const struct drm_plane_helper_funcs s7d_plane_helper_funcs = {
 	.atomic_update = s7d_plane_atomic_update,
 };
 
-bool s7d_plane_is_primary(const struct drm_plane *plane)
+bool s7d_plane_is_native(const struct drm_plane *plane)
 {
 	return plane && plane->funcs == &s7d_plane_funcs &&
 		plane->helper_private == &s7d_plane_helper_funcs;
 }
 
+enum s7d_plane_slot s7d_plane_slot(const struct drm_plane *plane)
+{
+	return container_of(plane, struct s7d_plane, base)->slot;
+}
+
+bool s7d_plane_is_primary(const struct drm_plane *plane)
+{
+	return s7d_plane_is_native(plane) && s7d_plane_slot(plane) == S7D_PLANE_PRIMARY;
+}
+
 struct drm_plane *s7d_plane_create(struct drm_device *drm,
-				 unsigned int possible_crtcs, u64 dma_mask)
+				 unsigned int possible_crtcs, u64 dma_mask,
+				 enum s7d_plane_slot slot)
 {
 	static const u32 formats[] = {
 		DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888,
 		DRM_FORMAT_RGBX8888, DRM_FORMAT_BGRX8888,
+		DRM_FORMAT_ARGB8888, DRM_FORMAT_ABGR8888,
+		DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
 	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	struct s7d_plane *plane;
+	enum drm_plane_type type;
+	const char *name;
+	unsigned int zpos;
+	int ret;
+
+	switch (slot) {
+	case S7D_PLANE_PRIMARY:
+		type = DRM_PLANE_TYPE_PRIMARY;
+		name = "S7D OSD1";
+		zpos = 0;
+		break;
+	case S7D_PLANE_RGB:
+		type = DRM_PLANE_TYPE_OVERLAY;
+		name = "S7D OSD2 overlay";
+		zpos = 2;
+		break;
+	case S7D_PLANE_CURSOR:
+		type = DRM_PLANE_TYPE_CURSOR;
+		name = "S7D OSD2 cursor";
+		zpos = 3;
+		break;
+	default:
+		return ERR_PTR(-EINVAL);
+	}
 
 	plane = drmm_universal_plane_alloc(drm, struct s7d_plane, base,
 					  possible_crtcs, &s7d_plane_funcs,
 					  formats, ARRAY_SIZE(formats), modifiers,
-					  DRM_PLANE_TYPE_PRIMARY, "S7D OSD1");
+					  type, "%s", name);
 	if (IS_ERR(plane))
 		return ERR_CAST(plane);
 	plane->dma_mask = dma_mask;
+	plane->slot = slot;
+	ret = drm_plane_create_zpos_immutable_property(&plane->base, zpos);
+	if (ret)
+		return ERR_PTR(ret);
+	ret = drm_plane_create_alpha_property(&plane->base);
+	if (ret)
+		return ERR_PTR(ret);
+	ret = drm_plane_create_blend_mode_property(&plane->base,
+		BIT(DRM_MODE_BLEND_PIXEL_NONE) | BIT(DRM_MODE_BLEND_PREMULTI) |
+		BIT(DRM_MODE_BLEND_COVERAGE));
+	if (ret)
+		return ERR_PTR(ret);
 	drm_plane_helper_add(&plane->base, &s7d_plane_helper_funcs);
 	return &plane->base;
 }

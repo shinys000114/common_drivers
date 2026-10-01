@@ -63,6 +63,7 @@ struct s7d_crtc_ops {
 };
 
 struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *primary,
+			       struct drm_plane *cursor,
 			       u8 revision, struct s7d_scanout *scanout,
 			       const struct s7d_crtc_ops *ops, void *data);
 
