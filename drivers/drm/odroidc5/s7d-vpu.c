@@ -187,7 +187,6 @@ static int s7d_vpu_stop(void *data)
 {
 	struct s7d_vpu *v = data;
 	static const u32 osds[] = { OSD1_CTRL, OSD2_CTRL };
-	u32 free_clk[ARRAY_SIZE(osds)];
 	u32 value;
 	unsigned int i;
 	int ret;
@@ -209,6 +208,11 @@ static int s7d_vpu_stop(void *data)
 	ret = s7d_rdma_quiesce(&v->rdma);
 	if (ret)
 		return ret;
+	if (!v->osd_draining) {
+		for (i = 0; i < ARRAY_SIZE(osds); i++)
+			v->osd_free_clk[i] = vpu_read(v, osds[i]) & OSD_FREE_CLK;
+		v->osd_draining = true;
+	}
 	if (!v->vd1_draining) {
 		v->vd1_free_clk = vpu_read(v, VD1_GEN) & VD1_FREE_CLK;
 		v->vd1_draining = true;
@@ -228,7 +232,6 @@ static int s7d_vpu_stop(void *data)
 		 * Keep the local OSD clock running until disable reaches OSD_ENABLE and DMA
 		 * drains (S905X5M, VIU_OSD1_CTRL_STAT ENABLE_FREE_CLK).
 		 */
-		free_clk[i] = vpu_read(v, osds[i]) & OSD_FREE_CLK;
 		ret = vpu_update(v, osds[i], OSD_CFG_SYNC | OSD_FREE_CLK | BIT(0),
 				 OSD_FREE_CLK);
 		if (ret)
@@ -261,10 +264,11 @@ static int s7d_vpu_stop(void *data)
 		return ret;
 	v->vd1_draining = false;
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
-		ret = vpu_update(v, osds[i], OSD_FREE_CLK, free_clk[i]);
+		ret = vpu_update(v, osds[i], OSD_FREE_CLK, v->osd_free_clk[i]);
 		if (ret)
 			return ret;
 	}
+	v->osd_draining = false;
 	if (v->pixel_protected) {
 		clk_rate_exclusive_put(v->clocks[PIXEL_CLK].clk);
 		v->pixel_protected = false;
