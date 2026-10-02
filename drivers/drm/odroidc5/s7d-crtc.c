@@ -337,10 +337,10 @@ static void s7d_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_stat
 	if (ret)
 		goto fail;
 	c->vblank_ref = true;
-	ret = s7d_scanout_initial_ready(c->scanout);
+	ret = c->ops->start(c->data);
 	if (ret)
 		goto fail;
-	ret = c->ops->start(c->data);
+	ret = s7d_scanout_initial_ready(c->scanout);
 	if (ret)
 		goto fail;
 	if (!c->ops->wait_for_link)

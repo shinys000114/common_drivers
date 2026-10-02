@@ -62,8 +62,8 @@ void s7d_scanout_init(struct s7d_scanout *scanout, struct s7d_rdma *rdma);
  * objects/import mappings. It does not replace any future pin/unpin API.
  *
  * Initial setup: take a reference BEFORE writing the OSD address. Call ready
- * after programming succeeds, with VENC still stopped, then enable VENC. On
- * any partial failure call fail and keep resources until stop/drain succeeds.
+ * only after programming and VENC start succeed. On any partial failure
+ * call fail and keep resources until stop/drain succeeds.
  * Firmware scanout reservations are owned by the parent, not adopted here.
  */
 int s7d_scanout_begin_initial(struct s7d_scanout *scanout,

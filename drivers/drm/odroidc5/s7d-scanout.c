@@ -90,7 +90,7 @@ int s7d_scanout_initial_ready(struct s7d_scanout *s)
 	} else if (s->phase != S7D_SCANOUT_INITIAL || !buffers_present(&s->pending)) {
 		ret = -EINVAL;
 	} else {
-		/* Caller has not enabled VENC yet; its first vblank is sufficient. */
+		/* Initial programming and VENC start have succeeded. */
 		s->wait_field = false;
 		s->phase = S7D_SCANOUT_VBLANK;
 	}
