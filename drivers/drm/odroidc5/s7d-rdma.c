@@ -12,6 +12,7 @@
 
 #include "s7d-rdma.h"
 #include "s7d-csc.h"
+#include "s7d-osd-pipeline.h"
 
 #define RDMA_START		0x1102
 #define RDMA_END		0x1103
@@ -158,6 +159,9 @@ static bool display_write_valid(u32 reg, u32 value)
 	case 0x1a3e:
 	case 0x1a64:
 		return !(value & ~0x0fff0fffU);
+	case 0x1a2f:
+	case 0x1abd:
+		return !value || value == BIT(28);
 	case 0x1a2d:
 	case 0x1a4d:
 		return value == 0x7fc0 || value == BIT(2);
@@ -260,6 +264,8 @@ int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 		u32 value = le32_to_cpu(entries[i].value);
 		u32 mask = s7d_csc_reg_mask(reg);
 
+		if (!mask)
+			mask = s7d_osd_unpack_mask(reg);
 		if (mask)
 			value |= rdma_read(r, reg) & ~mask;
 		else if (reg == 0x4800)

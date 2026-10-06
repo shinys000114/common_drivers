@@ -417,6 +417,8 @@ static int s7d_vpu_stop_hw(void *data)
 	 * its field/line strobes first leaves OSD_ENABLE latched on S7D.
 	 */
 	if (v->afbc_enabled) {
+		if (v->normal_unpack_owned & BIT(S7D_AFBC_SURFACE))
+			return -EIO;
 		abort_prepare = s7d_afbc_engine_can_abort_prepare(&v->afbc);
 		if (!abort_prepare) {
 			ret = s7d_afbc_engine_stop_begin(&v->afbc);
@@ -504,6 +506,15 @@ static int s7d_vpu_stop_hw(void *data)
 			return ret;
 		v->afbc_enabled = false;
 	}
+	for (i = 0; i < ARRAY_SIZE(osds); i++) {
+		u32 reg = i ? 0x1abd : 0x1a2f;
+
+		if (!(v->normal_unpack_owned & BIT(i)))
+			continue;
+		ret = vpu_update(v, reg, s7d_osd_unpack_mask(reg), 0);
+		if (ret)
+			return ret;
+	}
 	ret = stop_encoders(v);
 	if (ret)
 		return ret;
@@ -517,6 +528,7 @@ static int s7d_vpu_stop_hw(void *data)
 			return ret;
 	}
 	v->osd_draining = false;
+	v->normal_unpack_owned = 0;
 	if (v->pixel_protected) {
 		clk_rate_exclusive_put(v->clocks[PIXEL_CLK].clk);
 		v->pixel_protected = false;
@@ -634,8 +646,19 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 	for (i = 0; i < S7D_OSD_SETUP_REG_COUNT; i++) {
 		u32 reg = le32_to_cpu(state->osd.setup[i].reg);
 		u32 expected = le32_to_cpu(state->osd.setup[i].value);
-		u32 mask = U32_MAX;
+		u32 mask = s7d_osd_unpack_mask(reg);
 
+		if (mask) {
+			if (state->buffers.afbc.fb &&
+			    reg == state->buffers.afbc.plan.unpack.reg)
+				continue;
+			v->normal_unpack_owned |= reg == 0x1a2f ? BIT(0) : BIT(1);
+			ret = vpu_update(v, reg, mask, expected);
+			if (ret)
+				return ret;
+			continue;
+		}
+		mask = U32_MAX;
 		if (reg == OSD1_CTRL + OSD_FIFO_OFFSET ||
 		    reg == OSD2_CTRL + OSD_FIFO_OFFSET)
 			expected = (expected & ~GENMASK(9, 5)) |

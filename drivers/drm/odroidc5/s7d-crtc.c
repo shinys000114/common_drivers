@@ -107,7 +107,8 @@ static void s7d_crtc_build_update(struct s7d_crtc_state *state)
 		/* AFBC MIF configuration is fixed by the stopped prepare path. */
 		if (state->buffers.afbc.fb &&
 		    (reg == 0x1a3b || reg == 0x1a65 || reg == 0x1a66 ||
-		     reg == 0x1a3c || reg == 0x1a3d || reg == 0x1a4d))
+		     reg == 0x1a3c || reg == 0x1a3d || reg == 0x1a4d ||
+		     reg == 0x1abd))
 			continue;
 		state->update[count++] = state->osd.update[i];
 	}

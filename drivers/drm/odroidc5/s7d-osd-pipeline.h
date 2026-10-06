@@ -9,8 +9,8 @@
 #include "s7d-rdma.h"
 
 #define S7D_OSD_REV_B 0x0b
-#define S7D_OSD_SETUP_REG_COUNT 40
-#define S7D_OSD_UPDATE_REG_COUNT 19
+#define S7D_OSD_SETUP_REG_COUNT 42
+#define S7D_OSD_UPDATE_REG_COUNT 21
 
 struct s7d_osd_layer {
 	struct s7d_osd_state layout;
@@ -25,6 +25,8 @@ struct s7d_osd_pipeline_state {
 	struct s7d_rdma_entry setup[S7D_OSD_SETUP_REG_COUNT];
 	struct s7d_rdma_entry update[S7D_OSD_UPDATE_REG_COUNT];
 };
+
+u32 s7d_osd_unpack_mask(u32 reg);
 
 /*
  * Pure calculation for S7D Rev.B, an RGB primary and optional OSD2,

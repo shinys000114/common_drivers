@@ -46,6 +46,7 @@ struct s7d_vpu {
 	bool osd2_enable;
 	bool afbc_available;
 	bool afbc_ready;
+	u8 normal_unpack_owned;
 	bool afbc_enabled;
 	int afbc_admission_error;
 	u32 afbc_command_counter;
