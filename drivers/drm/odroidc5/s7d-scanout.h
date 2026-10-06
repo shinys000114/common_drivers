@@ -6,6 +6,7 @@
 #include <linux/workqueue.h>
 
 #include "s7d-rdma.h"
+#include "s7d-afbc.h"
 #include "s7d-csc.h"
 #include "s7d-postblend.h"
 #include "s7d-video-pipeline.h"
@@ -21,16 +22,27 @@ struct s7d_scanout_video {
 	struct s7d_postblend_state postblend;
 };
 
+struct s7d_scanout_afbc {
+	struct drm_framebuffer *fb;
+	struct s7d_afbc_state plan;
+};
+
 struct s7d_scanout_buffers {
 	struct drm_framebuffer *fb[S7D_SCANOUT_MAX_PLANES];
 	/* video.fb aliases an owned fb[] reference. */
 	struct s7d_scanout_video video;
+	/* afbc.fb aliases an owned fb[] reference. */
+	struct s7d_scanout_afbc afbc;
+	u64 generation;
 };
 
 struct s7d_frame_state {
 	u8 field;
 	bool idle;
 	bool early;
+	bool afbc_gate;
+	u64 afbc_completed_generation;
+	u64 afbc_completed_epoch;
 };
 
 enum s7d_scanout_phase {
@@ -51,6 +63,8 @@ struct s7d_scanout {
 	struct s7d_scanout_buffers retired;
 	enum s7d_scanout_phase phase;
 	u64 vblank_seq;
+	u64 generation;
+	u64 pending_afbc_epoch;
 	u8 applied_field;
 	u8 vblank_field;
 	bool vblank_valid;
@@ -89,6 +103,20 @@ int s7d_scanout_submit(struct s7d_scanout *scanout,
 			const struct s7d_scanout_buffers *buffers,
 			const struct s7d_rdma_entry *entries, unsigned int count,
 			bool video_unchanged);
+
+/* Flush before taking the backend frame lock. Staged callbacks cannot sleep. */
+void s7d_scanout_flush_retired(struct s7d_scanout *scanout);
+int s7d_scanout_submit_staged(struct s7d_scanout *scanout,
+			     const struct s7d_scanout_buffers *buffers,
+			     const struct s7d_rdma_entry *entries, unsigned int count,
+			     bool video_unchanged,
+			     int (*stage)(void *data,
+				const struct s7d_scanout_buffers *active,
+				const struct s7d_scanout_buffers *candidate,
+				u64 generation),
+			     int (*cancel)(void *data, u64 generation), void *data);
+u64 s7d_scanout_pending_generation(struct s7d_scanout *scanout);
+int s7d_scanout_afbc_started(struct s7d_scanout *scanout, u64 generation, u64 epoch);
 
 /*
  * Feed each acknowledged RDMA result and VENC vblank exactly once, whether

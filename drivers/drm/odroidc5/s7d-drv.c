@@ -13,6 +13,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_modeset_helper.h>
 #include <drm/drm_bridge.h>
@@ -20,12 +21,13 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_dma_helper.h>
-#include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_of.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_self_refresh_helper.h>
 #include <drm/drm_vblank.h>
 
+#include "s7d-fb.h"
 #include "s7d-gem.h"
 #include "s7d-hdmi.h"
 #include "s7d-plane.h"
@@ -68,13 +70,47 @@ static const struct drm_driver s7d_drm_driver = {
 
 static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *state)
 {
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	unsigned int checked_modesets = 0;
+	bool late_modeset = false;
+	int i, ret;
+
 	/* Cursor updates also require VSYNC RDMA completion and buffer retirement. */
 	state->legacy_cursor_update = false;
-	return drm_atomic_helper_check(drm, state);
+	ret = drm_atomic_helper_check_modeset(drm, state);
+	if (ret)
+		return ret;
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
+		if (crtc_state->mode_changed)
+			checked_modesets |= drm_crtc_mask(crtc);
+	if (drm->mode_config.normalize_zpos) {
+		ret = drm_atomic_normalize_zpos(drm, state);
+		if (ret)
+			return ret;
+	}
+	ret = drm_atomic_helper_check_planes(drm, state);
+	if (ret)
+		return ret;
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
+		if (crtc_state->mode_changed &&
+		    !(checked_modesets & drm_crtc_mask(crtc)))
+			late_modeset = true;
+	/* AFBC route/mixed-frame guards can require a modeset after plane check. */
+	if (late_modeset) {
+		ret = drm_atomic_helper_check_modeset(drm, state);
+		if (ret)
+			return ret;
+		ret = drm_atomic_helper_check_planes(drm, state);
+		if (ret)
+			return ret;
+	}
+	drm_self_refresh_helper_alter_state(state);
+	return 0;
 }
 
 static const struct drm_mode_config_funcs s7d_mode_config_funcs = {
-	.fb_create = drm_gem_fb_create,
+	.fb_create = s7d_fb_create,
 	.atomic_check = s7d_atomic_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
@@ -164,22 +200,30 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = s7d_vpu_init(pdev, &display->vpu, &link);
 	if (ret)
 		return dev_err_probe(dev, ret, "VPU resources\n");
-	primary = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_PRIMARY);
+	/* Cache read-only retained-state admission before building IN_FORMATS. */
+	ret = s7d_vpu_hold_boot(&display->vpu);
+	if (ret)
+		goto fini_vpu;
+	primary = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
+				   S7D_PLANE_PRIMARY, false);
 	if (IS_ERR(primary)) {
 		ret = PTR_ERR(primary);
 		goto fini_vpu;
 	}
-	cursor = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_CURSOR);
+	cursor = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
+				  S7D_PLANE_CURSOR, false);
 	if (IS_ERR(cursor)) {
 		ret = PTR_ERR(cursor);
 		goto fini_vpu;
 	}
-	overlay = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_RGB);
+	overlay = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_RGB,
+				   display->vpu.afbc_available && display->vpu.afbc_ready);
 	if (IS_ERR(overlay)) {
 		ret = PTR_ERR(overlay);
 		goto fini_vpu;
 	}
-	video = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_VIDEO);
+	video = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
+				 S7D_PLANE_VIDEO, false);
 	if (IS_ERR(video)) {
 		ret = PTR_ERR(video);
 		goto fini_vpu;
@@ -226,9 +270,6 @@ static int s7d_drm_probe(struct platform_device *pdev)
 		goto fini_vpu;
 	}
 	drm_crtc_vblank_off(display->vpu.crtc);
-	ret = s7d_vpu_hold_boot(&display->vpu);
-	if (ret)
-		goto fini_vpu;
 	platform_set_drvdata(pdev, display);
 	/* No framebuffer/RDMA takeover occurs before the first atomic commit. */
 	ret = drm_dev_register(drm, 0);

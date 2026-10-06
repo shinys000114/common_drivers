@@ -13,6 +13,7 @@
 #include <drm/drm_plane_helper.h>
 
 #include "s7d-plane.h"
+#include "s7d-fb.h"
 
 struct s7d_plane {
 	struct drm_plane base;
@@ -58,6 +59,8 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 
 	state->osd_valid = false;
 	state->video_valid = false;
+	state->afbc_valid = false;
+	state->layer.afbc = false;
 	state->layer.enabled = false;
 	if (!base->crtc) {
 		base->visible = false;
@@ -82,18 +85,35 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 			state->video_valid = true;
 		return ret;
 	}
-	ret = s7d_osd_build_state(base->fb, &base->src, plane->dma_mask,
-				&state->layer.layout);
-	if (!ret) {
+	if (base->fb->modifier != DRM_FORMAT_MOD_LINEAR) {
+		const struct drm_afbc_framebuffer *fb = s7d_fb_afbc_metadata(base->fb);
+
+		if (plane->slot != S7D_PLANE_RGB || !fb ||
+		    base->alpha != DRM_BLEND_ALPHA_OPAQUE ||
+		    base->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE)
+			return -EINVAL;
+		ret = s7d_afbc_build_state(fb, &base->src, plane->dma_mask,
+					 S7D_AFBC_SURFACE, &state->afbc);
+		if (ret)
+			return ret;
+		state->layer.layout = state->afbc.osd;
+		state->layer.afbc = true;
+		state->afbc_valid = true;
+	} else {
+		ret = s7d_osd_build_state(base->fb, &base->src, plane->dma_mask,
+					&state->layer.layout);
+		if (ret)
+			return ret;
 		if (base->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE)
 			state->layer.layout.alpha_config = 0x7fc0;
-		state->layer.dst = base->dst;
-		state->layer.alpha = DIV_ROUND_CLOSEST(base->alpha, 256);
-		state->layer.premult = base->pixel_blend_mode != DRM_MODE_BLEND_COVERAGE;
-		state->layer.enabled = true;
-		state->osd_valid = true;
 	}
-	return ret;
+	state->layer.dst = base->dst;
+	state->layer.alpha = DIV_ROUND_CLOSEST(base->alpha, 256);
+	state->layer.premult = base->pixel_blend_mode != DRM_MODE_BLEND_COVERAGE;
+	state->layer.enabled = true;
+	state->osd_valid = true;
+	return 0;
+
 }
 
 static int s7d_plane_atomic_check(struct drm_plane *plane,
@@ -111,12 +131,35 @@ static int s7d_plane_atomic_check(struct drm_plane *plane,
 			       state, crtc_state);
 }
 
+static bool s7d_plane_format_mod_supported(struct drm_plane *plane,
+					   u32 format, u64 modifier)
+{
+	return modifier == DRM_FORMAT_MOD_LINEAR;
+}
+
+static bool s7d_rgb_format_mod_supported(struct drm_plane *plane,
+					 u32 format, u64 modifier)
+{
+	return modifier == DRM_FORMAT_MOD_LINEAR ||
+		(format == DRM_FORMAT_ABGR8888 && modifier == S7D_AFBC_MODIFIER);
+}
+
 static const struct drm_plane_funcs s7d_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.reset = s7d_plane_reset,
 	.atomic_duplicate_state = s7d_plane_duplicate_state,
 	.atomic_destroy_state = s7d_plane_destroy_state,
+	.format_mod_supported = s7d_plane_format_mod_supported,
+};
+
+static const struct drm_plane_funcs s7d_rgb_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.reset = s7d_plane_reset,
+	.atomic_duplicate_state = s7d_plane_duplicate_state,
+	.atomic_destroy_state = s7d_plane_destroy_state,
+	.format_mod_supported = s7d_rgb_format_mod_supported,
 };
 
 static void s7d_plane_atomic_update(struct drm_plane *plane,
@@ -137,7 +180,8 @@ static const struct drm_plane_helper_funcs s7d_plane_helper_funcs = {
 
 bool s7d_plane_is_native(const struct drm_plane *plane)
 {
-	return plane && plane->funcs == &s7d_plane_funcs &&
+	return plane && (plane->funcs == &s7d_plane_funcs ||
+			 plane->funcs == &s7d_rgb_plane_funcs) &&
 		plane->helper_private == &s7d_plane_helper_funcs;
 }
 
@@ -153,7 +197,7 @@ bool s7d_plane_is_primary(const struct drm_plane *plane)
 
 struct drm_plane *s7d_plane_create(struct drm_device *drm,
 				 unsigned int possible_crtcs, u64 dma_mask,
-				 enum s7d_plane_slot slot)
+				 enum s7d_plane_slot slot, bool afbc_supported)
 {
 	static const u32 formats[] = {
 		DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888,
@@ -162,6 +206,11 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
 	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
+	static const u64 rgb_modifiers[] = {
+		DRM_FORMAT_MOD_LINEAR, S7D_AFBC_MODIFIER, DRM_FORMAT_MOD_INVALID,
+	};
+	const u64 *plane_modifiers = modifiers;
+	const struct drm_plane_funcs *funcs = &s7d_plane_funcs;
 	static const u32 video_formats[] = { DRM_FORMAT_NV12, DRM_FORMAT_NV21 };
 	const u32 *plane_formats = formats;
 	unsigned int format_count = ARRAY_SIZE(formats);
@@ -181,6 +230,10 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		type = DRM_PLANE_TYPE_OVERLAY;
 		name = "S7D OSD2 overlay";
 		zpos = 2;
+		if (afbc_supported) {
+			funcs = &s7d_rgb_plane_funcs;
+			plane_modifiers = rgb_modifiers;
+		}
 		break;
 	case S7D_PLANE_CURSOR:
 		type = DRM_PLANE_TYPE_CURSOR;
@@ -199,8 +252,8 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	}
 
 	plane = drmm_universal_plane_alloc(drm, struct s7d_plane, base,
-					  possible_crtcs, &s7d_plane_funcs,
-					  plane_formats, format_count, modifiers,
+					  possible_crtcs, funcs,
+					  plane_formats, format_count, plane_modifiers,
 					  type, "%s", name);
 	if (IS_ERR(plane))
 		return ERR_CAST(plane);

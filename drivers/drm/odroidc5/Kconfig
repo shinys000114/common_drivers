@@ -5,9 +5,10 @@ config AMLOGIC_C5_NATIVE_DISPLAY
 	bool "C5 native VPU/HDMI integration (experimental)"
 	depends on AMLOGIC_C5_DISPLAY_RESOURCES
 	depends on DRM = y && I2C = y && AMLOGIC_CPU_INFO = y
-	depends on DMA_CMA
+	depends on DMA_CMA && REGMAP_MMIO
 	depends on !AMLOGIC_MEDIA_ENABLE
 	select PHY_MESON_S7D_HDMI
+	select RESET_S7D_VPU
 	select DRM_KMS_HELPER
 	select DRM_GEM_DMA_HELPER
 	select DRM_DISPLAY_HELPER
@@ -22,6 +23,8 @@ config AMLOGIC_C5_NATIVE_DISPLAY
 	  shared OSD2 cursor/overlay planes, and an HDMI connector.
 	  Cursor and RGB overlay cannot be visible together. Video is unscaled
 	  8-bit SDR with BT.601/709 limited/full-range conversion.
+	  AFBC ABGR8888 is limited to an opaque 250x250 OSD2 overlay with
+	  cursor and video disabled.
 	  Requires retained firmware output on S7D revision B, with SDR RGB8 TMDS up to 594 MHz.
 	  Do not enable with legacy media/display writers. System sleep supports
 	  s2idle after native takeover, retaining the shared display domain.

@@ -29,6 +29,18 @@ static bool video_owned(const struct s7d_scanout_buffers *buffers)
 	return false;
 }
 
+static bool afbc_owned(const struct s7d_scanout_buffers *buffers)
+{
+	unsigned int i;
+
+	if (!buffers->afbc.fb || s7d_afbc_check_state(&buffers->afbc.plan))
+		return false;
+	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
+		if (buffers->fb[i] == buffers->afbc.fb)
+			return true;
+	return false;
+}
+
 bool s7d_scanout_video_equal(const struct s7d_scanout_buffers *a,
 			     const struct s7d_scanout_buffers *b)
 {
@@ -101,7 +113,8 @@ int s7d_scanout_begin_initial(struct s7d_scanout *s,
 
 	if (!buffers || !buffers_present(buffers))
 		return -EINVAL;
-	if (buffers->video.fb && !video_owned(buffers))
+	if ((buffers->video.fb && !video_owned(buffers)) ||
+	    (buffers->afbc.fb && !afbc_owned(buffers)))
 		return -EINVAL;
 	flush_work(&s->retire_work);
 	spin_lock_irqsave(&s->lock, flags);
@@ -111,9 +124,13 @@ int s7d_scanout_begin_initial(struct s7d_scanout *s,
 		   buffers_present(&s->active) || buffers_present(&s->pending) ||
 		   buffers_present(&s->retired)) {
 		ret = -EBUSY;
+	} else if (s->generation == ~0ULL) {
+		ret = -EOVERFLOW;
 	} else {
 		buffers_get(buffers);
 		s->pending = *buffers;
+		s->pending.generation = ++s->generation;
+		s->pending_afbc_epoch = 0;
 		s->phase = S7D_SCANOUT_INITIAL;
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
@@ -139,21 +156,61 @@ int s7d_scanout_initial_ready(struct s7d_scanout *s)
 	return ret;
 }
 
-int s7d_scanout_submit(struct s7d_scanout *s,
-			const struct s7d_scanout_buffers *buffers,
-			const struct s7d_rdma_entry *entries, unsigned int count,
-			bool video_unchanged)
+void s7d_scanout_flush_retired(struct s7d_scanout *s)
+{
+	flush_work(&s->retire_work);
+}
+
+u64 s7d_scanout_pending_generation(struct s7d_scanout *s)
 {
 	unsigned long flags;
-	bool put = false;
+	u64 generation;
+
+	spin_lock_irqsave(&s->lock, flags);
+	generation = buffers_present(&s->pending) ? s->pending.generation : 0;
+	spin_unlock_irqrestore(&s->lock, flags);
+	return generation;
+}
+
+int s7d_scanout_afbc_started(struct s7d_scanout *s, u64 generation, u64 epoch)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->fault) {
+		ret = -EIO;
+	} else if (!epoch || !generation || generation != s->pending.generation ||
+		   !afbc_owned(&s->pending) ||
+		   (s->phase != S7D_SCANOUT_INITIAL && s->phase != S7D_SCANOUT_VBLANK)) {
+		ret = -EINVAL;
+	} else if (s->pending_afbc_epoch && s->pending_afbc_epoch != epoch) {
+		ret = -EBUSY;
+	} else {
+		s->pending_afbc_epoch = epoch;
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	return ret;
+}
+
+int s7d_scanout_submit_staged(struct s7d_scanout *s,
+			     const struct s7d_scanout_buffers *buffers,
+			     const struct s7d_rdma_entry *entries, unsigned int count,
+			     bool video_unchanged,
+			     int (*stage)(void *data,
+				const struct s7d_scanout_buffers *active,
+				const struct s7d_scanout_buffers *candidate,
+				u64 generation),
+			     int (*cancel)(void *data, u64 generation), void *data)
+{
+	struct s7d_scanout_buffers candidate;
+	unsigned long flags;
 	int ret;
 
-	if (!buffers || !buffers_present(buffers))
+	if (!buffers || !buffers_present(buffers) || (!!stage != !!cancel) ||
+	    (buffers->video.fb && !video_owned(buffers)) ||
+	    (buffers->afbc.fb && (!afbc_owned(buffers) || !stage)))
 		return -EINVAL;
-	if (buffers->video.fb && !video_owned(buffers))
-		return -EINVAL;
-	/* The previous IRQ may already have scheduled a sleeping GEM release. */
-	flush_work(&s->retire_work);
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->fault) {
 		ret = -EIO;
@@ -164,32 +221,64 @@ int s7d_scanout_submit(struct s7d_scanout *s,
 		ret = -EBUSY;
 		goto out;
 	}
-	/* An omitted video payload must match the owner, not just old DRM state. */
-	if (video_unchanged && !s7d_scanout_video_equal(&s->active, buffers)) {
+	/* AFBC entry and exit require a stopped, fully prepared pipeline. */
+	if (!!s->active.afbc.fb != !!buffers->afbc.fb ||
+	    (video_unchanged && !s7d_scanout_video_equal(&s->active, buffers))) {
 		ret = -EINVAL;
 		goto out;
 	}
-	buffers_get(buffers);
-	/*
-	 * Nest owner -> RDMA lock. IRQ must release the RDMA lock before calling
-	 * s7d_scanout_irq. Publishing pending and arming are serialized vs IRQ.
-	 */
-	ret = s7d_rdma_submit(s->rdma, entries, count);
-	if (ret) {
-		/* Backend errors precede table replacement and trigger arming. */
-		put = true;
-		if (ret == -EIO)
-			s->fault = true;
+	if (s->generation == ~0ULL) {
+		ret = -EOVERFLOW;
 		goto out;
 	}
-	s->pending = *buffers;
+	candidate = *buffers;
+	candidate.generation = ++s->generation;
+	buffers_get(&candidate);
+	if (stage) {
+		ret = stage(data, &s->active, &candidate, candidate.generation);
+		if (ret)
+			goto rollback;
+	}
+	/* Backend frame lock -> owner lock -> RDMA lock. */
+	ret = s7d_rdma_submit(s->rdma, entries, count);
+	if (ret)
+		goto rollback;
+	s->pending = candidate;
+	s->pending_afbc_epoch = 0;
 	s->phase = S7D_SCANOUT_RDMA;
 	s->vblank_valid = false;
 	s->early_complete = false;
+	goto out;
+rollback:
+	if (cancel && cancel(data, candidate.generation)) {
+		/* An uncertain stage still owns its header and framebuffer. */
+		s->pending = candidate;
+		s->pending_afbc_epoch = 0;
+		s->fault = true;
+	} else {
+		/* GEM release may sleep; the caller still holds the frame lock. */
+		s->retired = candidate;
+		schedule_work(&s->retire_work);
+	}
+	if (ret == -EIO)
+		s->fault = true;
 out:
 	spin_unlock_irqrestore(&s->lock, flags);
-	if (put)
-		buffers_put(buffers);
+	return ret;
+}
+
+int s7d_scanout_submit(struct s7d_scanout *s,
+			const struct s7d_scanout_buffers *buffers,
+			const struct s7d_rdma_entry *entries, unsigned int count,
+			bool video_unchanged)
+{
+	int ret;
+
+	s7d_scanout_flush_retired(s);
+	ret = s7d_scanout_submit_staged(s, buffers, entries, count, video_unchanged,
+				       NULL, NULL, NULL);
+	if (ret)
+		s7d_scanout_flush_retired(s);
 	return ret;
 }
 
@@ -217,7 +306,7 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 		s->phase = S7D_SCANOUT_VBLANK;
 		s->applied_field = frame->field;
 		s->wait_field = true;
-		s->early_complete = frame->early;
+		s->early_complete = frame->early && !s->pending.afbc.fb;
 	}
 	if (s->phase != S7D_SCANOUT_VBLANK)
 		goto out;
@@ -231,6 +320,12 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 	} else if (!vblank) {
 		goto out;
 	}
+	if (s->pending.afbc.fb &&
+	    (!vblank || !frame->idle || !frame->afbc_gate ||
+	     !s->pending_afbc_epoch ||
+	     frame->afbc_completed_generation != s->pending.generation ||
+	     frame->afbc_completed_epoch != s->pending_afbc_epoch))
+		goto out;
 	if (!buffers_present(&s->pending) || buffers_present(&s->retired)) {
 		s->fault = true;
 		result = S7D_SCANOUT_FAULT;
@@ -239,6 +334,7 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 	s->retired = s->active;
 	s->active = s->pending;
 	s->pending = (struct s7d_scanout_buffers) {0};
+	s->pending_afbc_epoch = 0;
 	s->phase = S7D_SCANOUT_IDLE;
 	if (buffers_present(&s->retired))
 		schedule_work(&s->retire_work);
@@ -275,6 +371,7 @@ int s7d_scanout_quiesce(struct s7d_scanout *s)
 	s->active = (struct s7d_scanout_buffers) {0};
 	s->pending = (struct s7d_scanout_buffers) {0};
 	s->phase = S7D_SCANOUT_STOPPED;
+	s->pending_afbc_epoch = 0;
 	s->wait_field = false;
 	s->fault = false;
 	spin_unlock_irqrestore(&s->lock, flags);

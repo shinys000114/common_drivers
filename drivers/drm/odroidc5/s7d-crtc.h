@@ -68,6 +68,7 @@ struct s7d_crtc_ops {
 	int (*acquire)(void *data);
 	int (*prepare)(void *data, const struct s7d_crtc_state *state);
 	int (*start)(void *data);
+	int (*submit)(void *data, const struct s7d_crtc_state *state);
 	int (*stop)(void *data);
 	void (*release)(void *data);
 	int (*enable_vblank)(void *data);

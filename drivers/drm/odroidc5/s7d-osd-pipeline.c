@@ -52,7 +52,8 @@
 
 #define REG(r, v) { .reg = cpu_to_le32(r), .value = cpu_to_le32(v) }
 
-static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height)
+static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
+		       bool secondary)
 {
 	const struct s7d_osd_state *layout = &layer->layout;
 	const struct drm_rect *dst = &layer->dst;
@@ -60,10 +61,20 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height)
 
 	if (!layer->enabled)
 		return 0;
+	if (layer->afbc) {
+		if (!secondary || layer->alpha != 256 ||
+		    layout->block_config != (BIT(30) | (5 << 8)) ||
+		    layout->alpha_config != 0x7fc2 ||
+		    layout->frame_addr != 0x00200000 || layout->stride != 64 ||
+		    layout->scope_x != (249 << 16) || layout->scope_y != (249 << 16))
+			return -EINVAL;
+	} else if ((layout->block_config & ~0xcU) != 0x8500 ||
+		   (layout->alpha_config != 0x7fc0 && layout->alpha_config != BIT(2))) {
+		return -EINVAL;
+	}
 	if (((layout->scope_x | layout->scope_y) & 0xe000e000) ||
 	    !layout->stride || layout->stride > 0xfff || (layout->stride & 3) ||
-	    (layout->block_config & ~0xcU) != 0x8500 || layer->alpha > 256 ||
-	    (layout->alpha_config != 0x7fc0 && layout->alpha_config != BIT(2)) ||
+	    layer->alpha > 256 ||
 	    dst->x1 < 0 || dst->y1 < 0 || dst->x2 > (int)width || dst->y2 > (int)height ||
 	    dst->x2 <= dst->x1 || dst->y2 <= dst->y1)
 		return -EINVAL;
@@ -97,8 +108,8 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 	if (!width || !height || width > 4096 || height > 4096 ||
 	    !layers[0].enabled || layers[0].dst.x1 || layers[0].dst.y1 ||
 	    layers[0].dst.x2 != (int)width || layers[0].dst.y2 != (int)height ||
-	    check_layer(&layers[0], width, height) ||
-	    check_layer(&layers[1], width, height))
+	    check_layer(&layers[0], width, height, false) ||
+	    check_layer(&layers[1], width, height, true))
 		return -EINVAL;
 	primary = &layers[0].layout;
 	h_scope = (width - 1) << 16;
