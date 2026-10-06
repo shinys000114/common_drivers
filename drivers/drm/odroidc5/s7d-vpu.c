@@ -351,6 +351,10 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		    reg == OSD2_CTRL + OSD_FIFO_OFFSET)
 			expected = (expected & ~GENMASK(9, 5)) |
 				   (state->encp.fifo_hold_lines << 5);
+		if (reg == OSD2_CTRL)
+			v->osd2_enable = expected & BIT(0);
+		if (reg == OSD1_CTRL || reg == OSD2_CTRL)
+			expected &= ~BIT(0);
 		writel(expected, v->regs + reg * 4);
 		/* Mixed status/config and Rev.B's documented alpha encoding. */
 		if (reg == OSD1_CTRL || reg == OSD2_CTRL)
@@ -417,12 +421,19 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 static int s7d_vpu_start(void *data)
 {
 	struct s7d_vpu *v = data;
+	int ret;
 
 	if (!v->acquired || !v->touched)
 		return -EIO;
 	enable_irq(v->rdma_irq);
 	v->rdma_enabled = true;
-	return vpu_update(v, ENCP_EN, BIT(0), BIT(0));
+	ret = vpu_update(v, ENCP_EN, BIT(0), BIT(0));
+	if (ret)
+		return ret;
+	ret = vpu_update(v, OSD2_CTRL, BIT(0), v->osd2_enable ? BIT(0) : 0);
+	if (ret)
+		return ret;
+	return vpu_update(v, OSD1_CTRL, BIT(0), BIT(0));
 }
 
 static void s7d_vpu_release(void *data)
