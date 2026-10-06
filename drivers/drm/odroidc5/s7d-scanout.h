@@ -6,13 +6,25 @@
 #include <linux/workqueue.h>
 
 #include "s7d-rdma.h"
+#include "s7d-csc.h"
+#include "s7d-postblend.h"
+#include "s7d-video-pipeline.h"
 
 struct drm_framebuffer;
 
 #define S7D_SCANOUT_MAX_PLANES 4
 
+struct s7d_scanout_video {
+	struct drm_framebuffer *fb;
+	struct s7d_video_pipeline_state pipeline;
+	struct s7d_csc_state csc;
+	struct s7d_postblend_state postblend;
+};
+
 struct s7d_scanout_buffers {
 	struct drm_framebuffer *fb[S7D_SCANOUT_MAX_PLANES];
+	/* video.fb aliases an owned fb[] reference. */
+	struct s7d_scanout_video video;
 };
 
 struct s7d_frame_state {
@@ -54,6 +66,8 @@ enum s7d_scanout_result {
 };
 
 void s7d_scanout_init(struct s7d_scanout *scanout, struct s7d_rdma *rdma);
+bool s7d_scanout_video_equal(const struct s7d_scanout_buffers *a,
+			     const struct s7d_scanout_buffers *b);
 
 /*
  * Serialize all process-context calls in the CRTC commit path, after waiting
@@ -73,7 +87,8 @@ int s7d_scanout_initial_ready(struct s7d_scanout *scanout);
 /* One pending flip only. RDMA submit errors never arm the new list. */
 int s7d_scanout_submit(struct s7d_scanout *scanout,
 			const struct s7d_scanout_buffers *buffers,
-			const struct s7d_rdma_entry *entries, unsigned int count);
+			const struct s7d_rdma_entry *entries, unsigned int count,
+			bool video_unchanged);
 
 /*
  * Feed each acknowledged RDMA result and VENC vblank exactly once, whether

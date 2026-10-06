@@ -69,6 +69,7 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	if (!state)
 		return NULL;
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &state->base);
+	state->video_unchanged = false;
 	return &state->base;
 }
 
@@ -80,35 +81,55 @@ s7d_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode)
 	return s7d_encp_build_state(mode, &state);
 }
 
+static void s7d_crtc_check_video_update(struct s7d_crtc_state *state,
+				      const struct s7d_crtc_state *old)
+{
+	state->buffers.video = (struct s7d_scanout_video) {0};
+	if (state->buffers.fb[S7D_PLANE_VIDEO])
+		state->buffers.video = (struct s7d_scanout_video) {
+			.fb = state->buffers.fb[S7D_PLANE_VIDEO],
+			.pipeline = state->video,
+			.csc = state->csc,
+			.postblend = state->postblend,
+		};
+	state->video_unchanged = old && old->valid && old->base.active &&
+		!drm_atomic_crtc_needs_modeset(&state->base) &&
+		s7d_scanout_video_equal(&old->buffers, &state->buffers);
+}
+
 static void s7d_crtc_build_update(struct s7d_crtc_state *state)
 {
 	unsigned int count = 0, i;
 
 	memcpy(state->update, state->osd.update, sizeof(state->osd.update));
 	count += S7D_OSD_UPDATE_REG_COUNT;
-	memcpy(state->update + count, state->video.update,
-	       state->video.update_count * sizeof(*state->update));
-	count += state->video.update_count;
-	for (i = 0; state->video.update_count && i < S7D_CSC_MATRIX_REG_COUNT; i++) {
-		state->update[count++] = (struct s7d_rdma_entry) {
-			.reg = cpu_to_le32(state->csc.matrix[i].reg),
-			.value = cpu_to_le32(state->csc.matrix[i].value),
-		};
+	if (!state->video_unchanged) {
+		memcpy(state->update + count, state->video.update,
+		       state->video.update_count * sizeof(*state->update));
+		count += state->video.update_count;
+		for (i = 0; state->video.update_count && i < S7D_CSC_MATRIX_REG_COUNT; i++) {
+			state->update[count++] = (struct s7d_rdma_entry) {
+				.reg = cpu_to_le32(state->csc.matrix[i].reg),
+				.value = cpu_to_le32(state->csc.matrix[i].value),
+			};
+		}
 	}
 	memcpy(state->update + count, state->postblend.regs,
 	       sizeof(state->postblend.regs));
 	count += S7D_POSTBLEND_REG_COUNT;
 	/* Block the blend source before disabling fetch; enable after its setup. */
-	state->update[count++] = (struct s7d_rdma_entry) {
-		.reg = cpu_to_le32(state->video.control.reg),
-		.value = cpu_to_le32(state->video.control.value),
-	};
+	if (!state->video_unchanged)
+		state->update[count++] = (struct s7d_rdma_entry) {
+			.reg = cpu_to_le32(state->video.control.reg),
+			.value = cpu_to_le32(state->video.control.value),
+		};
 	state->update_count = count;
 }
 
 static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
 {
 	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
+	struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(atomic, crtc);
 	struct s7d_crtc_state *state = to_s7d_crtc_state(base);
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct drm_plane *plane;
@@ -120,6 +141,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	int ret;
 
 	state->valid = false;
+	state->video_unchanged = false;
 	state->buffers = (struct s7d_scanout_buffers) {0};
 	if (!base->active)
 		return 0;
@@ -192,6 +214,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		layers[1].enabled, &state->postblend);
 	if (ret)
 		return ret;
+	s7d_crtc_check_video_update(state, old ? to_s7d_crtc_state(old) : NULL);
 	s7d_crtc_build_update(state);
 	state->pixel_rate = (unsigned long)base->adjusted_mode.clock * 1000;
 	ret = c->ops->check(c->data, state);
@@ -426,7 +449,7 @@ static void s7d_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_state
 	if (ret)
 		goto fail;
 	ret = s7d_scanout_submit(c->scanout, &state->buffers, state->update,
-				 state->update_count);
+				 state->update_count, state->video_unchanged);
 	if (ret)
 		goto fail;
 	mutex_unlock(&c->mutex);

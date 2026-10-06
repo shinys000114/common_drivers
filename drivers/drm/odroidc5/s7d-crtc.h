@@ -29,6 +29,7 @@ struct s7d_crtc_state {
 	struct s7d_scanout_buffers buffers;
 	unsigned long pixel_rate;
 	bool valid;
+	bool video_unchanged;
 };
 
 static inline struct s7d_crtc_state *

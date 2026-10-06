@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/errno.h>
+#include <linux/string.h>
 
 #include <drm/drm_framebuffer.h>
 
@@ -14,6 +15,44 @@ static bool buffers_present(const struct s7d_scanout_buffers *buffers)
 		if (buffers->fb[i])
 			return true;
 	return false;
+}
+
+static bool video_owned(const struct s7d_scanout_buffers *buffers)
+{
+	unsigned int i;
+
+	if (!buffers->video.fb)
+		return false;
+	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
+		if (buffers->fb[i] == buffers->video.fb)
+			return true;
+	return false;
+}
+
+bool s7d_scanout_video_equal(const struct s7d_scanout_buffers *a,
+			     const struct s7d_scanout_buffers *b)
+{
+	unsigned int i;
+
+	if (!video_owned(a) || !video_owned(b) || a->video.fb != b->video.fb ||
+	    a->video.pipeline.update_count != S7D_VIDEO_UPDATE_REG_COUNT ||
+	    b->video.pipeline.update_count != S7D_VIDEO_UPDATE_REG_COUNT ||
+	    !(a->video.pipeline.control.value & BIT(0)) ||
+	    memcmp(&a->video.pipeline, &b->video.pipeline, sizeof(a->video.pipeline)) ||
+	    memcmp(&a->video.csc, &b->video.csc, sizeof(a->video.csc)))
+		return false;
+	for (i = 0; i < S7D_POSTBLEND_REG_COUNT; i++) {
+		const struct s7d_rdma_entry *x = &a->video.postblend.regs[i];
+		const struct s7d_rdma_entry *y = &b->video.postblend.regs[i];
+		u32 mask = le32_to_cpu(x->reg) == 0x1dfe ? BIT(10) : 0;
+
+		if (x->reg != y->reg)
+			return false;
+		/* Only the OSD2 source 4 enable may differ. */
+		if (le32_to_cpu(x->value ^ y->value) & ~mask)
+			return false;
+	}
+	return true;
 }
 
 static void buffers_get(const struct s7d_scanout_buffers *buffers)
@@ -62,6 +101,8 @@ int s7d_scanout_begin_initial(struct s7d_scanout *s,
 
 	if (!buffers || !buffers_present(buffers))
 		return -EINVAL;
+	if (buffers->video.fb && !video_owned(buffers))
+		return -EINVAL;
 	flush_work(&s->retire_work);
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->fault) {
@@ -100,13 +141,16 @@ int s7d_scanout_initial_ready(struct s7d_scanout *s)
 
 int s7d_scanout_submit(struct s7d_scanout *s,
 			const struct s7d_scanout_buffers *buffers,
-			const struct s7d_rdma_entry *entries, unsigned int count)
+			const struct s7d_rdma_entry *entries, unsigned int count,
+			bool video_unchanged)
 {
 	unsigned long flags;
 	bool put = false;
 	int ret;
 
 	if (!buffers || !buffers_present(buffers))
+		return -EINVAL;
+	if (buffers->video.fb && !video_owned(buffers))
 		return -EINVAL;
 	/* The previous IRQ may already have scheduled a sleeping GEM release. */
 	flush_work(&s->retire_work);
@@ -118,6 +162,11 @@ int s7d_scanout_submit(struct s7d_scanout *s,
 	if (s->phase != S7D_SCANOUT_IDLE || !buffers_present(&s->active) ||
 	    buffers_present(&s->pending) || buffers_present(&s->retired)) {
 		ret = -EBUSY;
+		goto out;
+	}
+	/* An omitted video payload must match the owner, not just old DRM state. */
+	if (video_unchanged && !s7d_scanout_video_equal(&s->active, buffers)) {
+		ret = -EINVAL;
 		goto out;
 	}
 	buffers_get(buffers);
