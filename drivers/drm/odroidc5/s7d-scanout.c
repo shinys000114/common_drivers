@@ -6,6 +6,7 @@
 #include <drm/drm_framebuffer.h>
 
 #include "s7d-scanout.h"
+#include "s7d-plane.h"
 
 static bool buffers_present(const struct s7d_scanout_buffers *buffers)
 {
@@ -31,14 +32,17 @@ static bool video_owned(const struct s7d_scanout_buffers *buffers)
 
 static bool afbc_owned(const struct s7d_scanout_buffers *buffers)
 {
-	unsigned int i;
+	unsigned int slot;
 
 	if (!buffers->afbc.fb || s7d_afbc_check_state(&buffers->afbc.plan))
 		return false;
-	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
-		if (buffers->fb[i] == buffers->afbc.fb)
-			return true;
-	return false;
+	if (buffers->afbc.plan.surface_mask == BIT(0))
+		slot = S7D_PLANE_PRIMARY;
+	else if (buffers->afbc.plan.surface_mask == BIT(1))
+		slot = S7D_PLANE_RGB;
+	else
+		return false;
+	return buffers->fb[slot] == buffers->afbc.fb;
 }
 
 bool s7d_scanout_video_equal(const struct s7d_scanout_buffers *a,

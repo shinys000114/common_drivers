@@ -17,6 +17,7 @@
 #include <drm/drm_vblank.h>
 
 #include "s7d-crtc.h"
+#include "s7d-afbc-engine.h"
 #include "s7d-plane.h"
 
 struct s7d_crtc {
@@ -104,12 +105,20 @@ static void s7d_crtc_build_update(struct s7d_crtc_state *state)
 	for (i = 0; i < S7D_OSD_UPDATE_REG_COUNT; i++) {
 		u32 reg = le32_to_cpu(state->osd.update[i].reg);
 
-		/* AFBC MIF configuration is fixed by the stopped prepare path. */
-		if (state->buffers.afbc.fb &&
-		    (reg == 0x1a3b || reg == 0x1a65 || reg == 0x1a66 ||
-		     reg == 0x1a3c || reg == 0x1a3d || reg == 0x1a4d ||
-		     reg == 0x1abd))
-			continue;
+		/* Leave the selected AFBC MIF fixed; the other OSD stays linear. */
+		if (state->buffers.afbc.fb) {
+			u32 mask = state->buffers.afbc.plan.surface_mask;
+
+			if ((mask == BIT(0) &&
+			     (reg == 0x1a1b || reg == 0x1a14 || reg == 0x1a15 ||
+			      reg == 0x1a1c || reg == 0x1a1d || reg == 0x1a2d ||
+			      reg == 0x1a2f)) ||
+			    (mask == BIT(1) &&
+			     (reg == 0x1a3b || reg == 0x1a65 || reg == 0x1a66 ||
+			      reg == 0x1a3c || reg == 0x1a3d || reg == 0x1a4d ||
+			      reg == 0x1abd)))
+				continue;
+		}
 		state->update[count++] = state->osd.update[i];
 	}
 	if (!state->video_unchanged) {
@@ -208,25 +217,36 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 			if (slot != S7D_PLANE_PRIMARY && layers[1].enabled)
 				return -ENOSPC;
 			layers[slot == S7D_PLANE_PRIMARY ? 0 : 1] = checked->layer;
-			if (checked->afbc_valid)
+			if (checked->afbc_valid) {
+				if (state->buffers.afbc.fb)
+					return -ENOSPC;
 				state->buffers.afbc = (struct s7d_scanout_afbc) {
 					.fb = ps->fb,
 					.plan = checked->afbc,
 				};
+			}
 		}
 		state->buffers.fb[slot] = ps->fb;
 	}
 	if (!state->buffers.fb[S7D_PLANE_PRIMARY])
 		return -EINVAL;
 	if (state->buffers.afbc.fb &&
-	    (state->buffers.fb[S7D_PLANE_CURSOR] || video ||
-	     s7d_afbc_check_state(&state->buffers.afbc.plan)))
+	    (video || s7d_afbc_check_state(&state->buffers.afbc.plan) ||
+	     (state->buffers.fb[S7D_PLANE_CURSOR] &&
+	      state->buffers.afbc.plan.surface_mask != BIT(0))))
 		return -EINVAL;
-	/* Entry/exit changes routing and cannot run through display RDMA. */
-	if (old && old->active &&
-	    (!!to_s7d_crtc_state(old)->buffers.afbc.fb != !!state->buffers.afbc.fb ||
-	     (state->buffers.afbc.fb && (primary_changed || afbc_position_changed))))
-		base->mode_changed = true;
+	/* Entry, owner, layout and alpha-route changes require stopped preparation. */
+	if (old && old->active) {
+		const struct s7d_scanout_afbc *before = &to_s7d_crtc_state(old)->buffers.afbc;
+		const struct s7d_scanout_afbc *after = &state->buffers.afbc;
+
+		if (!!before->fb != !!after->fb ||
+		    (after->fb &&
+		     (!s7d_afbc_same_layout(&before->plan, &after->plan) ||
+		      afbc_position_changed ||
+		      (after->plan.surface_mask == BIT(1) && primary_changed))))
+			base->mode_changed = true;
+	}
 	/* A fault requires a full disable/enable or link-recovery modeset. */
 	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
 		return -EIO;

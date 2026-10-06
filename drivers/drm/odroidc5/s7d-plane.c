@@ -88,12 +88,17 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	if (base->fb->modifier != DRM_FORMAT_MOD_LINEAR) {
 		const struct drm_afbc_framebuffer *fb = s7d_fb_afbc_metadata(base->fb);
 
-		if (plane->slot != S7D_PLANE_RGB || !fb ||
-		    base->alpha != DRM_BLEND_ALPHA_OPAQUE ||
-		    base->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE)
+		if ((plane->slot != S7D_PLANE_PRIMARY && plane->slot != S7D_PLANE_RGB) ||
+		    !fb || base->alpha != DRM_BLEND_ALPHA_OPAQUE ||
+		    (base->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE &&
+		     (plane->slot != S7D_PLANE_PRIMARY ||
+		      base->pixel_blend_mode != DRM_MODE_BLEND_PREMULTI)))
 			return -EINVAL;
 		ret = s7d_afbc_build_state(fb, &base->src, plane->dma_mask,
-					 S7D_AFBC_SURFACE, &state->afbc);
+					 plane->slot == S7D_PLANE_PRIMARY ? 0 : 1,
+					 &state->afbc);
+		if (!ret && base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
+			ret = s7d_afbc_set_premult(&state->afbc);
 		if (ret)
 			return ret;
 		state->layer.layout = state->afbc.osd;
@@ -225,6 +230,10 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		type = DRM_PLANE_TYPE_PRIMARY;
 		name = "S7D OSD1";
 		zpos = 0;
+		if (afbc_supported) {
+			funcs = &s7d_rgb_plane_funcs;
+			plane_modifiers = rgb_modifiers;
+		}
 		break;
 	case S7D_PLANE_RGB:
 		type = DRM_PLANE_TYPE_OVERLAY;

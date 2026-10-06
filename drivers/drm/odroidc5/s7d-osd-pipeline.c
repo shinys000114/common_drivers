@@ -80,10 +80,11 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 	if (!layer->enabled)
 		return 0;
 	if (layer->afbc) {
-		if (!secondary || layer->alpha != 256 ||
+		if (layer->alpha != 256 || !layer->premult ||
 		    layout->block_config != (BIT(30) | (5 << 8)) ||
-		    layout->alpha_config != 0x7fc2 ||
-		    layout->frame_addr != 0x00200000 ||
+		    (layout->alpha_config != 0x7fc2 &&
+		     (secondary || layout->alpha_config != (BIT(2) | BIT(1)))) ||
+		    layout->frame_addr != (secondary ? 0x00200000 : 0x00100000) ||
 		    ((layout->scope_x | layout->scope_y) & 0xffff) ||
 		    layout->stride != ALIGN((layout->scope_x >> 16) + 1, 256) / 4)
 			return -EINVAL;
@@ -125,6 +126,7 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 	if (revision != S7D_OSD_REV_B)
 		return -EOPNOTSUPP;
 	if (!width || !height || width > 4096 || height > 4096 ||
+	    (layers[0].afbc && layers[1].enabled && layers[1].afbc) ||
 	    !layers[0].enabled || layers[0].dst.x1 || layers[0].dst.y1 ||
 	    layers[0].dst.x2 != (int)width || layers[0].dst.y2 != (int)height ||
 	    check_layer(&layers[0], width, height, false) ||

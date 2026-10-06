@@ -31,6 +31,17 @@ struct s7d_afbc_reg_value {
 	u32 value;
 };
 
+struct s7d_afbc_surface {
+	u32 mask;
+	u32 bank;
+	u32 alias;
+	u32 ctrl;
+	u32 fifo;
+	u32 alpha;
+	u32 unpack;
+	u32 route_mask;
+};
+
 struct s7d_afbc_state {
 	struct s7d_osd_state osd;
 	/* Decoder-owned settings; never replay through display RDMA. */
@@ -54,5 +65,7 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 			 const struct drm_rect *source, u64 dma_mask,
 			 unsigned int surface, struct s7d_afbc_state *out);
 int s7d_afbc_check_state(const struct s7d_afbc_state *state);
+int s7d_afbc_set_premult(struct s7d_afbc_state *state);
+const struct s7d_afbc_surface *s7d_afbc_surface_get(u32 mask);
 
 #endif

@@ -24,8 +24,6 @@
 #define AFBC_MANUAL_RESET		BIT(23)
 #define AFBC_PAYLOAD_LIMIT	BIT(19)
 #define ENCP_EN			0x1b80
-#define OSD2_CTRL		0x1a30
-#define OSD2_FIFO		0x1a4b
 #define READ0_STATUS		0x27ad
 #define OSD_ACTUAL_ENABLE	BIT(21)
 #define OSD_FIFO_BUSY		GENMASK(21, 20)
@@ -91,9 +89,20 @@ int s7d_afbc_engine_read(struct s7d_afbc_engine *e,
 	return ret;
 }
 
+static const struct s7d_afbc_surface *engine_surface(const struct s7d_afbc_engine *e)
+{
+	if (e->phase == S7D_AFBC_PREPARED ||
+	    (e->phase == S7D_AFBC_STOPPING && e->stop_unstarted))
+		return e->pending_valid ?
+			s7d_afbc_surface_get(e->pending.surface_mask) : NULL;
+	return e->bound_valid ? s7d_afbc_surface_get(e->bound.surface_mask) : NULL;
+}
+
 static int observation_check(struct s7d_afbc_engine *e,
 			     const struct s7d_afbc_observation *o)
 {
+	const struct s7d_afbc_surface *s = engine_surface(e);
+
 	e->observed = *o;
 	if (o->raw & AFBC_RAW_ERROR)
 		return s7d_afbc_engine_fail(e, -EIO, AFBC_RAW);
@@ -101,7 +110,7 @@ static int observation_check(struct s7d_afbc_engine *e,
 		return s7d_afbc_engine_fail(e, -EIO, AFBC_STATUS);
 	if (!(o->top & AFBC_MANUAL_RESET))
 		return s7d_afbc_engine_fail(e, -EIO, AFBC_TOP);
-	if (o->surfaces != BIT(1))
+	if (!s || o->surfaces != s->mask)
 		return s7d_afbc_engine_fail(e, -EIO, AFBC_SURFACES);
 	return 0;
 }
@@ -200,16 +209,16 @@ int s7d_afbc_engine_prepare(struct s7d_afbc_engine *e,
 		return ret;
 	if (surfaces)
 		return s7d_afbc_engine_fail(e, -EBUSY, AFBC_SURFACES);
-	ret = engine_read(e, 0x3a32, &format);
+	ret = engine_read(e, copy.regs[2].reg, &format);
 	if (ret)
 		return ret;
 	if (format & AFBC_PAYLOAD_LIMIT)
-		return s7d_afbc_engine_fail(e, -EOPNOTSUPP, 0x3a32);
-	ret = engine_read(e, plan->unpack.reg, &unpack);
+		return s7d_afbc_engine_fail(e, -EOPNOTSUPP, copy.regs[2].reg);
+	ret = engine_read(e, copy.unpack.reg, &unpack);
 	if (ret)
 		return ret;
 	if (unpack & (BIT(16) | BIT(28)))
-		return s7d_afbc_engine_fail(e, -EOPNOTSUPP, plan->unpack.reg);
+		return s7d_afbc_engine_fail(e, -EOPNOTSUPP, copy.unpack.reg);
 	ret = engine_write(e, AFBC_TOP, o.top | AFBC_MANUAL_RESET);
 	if (!ret)
 		ret = engine_read(e, AFBC_TOP, &top);
@@ -301,6 +310,7 @@ static int issue(struct s7d_afbc_engine *e,
 int s7d_afbc_engine_start_initial(struct s7d_afbc_engine *e)
 {
 	struct s7d_afbc_observation o;
+	const struct s7d_afbc_surface *s;
 	u32 value;
 	int ret;
 
@@ -313,16 +323,17 @@ int s7d_afbc_engine_start_initial(struct s7d_afbc_engine *e)
 		return ret;
 	if (!inactive(&o))
 		return s7d_afbc_engine_fail(e, -EBUSY, AFBC_STATUS);
+	s = engine_surface(e);
 	ret = engine_read(e, ENCP_EN, &value);
 	if (ret)
 		return ret;
 	if (!(value & BIT(0)))
 		return s7d_afbc_engine_fail(e, -EHOSTDOWN, ENCP_EN);
-	ret = engine_read(e, OSD2_CTRL, &value);
+	ret = engine_read(e, s->ctrl, &value);
 	if (ret)
 		return ret;
 	if (value & (BIT(0) | OSD_ACTUAL_ENABLE))
-		return s7d_afbc_engine_fail(e, -EBUSY, OSD2_CTRL);
+		return s7d_afbc_engine_fail(e, -EBUSY, s->ctrl);
 	return issue(e, NULL, true);
 }
 
@@ -452,14 +463,14 @@ int s7d_afbc_engine_restart(struct s7d_afbc_engine *e,
 	take_pending = e->pending_valid && e->pending_ready;
 	if (take_pending) {
 		for (i = 0; i < 2; i++) {
-			ret = engine_write(e, 0x3a30 + i,
+			ret = engine_write(e, e->pending.regs[i].reg,
 					   e->pending.regs[i].value);
 			if (!ret)
-				ret = engine_read(e, 0x3a30 + i, &value);
+				ret = engine_read(e, e->pending.regs[i].reg, &value);
 			if (ret)
 				return ret;
 			if (value != e->pending.regs[i].value)
-				return s7d_afbc_engine_fail(e, -EIO, 0x3a30 + i);
+				return s7d_afbc_engine_fail(e, -EIO, e->pending.regs[i].reg);
 		}
 	}
 	return issue(e, frame, take_pending);
@@ -501,6 +512,7 @@ int s7d_afbc_engine_stop_sample(struct s7d_afbc_engine *e,
 int s7d_afbc_engine_stop_finish(struct s7d_afbc_engine *e)
 {
 	struct s7d_afbc_observation o;
+	const struct s7d_afbc_surface *s;
 	u32 value;
 	int ret;
 
@@ -515,12 +527,13 @@ int s7d_afbc_engine_stop_finish(struct s7d_afbc_engine *e)
 		ret = s7d_afbc_engine_stop_sample(e, &o);
 	if (ret <= 0)
 		return ret ? ret : -EAGAIN;
-	ret = engine_read(e, OSD2_CTRL, &value);
+	s = engine_surface(e);
+	ret = engine_read(e, s->ctrl, &value);
 	if (ret)
 		return ret;
 	if (value & (BIT(0) | OSD_ACTUAL_ENABLE))
 		return -EAGAIN;
-	ret = engine_read(e, OSD2_FIFO, &value);
+	ret = engine_read(e, s->fifo, &value);
 	if (ret)
 		return ret;
 	if (value & OSD_FIFO_BUSY)
@@ -543,24 +556,32 @@ int s7d_afbc_engine_stop_finish(struct s7d_afbc_engine *e)
 
 bool s7d_afbc_engine_can_abort_prepare(const struct s7d_afbc_engine *e)
 {
-	return e->phase == S7D_AFBC_ERROR &&
-	       e->failed_phase == S7D_AFBC_STOPPED && !e->bound_valid &&
-	       e->failed_readback &&
-	       !e->epoch && !e->failed_epoch && e->pending_valid &&
-	       e->pending_generation &&
-	       e->failed_generation == e->pending_generation &&
-	       e->accepted_generation == e->pending_generation &&
-	       e->failed_reg >= 0x3a30 && e->failed_reg <= 0x3a3c;
+	unsigned int i;
+
+	if (e->phase != S7D_AFBC_ERROR ||
+	    e->failed_phase != S7D_AFBC_STOPPED || e->bound_valid ||
+	    !e->failed_readback || e->epoch || e->failed_epoch || !e->pending_valid ||
+	    !e->pending_generation ||
+	    e->failed_generation != e->pending_generation ||
+	    e->accepted_generation != e->pending_generation ||
+	    s7d_afbc_check_state(&e->pending))
+		return false;
+	for (i = 0; i < S7D_AFBC_SURFACE_REG_COUNT; i++)
+		if (e->failed_reg == e->pending.regs[i].reg)
+			return true;
+	return false;
 }
 
 int s7d_afbc_engine_abort_prepare(struct s7d_afbc_engine *e, u32 *failed_reg)
 {
 	struct s7d_afbc_observation o;
+	const struct s7d_afbc_surface *s;
 	u32 value;
 	int ret;
 
 	if (!s7d_afbc_engine_can_abort_prepare(e))
 		return e->phase == S7D_AFBC_ERROR ? e->last_error : -EINVAL;
+	s = s7d_afbc_surface_get(e->pending.surface_mask);
 	*failed_reg = AFBC_RAW;
 	ret = e->io->read(e->data, AFBC_RAW, &o.raw);
 	if (ret)
@@ -593,14 +614,14 @@ int s7d_afbc_engine_abort_prepare(struct s7d_afbc_engine *e, u32 *failed_reg)
 		return ret;
 	if (value & BIT(0))
 		return -EBUSY;
-	*failed_reg = OSD2_CTRL;
-	ret = e->io->read(e->data, OSD2_CTRL, &value);
+	*failed_reg = s->ctrl;
+	ret = e->io->read(e->data, s->ctrl, &value);
 	if (ret)
 		return ret;
 	if (value & (BIT(0) | OSD_ACTUAL_ENABLE))
 		return -EBUSY;
-	*failed_reg = OSD2_FIFO;
-	ret = e->io->read(e->data, OSD2_FIFO, &value);
+	*failed_reg = s->fifo;
+	ret = e->io->read(e->data, s->fifo, &value);
 	if (ret)
 		return ret;
 	if (value & OSD_FIFO_BUSY)

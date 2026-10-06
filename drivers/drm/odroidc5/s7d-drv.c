@@ -205,7 +205,9 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	if (ret)
 		goto fini_vpu;
 	primary = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
-				   S7D_PLANE_PRIMARY, false);
+				   S7D_PLANE_PRIMARY,
+				   display->vpu.afbc_available &&
+				   (display->vpu.afbc_ready_mask & BIT(0)));
 	if (IS_ERR(primary)) {
 		ret = PTR_ERR(primary);
 		goto fini_vpu;
@@ -217,7 +219,8 @@ static int s7d_drm_probe(struct platform_device *pdev)
 		goto fini_vpu;
 	}
 	overlay = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_RGB,
-				   display->vpu.afbc_available && display->vpu.afbc_ready);
+				   display->vpu.afbc_available &&
+				   (display->vpu.afbc_ready_mask & BIT(1)));
 	if (IS_ERR(overlay)) {
 		ret = PTR_ERR(overlay);
 		goto fini_vpu;

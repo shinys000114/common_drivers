@@ -58,8 +58,6 @@
 #define AFBC_COMMAND		0x3a05
 #define AFBC_STATUS		0x3a06
 #define AFBC_SURFACES		0x3a07
-#define AFBC_FORMAT1		0x3a32
-#define AFBC_UNPACK2		0x1abd
 
 static u32 vpu_read(struct s7d_vpu *v, u32 reg)
 {
@@ -181,6 +179,7 @@ static void s7d_vpu_afbc_admission(struct s7d_vpu *v)
 {
 	struct s7d_afbc_observation o;
 	u32 format, unpack;
+	unsigned int i;
 	int ret;
 
 	if (!v->afbc_available)
@@ -192,16 +191,23 @@ static void s7d_vpu_afbc_admission(struct s7d_vpu *v)
 		ret = -EIO;
 	if (!ret && ((o.status & GENMASK(1, 0)) || (o.top & BIT(31)) || o.surfaces))
 		ret = -EBUSY;
-	if (!ret)
-		ret = s7d_vpu_afbc_read(v, AFBC_FORMAT1, &format);
-	if (!ret && (format & BIT(19)))
-		ret = -EOPNOTSUPP;
-	if (!ret)
-		ret = s7d_vpu_afbc_read(v, AFBC_UNPACK2, &unpack);
-	if (!ret && (unpack & (BIT(16) | BIT(28))))
-		ret = -EOPNOTSUPP;
-	v->afbc_admission_error = ret;
-	v->afbc_ready = !ret;
+	v->afbc_ready_mask = 0;
+	for (i = 0; i < ARRAY_SIZE(v->afbc_admission_error); i++) {
+		const struct s7d_afbc_surface *s = s7d_afbc_surface_get(BIT(i));
+		int err = ret;
+
+		if (!err)
+			err = s7d_vpu_afbc_read(v, s->bank + 2, &format);
+		if (!err && (format & BIT(19)))
+			err = -EOPNOTSUPP;
+		if (!err)
+			err = s7d_vpu_afbc_read(v, s->unpack, &unpack);
+		if (!err && (unpack & (BIT(16) | BIT(28))))
+			err = -EOPNOTSUPP;
+		v->afbc_admission_error[i] = err;
+		if (!err)
+			v->afbc_ready_mask |= s->mask;
+	}
 }
 
 static int s7d_vpu_afbc_stop_sample(struct s7d_vpu *v)
@@ -279,11 +285,13 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	int ret;
 
 	if (state->buffers.afbc.fb) {
-		if (!v->afbc_available || !v->afbc_ready)
-			return v->afbc_admission_error ?: -EOPNOTSUPP;
+		u32 mask = state->buffers.afbc.plan.surface_mask;
+
 		ret = s7d_afbc_check_state(&state->buffers.afbc.plan);
 		if (ret)
 			return ret;
+		if (!v->afbc_available || !(v->afbc_ready_mask & mask))
+			return v->afbc_admission_error[mask == BIT(0) ? 0 : 1] ?: -EOPNOTSUPP;
 	}
 	/* One unscaled RGB pixel per VPU cycle; protect this rate at prepare. */
 	if (state->pixel_rate < 25175000 || state->pixel_rate > 594000000 ||
@@ -398,6 +406,7 @@ static int s7d_vpu_stop_hw(void *data)
 	static const u32 osds[] = { OSD1_CTRL, OSD2_CTRL };
 	u32 value;
 	unsigned int i;
+	const struct s7d_afbc_surface *surface = NULL;
 	bool abort_prepare = false;
 	int ret;
 
@@ -417,7 +426,8 @@ static int s7d_vpu_stop_hw(void *data)
 	 * its field/line strobes first leaves OSD_ENABLE latched on S7D.
 	 */
 	if (v->afbc_enabled) {
-		if (v->normal_unpack_owned & BIT(S7D_AFBC_SURFACE))
+		surface = s7d_afbc_surface_get(v->afbc_surface_mask);
+		if (!surface || (v->normal_unpack_owned & surface->mask))
 			return -EIO;
 		abort_prepare = s7d_afbc_engine_can_abort_prepare(&v->afbc);
 		if (!abort_prepare) {
@@ -497,14 +507,16 @@ static int s7d_vpu_stop_hw(void *data)
 		}
 		if (ret)
 			return ret;
-		ret = vpu_update(v, OSD_PATH, BIT(5), 0);
+		ret = vpu_update(v, OSD_PATH, surface->route_mask, 0);
 		if (!ret)
-			ret = vpu_update(v, AFBC_UNPACK2, BIT(31), 0);
+			ret = vpu_update(v, surface->unpack, v->afbc_unpack_mask, 0);
 		if (!ret)
-			ret = vpu_update(v, 0x1a4d, BIT(1), 0);
+			ret = vpu_update(v, surface->alpha, BIT(1), 0);
 		if (ret)
 			return ret;
 		v->afbc_enabled = false;
+		v->afbc_surface_mask = 0;
+		v->afbc_unpack_mask = 0;
 	}
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		u32 reg = i ? 0x1abd : 0x1a2f;
@@ -743,6 +755,8 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 		ret = s7d_vpu_afbc_resets(v);
 		if (ret)
 			return ret;
+		v->afbc_surface_mask = p->surface_mask;
+		v->afbc_unpack_mask = p->unpack.mask & ~GENMASK(15, 0);
 		v->afbc_enabled = true;
 		ret = s7d_afbc_engine_prepare(&v->afbc, p, generation);
 		if (!ret)

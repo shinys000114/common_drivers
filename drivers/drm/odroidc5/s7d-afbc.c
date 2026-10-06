@@ -17,8 +17,28 @@
 #define REG(r, v) { .reg = (r), .value = (v) }
 /* AFBC_EN is a software flag, not a decoder FORMAT_SPECIFIER field. */
 #define AFBC_FORMAT (BIT(18) | BIT(16) | BIT(9) | BIT(8) | 5)
-#define AFBC_BANK 0x3a30
-#define AFBC_ALIAS 0x02000000
+
+const struct s7d_afbc_surface *s7d_afbc_surface_get(u32 mask)
+{
+	static const struct s7d_afbc_surface surfaces[] = {
+		{
+			.mask = BIT(0), .bank = 0x3a10, .alias = 0x01000000,
+			.ctrl = 0x1a10, .fifo = 0x1a2b, .alpha = 0x1a2d,
+			.unpack = 0x1a2f, .route_mask = BIT(4),
+		},
+		{
+			.mask = BIT(1), .bank = 0x3a30, .alias = 0x02000000,
+			.ctrl = 0x1a30, .fifo = 0x1a4b, .alpha = 0x1a4d,
+			.unpack = 0x1abd, .route_mask = BIT(5),
+		},
+	};
+
+	if (mask == BIT(0))
+		return &surfaces[0];
+	if (mask == BIT(1))
+		return &surfaces[1];
+	return NULL;
+}
 
 struct s7d_afbc_layout {
 	u32 aligned_width;
@@ -62,12 +82,13 @@ static int afbc_layout(u32 width, u32 height, struct s7d_afbc_layout *layout)
 
 int s7d_afbc_check_state(const struct s7d_afbc_state *p)
 {
+	const struct s7d_afbc_surface *s = p ?
+		s7d_afbc_surface_get(p->surface_mask) : NULL;
 	struct s7d_afbc_layout layout;
-	u32 settings[11], width, height;
+	u32 settings[11], width, height, unpack_mask, unpack_value;
 	unsigned int i;
 
-	if (!p || p->surface_mask != BIT(S7D_AFBC_SURFACE) ||
-	    (p->osd.scope_x & 0xffff) || (p->osd.scope_y & 0xffff))
+	if (!s || (p->osd.scope_x & 0xffff) || (p->osd.scope_y & 0xffff))
 		return -EINVAL;
 	width = (p->osd.scope_x >> 16) + 1;
 	height = (p->osd.scope_y >> 16) + 1;
@@ -81,24 +102,31 @@ int s7d_afbc_check_state(const struct s7d_afbc_state *p)
 	    p->body_addr != p->header_addr + p->header_size ||
 	    p->last_byte_addr != p->body_addr + p->body_size - 1)
 		return -EINVAL;
+	unpack_mask = BIT(31) | GENMASK(15, 0);
+	unpack_value = BIT(31) | 0x1234;
+	if (p->osd.alpha_config == (BIT(2) | BIT(1)) && s->mask == BIT(0)) {
+		unpack_mask |= BIT(28) | GENMASK(25, 24);
+		unpack_value |= BIT(28);
+	} else if (p->osd.alpha_config != 0x7fc2) {
+		return -EINVAL;
+	}
 	if (p->osd.block_config != (BIT(30) | (5 << 8)) ||
-	    p->osd.frame_addr != (AFBC_ALIAS >> 4) ||
+	    p->osd.frame_addr != (s->alias >> 4) ||
 	    p->osd.stride != layout.pitch >> 4 ||
-	    p->osd.alpha_config != 0x7fc2 ||
-	    p->route.reg != 0x1a0e || p->route.mask != BIT(5) ||
-	    p->route.value != BIT(5) || p->unpack.reg != 0x1abd ||
-	    p->unpack.mask != (BIT(31) | GENMASK(15, 0)) ||
-	    p->unpack.value != (BIT(31) | 0x1234))
+	    p->route.reg != 0x1a0e || p->route.mask != s->route_mask ||
+	    p->route.value != s->route_mask || p->unpack.reg != s->unpack ||
+	    p->unpack.mask != unpack_mask ||
+	    p->unpack.value != unpack_value)
 		return -EINVAL;
 	for (i = 0; i < S7D_AFBC_SURFACE_REG_COUNT; i++)
-		if (p->regs[i].reg != AFBC_BANK + i)
+		if (p->regs[i].reg != s->bank + i)
 			return -EINVAL;
 	if (p->regs[0].value != lower_32_bits(p->header_addr) ||
 	    p->regs[1].value != upper_32_bits(p->header_addr))
 		return -EINVAL;
 	memcpy(settings, (u32[]) {
 		AFBC_FORMAT, layout.aligned_width, layout.buffer_height,
-		0, width - 1, 0, height - 1, AFBC_ALIAS, 0, layout.pitch, 0,
+		0, width - 1, 0, height - 1, s->alias, 0, layout.pitch, 0,
 	}, sizeof(settings));
 	for (i = 2; i < S7D_AFBC_SURFACE_REG_COUNT; i++)
 		if (p->regs[i].value != settings[i - 2])
@@ -112,12 +140,14 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 {
 	const struct drm_gem_dma_object *obj;
 	const struct drm_framebuffer *fb;
+	const struct s7d_afbc_surface *s;
 	struct s7d_afbc_layout layout;
 	u64 header_addr, dma_end;
 	int ret;
 
-	if (!afbc_fb || !src || !out || surface != S7D_AFBC_SURFACE)
+	if (!afbc_fb || !src || !out || surface > 1)
 		return -EINVAL;
+	s = s7d_afbc_surface_get(BIT(surface));
 	fb = &afbc_fb->base;
 	if (!fb->format || fb->format->format != DRM_FORMAT_ABGR8888 ||
 	    fb->format->num_planes != 1 || !fb->obj[0] ||
@@ -149,34 +179,34 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 	*out = (struct s7d_afbc_state) {
 		.osd = {
 			.block_config = BIT(30) | (5 << 8),
-			.frame_addr = AFBC_ALIAS >> 4,
+			.frame_addr = s->alias >> 4,
 			.stride = layout.pitch >> 4,
 			.scope_x = (fb->width - 1) << 16,
 			.scope_y = (fb->height - 1) << 16,
 			.alpha_config = 0x7fc2,
 		},
 		.regs = {
-			REG(AFBC_BANK, lower_32_bits(header_addr)),
-			REG(AFBC_BANK + 1, upper_32_bits(header_addr)),
-			REG(AFBC_BANK + 2, AFBC_FORMAT),
-			REG(AFBC_BANK + 3, layout.aligned_width),
-			REG(AFBC_BANK + 4, layout.buffer_height),
-			REG(AFBC_BANK + 5, 0),
-			REG(AFBC_BANK + 6, fb->width - 1),
-			REG(AFBC_BANK + 7, 0),
-			REG(AFBC_BANK + 8, fb->height - 1),
-			REG(AFBC_BANK + 9, AFBC_ALIAS),
-			REG(AFBC_BANK + 10, 0),
-			REG(AFBC_BANK + 11, layout.pitch),
-			REG(AFBC_BANK + 12, 0),
+			REG(s->bank, lower_32_bits(header_addr)),
+			REG(s->bank + 1, upper_32_bits(header_addr)),
+			REG(s->bank + 2, AFBC_FORMAT),
+			REG(s->bank + 3, layout.aligned_width),
+			REG(s->bank + 4, layout.buffer_height),
+			REG(s->bank + 5, 0),
+			REG(s->bank + 6, fb->width - 1),
+			REG(s->bank + 7, 0),
+			REG(s->bank + 8, fb->height - 1),
+			REG(s->bank + 9, s->alias),
+			REG(s->bank + 10, 0),
+			REG(s->bank + 11, layout.pitch),
+			REG(s->bank + 12, 0),
 		},
 		.route = {
 			.reg = 0x1a0e,
-			.mask = BIT(5),
-			.value = BIT(5),
+			.mask = s->route_mask,
+			.value = s->route_mask,
 		},
 		.unpack = {
-			.reg = 0x1abd,
+			.reg = s->unpack,
 			.mask = BIT(31) | GENMASK(15, 0),
 			.value = BIT(31) | 0x1234,
 		},
@@ -189,7 +219,21 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 		.aligned_width = layout.aligned_width,
 		.aligned_height = layout.aligned_height,
 		.buffer_height = layout.buffer_height,
-		.surface_mask = BIT(S7D_AFBC_SURFACE),
+		.surface_mask = s->mask,
 	};
+	return 0;
+}
+
+int s7d_afbc_set_premult(struct s7d_afbc_state *state)
+{
+	int ret = s7d_afbc_check_state(state);
+
+	if (ret)
+		return ret;
+	if (state->surface_mask != BIT(0))
+		return -EOPNOTSUPP;
+	state->osd.alpha_config = BIT(2) | BIT(1);
+	state->unpack.mask |= BIT(28) | GENMASK(25, 24);
+	state->unpack.value |= BIT(28);
 	return 0;
 }

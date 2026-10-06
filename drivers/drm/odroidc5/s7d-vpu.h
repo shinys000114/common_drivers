@@ -45,10 +45,12 @@ struct s7d_vpu {
 	bool touched;
 	bool osd2_enable;
 	bool afbc_available;
-	bool afbc_ready;
+	u32 afbc_ready_mask;
+	u32 afbc_surface_mask;
+	u32 afbc_unpack_mask;
 	u8 normal_unpack_owned;
 	bool afbc_enabled;
-	int afbc_admission_error;
+	int afbc_admission_error[2];
 	u32 afbc_command_counter;
 	bool vd1_enable;
 	bool pixel_protected;
