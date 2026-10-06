@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR MIT)
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
+#include <dt-bindings/reset/amlogic,s7d-vpu-reset.h>
 
 &vdin1_cma_reserved {
 	status = "disabled";
@@ -239,12 +240,21 @@
 			 <&clkc CLKID_SYS_VPU_INTR>, <&clkc CLKID_ENCP>, <&xtal>;
 		clock-names = "vpu", "vapb", "intr", "encp", "xtal";
 		resets = <&reset RESET_VIU>, <&reset RESET_VENC>,
-			 <&reset RESET_VENCP>, <&reset RESET_RDMA>;
-		reset-names = "viu", "venc", "vencp", "rdma";
+			 <&reset RESET_VENCP>, <&reset RESET_RDMA>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBCD_REGS>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBCD_LOGIC>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBC_ARBITER_REGS>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBC_ARBITER_LOGIC>;
+		reset-names = "viu", "venc", "vencp", "rdma", "afbc-regs",
+			      "afbc-logic", "afbc-arbiter-regs", "afbc-arbiter-logic";
 		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
 		/* Retain the firmware reservation; the driver does not free this RAM. */
 		memory-region = <&c5_display_cma>, <&logo_reserved>;
 		memory-region-names = "scanout", "boot-logo";
+		c5_vpu_local_reset: reset-controller {
+			compatible = "amlogic,s7d-vpu-reset";
+			#reset-cells = <1>;
+		};
 		port {
 			c5_vpu_out: endpoint {
 				remote-endpoint = <&c5_hdmi_in>;
