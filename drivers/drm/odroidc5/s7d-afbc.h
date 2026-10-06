@@ -10,8 +10,9 @@
 struct drm_afbc_framebuffer;
 struct drm_rect;
 
-#define S7D_AFBC_WIDTH 250
-#define S7D_AFBC_HEIGHT 250
+/* Current native KMS output profile. */
+#define S7D_AFBC_MAX_WIDTH 4096
+#define S7D_AFBC_MAX_HEIGHT 2160
 #define S7D_AFBC_SURFACE 1
 #define S7D_AFBC_SURFACE_REG_COUNT 13
 #define S7D_AFBC_MODIFIER DRM_FORMAT_MOD_ARM_AFBC( \

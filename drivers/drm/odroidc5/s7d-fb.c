@@ -38,8 +38,8 @@ s7d_fb_create(struct drm_device *dev, struct drm_file *file,
 	if (cmd->modifier[0] != S7D_AFBC_MODIFIER ||
 	    cmd->pixel_format != DRM_FORMAT_ABGR8888 ||
 	    cmd->flags != DRM_MODE_FB_MODIFIERS ||
-	    cmd->width != S7D_AFBC_WIDTH || cmd->height != S7D_AFBC_HEIGHT ||
-	    cmd->pitches[0] != 1024 || cmd->offsets[0])
+	    !cmd->width || !cmd->height || cmd->width > S7D_AFBC_MAX_WIDTH ||
+	    cmd->height > S7D_AFBC_MAX_HEIGHT || cmd->offsets[0])
 		return ERR_PTR(-EINVAL);
 
 	fb = kzalloc(sizeof(*fb), GFP_KERNEL);

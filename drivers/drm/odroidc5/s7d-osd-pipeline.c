@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
+#include <linux/align.h>
 #include <linux/bits.h>
 #include <linux/errno.h>
 #include <linux/types.h>
@@ -65,8 +66,9 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 		if (!secondary || layer->alpha != 256 ||
 		    layout->block_config != (BIT(30) | (5 << 8)) ||
 		    layout->alpha_config != 0x7fc2 ||
-		    layout->frame_addr != 0x00200000 || layout->stride != 64 ||
-		    layout->scope_x != (249 << 16) || layout->scope_y != (249 << 16))
+		    layout->frame_addr != 0x00200000 ||
+		    ((layout->scope_x | layout->scope_y) & 0xffff) ||
+		    layout->stride != ALIGN((layout->scope_x >> 16) + 1, 256) / 4)
 			return -EINVAL;
 	} else if ((layout->block_config & ~0xcU) != 0x8500 ||
 		   (layout->alpha_config != 0x7fc0 && layout->alpha_config != BIT(2))) {
