@@ -817,8 +817,13 @@ static void s7d_hdmi_enable(struct drm_bridge *bridge, struct drm_bridge_state *
 	if (!ret) {
 		h->phy_on = true;
 		h->audio_error = 0;
-		if (h->audio_valid && h->eld_valid)
-			s7d_hdmi_audio_apply(h);
+		h->audio_valid = false;
+		if (h->audio_clock_on && h->eld_valid) {
+			if (s7d_hdmi_audio_supported(h->eld, &h->audio_params))
+				h->audio_valid = !s7d_hdmi_audio_apply(h);
+			else
+				h->audio_error = -EINVAL;
+		}
 		s7d_crtc_link_ready(h->crtc);
 		schedule_work(&h->audio_notify);
 	}
