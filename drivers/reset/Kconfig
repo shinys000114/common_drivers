@@ -19,4 +19,11 @@ config RESET_MESON_S7D_AUDIO
 	  Provide the audio block reset lines through the audio controller's
 	  regmap, without resetting unrelated audio engines at probe time.
 
+config RESET_S7D_VPU
+	tristate "Amlogic S7D VPU local resets"
+	depends on REGMAP
+	help
+	  Provide local AFBC and arbiter reset levels through the VPU parent's
+	  regmap. Acquiring these reset lines does not change their state.
+
 endif
