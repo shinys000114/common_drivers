@@ -6,6 +6,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_blend.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
@@ -56,6 +57,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	int ret;
 
 	state->osd_valid = false;
+	state->video_valid = false;
 	state->layer.enabled = false;
 	if (!base->crtc) {
 		base->visible = false;
@@ -73,6 +75,13 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 						 plane->slot != S7D_PLANE_PRIMARY, false);
 	if (ret || !base->visible)
 		return ret;
+	if (plane->slot == S7D_PLANE_VIDEO) {
+		ret = s7d_video_build_state(base->fb, &base->src, plane->dma_mask,
+					    &state->video);
+		if (!ret)
+			state->video_valid = true;
+		return ret;
+	}
 	ret = s7d_osd_build_state(base->fb, &base->src, plane->dma_mask,
 				&state->layer.layout);
 	if (!ret) {
@@ -153,6 +162,9 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
 	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
+	static const u32 video_formats[] = { DRM_FORMAT_NV12, DRM_FORMAT_NV21 };
+	const u32 *plane_formats = formats;
+	unsigned int format_count = ARRAY_SIZE(formats);
 	struct s7d_plane *plane;
 	enum drm_plane_type type;
 	const char *name;
@@ -175,13 +187,20 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		name = "S7D OSD2 cursor";
 		zpos = 3;
 		break;
+	case S7D_PLANE_VIDEO:
+		type = DRM_PLANE_TYPE_OVERLAY;
+		name = "S7D VD1";
+		zpos = 1;
+		plane_formats = video_formats;
+		format_count = ARRAY_SIZE(video_formats);
+		break;
 	default:
 		return ERR_PTR(-EINVAL);
 	}
 
 	plane = drmm_universal_plane_alloc(drm, struct s7d_plane, base,
 					  possible_crtcs, &s7d_plane_funcs,
-					  formats, ARRAY_SIZE(formats), modifiers,
+					  plane_formats, format_count, modifiers,
 					  type, "%s", name);
 	if (IS_ERR(plane))
 		return ERR_CAST(plane);
@@ -190,6 +209,16 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	ret = drm_plane_create_zpos_immutable_property(&plane->base, zpos);
 	if (ret)
 		return ERR_PTR(ret);
+	if (slot == S7D_PLANE_VIDEO) {
+		ret = drm_plane_create_color_properties(&plane->base,
+			BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709),
+			BIT(DRM_COLOR_YCBCR_LIMITED_RANGE) | BIT(DRM_COLOR_YCBCR_FULL_RANGE),
+			DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE);
+		if (ret)
+			return ERR_PTR(ret);
+		drm_plane_helper_add(&plane->base, &s7d_plane_helper_funcs);
+		return &plane->base;
+	}
 	ret = drm_plane_create_alpha_property(&plane->base);
 	if (ret)
 		return ERR_PTR(ret);

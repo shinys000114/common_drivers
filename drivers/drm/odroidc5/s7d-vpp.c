@@ -37,6 +37,10 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x1dfe, 0x00110f1f, BIT(20) }, /* OSD2: no source */
 		/* Direct OSD memory path, no GFCD, AFBC or output exchange. */
 		{ 0x1a0e, BIT(14) | GENMASK(12, 9) | GENMASK(7, 0), 0 },
+		/* VD1 linear MIF, no DI/AFBC/filmgrain, preserving its clock byte. */
+		{ 0x1a0a, 0x007dff00, 0 },
+		{ 0x4870, GENMASK(1, 0), BIT(0) }, /* Filmgrain bypass */
+		{ 0x1dab, GENMASK(11, 0), 0x440 },
 		/* Bypass OSD/video Dolby paths, with unsigned 12-bit extension. */
 		{ 0x1a0c, GENMASK(7, 0), 0xf },
 		/* No OSD scaling; discard inherited interlace/filter enables. */
@@ -70,12 +74,16 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x32bd, GENMASK(1, 0), 0 }, /* POST matrix */
 		{ 0x39ad, GENMASK(1, 0), 0 }, /* POST2 matrix */
 		/* No colour enhancement, highlight, super-resolution or LUTs. */
-		{ 0x1d26, GENMASK(30, 28) | GENMASK(11, 6) | BIT(3) | BIT(1), BIT(7) },
+		{ 0x1d26, GENMASK(30, 28) | GENMASK(11, 6) | BIT(4) | BIT(3) | BIT(1),
+		  BIT(7) | BIT(6) },
 		{ 0x1d5f, BIT(16), 0 }, /* Matrix probe highlight */
 		{ 0x1d40, BIT(2) | BIT(0), 0 }, /* VADJ2/VADJ1 */
 		{ 0x1d6a, GENMASK(31, 30), 0 }, /* Gain/offset, immediate disable */
 		{ 0x1d91, GENMASK(3, 0), 0 }, /* SRSHARP0 */
 		{ 0x1d92, GENMASK(3, 0), 0 }, /* SRSHARP1 */
+		{ 0x5000, BIT(0), 0 }, /* S7D VSR/SAFA bypass */
+		{ 0x5204, BIT(0), 0 }, /* SAFA sharpness */
+		{ 0x500b, BIT(2), 0 }, /* VSR dither, preserve clear pulse */
 		{ 0x1da1, GENMASK(20, 18) | GENMASK(4, 2) | BIT(0), 0 },
 		{ 0x39d0, BIT(2) | BIT(0), 0 }, /* LUT3D, no VSYNC shadow */
 		{ 0x39d4, GENMASK(1, 0), 0 }, /* Pre-gamma */
@@ -88,16 +96,11 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x1d95, 0x3fff3fff, 0 }, /* Post unsigned/signed conversion */
 		{ 0x1dd9, GENMASK(29, 0), GENMASK(29, 0) }, /* Full-range clip top */
 		{ 0x1dda, GENMASK(29, 0), 0 }, /* Full-range clip bottom */
-		/* Scope packing differs from the MIF/blend input scopes. */
-		{ 0x1df5, 0x1fff1fff, width - 1 },
-		{ 0x1df6, 0x1fff1fff, height - 1 },
 		{ 0x1d21, 0x3fff3fff, (height << 16) | width },
 		{ 0x1da5, 0x1fff1fff, (width << 16) | height },
 		{ 0x1d22, GENMASK(15, 0), 0x0808 }, /* Pre/post hold lines */
 		/* 4096-pixel FIFO, not active width. Never replay force-go pulses. */
 		{ 0x1d27, U32_MAX, 0xfff01000 },
-		/* Select OSD1 only, postblend, no premultiplication. */
-		{ 0x1dfd, 0x00110f1f, BIT(20) | (3 << 8) },
 	};
 	unsigned int i;
 	u32 value;

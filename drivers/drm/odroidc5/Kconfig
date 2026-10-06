@@ -18,8 +18,10 @@ config AMLOGIC_C5_NATIVE_DISPLAY
 	  Build the S7D VPU execution path and native RGB8 TMDS bridge, with
 	  DRM EDID/SCDC helpers, CCF consumers and generic PHY ownership.
 	  Static device trees and built-in drivers only; unbind is suppressed.
-	  Register one CRTC, linear RGB primary and shared OSD2 cursor/overlay
-	  planes, and an HDMI connector. Cursor and overlay cannot be visible together.
+	  Register one CRTC, linear RGB primary, linear NV12/NV21 video and
+	  shared OSD2 cursor/overlay planes, and an HDMI connector.
+	  Cursor and RGB overlay cannot be visible together. Video is unscaled
+	  8-bit SDR with BT.601/709 limited/full-range conversion.
 	  Requires retained firmware output on S7D revision B, with SDR RGB8 TMDS up to 594 MHz.
 	  Do not enable with legacy media/display writers. System sleep supports
 	  s2idle after native takeover, retaining the shared display domain.

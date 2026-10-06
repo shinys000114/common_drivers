@@ -9,8 +9,8 @@
 #include "s7d-rdma.h"
 
 #define S7D_OSD_REV_B 0x0b
-#define S7D_OSD_SETUP_REG_COUNT 43
-#define S7D_OSD_UPDATE_REG_COUNT 20
+#define S7D_OSD_SETUP_REG_COUNT 40
+#define S7D_OSD_UPDATE_REG_COUNT 19
 
 struct s7d_osd_layer {
 	struct s7d_osd_state layout;

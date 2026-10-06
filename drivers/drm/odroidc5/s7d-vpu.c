@@ -218,7 +218,7 @@ static int s7d_vpu_stop(void *data)
 		v->vd1_draining = true;
 	}
 	/* Keep VD1 running until its state machines and READ0 have drained. */
-	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK | BIT(30) | BIT(0), VD1_FREE_CLK);
+	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK | BIT(30) | BIT(7) | BIT(0), VD1_FREE_CLK);
 	if (ret)
 		return ret;
 	ret = readl_poll_timeout(v->regs + VD1_GEN * 4, value,
@@ -297,8 +297,9 @@ static int check_handoff(struct s7d_vpu *v)
 	 * The provider profile excludes Linux video/capture and legacy writers.
 	 */
 	if ((vpu_read(v, OSD_PATH) & (BIT(14) | GENMASK(12, 9) | GENMASK(7, 0))) ||
-	    (vpu_read(v, VD1_PATH) & GENMASK(15, 8)) ||
-	    ((vpu_read(v, VD1_BLEND) | vpu_read(v, VD2_BLEND)) & 0x0f0f))
+	    (vpu_read(v, VD1_PATH) & 0x007dff00) ||
+	    (!v->touched &&
+	     ((vpu_read(v, VD1_BLEND) | vpu_read(v, VD2_BLEND)) & 0x0f0f)))
 		return -EOPNOTSUPP;
 	/* ENCP FIFO must use cts_vpu_clk, not an unowned vpu_clkc route. */
 	if (vpu_read(v, VENC_CLK) & BIT(0))
@@ -319,6 +320,36 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 
 	ret = s7d_vpp_setup(v->regs, state->base.adjusted_mode.hdisplay,
 			    state->base.adjusted_mode.vdisplay, &v->failed_reg);
+	if (ret)
+		return ret;
+	for (i = 0; i < S7D_VIDEO_SETUP_REG_COUNT; i++) {
+		const struct s7d_video_reg_setting *s = &state->video.setup[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {
+		const struct s7d_csc_reg *s = &state->csc.matrix[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < S7D_CSC_CONTROL_REG_COUNT; i++) {
+		const struct s7d_csc_reg *s = &state->csc.control[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	ret = vpu_update(v, 0x1d76, GENMASK(8, 0), 256);
+	if (ret)
+		return ret;
+	ret = vpu_update(v, 0x3968, GENMASK(23, 0), 0);
+	if (ret)
+		return ret;
+	ret = vpu_update(v, 0x3969, 0x1ffff9ff, 0);
 	if (ret)
 		return ret;
 	for (i = 0; i < S7D_ENCP_REG_COUNT; i++) {
@@ -368,7 +399,22 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 			return -EIO;
 		}
 	}
-	return 0;
+	for (i = 0; i < state->video.update_count; i++) {
+		ret = vpu_update(v, le32_to_cpu(state->video.update[i].reg), U32_MAX,
+				 le32_to_cpu(state->video.update[i].value));
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < S7D_POSTBLEND_REG_COUNT; i++) {
+		ret = vpu_update(v, le32_to_cpu(state->postblend.regs[i].reg), U32_MAX,
+				 le32_to_cpu(state->postblend.regs[i].value));
+		if (ret)
+			return ret;
+	}
+	v->vd1_enable = state->video.control.value & BIT(0);
+	return vpu_update(v, state->video.control.reg,
+			  state->video.control.mask | BIT(30),
+			  state->video.control.value & ~BIT(0));
 }
 
 static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
@@ -428,6 +474,9 @@ static int s7d_vpu_start(void *data)
 	enable_irq(v->rdma_irq);
 	v->rdma_enabled = true;
 	ret = vpu_update(v, ENCP_EN, BIT(0), BIT(0));
+	if (ret)
+		return ret;
+	ret = vpu_update(v, VD1_GEN, BIT(0), v->vd1_enable ? BIT(0) : 0);
 	if (ret)
 		return ret;
 	ret = vpu_update(v, OSD2_CTRL, BIT(0), v->osd2_enable ? BIT(0) : 0);

@@ -4,6 +4,7 @@
 #include <linux/jiffies.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -79,6 +80,32 @@ s7d_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode)
 	return s7d_encp_build_state(mode, &state);
 }
 
+static void s7d_crtc_build_update(struct s7d_crtc_state *state)
+{
+	unsigned int count = 0, i;
+
+	memcpy(state->update, state->osd.update, sizeof(state->osd.update));
+	count += S7D_OSD_UPDATE_REG_COUNT;
+	memcpy(state->update + count, state->video.update,
+	       state->video.update_count * sizeof(*state->update));
+	count += state->video.update_count;
+	for (i = 0; state->video.update_count && i < S7D_CSC_MATRIX_REG_COUNT; i++) {
+		state->update[count++] = (struct s7d_rdma_entry) {
+			.reg = cpu_to_le32(state->csc.matrix[i].reg),
+			.value = cpu_to_le32(state->csc.matrix[i].value),
+		};
+	}
+	memcpy(state->update + count, state->postblend.regs,
+	       sizeof(state->postblend.regs));
+	count += S7D_POSTBLEND_REG_COUNT;
+	/* Block the blend source before disabling fetch; enable after its setup. */
+	state->update[count++] = (struct s7d_rdma_entry) {
+		.reg = cpu_to_le32(state->video.control.reg),
+		.value = cpu_to_le32(state->video.control.value),
+	};
+	state->update_count = count;
+}
+
 static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
 {
 	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
@@ -86,6 +113,10 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct drm_plane *plane;
 	struct s7d_osd_layer layers[2] = {0};
+	const struct s7d_plane_state *video = NULL;
+	struct drm_rect video_dst;
+	enum drm_color_encoding encoding = DRM_COLOR_YCBCR_BT709;
+	enum drm_color_range range = DRM_COLOR_YCBCR_LIMITED_RANGE;
 	int ret;
 
 	state->valid = false;
@@ -119,12 +150,23 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		checked = to_s7d_plane_state(ps);
 		if (!ps->visible)
 			continue;
-		if (ps->crtc != crtc || !ps->fb || !checked->osd_valid)
+		if (ps->crtc != crtc || !ps->fb)
 			return -EINVAL;
 		slot = s7d_plane_slot(plane);
-		if (slot != S7D_PLANE_PRIMARY && layers[1].enabled)
-			return -ENOSPC;
-		layers[slot == S7D_PLANE_PRIMARY ? 0 : 1] = checked->layer;
+		if (slot == S7D_PLANE_VIDEO) {
+			if (!checked->video_valid)
+				return -EINVAL;
+			video = checked;
+			video_dst = ps->dst;
+			encoding = ps->color_encoding;
+			range = ps->color_range;
+		} else {
+			if (!checked->osd_valid)
+				return -EINVAL;
+			if (slot != S7D_PLANE_PRIMARY && layers[1].enabled)
+				return -ENOSPC;
+			layers[slot == S7D_PLANE_PRIMARY ? 0 : 1] = checked->layer;
+		}
 		state->buffers.fb[slot] = ps->fb;
 	}
 	if (!state->buffers.fb[S7D_PLANE_PRIMARY])
@@ -138,6 +180,19 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 				     base->adjusted_mode.vdisplay, layers, &state->osd);
 	if (ret)
 		return ret;
+	ret = s7d_video_build_pipeline(video ? &video->video : NULL,
+				       video ? &video_dst : NULL, &state->video);
+	if (ret)
+		return ret;
+	ret = s7d_csc_build_state(encoding, range, &state->csc);
+	if (ret)
+		return ret;
+	ret = s7d_postblend_build_state(base->adjusted_mode.hdisplay,
+		base->adjusted_mode.vdisplay, video ? &video_dst : NULL,
+		layers[1].enabled, &state->postblend);
+	if (ret)
+		return ret;
+	s7d_crtc_build_update(state);
 	state->pixel_rate = (unsigned long)base->adjusted_mode.clock * 1000;
 	ret = c->ops->check(c->data, state);
 	if (!ret)
@@ -370,8 +425,8 @@ static void s7d_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_state
 	ret = s7d_crtc_arm_event(c, &state->base, false);
 	if (ret)
 		goto fail;
-	ret = s7d_scanout_submit(c->scanout, &state->buffers, state->osd.update,
-				 S7D_OSD_UPDATE_REG_COUNT);
+	ret = s7d_scanout_submit(c->scanout, &state->buffers, state->update,
+				 state->update_count);
 	if (ret)
 		goto fail;
 	mutex_unlock(&c->mutex);

@@ -11,6 +11,7 @@
 #include <linux/string.h>
 
 #include "s7d-rdma.h"
+#include "s7d-csc.h"
 
 #define RDMA_START		0x1102
 #define RDMA_END		0x1103
@@ -113,6 +114,7 @@ int s7d_rdma_prepare(struct s7d_rdma *r)
 		r->fault = true;
 		ret = -EIO;
 	} else {
+		r->vd1_free_clk = rdma_read(r, 0x4800) & BIT(31);
 		r->fault = false;
 		r->ready = true;
 	}
@@ -120,8 +122,12 @@ int s7d_rdma_prepare(struct s7d_rdma *r)
 	return ret;
 }
 
-static bool osd_write_valid(u32 reg, u32 value)
+static bool display_write_valid(u32 reg, u32 value)
 {
+	u32 mask = s7d_csc_reg_mask(reg);
+
+	if (mask)
+		return !(value & ~mask);
 	switch (reg) {
 	case 0x1a1b:
 	case 0x1a3b:
@@ -138,6 +144,16 @@ static bool osd_write_valid(u32 reg, u32 value)
 	case 0x1a3d:
 	case 0x39b3:
 	case 0x39b4:
+	case 0x1df5:
+	case 0x1df6:
+	case 0x1df7:
+	case 0x1df8:
+	case 0x1d1c:
+	case 0x1d1d:
+	case 0x4803:
+	case 0x4804:
+	case 0x4805:
+	case 0x4806:
 		return !(value & ~0x1fff1fffU);
 	case 0x1a3e:
 	case 0x1a64:
@@ -154,8 +170,39 @@ static bool osd_write_valid(u32 reg, u32 value)
 		value |= BIT(17) | BIT(19);
 		return value == (0x807f4413 | BIT(25)) ||
 		       value == (0x80ff2413 | BIT(25));
+	case 0x1d1a:
+	case 0x1d1b:
+		return value < 4096;
+	case 0x1d20:
+		return (value >> 16) && (value >> 16) <= 4096 &&
+		       (value & 0xffff) && (value & 0xffff) <= 4096;
 	case 0x1dfe:
 		return value == BIT(20) || value == (BIT(20) | (4 << 8));
+	case 0x1dfb:
+		return value == BIT(16) || value == (BIT(16) | BIT(4) | BIT(0));
+	case 0x1dfc:
+		return value == (3 << 8);
+	case 0x1dfd:
+		return value == BIT(20) || value == (BIT(20) | (1 << 8));
+	case 0x4800:
+		return value == 0x38400052 || value == 0x38400053;
+	case 0x4819:
+		return value == 1 || value == 2;
+	case 0x4820:
+	case 0x4821:
+		return true;
+	case 0x4823:
+		return !(value & ~0x1fff1fffU) &&
+		       (value & 0x1fff) && (value >> 16);
+	case 0x4824:
+		return !(value & ~0x11fffU) && (value & BIT(16)) && (value & 0x1fff);
+	case 0x481e:
+		return (value >> 16) >= 2 && (value >> 16) <= 4096 &&
+		       !(value & BIT(16)) && (value & 0xffff) == (value >> 17);
+	case 0x1d01:
+		return value >= 2 && value <= 4096 && !(value & BIT(0));
+	case 0x1d02:
+		return value >= 2 && value <= 2160 && !(value & BIT(0));
 	default:
 		return false;
 	}
@@ -174,8 +221,8 @@ int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 		u32 reg = le32_to_cpu(entries[i].reg);
 		u32 value = le32_to_cpu(entries[i].value);
 
-		/* Replays before CPU masking must be idempotent OSD/postblend writes. */
-		if (!osd_write_valid(reg, value))
+		/* Replays before CPU masking must remain idempotent. */
+		if (!display_write_valid(reg, value))
 			return -EINVAL;
 	}
 
@@ -202,12 +249,23 @@ int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 		goto out;
 	}
 	/*
-	 * S7D executes OSD payload but does not self-mask RDMA_SRC1 from a
+	 * S7D executes the payload but does not self-mask RDMA_SRC1 from a
 	 * descriptor. Keep this immutable list until CPU masking and a verified
 	 * engine reset in the threaded IRQ. Delayed IRQs may replay these same
 	 * idempotent values; they must never fetch a reused table or old buffer.
 	 */
 	memcpy(r->table, entries, count * sizeof(*entries));
+	for (i = 0; i < count; i++) {
+		u32 reg = le32_to_cpu(entries[i].reg);
+		u32 value = le32_to_cpu(entries[i].value);
+		u32 mask = s7d_csc_reg_mask(reg);
+
+		if (mask)
+			value |= rdma_read(r, reg) & ~mask;
+		else if (reg == 0x4800)
+			value |= r->vd1_free_clk;
+		r->table[i].value = cpu_to_le32(value);
+	}
 	dma_wmb();
 	rdma_write(r, RDMA_START, lower_32_bits(r->dma));
 	rdma_write(r, RDMA_END, lower_32_bits(r->dma) +

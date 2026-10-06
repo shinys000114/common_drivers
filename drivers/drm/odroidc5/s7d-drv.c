@@ -109,7 +109,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	struct drm_encoder *encoder;
 	struct drm_bridge *bridge;
 	struct s7d_vpu_link link;
-	struct drm_plane *primary, *cursor, *overlay;
+	struct drm_plane *primary, *cursor, *overlay, *video;
 	struct drm_device *drm;
 	struct s7d_drm *display;
 	u8 major, revision;
@@ -177,6 +177,11 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	overlay = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_RGB);
 	if (IS_ERR(overlay)) {
 		ret = PTR_ERR(overlay);
+		goto fini_vpu;
+	}
+	video = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_VIDEO);
+	if (IS_ERR(video)) {
+		ret = PTR_ERR(video);
 		goto fini_vpu;
 	}
 	display->vpu.crtc = s7d_crtc_create(drm, primary, cursor, revision, &display->vpu.scanout,

@@ -7,6 +7,7 @@
 
 #include "s7d-osd.h"
 #include "s7d-osd-pipeline.h"
+#include "s7d-video.h"
 
 enum s7d_plane_slot {
 	S7D_PLANE_PRIMARY,
@@ -18,7 +19,9 @@ enum s7d_plane_slot {
 struct s7d_plane_state {
 	struct drm_plane_state base;
 	struct s7d_osd_layer layer;
+	struct s7d_video_state video;
 	bool osd_valid;
+	bool video_valid;
 };
 
 static inline struct s7d_plane_state *
