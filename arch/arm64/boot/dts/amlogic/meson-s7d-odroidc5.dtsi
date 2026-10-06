@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR MIT)
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 
+&vdin1_cma_reserved {
+	status = "disabled";
+};
+
 &gpu {
 	status = "disabled";
 };
