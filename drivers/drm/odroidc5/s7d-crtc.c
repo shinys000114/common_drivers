@@ -286,9 +286,6 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		      (after->plan.surface_mask == BIT(1) && primary_changed))))
 			base->mode_changed = true;
 	}
-	/* A fault requires a full disable/enable or link-recovery modeset. */
-	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
-		return -EIO;
 	if (base->mode.hdisplay != base->adjusted_mode.hdisplay ||
 	    base->mode.vdisplay != base->adjusted_mode.vdisplay)
 		return -EINVAL;
@@ -298,6 +295,15 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 				     base->adjusted_mode.vdisplay, layers, &state->osd);
 	if (ret)
 		return ret;
+	if (old && old->active &&
+	    (!s7d_osd_scaler_same(&state->osd.scalers[0],
+				 &to_s7d_crtc_state(old)->osd.scalers[0]) ||
+	     !s7d_osd_scaler_same(&state->osd.scalers[1],
+				 &to_s7d_crtc_state(old)->osd.scalers[1])))
+		base->mode_changed = true;
+	/* A fault requires a full disable/enable or link-recovery modeset. */
+	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
+		return -EIO;
 	ret = s7d_video_build_pipeline(video ? &video->video : NULL,
 				       video ? &video_dst : NULL, &state->video);
 	if (ret)

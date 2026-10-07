@@ -23,6 +23,8 @@ config AMLOGIC_C5_NATIVE_DISPLAY
 	  shared OSD2 cursor/overlay planes, and an HDMI connector.
 	  Cursor and RGB overlay cannot be visible together. Video is unscaled
 	  8-bit SDR with BT.601/709 limited/full-range conversion.
+	  Opaque linear RGB enlargement supports up to 4x. Only one plane
+	  can be enlarged at a time.
 	  Unscaled AFBC ABGR8888 supports a primary or opaque OSD2 overlay
 	  up to 4096x2160. An AFBC primary can use a linear OSD2 cursor or
 	  overlay. Only one AFBC surface is active; video is disabled with AFBC.

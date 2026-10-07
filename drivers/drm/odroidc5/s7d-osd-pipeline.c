@@ -71,11 +71,12 @@ static u32 linear_unpack(const struct s7d_osd_layer *layer)
 }
 
 static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
-		       bool secondary)
+		       bool secondary, struct s7d_osd_scaler_state *scaler)
 {
 	const struct s7d_osd_state *layout = &layer->layout;
 	const struct drm_rect *dst = &layer->dst;
 	u32 x_start, x_end, y_start, y_end;
+	int ret;
 
 	if (!layer->enabled)
 		return 0;
@@ -103,9 +104,15 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 	y_start = layout->scope_y & 0x1fff;
 	y_end = layout->scope_y >> 16;
 	if (x_end < x_start || y_end < y_start ||
-	    x_end - x_start + 1 != (u32)drm_rect_width(dst) ||
-	    y_end - y_start + 1 != (u32)drm_rect_height(dst) ||
 	    (x_end + 1) * 4 > layout->stride * 16)
+		return -EINVAL;
+	ret = s7d_osd_scaler_build(secondary, x_end - x_start + 1,
+				   y_end - y_start + 1, drm_rect_width(dst),
+				   drm_rect_height(dst), scaler);
+	if (ret)
+		return ret;
+	if (scaler->enabled &&
+	    (layer->afbc || layer->alpha != 256 || layout->alpha_config != 0x7fc0))
 		return -EINVAL;
 	return 0;
 }
@@ -118,7 +125,9 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 		.block_config = 0x8504, .stride = 4, .alpha_config = 0x7fc0,
 	};
 	const struct s7d_osd_state *primary;
+	struct s7d_osd_scaler_state scalers[2] = {0};
 	u32 h_scope, v_scope, secondary_h = 0x1fff1fff, secondary_v = 0x043a0439;
+	u32 primary_mif_h, primary_mif_v, secondary_mif_h = 0, secondary_mif_v = 0;
 	u32 size, blend = 0x807f4413 | BIT(25), alpha, secondary_ctrl = 0x00100004;
 
 	if (!layers || !state)
@@ -129,24 +138,38 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 	    (layers[0].afbc && layers[1].enabled && layers[1].afbc) ||
 	    !layers[0].enabled || layers[0].dst.x1 || layers[0].dst.y1 ||
 	    layers[0].dst.x2 != (int)width || layers[0].dst.y2 != (int)height ||
-	    check_layer(&layers[0], width, height, false) ||
-	    check_layer(&layers[1], width, height, true))
+	    check_layer(&layers[0], width, height, false, &scalers[0]) ||
+	    check_layer(&layers[1], width, height, true, &scalers[1]) ||
+	    (scalers[0].enabled && scalers[1].enabled) ||
+	    ((layers[0].afbc || (layers[1].enabled && layers[1].afbc)) &&
+	     (scalers[0].enabled || scalers[1].enabled)))
 		return -EINVAL;
 	primary = &layers[0].layout;
 	h_scope = (width - 1) << 16;
 	v_scope = (height - 1) << 16;
+	primary_mif_h = scalers[0].enabled ?
+		(((primary->scope_x >> 16) - (primary->scope_x & 0x1fff)) << 16) : h_scope;
+	primary_mif_v = scalers[0].enabled ?
+		(((primary->scope_y >> 16) - (primary->scope_y & 0x1fff)) << 16) : v_scope;
 	size = (height << 16) | width;
 	alpha = (layers[0].alpha << 20) | (256 << 11);
 	if (layers[1].enabled) {
 		secondary = layers[1].layout;
 		secondary_h = ((layers[1].dst.x2 - 1) << 16) | layers[1].dst.x1;
 		secondary_v = ((layers[1].dst.y2 - 1) << 16) | layers[1].dst.y1;
+		secondary_mif_h = scalers[1].enabled ?
+			(((secondary.scope_x >> 16) - (secondary.scope_x & 0x1fff)) << 16) :
+			secondary_h;
+		secondary_mif_v = scalers[1].enabled ?
+			(((secondary.scope_y >> 16) - (secondary.scope_y & 0x1fff)) << 16) :
+			secondary_v;
 		secondary_ctrl |= BIT(0);
 		/* Rev.B routes OSD2 through DIN3, with OSD4 as its alpha input. */
 		blend = (blend & ~GENMASK(15, 12)) | (2 << 12) | BIT(23);
 		alpha = (layers[0].alpha << 20) | (layers[1].alpha << 11);
 	}
 	*state = (struct s7d_osd_pipeline_state) {
+		.scalers = { scalers[0], scalers[1] },
 		.setup = {
 			REG(OSD1_FIFO_CTRL, 0x82840501),
 			REG(OSD1_PROT_CTRL, 0x80620200),
@@ -157,8 +180,8 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 			REG(OSD1_LINE_STRIDE, primary->stride),
 			REG(OSD1_BLK0_CFG_W1, primary->scope_x),
 			REG(OSD1_BLK0_CFG_W2, primary->scope_y),
-			REG(OSD1_BLK0_CFG_W3, h_scope),
-			REG(OSD1_BLK0_CFG_W4, v_scope),
+			REG(OSD1_BLK0_CFG_W3, primary_mif_h),
+			REG(OSD1_BLK0_CFG_W4, primary_mif_v),
 			REG(OSD1_DIMM_CTRL, 0),
 			REG(OSD2_FIFO_CTRL, 0x82840501),
 			REG(OSD2_PROT_CTRL, 0x80620200),
@@ -169,8 +192,8 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 			REG(OSD2_LINE_STRIDE, secondary.stride),
 			REG(OSD2_BLK0_CFG_W1, secondary.scope_x),
 			REG(OSD2_BLK0_CFG_W2, secondary.scope_y),
-			REG(OSD2_BLK0_CFG_W3, layers[1].enabled ? secondary_h : 0),
-			REG(OSD2_BLK0_CFG_W4, layers[1].enabled ? secondary_v : 0),
+			REG(OSD2_BLK0_CFG_W3, secondary_mif_h),
+			REG(OSD2_BLK0_CFG_W4, secondary_mif_v),
 			REG(OSD2_DIMM_CTRL, 0),
 			REG(OSD1_NORMAL_SWAP, 0x3210),
 			REG(OSD2_NORMAL_SWAP, 0x3210),
@@ -205,8 +228,8 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 			REG(OSD2_LINE_STRIDE, secondary.stride),
 			REG(OSD2_BLK0_CFG_W1, secondary.scope_x),
 			REG(OSD2_BLK0_CFG_W2, secondary.scope_y),
-			REG(OSD2_BLK0_CFG_W3, layers[1].enabled ? secondary_h : 0),
-			REG(OSD2_BLK0_CFG_W4, layers[1].enabled ? secondary_v : 0),
+			REG(OSD2_BLK0_CFG_W3, secondary_mif_h),
+			REG(OSD2_BLK0_CFG_W4, secondary_mif_v),
 			REG(OSD2_CTRL_STAT2, secondary.alpha_config),
 			REG(OSD2_MALI_UNPACK_CTRL, linear_unpack(&layers[1])),
 			REG(OSD_BLEND_DIN1_H, secondary_h),

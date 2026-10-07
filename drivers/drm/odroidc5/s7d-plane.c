@@ -56,6 +56,8 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 			   const struct drm_crtc_state *crtc_state)
 {
 	struct s7d_plane_state *state = to_s7d_plane_state(base);
+	int min_scale = DRM_PLANE_NO_SCALING;
+	bool can_scale, scaled;
 	int ret;
 
 	state->osd_valid = false;
@@ -73,12 +75,26 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	    (base->fb->width > 256 || base->fb->height > 256))
 		return -EINVAL;
 
+	can_scale = base->fb && base->fb->modifier == DRM_FORMAT_MOD_LINEAR &&
+		(plane->slot == S7D_PLANE_PRIMARY || plane->slot == S7D_PLANE_RGB);
+	if (can_scale)
+		min_scale /= S7D_OSD_SCALER_MAX_UPSCALE;
+	scaled = base->src_w != ((u64)base->crtc_w << 16) ||
+		base->src_h != ((u64)base->crtc_h << 16);
 	ret = drm_atomic_helper_check_plane_state(base, crtc_state,
-						 DRM_PLANE_NO_SCALING,
+						 min_scale,
 						 DRM_PLANE_NO_SCALING,
 						 plane->slot != S7D_PLANE_PRIMARY, false);
 	if (ret || !base->visible)
 		return ret;
+	if (scaled &&
+	    (base->src.x1 != base->src_x || base->src.y1 != base->src_y ||
+	     drm_rect_width(&base->src) != base->src_w ||
+	     drm_rect_height(&base->src) != base->src_h ||
+	     base->dst.x1 != base->crtc_x || base->dst.y1 != base->crtc_y ||
+	     drm_rect_width(&base->dst) != base->crtc_w ||
+	     drm_rect_height(&base->dst) != base->crtc_h))
+		return -EINVAL;
 	if (plane->slot == S7D_PLANE_VIDEO) {
 		ret = s7d_video_build_state(base->fb, &base->src, plane->dma_mask,
 					    &state->video);
@@ -112,6 +128,9 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 			return ret;
 		if (base->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE)
 			state->layer.layout.alpha_config = 0x7fc0;
+		if (scaled && (base->alpha != DRM_BLEND_ALPHA_OPAQUE ||
+			       state->layer.layout.alpha_config != 0x7fc0))
+			return -EINVAL;
 	}
 	state->layer.dst = base->dst;
 	state->layer.alpha = DIV_ROUND_CLOSEST(base->alpha, 256);
