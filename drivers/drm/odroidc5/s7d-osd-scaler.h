@@ -24,5 +24,8 @@ int s7d_osd_scaler_build(unsigned int index, u32 input_w, u32 input_h,
 			 struct s7d_osd_scaler_state *state);
 bool s7d_osd_scaler_same(const struct s7d_osd_scaler_state *a,
 			const struct s7d_osd_scaler_state *b);
+/* Caller owns the VPU and has stopped all fetchers, VENCs and RDMA. */
+int s7d_osd_scaler_setup(void __iomem *vcbus,
+			 const struct s7d_osd_scaler_state states[2], u32 *failed_reg);
 
 #endif

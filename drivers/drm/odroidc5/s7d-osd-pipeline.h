@@ -6,6 +6,7 @@
 #include <drm/drm_rect.h>
 
 #include "s7d-osd.h"
+#include "s7d-osd-scaler.h"
 #include "s7d-rdma.h"
 
 #define S7D_OSD_REV_B 0x0b
@@ -22,6 +23,7 @@ struct s7d_osd_layer {
 };
 
 struct s7d_osd_pipeline_state {
+	struct s7d_osd_scaler_state scalers[2];
 	struct s7d_rdma_entry setup[S7D_OSD_SETUP_REG_COUNT];
 	struct s7d_rdma_entry update[S7D_OSD_UPDATE_REG_COUNT];
 };

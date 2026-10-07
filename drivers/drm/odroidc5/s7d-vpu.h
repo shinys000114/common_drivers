@@ -59,6 +59,8 @@ struct s7d_vpu {
 	bool osd_draining;
 	u32 vd1_free_clk;
 	u32 osd_free_clk[2];
+	u32 osd_scaler_route_saved;
+	bool osd_scaler_route_owned;
 	u16 flip_start;
 	u16 flip_end;
 	u32 failed_reg;
