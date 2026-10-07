@@ -14,6 +14,7 @@
 #include <linux/sizes.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -825,9 +826,10 @@ static void s7d_vpu_report_error(void *data, int error)
 	if (!s7d_crtc_last_error(v->crtc))
 		return;
 	if (v->afbc.phase == S7D_AFBC_ERROR)
-		dev_err(v->dev, "AFBC failed: %d reg %#x phase %u gen %llu epoch %llu command %#x last raw %#x status %#x top %#x surfaces %#x readback %d expected %#x observed %#x\n",
+		dev_err(v->dev, "AFBC failed: %d reg %#x phase %u gen %llu epoch %llu ns %llu caller %pS command %#x last raw %#x status %#x top %#x surfaces %#x readback %d expected %#x observed %#x\n",
 			v->afbc.last_error, v->afbc.failed_reg, v->afbc.failed_phase,
 			v->afbc.failed_generation, v->afbc.failed_epoch,
+			v->afbc.failed_ns, (void *)v->afbc.failed_caller,
 			v->afbc_command_counter, v->afbc.observed.raw,
 			v->afbc.observed.status, v->afbc.observed.top,
 			v->afbc.observed.surfaces, v->afbc.failed_readback,
@@ -915,6 +917,36 @@ static int s7d_vpu_afbc_restart(struct s7d_vpu *v,
 	return 0;
 }
 
+static void s7d_vpu_afbc_report_first(struct s7d_vpu *v, bool restart,
+		bool vblank, enum s7d_rdma_result result,
+		u32 before, u32 after, u32 fifo, u32 fifo2, u32 vd1, u32 arbiter)
+{
+	struct s7d_scanout *s = &v->scanout;
+	unsigned long flags;
+	u64 active_generation, pending_generation, active_header, pending_header;
+	u32 active_fb, pending_fb;
+	unsigned int phase;
+
+	lockdep_assert_held(&v->frame_lock);
+	spin_lock_irqsave(&s->lock, flags);
+	active_generation = s->active.generation;
+	pending_generation = s->pending.generation;
+	active_header = s->active.afbc.plan.header_addr;
+	pending_header = s->pending.afbc.plan.header_addr;
+	active_fb = s->active.afbc.fb ? s->active.afbc.fb->base.id : 0;
+	pending_fb = s->pending.afbc.fb ? s->pending.afbc.fb->base.id : 0;
+	phase = s->phase;
+	spin_unlock_irqrestore(&s->lock, flags);
+	dev_err(v->dev, "AFBC first frame fault: %s vblank %u rdma %u ns %llu caller %pS owner %u active fb %u gen %llu header %#llx pending fb %u gen %llu header %#llx bound %u gen %llu header %#llx staged %u gen %llu header %#llx native before %#x after %#x fifo %#x fifo2 %#x vd1 %#x read0 %#x\n",
+		restart ? "restart" : "sample", vblank, result,
+		v->afbc.failed_ns, (void *)v->afbc.failed_caller, phase,
+		active_fb, active_generation, active_header,
+		pending_fb, pending_generation, pending_header,
+		v->afbc.bound_valid, v->afbc.generation, v->afbc.bound.header_addr,
+		v->afbc.pending_valid, v->afbc.pending_generation,
+		v->afbc.pending.header_addr, before, after, fifo, fifo2, vd1, arbiter);
+}
+
 static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 			      enum s7d_rdma_result result)
 {
@@ -922,10 +954,12 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	struct s7d_afbc_frame afbc_frame;
 	unsigned long flags;
 	u32 before, after, fifo, fifo2, vd1, arbiter;
+	bool afbc_error;
 	int ret;
 
 	/* An older IRQ sample must not overtake the threaded RDMA completion. */
 	spin_lock_irqsave(&v->frame_lock, flags);
+	afbc_error = v->afbc.phase == S7D_AFBC_ERROR;
 	before = vpu_read(v, ENCP_INFO_READ);
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
 	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
@@ -948,6 +982,9 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	};
 	ret = s7d_vpu_afbc_sample(v, result, &frame, &afbc_frame);
 	if (ret) {
+		if (!afbc_error && v->afbc.phase == S7D_AFBC_ERROR)
+			s7d_vpu_afbc_report_first(v, false, vblank, result,
+				before, after, fifo, fifo2, vd1, arbiter);
 		v->failed_reg = v->afbc.failed_reg;
 		result = S7D_RDMA_FAULT;
 	}
@@ -955,6 +992,8 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	s7d_crtc_irq(v->crtc, vblank, result, &frame);
 	ret = s7d_vpu_afbc_restart(v, &afbc_frame);
 	if (ret) {
+		s7d_vpu_afbc_report_first(v, true, vblank, result,
+			before, after, fifo, fifo2, vd1, arbiter);
 		v->failed_reg = v->afbc.failed_reg;
 		s7d_crtc_link_error(v->crtc, ret);
 	}

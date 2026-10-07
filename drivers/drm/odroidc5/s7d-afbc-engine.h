@@ -54,6 +54,8 @@ struct s7d_afbc_engine {
 	u64 last_start_sequence;
 	u64 failed_generation;
 	u64 failed_epoch;
+	u64 failed_ns;
+	unsigned long failed_caller;
 	enum s7d_afbc_engine_phase failed_phase;
 	u32 failed_reg;
 	u32 failed_expected;

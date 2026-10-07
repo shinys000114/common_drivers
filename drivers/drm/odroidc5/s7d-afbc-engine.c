@@ -2,7 +2,9 @@
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/bitops.h>
 #include <linux/errno.h>
+#include <linux/instruction_pointer.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
 
 #include "s7d-afbc-engine.h"
 
@@ -41,6 +43,8 @@ void s7d_afbc_engine_init(struct s7d_afbc_engine *e,
 int s7d_afbc_engine_fail(struct s7d_afbc_engine *e, int error, u32 reg)
 {
 	if (e->phase != S7D_AFBC_ERROR) {
+		e->failed_caller = _RET_IP_;
+		e->failed_ns = ktime_get_mono_fast_ns();
 		e->last_error = error < 0 ? error : -EIO;
 		e->failed_reg = reg;
 		e->failed_generation = e->phase == S7D_AFBC_RUNNING ||
