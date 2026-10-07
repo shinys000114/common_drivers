@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (c) 2026 Hardkernel Co., Ltd.
-ccflags-y += -I$(srctree)/$(src)
+ccflags-y += -I$(src)
 
 obj-$(CONFIG_AMLOGIC_C5_NATIVE_DISPLAY) += s7d-display.o
 s7d-display-y := s7d-drv.o s7d-hdmi.o s7d-hdmi-audio.o s7d-hdmi-io.o s7d-hdmi-ddc.o \
