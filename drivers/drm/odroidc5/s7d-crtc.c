@@ -71,7 +71,45 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 		return NULL;
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &state->base);
 	state->video_unchanged = false;
+	state->input_captured = false;
+	state->primary_submitted = false;
+	state->connector_submitted = false;
+	state->primary_dependency = false;
+	state->afbc_unchanged = false;
 	return &state->base;
+}
+
+void s7d_crtc_capture_input(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
+{
+	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
+	struct s7d_crtc_state *state;
+	struct drm_connector *connector;
+	struct drm_connector_state *connector_state;
+	int i;
+
+	if (!base || !s7d_crtc_is_native(crtc))
+		return;
+	state = to_s7d_crtc_state(base);
+	if (state->input_captured)
+		return;
+	state->input_captured = true;
+	state->primary_submitted = drm_atomic_get_new_plane_state(atomic, crtc->primary);
+	for_each_new_connector_in_state(atomic, connector, connector_state, i)
+		if (connector_state->crtc == crtc ||
+		    drm_atomic_get_old_connector_state(atomic, connector)->crtc == crtc)
+			state->connector_submitted = true;
+}
+
+void s7d_crtc_primary_dependency(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
+{
+	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
+	struct s7d_crtc_state *state;
+
+	if (!base || !s7d_crtc_is_native(crtc))
+		return;
+	state = to_s7d_crtc_state(base);
+	state->primary_dependency = true;
+	state->afbc_unchanged = false;
 }
 
 static enum drm_mode_status
@@ -161,6 +199,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 
 	state->valid = false;
 	state->video_unchanged = false;
+	state->afbc_unchanged = false;
 	state->buffers = (struct s7d_scanout_buffers) {0};
 	if (!base->active)
 		return 0;
@@ -272,6 +311,12 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (ret)
 		return ret;
 	s7d_crtc_check_video_update(state, old ? to_s7d_crtc_state(old) : NULL);
+	state->afbc_unchanged = state->input_captured &&
+		!state->primary_submitted && !state->connector_submitted &&
+		!state->primary_dependency && old && old->active &&
+		to_s7d_crtc_state(old)->valid &&
+		!drm_atomic_crtc_needs_modeset(base) &&
+		s7d_scanout_afbc_equal(&to_s7d_crtc_state(old)->buffers, &state->buffers);
 	s7d_crtc_build_update(state);
 	state->pixel_rate = (unsigned long)base->adjusted_mode.clock * 1000;
 	ret = c->ops->check(c->data, state);

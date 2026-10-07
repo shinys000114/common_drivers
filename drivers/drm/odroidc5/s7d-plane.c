@@ -13,6 +13,7 @@
 #include <drm/drm_plane_helper.h>
 
 #include "s7d-plane.h"
+#include "s7d-crtc.h"
 #include "s7d-fb.h"
 
 struct s7d_plane {
@@ -177,8 +178,19 @@ static void s7d_plane_atomic_update(struct drm_plane *plane,
 	 */
 }
 
+static int s7d_plane_prepare_fb(struct drm_plane *plane, struct drm_plane_state *state)
+{
+	bool dependency = state->fence;
+	int ret = drm_gem_plane_helper_prepare_fb(plane, state);
+
+	if (s7d_plane_is_primary(plane) && state->crtc &&
+	    (dependency || state->fence))
+		s7d_crtc_primary_dependency(state->crtc, state->state);
+	return ret;
+}
+
 static const struct drm_plane_helper_funcs s7d_plane_helper_funcs = {
-	.prepare_fb = drm_gem_plane_helper_prepare_fb,
+	.prepare_fb = s7d_plane_prepare_fb,
 	.atomic_check = s7d_plane_atomic_check,
 	.atomic_update = s7d_plane_atomic_update,
 };

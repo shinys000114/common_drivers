@@ -25,6 +25,7 @@ struct s7d_scanout_video {
 struct s7d_scanout_afbc {
 	struct drm_framebuffer *fb;
 	struct s7d_afbc_state plan;
+	u64 generation;
 };
 
 struct s7d_scanout_buffers {
@@ -69,6 +70,7 @@ struct s7d_scanout {
 	u8 vblank_field;
 	bool vblank_valid;
 	bool early_complete;
+	bool pending_afbc_unchanged;
 	bool wait_field;
 	bool fault;
 };
@@ -80,6 +82,8 @@ enum s7d_scanout_result {
 };
 
 void s7d_scanout_init(struct s7d_scanout *scanout, struct s7d_rdma *rdma);
+bool s7d_scanout_afbc_equal(const struct s7d_scanout_buffers *a,
+			    const struct s7d_scanout_buffers *b);
 bool s7d_scanout_video_equal(const struct s7d_scanout_buffers *a,
 			     const struct s7d_scanout_buffers *b);
 
@@ -109,13 +113,15 @@ void s7d_scanout_flush_retired(struct s7d_scanout *scanout);
 int s7d_scanout_submit_staged(struct s7d_scanout *scanout,
 			     const struct s7d_scanout_buffers *buffers,
 			     const struct s7d_rdma_entry *entries, unsigned int count,
-			     bool video_unchanged,
+			     bool video_unchanged, bool afbc_unchanged,
 			     int (*stage)(void *data,
 				const struct s7d_scanout_buffers *active,
 				const struct s7d_scanout_buffers *candidate,
 				u64 generation),
 			     int (*cancel)(void *data, u64 generation), void *data);
 u64 s7d_scanout_pending_generation(struct s7d_scanout *scanout);
+u64 s7d_scanout_pending_afbc_generation(struct s7d_scanout *scanout);
+bool s7d_scanout_afbc_unchanged(struct s7d_scanout *scanout);
 int s7d_scanout_afbc_started(struct s7d_scanout *scanout, u64 generation, u64 epoch);
 
 /*

@@ -7,6 +7,7 @@
 
 #include "s7d-scanout.h"
 #include "s7d-plane.h"
+#include "s7d-afbc-engine.h"
 
 static bool buffers_present(const struct s7d_scanout_buffers *buffers)
 {
@@ -43,6 +44,15 @@ static bool afbc_owned(const struct s7d_scanout_buffers *buffers)
 	else
 		return false;
 	return buffers->fb[slot] == buffers->afbc.fb;
+}
+
+bool s7d_scanout_afbc_equal(const struct s7d_scanout_buffers *a,
+			    const struct s7d_scanout_buffers *b)
+{
+	return afbc_owned(a) && afbc_owned(b) &&
+		a->afbc.plan.surface_mask == BIT(0) && a->afbc.fb == b->afbc.fb &&
+		s7d_afbc_same_layout(&a->afbc.plan, &b->afbc.plan) &&
+		a->afbc.plan.header_addr == b->afbc.plan.header_addr;
 }
 
 bool s7d_scanout_video_equal(const struct s7d_scanout_buffers *a,
@@ -134,7 +144,9 @@ int s7d_scanout_begin_initial(struct s7d_scanout *s,
 		buffers_get(buffers);
 		s->pending = *buffers;
 		s->pending.generation = ++s->generation;
+		s->pending.afbc.generation = buffers->afbc.fb ? s->pending.generation : 0;
 		s->pending_afbc_epoch = 0;
+		s->pending_afbc_unchanged = false;
 		s->phase = S7D_SCANOUT_INITIAL;
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
@@ -176,6 +188,29 @@ u64 s7d_scanout_pending_generation(struct s7d_scanout *s)
 	return generation;
 }
 
+u64 s7d_scanout_pending_afbc_generation(struct s7d_scanout *s)
+{
+	unsigned long flags;
+	u64 generation;
+
+	spin_lock_irqsave(&s->lock, flags);
+	generation = s->pending.afbc.fb && !s->pending_afbc_unchanged ?
+		s->pending.afbc.generation : 0;
+	spin_unlock_irqrestore(&s->lock, flags);
+	return generation;
+}
+
+bool s7d_scanout_afbc_unchanged(struct s7d_scanout *s)
+{
+	unsigned long flags;
+	bool unchanged;
+
+	spin_lock_irqsave(&s->lock, flags);
+	unchanged = s->pending_afbc_unchanged;
+	spin_unlock_irqrestore(&s->lock, flags);
+	return unchanged;
+}
+
 int s7d_scanout_afbc_started(struct s7d_scanout *s, u64 generation, u64 epoch)
 {
 	unsigned long flags;
@@ -184,8 +219,8 @@ int s7d_scanout_afbc_started(struct s7d_scanout *s, u64 generation, u64 epoch)
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->fault) {
 		ret = -EIO;
-	} else if (!epoch || !generation || generation != s->pending.generation ||
-		   !afbc_owned(&s->pending) ||
+	} else if (!epoch || !generation || generation != s->pending.afbc.generation ||
+		   s->pending_afbc_unchanged || !afbc_owned(&s->pending) ||
 		   (s->phase != S7D_SCANOUT_INITIAL && s->phase != S7D_SCANOUT_VBLANK)) {
 		ret = -EINVAL;
 	} else if (s->pending_afbc_epoch && s->pending_afbc_epoch != epoch) {
@@ -200,7 +235,7 @@ int s7d_scanout_afbc_started(struct s7d_scanout *s, u64 generation, u64 epoch)
 int s7d_scanout_submit_staged(struct s7d_scanout *s,
 			     const struct s7d_scanout_buffers *buffers,
 			     const struct s7d_rdma_entry *entries, unsigned int count,
-			     bool video_unchanged,
+			     bool video_unchanged, bool afbc_unchanged,
 			     int (*stage)(void *data,
 				const struct s7d_scanout_buffers *active,
 				const struct s7d_scanout_buffers *candidate,
@@ -227,7 +262,9 @@ int s7d_scanout_submit_staged(struct s7d_scanout *s,
 	}
 	/* AFBC entry and exit require a stopped, fully prepared pipeline. */
 	if (!!s->active.afbc.fb != !!buffers->afbc.fb ||
-	    (video_unchanged && !s7d_scanout_video_equal(&s->active, buffers))) {
+	    (video_unchanged && !s7d_scanout_video_equal(&s->active, buffers)) ||
+	    (afbc_unchanged && (!s->active.afbc.generation ||
+			       !s7d_scanout_afbc_equal(&s->active, buffers)))) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -237,6 +274,8 @@ int s7d_scanout_submit_staged(struct s7d_scanout *s,
 	}
 	candidate = *buffers;
 	candidate.generation = ++s->generation;
+	candidate.afbc.generation = !candidate.afbc.fb ? 0 :
+		(afbc_unchanged ? s->active.afbc.generation : candidate.generation);
 	buffers_get(&candidate);
 	if (stage) {
 		ret = stage(data, &s->active, &candidate, candidate.generation);
@@ -249,12 +288,13 @@ int s7d_scanout_submit_staged(struct s7d_scanout *s,
 		goto rollback;
 	s->pending = candidate;
 	s->pending_afbc_epoch = 0;
+	s->pending_afbc_unchanged = afbc_unchanged;
 	s->phase = S7D_SCANOUT_RDMA;
 	s->vblank_valid = false;
 	s->early_complete = false;
 	goto out;
 rollback:
-	if (cancel && cancel(data, candidate.generation)) {
+	if (cancel && !afbc_unchanged && cancel(data, candidate.generation)) {
 		/* An uncertain stage still owns its header and framebuffer. */
 		s->pending = candidate;
 		s->pending_afbc_epoch = 0;
@@ -280,7 +320,7 @@ int s7d_scanout_submit(struct s7d_scanout *s,
 
 	s7d_scanout_flush_retired(s);
 	ret = s7d_scanout_submit_staged(s, buffers, entries, count, video_unchanged,
-				       NULL, NULL, NULL);
+				       false, NULL, NULL, NULL);
 	if (ret)
 		s7d_scanout_flush_retired(s);
 	return ret;
@@ -310,7 +350,8 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 		s->phase = S7D_SCANOUT_VBLANK;
 		s->applied_field = frame->field;
 		s->wait_field = true;
-		s->early_complete = frame->early && !s->pending.afbc.fb;
+		s->early_complete = frame->early &&
+			(!s->pending.afbc.fb || s->pending_afbc_unchanged);
 	}
 	if (s->phase != S7D_SCANOUT_VBLANK)
 		goto out;
@@ -325,10 +366,11 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 		goto out;
 	}
 	if (s->pending.afbc.fb &&
-	    (!vblank || !frame->idle || !frame->afbc_gate ||
-	     !s->pending_afbc_epoch ||
-	     frame->afbc_completed_generation != s->pending.generation ||
-	     frame->afbc_completed_epoch != s->pending_afbc_epoch))
+	    (!frame->afbc_gate ||
+	     frame->afbc_completed_generation != s->pending.afbc.generation ||
+	     (!s->pending_afbc_unchanged &&
+	      (!vblank || !frame->idle || !s->pending_afbc_epoch ||
+	       frame->afbc_completed_epoch != s->pending_afbc_epoch))))
 		goto out;
 	if (!buffers_present(&s->pending) || buffers_present(&s->retired)) {
 		s->fault = true;
@@ -339,6 +381,7 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 	s->active = s->pending;
 	s->pending = (struct s7d_scanout_buffers) {0};
 	s->pending_afbc_epoch = 0;
+	s->pending_afbc_unchanged = false;
 	s->phase = S7D_SCANOUT_IDLE;
 	if (buffers_present(&s->retired))
 		schedule_work(&s->retire_work);
@@ -376,6 +419,7 @@ int s7d_scanout_quiesce(struct s7d_scanout *s)
 	s->pending = (struct s7d_scanout_buffers) {0};
 	s->phase = S7D_SCANOUT_STOPPED;
 	s->pending_afbc_epoch = 0;
+	s->pending_afbc_unchanged = false;
 	s->wait_field = false;
 	s->fault = false;
 	spin_unlock_irqrestore(&s->lock, flags);

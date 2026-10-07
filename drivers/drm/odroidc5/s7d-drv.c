@@ -72,10 +72,26 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 {
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *crtc_state;
+	struct drm_plane *plane;
+	struct drm_plane_state *old_plane_state, *new_plane_state;
 	unsigned int checked_modesets = 0;
 	bool late_modeset = false;
 	int i, ret;
 
+	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
+		if (old_plane_state->crtc) {
+			crtc_state = drm_atomic_get_crtc_state(state, old_plane_state->crtc);
+			if (IS_ERR(crtc_state))
+				return PTR_ERR(crtc_state);
+		}
+		if (new_plane_state->crtc) {
+			crtc_state = drm_atomic_get_crtc_state(state, new_plane_state->crtc);
+			if (IS_ERR(crtc_state))
+				return PTR_ERR(crtc_state);
+		}
+	}
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
+		s7d_crtc_capture_input(crtc, state);
 	/* Cursor updates also require VSYNC RDMA completion and buffer retirement. */
 	state->legacy_cursor_update = false;
 	ret = drm_atomic_helper_check_modeset(drm, state);

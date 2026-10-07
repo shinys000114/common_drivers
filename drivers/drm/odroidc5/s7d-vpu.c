@@ -241,9 +241,17 @@ static int s7d_vpu_afbc_stage(void *data,
 	if (!candidate->afbc.fb && !active->afbc.fb)
 		return v->afbc_enabled ? -EIO : 0;
 	if (!v->afbc_enabled || !candidate->afbc.fb || !active->afbc.fb ||
-	    !e->bound_valid || e->generation != active->generation ||
+	    !e->bound_valid || e->generation != active->afbc.generation ||
 	    !s7d_afbc_same_layout(&e->bound, &active->afbc.plan) ||
 	    e->bound.header_addr != active->afbc.plan.header_addr)
+		return s7d_afbc_engine_fail(e, -EIO, AFBC_SURFACES);
+	if (candidate->afbc.generation == active->afbc.generation) {
+		if (e->phase != S7D_AFBC_RUNNING || e->pending_valid ||
+		    !s7d_scanout_afbc_equal(active, candidate))
+			return s7d_afbc_engine_fail(e, -EIO, AFBC_SURFACES);
+		return 0;
+	}
+	if (candidate->afbc.generation != generation)
 		return s7d_afbc_engine_fail(e, -EIO, AFBC_SURFACES);
 	return s7d_afbc_engine_stage(e, &candidate->afbc.plan, generation);
 }
@@ -266,7 +274,8 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 	s7d_scanout_flush_retired(&v->scanout);
 	spin_lock_irqsave(&v->frame_lock, flags);
 	ret = s7d_scanout_submit_staged(&v->scanout, &state->buffers, state->update,
-		state->update_count, state->video_unchanged, s7d_vpu_afbc_stage,
+		state->update_count, state->video_unchanged, state->afbc_unchanged,
+		s7d_vpu_afbc_stage,
 		s7d_vpu_afbc_cancel, v);
 	spin_unlock_irqrestore(&v->frame_lock, flags);
 	return ret;
@@ -751,7 +760,7 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 		return ret;
 	if (state->buffers.afbc.fb) {
 		const struct s7d_afbc_state *p = &state->buffers.afbc.plan;
-		u64 generation = s7d_scanout_pending_generation(&v->scanout);
+		u64 generation = s7d_scanout_pending_afbc_generation(&v->scanout);
 
 		ret = s7d_vpu_afbc_resets(v);
 		if (ret)
@@ -879,15 +888,16 @@ static int s7d_vpu_afbc_sample(struct s7d_vpu *v,
 		ret = s7d_afbc_engine_sample(&v->afbc, afbc_frame, &o);
 	if (ret < 0)
 		return ret;
-	if (result == S7D_RDMA_COMPLETE) {
+	if (result == S7D_RDMA_COMPLETE && !s7d_scanout_afbc_unchanged(&v->scanout)) {
 		ret = s7d_afbc_engine_rdma_drained(&v->afbc,
-				 s7d_scanout_pending_generation(&v->scanout));
+				 s7d_scanout_pending_afbc_generation(&v->scanout));
 		if (ret)
 			return s7d_afbc_engine_fail(&v->afbc, ret, 0);
 	}
 	frame->afbc_completed_generation = v->afbc.completed_generation;
 	frame->afbc_completed_epoch = v->afbc.completed_generation_epoch;
-	frame->early = false;
+	if (!s7d_scanout_afbc_unchanged(&v->scanout))
+		frame->early = false;
 	return 0;
 }
 
@@ -907,7 +917,7 @@ static int s7d_vpu_afbc_restart(struct s7d_vpu *v,
 		return s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
 	s7d_vpu_afbc_arm_timeout(v);
 	if (v->afbc.generation != previous_generation) {
-		generation = s7d_scanout_pending_generation(&v->scanout);
+		generation = s7d_scanout_pending_afbc_generation(&v->scanout);
 		if (!generation || generation != v->afbc.generation)
 			return s7d_afbc_engine_fail(&v->afbc, -EIO, 0);
 		ret = s7d_scanout_afbc_started(&v->scanout, generation, v->afbc.epoch);
@@ -924,6 +934,7 @@ static void s7d_vpu_afbc_report_first(struct s7d_vpu *v, bool restart,
 	struct s7d_scanout *s = &v->scanout;
 	unsigned long flags;
 	u64 active_generation, pending_generation, active_header, pending_header;
+	u64 active_afbc_generation, pending_afbc_generation;
 	u32 active_fb, pending_fb;
 	unsigned int phase;
 
@@ -931,17 +942,19 @@ static void s7d_vpu_afbc_report_first(struct s7d_vpu *v, bool restart,
 	spin_lock_irqsave(&s->lock, flags);
 	active_generation = s->active.generation;
 	pending_generation = s->pending.generation;
+	active_afbc_generation = s->active.afbc.generation;
+	pending_afbc_generation = s->pending.afbc.generation;
 	active_header = s->active.afbc.plan.header_addr;
 	pending_header = s->pending.afbc.plan.header_addr;
 	active_fb = s->active.afbc.fb ? s->active.afbc.fb->base.id : 0;
 	pending_fb = s->pending.afbc.fb ? s->pending.afbc.fb->base.id : 0;
 	phase = s->phase;
 	spin_unlock_irqrestore(&s->lock, flags);
-	dev_err(v->dev, "AFBC first frame fault: %s vblank %u rdma %u ns %llu caller %pS owner %u active fb %u gen %llu header %#llx pending fb %u gen %llu header %#llx bound %u gen %llu header %#llx staged %u gen %llu header %#llx native before %#x after %#x fifo %#x fifo2 %#x vd1 %#x read0 %#x\n",
+	dev_err(v->dev, "AFBC first frame fault: %s vblank %u rdma %u ns %llu caller %pS owner %u active fb %u gen %llu afbc gen %llu header %#llx pending fb %u gen %llu afbc gen %llu header %#llx bound %u gen %llu header %#llx staged %u gen %llu header %#llx native before %#x after %#x fifo %#x fifo2 %#x vd1 %#x read0 %#x\n",
 		restart ? "restart" : "sample", vblank, result,
 		v->afbc.failed_ns, (void *)v->afbc.failed_caller, phase,
-		active_fb, active_generation, active_header,
-		pending_fb, pending_generation, pending_header,
+		active_fb, active_generation, active_afbc_generation, active_header,
+		pending_fb, pending_generation, pending_afbc_generation, pending_header,
 		v->afbc.bound_valid, v->afbc.generation, v->afbc.bound.header_addr,
 		v->afbc.pending_valid, v->afbc.pending_generation,
 		v->afbc.pending.header_addr, before, after, fifo, fifo2, vd1, arbiter);
