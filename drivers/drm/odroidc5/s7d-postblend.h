@@ -19,7 +19,8 @@ struct s7d_postblend_state {
  * errors leave state unchanged.
  */
 int s7d_postblend_build_state(u32 width, u32 height,
-			     const struct drm_rect *video_dst, bool osd2_enabled,
+			     const struct drm_rect *video_dst,
+			     u32 video_width, u32 video_height, bool osd2_enabled,
 			     struct s7d_postblend_state *state);
 
 #endif

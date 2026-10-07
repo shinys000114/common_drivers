@@ -77,9 +77,7 @@ static int check_layout(const struct s7d_video_state *layout,
 	chroma_y = ((y_end >> 1) << 16) | (y_start >> 1);
 	*width = x_end - x_start + 1;
 	*height = y_end - y_start + 1;
-	if (layout->scope_x[1] != chroma_x || layout->scope_y[1] != chroma_y ||
-	    *width != (u32)drm_rect_width(dst) ||
-	    *height != (u32)drm_rect_height(dst))
+	if (layout->scope_x[1] != chroma_x || layout->scope_y[1] != chroma_y)
 		return -EINVAL;
 	return 0;
 }
@@ -90,7 +88,7 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 {
 	/*
 	 * Sources: video_hw.c S7D selection, vd1_set_dcu(), vd_set_blk_mode(),
-	 * vd_mif_setting() and vd1_scaler_setting();
+	 * vd_mif_setting() and video_safa.c;
 	 * S905X5M tables 9-1326..1353, 9-1454..1459 and 9-1678.
 	 * The PDF's GEN2/GEN3/FMT addresses and NV selectors disagree with the
 	 * selected S7D source; use its SC2 MIF/T7 linear register arrays.
@@ -130,6 +128,9 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 		return 0;
 	}
 	if (check_layout(layout, dst, &width, &height))
+		return -EINVAL;
+	if (s7d_video_scaler_build(width, height, drm_rect_width(dst),
+				   drm_rect_height(dst), &next.scaler))
 		return -EINVAL;
 	color = layout->format == DRM_FORMAT_NV12 ? 2 : 1;
 	/* SC2/T7 linear access requires STRIDE1[16], outside the stride. */

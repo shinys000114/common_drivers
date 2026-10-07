@@ -274,6 +274,14 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	     (state->buffers.fb[S7D_PLANE_CURSOR] &&
 	      state->buffers.afbc.plan.surface_mask != BIT(0))))
 		return -EINVAL;
+	ret = s7d_video_build_pipeline(video ? &video->video : NULL,
+				       video ? &video_dst : NULL, &state->video);
+	if (ret)
+		return ret;
+	if (old && old->active &&
+	    !s7d_video_scaler_same_config(&to_s7d_crtc_state(old)->video.scaler,
+					  &state->video.scaler))
+		base->mode_changed = true;
 	/* Entry, owner, layout and alpha-route changes require stopped preparation. */
 	if (old && old->active) {
 		const struct s7d_scanout_afbc *before = &to_s7d_crtc_state(old)->buffers.afbc;
@@ -295,6 +303,9 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 				     base->adjusted_mode.vdisplay, layers, &state->osd);
 	if (ret)
 		return ret;
+	if (state->video.scaler.enabled &&
+	    (state->osd.scalers[0].enabled || state->osd.scalers[1].enabled))
+		return -EINVAL;
 	if (old && old->active &&
 	    (!s7d_osd_scaler_same(&state->osd.scalers[0],
 				 &to_s7d_crtc_state(old)->osd.scalers[0]) ||
@@ -304,15 +315,12 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	/* A fault requires a full disable/enable or link-recovery modeset. */
 	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
 		return -EIO;
-	ret = s7d_video_build_pipeline(video ? &video->video : NULL,
-				       video ? &video_dst : NULL, &state->video);
-	if (ret)
-		return ret;
 	ret = s7d_csc_build_state(encoding, range, &state->csc);
 	if (ret)
 		return ret;
 	ret = s7d_postblend_build_state(base->adjusted_mode.hdisplay,
 		base->adjusted_mode.vdisplay, video ? &video_dst : NULL,
+		state->video.scaler.src_width, state->video.scaler.src_height,
 		layers[1].enabled, &state->postblend);
 	if (ret)
 		return ret;
