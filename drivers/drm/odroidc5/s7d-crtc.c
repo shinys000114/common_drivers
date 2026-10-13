@@ -167,6 +167,11 @@ static void s7d_crtc_check_video_update(struct s7d_crtc_state *state,
 		&state->video, &state->csc, &state->postblend);
 	s7d_crtc_snapshot_video(&state->buffers.video2, state->buffers.fb[S7D_PLANE_VIDEO2],
 		&state->video2, &state->csc2, &state->postblend);
+	/* VD2 PPS presence and input dimensions are prepared while stopped. */
+	if (old && old->valid && old->base.active &&
+	    (state->video2.scaler.src_width != old->video2.scaler.src_width ||
+	     state->video2.scaler.src_height != old->video2.scaler.src_height))
+		state->base.mode_changed = true;
 	if (old && old->valid && old->base.active &&
 	    ((state->buffers.afbc.fb && state->buffers.video.fb) ||
 	     (old->buffers.afbc.fb && old->buffers.video.fb)) &&

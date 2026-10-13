@@ -13,6 +13,7 @@
 #define S7D_VIDEO_SETUP_REG_COUNT 14
 #define S7D_VIDEO_UPDATE_REG_COUNT 12
 #define S7D_VIDEO2_UPDATE_REG_COUNT 11
+#define S7D_VIDEO2_PPS_SETUP_REG_COUNT 25
 
 /* The only inherited GEN field that may enter a replay descriptor. */
 #define S7D_VIDEO_GEN_REPLAY_PRESERVE_MASK BIT(31)
@@ -29,6 +30,11 @@ struct s7d_video_pipeline_state {
 	unsigned int update_count;
 	struct s7d_video_reg_setting control;
 	struct s7d_video_scaler_state scaler;
+};
+
+struct s7d_video2_pps_state {
+	struct s7d_video_reg_setting setup[S7D_VIDEO2_PPS_SETUP_REG_COUNT];
+	struct s7d_video_reg_setting control;
 };
 
 /*
@@ -48,5 +54,9 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
 			       const struct drm_rect *dst,
 			       struct s7d_video_pipeline_state *out);
+
+/* Pure 1:1 VD2 PPS plan; apply only with VENC and both VD fetches stopped. */
+int s7d_video_build_vd2_pps(u32 width, u32 height,
+			  struct s7d_video2_pps_state *out);
 
 #endif

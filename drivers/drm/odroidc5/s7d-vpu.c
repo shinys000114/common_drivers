@@ -772,6 +772,33 @@ static int program_video_scaler(struct s7d_vpu *v,
 	return vpu_update(v, state->control.reg, state->control.mask, state->control.value);
 }
 
+static int program_video2_pps(struct s7d_vpu *v,
+			      const struct s7d_video_pipeline_state *video)
+{
+	struct s7d_video2_pps_state pps;
+	unsigned int i;
+	int ret;
+
+	if (!video->update_count)
+		return 0;
+	ret = s7d_video_build_vd2_pps(video->scaler.src_width,
+				    video->scaler.src_height, &pps);
+	if (ret)
+		return ret;
+	/* Fetch and VENC are stopped; close the PPS before changing geometry. */
+	ret = vpu_update(v, pps.control.reg, pps.control.mask, 0);
+	if (ret)
+		return ret;
+	for (i = 0; i < S7D_VIDEO2_PPS_SETUP_REG_COUNT; i++) {
+		const struct s7d_video_reg_setting *s = &pps.setup[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	return vpu_update(v, pps.control.reg, pps.control.mask, pps.control.value);
+}
+
 static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 {
 	/* S7D VENC supplies BRG; rotate to RGB before the HDMI formatter. */
@@ -799,6 +826,9 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 			return ret;
 	}
 	ret = program_video_scaler(v, &state->video.scaler);
+	if (ret)
+		return ret;
+	ret = program_video2_pps(v, &state->video2);
 	if (ret)
 		return ret;
 	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {
