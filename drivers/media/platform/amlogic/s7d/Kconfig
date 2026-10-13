@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config VIDEO_AMLOGIC_S7D
+	tristate "Amlogic S7D stateful H.264 decoder"
+	depends on ARM64 && OF && VIDEO_DEV
+	depends on COMMON_CLK && PM && PM_GENERIC_DOMAINS && RESET_CONTROLLER
+	depends on DMA_CMA && OF_RESERVED_MEM
+	depends on AMLOGIC_TEE && AMLOGIC_OPTEE && !AMLOGIC_MEDIA_ENABLE
+	depends on AMLOGIC_S7D_VIDEO_FIRMWARE
+	select MFD_SYSCON
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_VMALLOC
+	help
+	  Standard V4L2 memory-to-memory interface for the S7D VDEC engine.
+	  The initial H.264 path uses the Amlogic TEE firmware service,
+	  vmalloc input and 32-bit coherent capture buffers on the codec DMA
+	  device.
+

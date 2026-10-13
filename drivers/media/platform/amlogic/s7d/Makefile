@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+obj-$(CONFIG_VIDEO_AMLOGIC_S7D) += s7d-vdec.o
+
+s7d-vdec-y := \
+	s7d-vdec-platform.o \
+	h264/s7d-h264-backend.o \
+	common/s7d-codec-session.o \
+	common/s7d-codec-vb2.o \
+	common/s7d-codec-memory.o \
+	common/s7d-codec-dos.o \
+	common/s7d-codec-firmware.o \
+	h264/s7d-vdec-runtime.o \
+	common/s7d-codec-layout.o \
+	h264/s7d-h264-layout.o \
+	h264/s7d-h264-protocol.o \
+	h264/s7d-h264-context.o \
+	h264/s7d-h264-input.o \
+	h264/s7d-h264-dpb.o \
+	h264/s7d-h264-picture-snapshot.o \
+	h264/s7d-h264-capture.o \
+	h264/s7d-h264-picture-hw.o \
+	h264/s7d-h264-mailbox.o \
+	common/s7d-v4l2.o \
+	common/s7d-v4l2-device.o
+
