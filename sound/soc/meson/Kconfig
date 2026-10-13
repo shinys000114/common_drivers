@@ -10,3 +10,9 @@ config SND_SOC_MESON_S7D_HDMI_AUDIO
 	  Each output owns a fixed FRDDR channel and its output engine.
 	  Uses the native audio clock and reset providers and shared regmap.
 	  Connect the CPU DAIs to codecs through an ASoC sound card.
+
+config SND_SOC_MESON_S7D_T9015
+	tristate "Amlogic S7D T9015 stereo DAC"
+	depends on MFD_MESON_S7D_AUDIO && COMMON_CLK_MESON_S7D_AUDIO
+	help
+	  Minimal playback support for the on-chip stereo analog codec.
