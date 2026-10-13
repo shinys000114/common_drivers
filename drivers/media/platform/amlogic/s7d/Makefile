@@ -26,3 +26,11 @@ s7d-vdec-y := \
 	s7d-h264-mailbox.o \
 	s7d-v4l2.o \
 	s7d-v4l2-device.o
+
+s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) += \
+	s7d-hevc-sequence.o \
+	s7d-hevc-rpm.o \
+	s7d-hevc-context.o \
+	s7d-hevc-picture.o \
+	s7d-hevc-backend.o \
+	s7d-hevc-v4l2.o
