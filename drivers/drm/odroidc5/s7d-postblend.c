@@ -83,7 +83,7 @@ int s7d_postblend_build_state(u32 width, u32 height,
 			REG(0x1d1f, video2_v),
 			/* Port 0 requires bit 16; keep straight OSD output off it. */
 			REG(VD1_BLEND_SRC_CTRL, BIT(16) | pre_src),
-			REG(VD2_BLEND_SRC_CTRL, 3 << 8),
+			REG(VD2_BLEND_SRC_CTRL, (3 << 8) | (video2_dst ? BIT(20) : 0)),
 			/* Bit 20 keeps logical OSD1 on the postblend path. */
 			REG(OSD1_BLEND_SRC_CTRL, BIT(20) | video_src),
 			REG(OSD2_BLEND_SRC_CTRL, BIT(20) | secondary_src),

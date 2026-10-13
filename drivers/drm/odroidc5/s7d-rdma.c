@@ -194,7 +194,7 @@ static bool display_write_valid(u32 reg, u32 value)
 	case 0x1dfb:
 		return value == BIT(16) || value == (BIT(16) | BIT(4) | BIT(0));
 	case 0x1dfc:
-		return value == (3 << 8);
+		return value == (3 << 8) || value == (BIT(20) | (3 << 8));
 	case 0x1dfd:
 		return value == BIT(20) || value == (BIT(20) | (1 << 8)) ||
 		       value == (BIT(20) | (2 << 8));
