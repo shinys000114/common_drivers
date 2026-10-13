@@ -2,3 +2,4 @@
 
 obj-$(CONFIG_SND_SOC)   += codecs/
 obj-$(CONFIG_SND_SOC)   += amlogic/
+obj-$(CONFIG_SND_SOC)   += meson/
