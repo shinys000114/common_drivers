@@ -23,6 +23,7 @@ struct s7d_vpu {
 	struct s7d_vpu_link link;
 	void __iomem *regs;
 	struct clk_bulk_data clocks[4];
+	struct clk_bulk_data pixel_route[4];
 	struct clk *xtal;
 	struct reset_control_bulk_data resets[3];
 	struct s7d_rdma rdma;
@@ -34,6 +35,7 @@ struct s7d_vpu {
 	atomic_t vsync_enabled;
 	bool rdma_enabled;
 	bool acquired;
+	bool pixel_enabled;
 	bool boot_held;
 	bool touched;
 	bool pixel_protected;

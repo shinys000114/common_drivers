@@ -44,6 +44,10 @@
 #define OSD_FREE_CLK		BIT(30)
 /* ENCP is clocks[3]; the other clocks retain the VPU and its APB/IRQ paths. */
 #define PIXEL_CLK		3
+#define PIXEL_PLL		0
+#define PIXEL_SOURCE		1
+#define PIXEL_MUX		2
+#define PIXEL_PARENT		3
 #define CLOCK_ERROR_PPM		1000
 
 static u32 vpu_read(struct s7d_vpu *v, u32 reg)
@@ -92,6 +96,14 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 
 static int check_handoff(struct s7d_vpu *v);
 
+static void s7d_vpu_disable_pixel(struct s7d_vpu *v)
+{
+	if (!v->pixel_enabled)
+		return;
+	clk_disable_unprepare(v->clocks[PIXEL_CLK].clk);
+	v->pixel_enabled = false;
+}
+
 static int s7d_vpu_acquire(void *data)
 {
 	struct s7d_vpu *v = data;
@@ -106,19 +118,29 @@ static int s7d_vpu_acquire(void *data)
 	ret = pm_runtime_resume_and_get(v->dev);
 	if (ret < 0)
 		return ret;
-	ret = clk_bulk_prepare_enable(ARRAY_SIZE(v->clocks), v->clocks);
+	ret = clk_bulk_prepare_enable(PIXEL_CLK, v->clocks);
 	if (ret) {
 		pm_runtime_put(v->dev);
 		return ret;
 	}
 	ret = check_handoff(v);
-	if (ret) {
-		clk_bulk_disable_unprepare(ARRAY_SIZE(v->clocks), v->clocks);
-		pm_runtime_put(v->dev);
-		return ret;
+	if (ret)
+		goto disable_bus;
+	/* Keep a live firmware output until prepare has verified its stop. */
+	if (clk_get_rate(v->clocks[PIXEL_CLK].clk) &&
+	    (vpu_read(v, ENCP_EN) & BIT(0))) {
+		ret = clk_prepare_enable(v->clocks[PIXEL_CLK].clk);
+		if (ret)
+			goto disable_bus;
+		v->pixel_enabled = true;
 	}
 	v->acquired = true;
 	return 0;
+disable_bus:
+	v->acquired = false;
+	clk_bulk_disable_unprepare(PIXEL_CLK, v->clocks);
+	pm_runtime_put(v->dev);
+	return ret;
 }
 
 int s7d_vpu_hold_boot(struct s7d_vpu *v)
@@ -246,6 +268,7 @@ static int s7d_vpu_stop(void *data)
 		clk_rate_exclusive_put(v->clocks[PIXEL_CLK].clk);
 		v->pixel_protected = false;
 	}
+	s7d_vpu_disable_pixel(v);
 	return 0;
 }
 
@@ -333,6 +356,37 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 	return 0;
 }
 
+static int s7d_vpu_prepare_pixel(struct s7d_vpu *v, unsigned long rate)
+{
+	int ret;
+
+	if (v->pixel_enabled)
+		return -EBUSY;
+	ret = clk_set_parent(v->pixel_route[PIXEL_SOURCE].clk,
+			     v->pixel_route[PIXEL_PLL].clk);
+	if (ret)
+		return ret;
+	ret = clk_set_parent(v->pixel_route[PIXEL_MUX].clk,
+			     v->pixel_route[PIXEL_PARENT].clk);
+	if (ret)
+		return ret;
+	/* A cold PLL has no saved configuration for its prepare callback. */
+	ret = clk_set_rate(v->pixel_route[PIXEL_PLL].clk, rate);
+	if (ret)
+		return ret;
+	if (!rate_matches(rate, clk_get_rate(v->pixel_route[PIXEL_PLL].clk)))
+		return -ERANGE;
+	ret = clk_set_rate(v->clocks[PIXEL_CLK].clk, rate);
+	if (ret)
+		return ret;
+	if (!rate_matches(rate, clk_get_rate(v->clocks[PIXEL_CLK].clk)))
+		return -ERANGE;
+	ret = clk_prepare_enable(v->clocks[PIXEL_CLK].clk);
+	if (!ret)
+		v->pixel_enabled = true;
+	return ret;
+}
+
 static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 {
 	struct s7d_vpu *v = data;
@@ -346,12 +400,9 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_vpu_stop(v);
 	if (ret)
 		return ret;
-	/* stop() has released the PHY's exclusive PLL reference through HDMI. */
-	ret = clk_set_rate(v->clocks[PIXEL_CLK].clk, state->pixel_rate);
+	ret = s7d_vpu_prepare_pixel(v, state->pixel_rate);
 	if (ret)
 		return ret;
-	if (!rate_matches(state->pixel_rate, clk_get_rate(v->clocks[PIXEL_CLK].clk)))
-		return -ERANGE;
 	ret = clk_rate_exclusive_get(v->clocks[PIXEL_CLK].clk);
 	if (ret)
 		return ret;
@@ -393,7 +444,8 @@ static void s7d_vpu_release(void *data)
 
 	if (!v->acquired)
 		return;
-	clk_bulk_disable_unprepare(ARRAY_SIZE(v->clocks), v->clocks);
+	s7d_vpu_disable_pixel(v);
+	clk_bulk_disable_unprepare(PIXEL_CLK, v->clocks);
 	pm_runtime_put(v->dev);
 	v->acquired = false;
 }
@@ -513,6 +565,13 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	v->clocks[2].id = "intr";
 	v->clocks[3].id = "encp";
 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(v->clocks), v->clocks);
+	if (ret)
+		return ret;
+	v->pixel_route[PIXEL_PLL].id = "pixel-pll";
+	v->pixel_route[PIXEL_SOURCE].id = "pixel-source";
+	v->pixel_route[PIXEL_MUX].id = "pixel-mux";
+	v->pixel_route[PIXEL_PARENT].id = "pixel-parent";
+	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(v->pixel_route), v->pixel_route);
 	if (ret)
 		return ret;
 	v->resets[0].id = "viu";

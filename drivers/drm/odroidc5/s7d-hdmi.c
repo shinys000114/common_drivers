@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
+#include <linux/amlogic/s7d-hdmi-phy.h>
 #include <linux/clk.h>
 #include <linux/hdmi.h>
 #include <linux/interrupt.h>
@@ -76,6 +77,8 @@ struct s7d_hdmi {
 	struct mutex lock;
 	struct clk_bulk_data basic[4];
 	struct clk_bulk_data video[2];
+	struct clk_bulk_data video_mux[2];
+	struct clk *video_parent;
 	struct reset_control_bulk_data resets[2];
 	struct phy *phy;
 	int irq;
@@ -327,6 +330,9 @@ static int s7d_hdmi_prepare(void *data, unsigned long pixel_rate)
 		goto out;
 	/* VPU protects the ENCP parent rate while we prepare sibling branches. */
 	for (i = 0; i < ARRAY_SIZE(h->video); i++) {
+		ret = clk_set_parent(h->video_mux[i].clk, h->video_parent);
+		if (ret)
+			goto out;
 		ret = clk_set_rate(h->video[i].clk, pixel_rate);
 		if (ret)
 			goto out;
@@ -645,6 +651,14 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(h->video), h->video);
 	if (ret)
 		return dev_err_probe(dev, ret, "video clocks\n");
+	h->video_mux[0].id = "pixel-mux";
+	h->video_mux[1].id = "fe-mux";
+	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(h->video_mux), h->video_mux);
+	if (ret)
+		return dev_err_probe(dev, ret, "video mux clocks\n");
+	h->video_parent = devm_clk_get(dev, "video-parent");
+	if (IS_ERR(h->video_parent))
+		return dev_err_probe(dev, PTR_ERR(h->video_parent), "video parent clock\n");
 	h->resets[0].id = "tx";
 	h->resets[1].id = "apb";
 	ret = devm_reset_control_bulk_get_exclusive(dev, ARRAY_SIZE(h->resets), h->resets);
@@ -698,10 +712,15 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 		ret = ret ? ret : -EOPNOTSUPP;
 		goto disable_basic;
 	}
-	ret = clk_bulk_prepare_enable(ARRAY_SIZE(h->video), h->video);
-	if (ret)
+	ret = s7d_hdmi_phy_is_enabled(h->phy);
+	if (ret < 0)
 		goto disable_basic;
-	h->video_on = true;
+	if (ret) {
+		ret = clk_bulk_prepare_enable(ARRAY_SIZE(h->video), h->video);
+		if (ret)
+			goto disable_basic;
+		h->video_on = true;
+	}
 	ret = top_write(h, TOP_MASK, 0x1ff, 0);
 	if (ret)
 		goto disable_video;
@@ -736,12 +755,14 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	ret = phy_init(h->phy);
 	if (ret)
 		goto remove_ddc;
-	ret = phy_power_on(h->phy);
-	if (ret) {
-		phy_exit(h->phy);
-		goto remove_ddc;
+	if (h->video_on) {
+		ret = phy_power_on(h->phy);
+		if (ret) {
+			phy_exit(h->phy);
+			goto remove_ddc;
+		}
+		h->phy_on = true;
 	}
-	h->phy_on = true;
 	platform_set_drvdata(pdev, h);
 	drm_bridge_add(&h->bridge);
 	enable_irq(h->irq);
@@ -749,7 +770,8 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 remove_ddc:
 	s7d_hdmi_ddc_unregister(&h->ddc);
 disable_video:
-	clk_bulk_disable_unprepare(ARRAY_SIZE(h->video), h->video);
+	if (h->video_on)
+		clk_bulk_disable_unprepare(ARRAY_SIZE(h->video), h->video);
 disable_basic:
 	clk_bulk_disable_unprepare(ARRAY_SIZE(h->basic), h->basic);
 put_pm:

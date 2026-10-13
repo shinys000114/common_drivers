@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 /* S7D HDMI analogue PHY. Sequencing derived from Amlogic hdmitx_hw_s7d.c. */
+#include <linux/amlogic/s7d-hdmi-phy.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/clk.h>
@@ -44,10 +45,8 @@ static int s7d_phy_stop(struct s7d_hdmi_phy *priv)
 	return regmap_write(priv->map, PHY_CTRL3, 0xc1b);
 }
 
-static int s7d_phy_power_on(struct phy *phy)
+static int s7d_phy_is_enabled(struct s7d_hdmi_phy *priv)
 {
-	struct s7d_hdmi_phy *priv = phy_get_drvdata(phy);
-	unsigned long rate;
 	u32 ctrl0, ctrl3;
 	bool active;
 	int ret;
@@ -63,8 +62,22 @@ static int s7d_phy_power_on(struct phy *phy)
 	ret = regmap_read(priv->map, PHY_CTRL3, &ctrl3);
 	if (ret)
 		return ret;
-	active &= ctrl0 && (ctrl3 & (PHY_LANES_ON | PHY_RESET_N)) ==
-			  (PHY_LANES_ON | PHY_RESET_N);
+	return active && ctrl0 && (ctrl3 & (PHY_LANES_ON | PHY_RESET_N)) ==
+			(PHY_LANES_ON | PHY_RESET_N);
+}
+
+static int s7d_phy_power_on(struct phy *phy)
+{
+	struct s7d_hdmi_phy *priv = phy_get_drvdata(phy);
+	unsigned long rate;
+	u32 ctrl0;
+	bool active;
+	int ret;
+
+	ret = s7d_phy_is_enabled(priv);
+	if (ret < 0)
+		return ret;
+	active = ret;
 
 	/* A live transmitter's analogue rate must not change behind its back. */
 	ret = clk_rate_exclusive_get(priv->pixel);
@@ -138,6 +151,22 @@ static const struct phy_ops s7d_phy_ops = {
 	.power_off = s7d_phy_power_off,
 	.owner = THIS_MODULE,
 };
+
+int s7d_hdmi_phy_is_enabled(struct phy *phy)
+{
+	int ret;
+
+	if (!phy || phy->ops != &s7d_phy_ops)
+		return -EINVAL;
+	ret = phy_pm_runtime_get_sync(phy);
+	if (ret < 0 && ret != -ENOTSUPP)
+		return ret;
+	mutex_lock(&phy->mutex);
+	ret = s7d_phy_is_enabled(phy_get_drvdata(phy));
+	mutex_unlock(&phy->mutex);
+	phy_pm_runtime_put(phy);
+	return ret;
+}
 
 static int s7d_phy_probe(struct platform_device *pdev)
 {
