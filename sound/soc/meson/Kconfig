@@ -16,3 +16,14 @@ config SND_SOC_MESON_S7D_T9015
 	depends on MFD_MESON_S7D_AUDIO && COMMON_CLK_MESON_S7D_AUDIO
 	help
 	  Minimal playback support for the on-chip stereo analog codec.
+
+config SND_SOC_ODROIDC5
+	tristate "ODROID-C5 sound card"
+	depends on AMLOGIC_C5_NATIVE_DISPLAY && SND_SOC_MESON_S7D_HDMI_AUDIO
+	select SND_SOC_HDMI_CODEC
+	select SND_SOC_MESON_S7D_T9015
+	select SND_SOC_SPDIF
+	help
+	  Board audio links, HDMI sink constraints and jack reporting.
+	  Connects native TDM B to HDMI, TDM C to the analog codec,
+	  and SPDIF A when its board overlay is enabled.
