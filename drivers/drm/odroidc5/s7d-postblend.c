@@ -26,7 +26,8 @@
 #define REG(r, v) { .reg = cpu_to_le32(r), .value = cpu_to_le32(v) }
 
 int s7d_postblend_build_state(u32 width, u32 height,
-			     const struct drm_rect *video_dst, bool osd2_enabled,
+			     const struct drm_rect *video_dst,
+			     u32 video_width, u32 video_height, bool osd2_enabled,
 			     struct s7d_postblend_state *state)
 {
 	u32 video_h = 0x1fff0000, video_v = 0x1fff0000;
@@ -38,12 +39,13 @@ int s7d_postblend_build_state(u32 width, u32 height,
 	if (video_dst) {
 		if (video_dst->x1 < 0 || video_dst->y1 < 0 ||
 		    video_dst->x2 > (int)width || video_dst->y2 > (int)height ||
-		    video_dst->x2 <= video_dst->x1 || video_dst->y2 <= video_dst->y1)
+		    video_dst->x2 <= video_dst->x1 || video_dst->y2 <= video_dst->y1 ||
+		    !video_width || !video_height || video_width > 4096 || video_height > 2160)
 			return -EINVAL;
 		video_h = (video_dst->x1 << 16) | (video_dst->x2 - 1);
 		video_v = (video_dst->y1 << 16) | (video_dst->y2 - 1);
-		input_width = video_dst->x2 - video_dst->x1;
-		input_height = video_dst->y2 - video_dst->y1;
+		input_width = video_width;
+		input_height = video_height;
 		video_src = 1 << 8;
 		/* Vendor vpp_blend_update() keeps the VD1 preblend input selected. */
 		pre_src = BIT(4) | BIT(0);

@@ -9,3 +9,4 @@ s7d-display-y := s7d-drv.o s7d-hdmi.o s7d-hdmi-io.o s7d-hdmi-ddc.o \
 		s7d-encp.o s7d-osd-pipeline.o s7d-scanout.o s7d-rdma.o
 s7d-display-y += s7d-afbc.o s7d-afbc-engine.o s7d-fb.o
 s7d-display-y += s7d-osd-scaler.o
+s7d-display-y += s7d-video-scaler.o

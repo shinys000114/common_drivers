@@ -310,6 +310,11 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 		clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
+	ret = s7d_video_scaler_check_mode(&state->video.scaler,
+		state->base.adjusted_mode.hdisplay, state->base.adjusted_mode.vdisplay,
+		state->pixel_rate, clk_get_rate(v->clocks[0].clk));
+	if (ret)
+		return ret;
 	/*
 	 * clk_round_rate() is constrained by the live PHY's exclusive vote.
 	 * Validate capability with the same pure planner as the CCF provider;
@@ -644,6 +649,73 @@ static int program_osd_scaler(struct s7d_vpu *v,
 	return s7d_osd_scaler_setup(v->regs, states, &v->failed_reg);
 }
 
+static int program_video_scaler(struct s7d_vpu *v,
+				const struct s7d_video_scaler_state *state)
+{
+	u32 bank, phase, pair, word, component;
+	unsigned int i;
+	int ret;
+
+	if (!state->enabled)
+		return 0;
+	if (state->setup_count > S7D_VIDEO_SCALER_SETUP_COUNT)
+		return -EINVAL;
+	/* Clear the documented preblend-to-VADJ1 bypass when scaling. */
+	ret = vpu_update(v, 0x1d93, BIT(0), 0);
+	if (ret)
+		return ret;
+	/* The selected S7D path scales before VE, whose input is the output size. */
+	ret = vpu_update(v, 0x1d26, BIT(1), BIT(1));
+	if (ret)
+		return ret;
+	ret = vpu_update(v, 0x1da4, 0x1fff1fff,
+			 (state->dst_width << 16) | state->dst_height);
+	if (ret)
+		return ret;
+	ret = vpu_update(v, state->pre_scale.reg, state->pre_scale.mask,
+			 state->pre_scale.value);
+	if (ret)
+		return ret;
+	for (i = 0; i < state->setup_count; i++) {
+		const struct s7d_video_scaler_reg *s = &state->setup[i];
+
+		/* Match the selected S7D size write; stopped readback is unqualified. */
+		if (s->reg == 0x1da6) {
+			writel(s->value, v->regs + s->reg * 4);
+			continue;
+		}
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	/* Match the selected input-size writes before enabling VSR. */
+	writel(state->src_width, v->regs + 0x1d01 * 4);
+	writel(state->src_height, v->regs + 0x1d02 * 4);
+	writel((state->src_height << 16) | state->src_width,
+	       v->regs + 0x1d20 * 4);
+	/* Indirect auto-increment ports are write-only during stopped preparation. */
+	for (component = 0; component < 2; component++) {
+		u32 index = component ? S7D_VIDEO_SCALER_COEF_IDX_CHROMA :
+			S7D_VIDEO_SCALER_COEF_IDX_LUMA;
+		u32 data = component ? S7D_VIDEO_SCALER_COEF_DATA_CHROMA :
+			S7D_VIDEO_SCALER_COEF_DATA_LUMA;
+
+		for (bank = 0; bank < S7D_VIDEO_SCALER_COEF_BANKS; bank++) {
+			writel(bank << 7, v->regs + index * 4);
+			for (phase = 0; phase < S7D_VIDEO_SCALER_COEF_PHASES; phase++) {
+				for (pair = 0; pair < S7D_VIDEO_SCALER_COEF_PAIRS; pair++) {
+					ret = s7d_video_scaler_coefficient(bank, phase,
+								   pair, &word);
+					if (ret)
+						return ret;
+					writel(word, v->regs + data * 4);
+				}
+			}
+		}
+	}
+	return vpu_update(v, state->control.reg, state->control.mask, state->control.value);
+}
+
 static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 {
 	/* S7D VENC supplies BRG; rotate to RGB before the HDMI formatter. */
@@ -663,6 +735,9 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		if (ret)
 			return ret;
 	}
+	ret = program_video_scaler(v, &state->video.scaler);
+	if (ret)
+		return ret;
 	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {
 		const struct s7d_csc_reg *s = &state->csc.matrix[i];
 
@@ -818,6 +893,11 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_osd_scaler_check_mode(state->osd.scalers,
 		state->base.adjusted_mode.htotal, state->pixel_rate,
 		clk_get_rate(v->clocks[0].clk));
+	if (ret)
+		return ret;
+	ret = s7d_video_scaler_check_mode(&state->video.scaler,
+		state->base.adjusted_mode.hdisplay, state->base.adjusted_mode.vdisplay,
+		state->pixel_rate, clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
 	ret = s7d_vpu_prepare_pixel(v, state->pixel_rate);

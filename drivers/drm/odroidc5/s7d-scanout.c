@@ -58,6 +58,8 @@ bool s7d_scanout_video_same_config(const struct s7d_scanout_buffers *a,
 		   sizeof(a->video.pipeline.setup)) ||
 	    memcmp(&a->video.pipeline.control, &b->video.pipeline.control,
 		   sizeof(a->video.pipeline.control)) ||
+	    memcmp(&a->video.pipeline.scaler, &b->video.pipeline.scaler,
+		   sizeof(a->video.pipeline.scaler)) ||
 	    memcmp(&a->video.csc, &b->video.csc, sizeof(a->video.csc)))
 		return false;
 	for (i = 0; i < S7D_VIDEO_UPDATE_REG_COUNT; i++) {
