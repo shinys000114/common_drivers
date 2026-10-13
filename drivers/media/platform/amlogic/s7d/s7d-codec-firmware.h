@@ -16,6 +16,7 @@ enum s7d_codec_firmware {
 	S7D_CODEC_FIRMWARE_H264_MH264,
 	/* Non-MMU HEVC; the initial backend selects Main8/DW 0x10. */
 	S7D_CODEC_FIRMWARE_HEVC,
+	S7D_CODEC_FIRMWARE_JPEG_ENC,
 };
 
 struct s7d_codec_firmware_owner *

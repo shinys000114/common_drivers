@@ -36,6 +36,19 @@
 #define DOS_SW_RESET0		DOS_REG(0x3f00)
 #define DOS_GCLK_EN0		DOS_REG(0x3f01)
 #define DOS_MEM_PD_VDEC		DOS_REG(0x3f30)
+#define DOS_MEM_PD_HCODEC		DOS_REG(0x3f32)
+#define DOS_SW_RESET1		DOS_REG(0x3f07)
+#define HCODEC_MMC_CTRL1		DOS_REG(0x1002)
+#define HCODEC_MFDIN_SCMD	DOS_REG(0x100f)
+#define HCODEC_MFDIN_DCFG	DOS_REG(0x100e)
+#define HCODEC_MBOX2_MASK	DOS_REG(0x107a)
+#define HCODEC_MPSR		DOS_REG(0x1301)
+#define HCODEC_CPSR		DOS_REG(0x1321)
+#define HCODEC_IMEM_DMA_CTRL	DOS_REG(0x1340)
+#define HCODEC_VLC_VB_CONTROL	DOS_REG(0x1d16)
+#define HCODEC_MFDIN_ENABLE	BIT(28)
+#define HCODEC_LOCAL_RESET	(BIT(2) | BIT(6) | BIT(7) | BIT(8) | \
+				 BIT(14) | BIT(16) | BIT(17))
 #define DOS_MEM_PD_HEVC		DOS_REG(0x3f33)
 #define DOS_SW_RESET3		DOS_REG(0x3f34)
 #define DOS_GCLK_EN3		DOS_REG(0x3f35)
@@ -73,8 +86,9 @@
 #define DMC_REQ_CTRL		0x0000
 #define DMC_CHAN_STS		(0x00cf * 4)
 #define DMC_VDEC_PORT		BIT(8)
+#define DMC_HCODEC_PORT		BIT(9)
+#define DOS_JPEG_RATE		666666666UL
 #define DOS_ENGINE_RATE		800000000UL
-#define DOS_ENGINE_RATE_MIN	(DOS_ENGINE_RATE - DOS_ENGINE_RATE / 1000000)
 #define DMA_TIMEOUT_US		100000
 #define RESPONSE_TIMEOUT_US	12500
 #define DMC_TIMEOUT_US		100000
@@ -86,9 +100,11 @@ struct s7d_codec_dos {
 	struct module *owner;
 	struct device *pd_dev;
 	struct device *hevc_pd_dev;
+	struct device *hcodec_pd_dev;
 	struct clk *bus_clk;
 	struct clk *vdec_clk;
 	struct clk *hevc_clk;
+	struct clk *hcodec_clk;
 	struct reset_control *hevc_reset;
 	struct regmap *map;
 	struct regmap *dmc;
@@ -98,6 +114,7 @@ struct s7d_codec_dos {
 	struct mutex lock;
 	int irq;
 	int hevc_irq;
+	int hcodec_irq;
 	enum s7d_codec_engine engine;
 	bool leased;
 	bool local_access_ready;
@@ -122,11 +139,11 @@ static const struct regmap_config dos_regmap_config = {
 
 static int dos_engine_check(enum s7d_codec_engine engine)
 {
-	if (engine == S7D_CODEC_ENGINE_HEVC)
+	if (engine == S7D_CODEC_ENGINE_HEVC || engine == S7D_CODEC_ENGINE_VDEC)
 		return 0;
-	if (engine == S7D_CODEC_ENGINE_VDEC)
-		return 0;
-	return engine == S7D_CODEC_ENGINE_HCODEC ? -EOPNOTSUPP : -EINVAL;
+	if (engine == S7D_CODEC_ENGINE_HCODEC)
+		return IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) ? 0 : -EOPNOTSUPP;
+	return -EINVAL;
 }
 
 static int dos_vdec_engine_check(enum s7d_codec_engine engine)
@@ -147,12 +164,16 @@ static int dos_lease_check(struct s7d_codec_dos *dos,
 static struct clk *dos_engine_clk(struct s7d_codec_dos *dos,
 				 enum s7d_codec_engine engine)
 {
+	if (engine == S7D_CODEC_ENGINE_HCODEC)
+		return dos->hcodec_clk;
 	return engine == S7D_CODEC_ENGINE_HEVC ? dos->hevc_clk : dos->vdec_clk;
 }
 
 static struct device *dos_engine_pd(struct s7d_codec_dos *dos,
 				   enum s7d_codec_engine engine)
 {
+	if (engine == S7D_CODEC_ENGINE_HCODEC)
+		return dos->hcodec_pd_dev;
 	return engine == S7D_CODEC_ENGINE_HEVC ? dos->hevc_pd_dev : dos->pd_dev;
 }
 
@@ -207,6 +228,56 @@ static int dos_reset(struct s7d_codec_dos *dos, u32 mask)
 	return val & mask ? -EIO : 0;
 }
 
+static int dos_hcodec_block_locked(struct s7d_codec_dos *dos)
+{
+	u32 val;
+	int ret;
+
+	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_HCODEC_PORT, 0);
+	if (ret)
+		return ret;
+	return regmap_read_poll_timeout(dos->dmc, DMC_CHAN_STS, val,
+					val & DMC_HCODEC_PORT, 10, DMC_TIMEOUT_US);
+}
+
+static int dos_hcodec_reset(struct s7d_codec_dos *dos, u32 mask)
+{
+	u32 val;
+	int i, ret;
+
+	for (i = 0; i < 3; i++) {
+		ret = regmap_read(dos->map, DOS_SW_RESET1, &val);
+		if (ret)
+			return ret;
+	}
+	ret = dos_update(dos->map, DOS_SW_RESET1, mask, mask);
+	if (ret)
+		return ret;
+	ret = dos_update(dos->map, DOS_SW_RESET1, mask, 0);
+	if (ret)
+		return ret;
+	for (i = 0; i < 3; i++) {
+		ret = regmap_read(dos->map, DOS_SW_RESET1, &val);
+		if (ret)
+			return ret;
+	}
+	return val & mask ? -EIO : 0;
+}
+
+static int dos_hcodec_prepare_access_locked(struct s7d_codec_dos *dos)
+{
+	int ret;
+
+	ret = dos_hcodec_block_locked(dos);
+	if (ret)
+		return ret;
+	ret = dos_update(dos->map, DOS_GCLK_EN0, GENMASK(26, 12),
+			 GENMASK(26, 12));
+	if (ret)
+		return ret;
+	return dos_write(dos->map, DOS_MEM_PD_HCODEC, 0);
+}
+
 static int dos_hevc_prepare_access_locked(struct s7d_codec_dos *dos)
 {
 	int ret;
@@ -242,6 +313,13 @@ static int dos_prepare_access_locked(struct s7d_codec_dos *dos)
 		return 0;
 	if (dos->faulted || dos->release_failed || dos->closing)
 		return -EIO;
+	if (dos->engine == S7D_CODEC_ENGINE_HCODEC) {
+		ret = dos_hcodec_prepare_access_locked(dos);
+		if (ret)
+			goto fault;
+		dos->local_access_ready = true;
+		return 0;
+	}
 	if (dos->engine == S7D_CODEC_ENGINE_HEVC) {
 		ret = dos_hevc_prepare_access_locked(dos);
 		if (ret)
@@ -289,6 +367,70 @@ static int dos_non_mmu(struct s7d_codec_dos *dos)
 	if (ret)
 		return ret;
 	return dos_write(dos->map, DOS_EXTIF_CFG1, 0);
+}
+
+static int dos_hcodec_stopped_locked(struct s7d_codec_dos *dos)
+{
+	int ret;
+
+	ret = dos_check(dos->map, HCODEC_MBOX2_MASK, U32_MAX, 0);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->map, HCODEC_MPSR, U32_MAX, 0);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->map, HCODEC_CPSR, U32_MAX, 0);
+	if (ret)
+		return ret;
+	return dos_check(dos->map, HCODEC_IMEM_DMA_CTRL, BIT(15), 0);
+}
+
+static int dos_hcodec_halt_locked(struct s7d_codec_dos *dos)
+{
+	u32 val;
+	int ret;
+
+	dos->halted = false;
+	ret = dos_hcodec_block_locked(dos);
+	if (ret)
+		return ret;
+	ret = dos_write(dos->map, HCODEC_MBOX2_MASK, 0);
+	if (ret)
+		return ret;
+	ret = dos_write(dos->map, HCODEC_MPSR, 0);
+	if (ret)
+		return ret;
+	ret = dos_write(dos->map, HCODEC_CPSR, 0);
+	if (ret)
+		return ret;
+	ret = dos_update(dos->map, HCODEC_MFDIN_SCMD, HCODEC_MFDIN_ENABLE, 0);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(dos->map, HCODEC_IMEM_DMA_CTRL, val,
+				      !(val & BIT(15)), 10, DMA_TIMEOUT_US);
+	if (ret)
+		return ret;
+	ret = dos_hcodec_reset(dos, HCODEC_LOCAL_RESET | DOS_CPU_RESET);
+	if (ret)
+		return ret;
+	ret = dos_hcodec_stopped_locked(dos);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->map, HCODEC_MFDIN_SCMD, HCODEC_MFDIN_ENABLE, 0);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_HCODEC_PORT, 0);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->dmc, DMC_CHAN_STS, DMC_HCODEC_PORT,
+			DMC_HCODEC_PORT);
+	if (ret)
+		return ret;
+	dos->halted = true;
+	dos->prepared = false;
+	dos->started = false;
+	dos->faulted = false;
+	return 0;
 }
 
 static int dos_hevc_halt_locked(struct s7d_codec_dos *dos)
@@ -531,6 +673,8 @@ static int dos_halt_locked(struct s7d_codec_dos *dos)
 	u32 val;
 	int ret;
 
+	if (dos->engine == S7D_CODEC_ENGINE_HCODEC)
+		return dos_hcodec_halt_locked(dos);
 	if (dos->engine == S7D_CODEC_ENGINE_HEVC)
 		return dos_hevc_halt_locked(dos);
 
@@ -684,8 +828,29 @@ s7d_codec_dos_create(struct platform_device *pdev, struct module *owner)
 		ret = dos->hevc_pd_dev ? PTR_ERR(dos->hevc_pd_dev) : -ENODEV;
 		goto err_hevc_reset;
 	}
+	if (!IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL))
+		return dos;
+	dos->hcodec_irq = platform_get_irq_byname(pdev, "mailbox_2");
+	if (dos->hcodec_irq < 0) {
+		ret = dos->hcodec_irq;
+		goto err_hevc_pd;
+	}
+	dos->hcodec_clk = clk_get(dos->dev, "hcodec");
+	if (IS_ERR(dos->hcodec_clk)) {
+		ret = PTR_ERR(dos->hcodec_clk);
+		goto err_hevc_pd;
+	}
+	dos->hcodec_pd_dev = dev_pm_domain_attach_by_name(dos->dev, "hcodec");
+	if (IS_ERR_OR_NULL(dos->hcodec_pd_dev)) {
+		ret = dos->hcodec_pd_dev ? PTR_ERR(dos->hcodec_pd_dev) : -ENODEV;
+		goto err_hcodec_clk;
+	}
 	return dos;
 
+err_hcodec_clk:
+	clk_put(dos->hcodec_clk);
+err_hevc_pd:
+	dev_pm_domain_detach(dos->hevc_pd_dev, false);
 err_hevc_reset:
 	reset_control_put(dos->hevc_reset);
 err_hevc_clk:
@@ -714,6 +879,8 @@ int s7d_codec_dos_irq(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
 
 	if (ret)
 		return ret;
+	if (engine == S7D_CODEC_ENGINE_HCODEC)
+		return dos->hcodec_irq;
 	return engine == S7D_CODEC_ENGINE_HEVC ? dos->hevc_irq : dos->irq;
 }
 
@@ -725,8 +892,8 @@ struct regmap *s7d_codec_dos_regmap(struct s7d_codec_dos *dos,
 	return ret ? ERR_PTR(ret) : dos->map;
 }
 
-int s7d_codec_dos_hold(struct s7d_codec_dos *dos,
-		       enum s7d_codec_engine engine)
+static int dos_hold_rate(struct s7d_codec_dos *dos,
+			 enum s7d_codec_engine engine, unsigned long rate)
 {
 	struct device *pd_dev;
 	struct clk *clk;
@@ -742,16 +909,16 @@ int s7d_codec_dos_hold(struct s7d_codec_dos *dos,
 	}
 	clk = dos_engine_clk(dos, engine);
 	pd_dev = dos_engine_pd(dos, engine);
-	rounded = clk_round_rate(clk, DOS_ENGINE_RATE);
+	rounded = clk_round_rate(clk, rate);
 	if (rounded < 0) {
 		ret = rounded;
 		goto out;
 	}
-	if (rounded < DOS_ENGINE_RATE_MIN || rounded > DOS_ENGINE_RATE) {
+	if (rounded < rate - rate / 1000000 || rounded > rate) {
 		ret = -ERANGE;
 		goto out;
 	}
-	ret = clk_set_rate_exclusive(clk, DOS_ENGINE_RATE);
+	ret = clk_set_rate_exclusive(clk, rate);
 	if (ret)
 		goto out;
 	if (clk_get_rate(clk) != rounded) {
@@ -785,6 +952,143 @@ out:
 	return ret;
 }
 
+int s7d_codec_dos_hold(struct s7d_codec_dos *dos,
+		       enum s7d_codec_engine engine)
+{
+	if (engine == S7D_CODEC_ENGINE_HCODEC)
+		return -EOPNOTSUPP;
+	return dos_hold_rate(dos, engine, DOS_ENGINE_RATE);
+}
+
+int s7d_codec_dos_jpeg_hold(struct s7d_codec_dos *dos)
+{
+	return dos_hold_rate(dos, S7D_CODEC_ENGINE_HCODEC, DOS_JPEG_RATE);
+}
+
+int s7d_codec_dos_jpeg_prepare(struct s7d_codec_dos *dos)
+{
+	int ret;
+
+	mutex_lock(&dos->lock);
+	ret = dos_lease_check(dos, S7D_CODEC_ENGINE_HCODEC);
+	if (ret)
+		goto out;
+	if (!dos->leased || dos->faulted || dos->release_failed || dos->closing ||
+	    dos->prepared) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = dos_prepare_access_locked(dos);
+	if (ret)
+		goto fault;
+	ret = dos_hcodec_halt_locked(dos);
+	if (ret)
+		goto fault;
+	ret = dos_write(dos->map, HCODEC_MMC_CTRL1, 0x32);
+	if (ret)
+		goto fault;
+	dos->prepared = true;
+	goto out;
+fault:
+	dos->faulted = true;
+	dos->halted = false;
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_jpeg_port_enable(struct s7d_codec_dos *dos)
+{
+	int ret;
+
+	mutex_lock(&dos->lock);
+	ret = dos_lease_check(dos, S7D_CODEC_ENGINE_HCODEC);
+	if (ret)
+		goto out;
+	if (!dos->leased || !dos->prepared || !dos->halted || dos->faulted ||
+	    dos->release_failed || dos->closing) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = dos_hcodec_stopped_locked(dos);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_HCODEC_PORT, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->dmc, DMC_CHAN_STS, DMC_HCODEC_PORT,
+			DMC_HCODEC_PORT);
+	if (ret)
+		goto fault;
+	dos->halted = false;
+	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_HCODEC_PORT, DMC_HCODEC_PORT);
+	if (ret)
+		goto fault;
+	goto out;
+fault:
+	dos->faulted = true;
+	dos->halted = false;
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_jpeg_start(struct s7d_codec_dos *dos)
+{
+	int ret;
+
+	mutex_lock(&dos->lock);
+	ret = dos_lease_check(dos, S7D_CODEC_ENGINE_HCODEC);
+	if (ret)
+		goto out;
+	if (!dos->leased || !dos->prepared || dos->halted || dos->started ||
+	    dos->faulted || dos->release_failed || dos->closing) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = dos_check(dos->map, HCODEC_MBOX2_MASK, U32_MAX, U32_MAX);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, HCODEC_MPSR, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, HCODEC_CPSR, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, HCODEC_IMEM_DMA_CTRL, BIT(15), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, HCODEC_MMC_CTRL1, U32_MAX, 0x32);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, HCODEC_MFDIN_SCMD, HCODEC_MFDIN_ENABLE,
+			HCODEC_MFDIN_ENABLE);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, HCODEC_MFDIN_DCFG, BIT(16) | BIT(17), BIT(17));
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, HCODEC_VLC_VB_CONTROL, GENMASK(5, 0), 0x3a);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_HCODEC_PORT, DMC_HCODEC_PORT);
+	if (ret)
+		goto fault;
+	dos->started = true;
+	ret = dos_hcodec_reset(dos, DOS_CPU_RESET);
+	if (ret)
+		goto fault;
+	ret = dos_write(dos->map, HCODEC_MPSR, 1);
+	if (ret)
+		goto fault;
+	goto out;
+fault:
+	dos->faulted = true;
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
 int s7d_codec_dos_prepare_access(struct s7d_codec_dos *dos,
 			       enum s7d_codec_engine engine)
 {
@@ -803,7 +1107,7 @@ int s7d_codec_dos_prepare_access(struct s7d_codec_dos *dos,
 int s7d_codec_dos_prepare(struct s7d_codec_dos *dos,
 			  enum s7d_codec_engine engine)
 {
-	int ret = dos_engine_check(engine);
+	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
 
 	if (ret)
 		return ret;
@@ -841,7 +1145,7 @@ out:
 int s7d_codec_dos_port_enable(struct s7d_codec_dos *dos,
 			      enum s7d_codec_engine engine)
 {
-	int ret = dos_engine_check(engine);
+	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
 
 	if (ret)
 		return ret;
@@ -1059,7 +1363,7 @@ out:
 int s7d_codec_dos_start(struct s7d_codec_dos *dos,
 			enum s7d_codec_engine engine)
 {
-	int ret = dos_engine_check(engine);
+	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
 
 	if (ret)
 		return ret;
@@ -1274,12 +1578,16 @@ int s7d_codec_dos_destroy(struct s7d_codec_dos *dos)
 		return -EBUSY;
 	}
 	dos->closing = true;
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL))
+		dev_pm_domain_detach(dos->hcodec_pd_dev, false);
 	dev_pm_domain_detach(dos->hevc_pd_dev, false);
 	dev_pm_domain_detach(dos->pd_dev, false);
 	regmap_exit(dos->map);
 	iounmap(dos->base);
 	release_mem_region(dos->start, dos->size);
 	reset_control_put(dos->hevc_reset);
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL))
+		clk_put(dos->hcodec_clk);
 	clk_put(dos->hevc_clk);
 	clk_put(dos->vdec_clk);
 	clk_put(dos->bus_clk);

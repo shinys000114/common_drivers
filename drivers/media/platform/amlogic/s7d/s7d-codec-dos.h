@@ -24,6 +24,13 @@ struct regmap *s7d_codec_dos_regmap(struct s7d_codec_dos *dos,
 				 enum s7d_codec_engine engine);
 int s7d_codec_dos_hold(struct s7d_codec_dos *dos,
 		       enum s7d_codec_engine engine);
+/* HCODEC has only a JPEG 666.67MHz lease; generic hold(HCODEC) is unsupported. */
+int s7d_codec_dos_jpeg_hold(struct s7d_codec_dos *dos);
+int s7d_codec_dos_jpeg_prepare(struct s7d_codec_dos *dos);
+/* Caller retains input, output and firmware backing before opening AXI9. */
+int s7d_codec_dos_jpeg_port_enable(struct s7d_codec_dos *dos);
+/* Caller has loaded firmware and armed the complete JPEG context/mailbox2. */
+int s7d_codec_dos_jpeg_start(struct s7d_codec_dos *dos);
 /* Process context; initializes local access once per held lease. */
 int s7d_codec_dos_prepare_access(struct s7d_codec_dos *dos,
 			       enum s7d_codec_engine engine);
