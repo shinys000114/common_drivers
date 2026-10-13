@@ -32,6 +32,8 @@ unsigned long vpu_mempd_psci_smc(int mempd_id, bool power_control)
 	unsigned long ret;
 
 	pd_max_id = get_max_id();
+	if (pd_max_id < 0)
+		return pd_max_id;
 	switch_id = mempd_id + pd_max_id;
 	ret = pwr_ctrl_psci_smc(switch_id, power_control);
 
