@@ -370,3 +370,80 @@
 		};
 	};
 };
+
+&vcodec_dos_dev {
+	status = "disabled";
+};
+
+&codec_io {
+	status = "disabled";
+};
+
+&{/vdec} {
+	status = "disabled";
+};
+
+&{/vcodec_dec} {
+	status = "disabled";
+};
+
+&{/amvenc_avc} {
+	status = "disabled";
+};
+
+&{/jpegenc} {
+	status = "disabled";
+};
+
+&{/mesonstream} {
+	status = "disabled";
+};
+
+&{/codec_mm} {
+	status = "disabled";
+};
+
+&codec_mm_cma {
+	alloc-ranges = <0 0 1 0>;
+};
+
+/ {
+	firmware {
+		c5_video_firmware: video-firmware {
+			compatible = "amlogic,s7d-video-firmware";
+			amlogic,tee = <&{/optee}>;
+		};
+	};
+
+	c5_media_dmc: syscon@fe036000 {
+		compatible = "amlogic,s7d-dmc", "syscon";
+		reg = <0 0xfe036000 0 0x2000>;
+	};
+
+	c5_vdec: video-codec@fe320000 {
+		compatible = "amlogic,s7d-vdec";
+		reg = <0 0xfe320000 0 0x10000>;
+		reg-names = "dos";
+		interrupts = <GIC_SPI 92 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 91 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 93 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "mailbox_1", "mailbox_0", "mailbox_2";
+		clocks = <&clkc CLKID_SYS_DOS>, <&clkc CLKID_VDEC>,
+			 <&clkc CLKID_HEVCF>, <&clkc CLKID_HCODEC>;
+		clock-names = "dos", "vdec", "hevc", "hcodec";
+		assigned-clocks = <&clkc CLKID_VDEC>;
+		assigned-clock-parents = <&clkc CLKID_VDEC_0>;
+		resets = <&reset RESET_BRG_HEVCF_PIPL1>;
+		reset-names = "hevc-pipeline";
+		power-domains = <&pwrdm PDID_S7D_DOS_VDEC>,
+				<&pwrdm PDID_S7D_DOS_HEVC>,
+				<&pwrdm PDID_S7D_DOS_HCODEC>;
+		power-domain-names = "vdec", "hevc", "hcodec";
+		amlogic,dmc-syscon = <&c5_media_dmc>;
+		amlogic,tee = <&{/optee}>;
+		amlogic,video-firmware = <&c5_video_firmware>;
+		memory-region = <&codec_mm_cma>;
+		memory-region-names = "codec";
+		status = "okay";
+	};
+};
