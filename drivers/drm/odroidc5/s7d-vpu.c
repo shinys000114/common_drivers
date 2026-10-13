@@ -31,6 +31,7 @@
 #define OSD_FIFO_OFFSET		0x1b
 #define OSD_FIFO_STATE		GENMASK(21, 20)
 #define OSD_PATH		0x1a0e
+#define OSD_SCALE_CTRL		0x1dff
 #define VD1_BLEND		0x1dfb
 #define VD2_BLEND		0x1dfc
 #define VD1_PATH		0x1a0a
@@ -304,6 +305,11 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	    state->base.adjusted_mode.vdisplay > 2160 ||
 	    clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
 		return -ERANGE;
+	ret = s7d_osd_scaler_check_mode(state->osd.scalers,
+		state->base.adjusted_mode.htotal, state->pixel_rate,
+		clk_get_rate(v->clocks[0].clk));
+	if (ret)
+		return ret;
 	/*
 	 * clk_round_rate() is constrained by the live PHY's exclusive vote.
 	 * Validate capability with the same pure planner as the CCF provider;
@@ -552,6 +558,15 @@ static int s7d_vpu_stop_hw(void *data)
 	ret = stop_encoders(v);
 	if (ret)
 		return ret;
+	if (v->osd_scaler_route_owned) {
+		/* Fetch, FIFO, READ0 and VENC are idle; clock references still held. */
+		ret = vpu_update(v, OSD_SCALE_CTRL, GENMASK(2, 0),
+				 v->osd_scaler_route_saved);
+		if (ret)
+			return ret;
+		v->osd_scaler_route_owned = false;
+		v->osd_scaler_route_saved = 0;
+	}
 	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK, v->vd1_free_clk);
 	if (ret)
 		return ret;
@@ -615,6 +630,20 @@ static int check_handoff(struct s7d_vpu *v)
 	return 0;
 }
 
+static int program_osd_scaler(struct s7d_vpu *v,
+			      const struct s7d_osd_scaler_state states[2])
+{
+	if (v->osd_scaler_route_owned)
+		return -EIO;
+	if (!states[0].enabled && !states[1].enabled)
+		return 0;
+	/* prepare() has verified stop and holds the VPU/clock references. */
+	v->osd_scaler_route_saved = vpu_read(v, OSD_SCALE_CTRL) & GENMASK(2, 0);
+	/* Own it before setup: a partial write failure must also be restored. */
+	v->osd_scaler_route_owned = true;
+	return s7d_osd_scaler_setup(v->regs, states, &v->failed_reg);
+}
+
 static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 {
 	/* S7D VENC supplies BRG; rotate to RGB before the HDMI formatter. */
@@ -676,6 +705,9 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 	if (ret)
 		return ret;
 	ret = vpu_update(v, HDMI_DITH, U32_MAX, BIT(10));
+	if (ret)
+		return ret;
+	ret = program_osd_scaler(v, state->osd.scalers);
 	if (ret)
 		return ret;
 	for (i = 0; i < S7D_OSD_SETUP_REG_COUNT; i++) {
@@ -783,6 +815,11 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	v->core_protected = true;
 	if (clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
 		return -ERANGE;
+	ret = s7d_osd_scaler_check_mode(state->osd.scalers,
+		state->base.adjusted_mode.htotal, state->pixel_rate,
+		clk_get_rate(v->clocks[0].clk));
+	if (ret)
+		return ret;
 	ret = s7d_vpu_prepare_pixel(v, state->pixel_rate);
 	if (ret)
 		return ret;

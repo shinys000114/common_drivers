@@ -6,6 +6,7 @@
 #include <drm/drm_rect.h>
 
 #include "s7d-osd.h"
+#include "s7d-osd-scaler.h"
 #include "s7d-rdma.h"
 
 #define S7D_OSD_REV_B 0x0b
@@ -22,6 +23,7 @@ struct s7d_osd_layer {
 };
 
 struct s7d_osd_pipeline_state {
+	struct s7d_osd_scaler_state scalers[2];
 	struct s7d_rdma_entry setup[S7D_OSD_SETUP_REG_COUNT];
 	struct s7d_rdma_entry update[S7D_OSD_UPDATE_REG_COUNT];
 };
@@ -30,15 +32,15 @@ u32 s7d_osd_unpack_mask(u32 reg);
 
 /*
  * Pure calculation for S7D Rev.B, an RGB primary and optional OSD2,
- * without scaling, with separate OSD outputs to postblend. Layouts must come
- * from the checked linear or AFBC builders: this does not establish GEM ownership, fences
- * or DMA bounds. Unknown revisions
+ * with bounded RGB enlargement and separate OSD outputs to postblend.
+ * Layouts must come from the checked linear or AFBC builders: this does not
+ * establish GEM ownership, fences or DMA bounds. Unknown revisions
  * fail; obtain the revision before entering atomic_check, without assuming
  * that a firmware version provider is already ready.
  *
  * setup configures the OSD MIFs and blend block. Apply it with
  * VENC stopped and all other fetchers/triggers quiesced under exclusive VPU
- * ownership. It does NOT prepare SRAM, arbitration, GFCD/scaler bypass,
+ * ownership. It does NOT prepare SRAM, arbitration, GFCD or the scalers,
  * colour processing, the primary postblend route, ENCP, clocks or HDMI.
  *
  * update is for a frame change at unchanged output dimensions on an
