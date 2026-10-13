@@ -1,0 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/* Copyright (c) 2026 Hardkernel Co., Ltd. */
+#ifndef _DT_BINDINGS_AMLOGIC_S7D_VPU_RESET_H
+#define _DT_BINDINGS_AMLOGIC_S7D_VPU_RESET_H
+
+#define S7D_VPU_RESET_AFBCD_REGS 0
+#define S7D_VPU_RESET_AFBCD_LOGIC 1
+#define S7D_VPU_RESET_AFBC_ARBITER_REGS 2
+#define S7D_VPU_RESET_AFBC_ARBITER_LOGIC 3
+
+#endif
