@@ -2,6 +2,10 @@
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <dt-bindings/reset/amlogic,s7d-vpu-reset.h>
 
+&vdin1_cma_reserved {
+	status = "disabled";
+};
+
 &gpu {
 	status = "disabled";
 };
