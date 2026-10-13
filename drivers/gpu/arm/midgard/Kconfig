@@ -18,12 +18,17 @@
 #
 #
 
+source "$(COMMON_DRIVERS_DIR)/drivers/gpu/arm/midgard/platform/c5/Kconfig"
+
 menuconfig MALI_MIDGARD
-	tristate "Mali Midgard series support"
+	tristate "Mali Midgard series support" if !AMLOGIC_C5_GPU_KBASE
+	depends on AMLOGIC_UVM || !AMLOGIC_UVM
 	select DMA_SHARED_BUFFER
 	select PM_DEVFREQ
 	select DEVFREQ_THERMAL
 	select FW_LOADER
+	default m if AMLOGIC_C5_GPU_KBASE && MODULES
+	default y if AMLOGIC_C5_GPU_KBASE
 	default n
 	help
 	  Enable this option to build support for a ARM Mali Midgard GPU.
@@ -35,7 +40,8 @@ if MALI_MIDGARD
 
 config MALI_PLATFORM_NAME
 	depends on MALI_MIDGARD
-	string "Platform name"
+	string "Platform name" if !AMLOGIC_C5_GPU_KBASE
+	default "c5" if AMLOGIC_C5_GPU_KBASE
 	default "devicetree"
 	help
 	  Enter the name of the desired platform configuration directory to
@@ -79,8 +85,9 @@ source "$(COMMON_DRIVERS_DIR)/drivers/gpu/arm/midgard/platform/Kconfig"
 endmenu
 
 config MALI_CSF_SUPPORT
-	bool "Enable Mali CSF based GPU support"
+	bool "Enable Mali CSF based GPU support" if !AMLOGIC_C5_GPU_KBASE
 	depends on MALI_MIDGARD
+	default y if AMLOGIC_C5_GPU_KBASE
 	default n
 	help
 	  Enables support for CSF based GPUs.

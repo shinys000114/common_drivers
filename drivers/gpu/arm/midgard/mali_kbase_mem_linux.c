@@ -85,7 +85,14 @@
  */
 #define KBASE_MEM_ION_SYNC_WORKAROUND
 #endif
+#if IS_REACHABLE(CONFIG_AMLOGIC_UVM)
 extern bool dmabuf_uvm_realloc(struct dma_buf *dmabuf);
+#else
+static inline bool dmabuf_uvm_realloc(struct dma_buf *dmabuf)
+{
+	return false;
+}
+#endif
 
 /*
  * fully_backed_gpf_memory - enable full physical backing of all grow-on-GPU-page-fault

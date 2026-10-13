@@ -3488,17 +3488,28 @@ int power_control_init(struct kbase_device *kbdev)
 			break;
 		}
 
-		err = clk_prepare_enable(kbdev->clocks[i]);
+		/* C5 prepares once here; its PM callbacks own enable references. */
+		err = IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE) ?
+			clk_prepare(kbdev->clocks[i]) :
+			clk_prepare_enable(kbdev->clocks[i]);
 		if (err) {
 			dev_err(kbdev->dev, "Failed to prepare and enable clock (%d)\n", err);
 			clk_put(kbdev->clocks[i]);
+			kbdev->clocks[i] = NULL;
 			break;
 		}
 	}
 
-	if (err == -EPROBE_DEFER) {
+	if (err == -EPROBE_DEFER ||
+	    (IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE) && i != 2)) {
+		if (!err)
+			err = -EINVAL;
 		while (i > 0) {
-			clk_disable_unprepare(kbdev->clocks[--i]);
+			--i;
+			if (IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE))
+				clk_unprepare(kbdev->clocks[i]);
+			else
+				clk_disable_unprepare(kbdev->clocks[i]);
 			clk_put(kbdev->clocks[i]);
 		}
 		goto clocks_probe_defer;
@@ -3545,7 +3556,9 @@ int power_control_init(struct kbase_device *kbdev)
 regulators_probe_defer:
 	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; i++) {
 		if (kbdev->clocks[i]) {
-			if (__clk_is_enabled(kbdev->clocks[i]))
+			if (IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE))
+				clk_unprepare(kbdev->clocks[i]);
+			else if (__clk_is_enabled(kbdev->clocks[i]))
 				clk_disable_unprepare(kbdev->clocks[i]);
 			clk_put(kbdev->clocks[i]);
 			kbdev->clocks[i] = NULL;
@@ -3582,7 +3595,9 @@ void power_control_term(struct kbase_device *kbdev)
 
 	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; i++) {
 		if (kbdev->clocks[i]) {
-			if (__clk_is_enabled(kbdev->clocks[i]))
+			if (IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE))
+				clk_unprepare(kbdev->clocks[i]);
+			else if (__clk_is_enabled(kbdev->clocks[i]))
 				clk_disable_unprepare(kbdev->clocks[i]);
 			clk_put(kbdev->clocks[i]);
 			kbdev->clocks[i] = NULL;
@@ -4779,6 +4794,8 @@ int kbase_backend_devfreq_init(struct kbase_device *kbdev)
 	/* Devfreq uses hardware counters, so must be initialized after it. */
 	int err = kbase_devfreq_init(kbdev);
 
+	if (err && IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE))
+		return err;
 	if (err)
 		dev_err(kbdev->dev, "Continuing without devfreq\n");
 #endif /* CONFIG_MALI_DEVFREQ */
@@ -4871,6 +4888,7 @@ static int kbase_platform_device_probe(struct platform_device *pdev)
 static int kbase_device_suspend(struct device *dev)
 {
 	struct kbase_device *kbdev = to_kbase_device(dev);
+	int ret;
 
 	if (!kbdev)
 		return -ENODEV;
@@ -4891,6 +4909,17 @@ static int kbase_device_suspend(struct device *dev)
 		flush_workqueue(kbdev->devfreq_queue.workq);
 	}
 #endif
+	if (IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)) {
+		ret = pm_runtime_force_suspend(dev);
+		if (ret) {
+			kbase_pm_resume(kbdev);
+#ifdef CONFIG_MALI_DEVFREQ
+			if (kbdev->devfreq)
+				kbase_devfreq_enqueue_work(kbdev, DEVFREQ_WORK_RESUME);
+#endif
+			return ret;
+		}
+	}
 	return 0;
 }
 
@@ -4906,10 +4935,16 @@ static int kbase_device_suspend(struct device *dev)
 static int kbase_device_resume(struct device *dev)
 {
 	struct kbase_device *kbdev = to_kbase_device(dev);
+	int ret;
 
 	if (!kbdev)
 		return -ENODEV;
 
+	if (IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)) {
+		ret = pm_runtime_force_resume(dev);
+		if (ret)
+			return ret;
+	}
 	kbase_pm_resume(kbdev);
 
 #ifdef CONFIG_MALI_MIDGARD_DVFS
@@ -5003,6 +5038,8 @@ static int kbase_device_runtime_resume(struct device *dev)
 	KBASE_KTRACE_ADD(kbdev, PM_RUNTIME_RESUME_CALLBACK, NULL, 0);
 	if (kbdev->pm.backend.callback_power_runtime_on) {
 		ret = kbdev->pm.backend.callback_power_runtime_on(kbdev);
+		if (ret)
+			return ret;
 		dev_dbg(dev, "runtime resume\n");
 	}
 
@@ -5071,10 +5108,15 @@ static const struct dev_pm_ops kbase_pm_ops = {
 };
 
 #if IS_ENABLED(CONFIG_OF)
-static const struct of_device_id kbase_dt_ids[] = { { .compatible = "arm,malit6xx" },
+static const struct of_device_id kbase_dt_ids[] = {
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
+						    { .compatible = "amlogic,s7d-mali" },
+#else
+						    { .compatible = "arm,malit6xx" },
 						    { .compatible = "arm,mali-midgard" },
 						    { .compatible = "arm,mali-bifrost" },
 						    { .compatible = "arm,mali-valhall" },
+#endif
 						    { /* sentinel */ } };
 MODULE_DEVICE_TABLE(of, kbase_dt_ids);
 #endif

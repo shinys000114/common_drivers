@@ -528,7 +528,9 @@ int kbase_device_early_init(struct kbase_device *kbdev)
 	spin_lock_init(&kbdev->hwaccess_lock);
 
 	/* Ensure we can access the GPU registers */
-	kbase_pm_register_access_enable(kbdev);
+	err = kbase_pm_register_access_enable(kbdev);
+	if (err)
+		goto pm_runtime_term;
 
 	/*
 	 * If -EPERM is returned, it means the device backend is not supported, but
