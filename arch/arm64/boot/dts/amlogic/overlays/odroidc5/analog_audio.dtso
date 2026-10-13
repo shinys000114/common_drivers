@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Copyright (c) 2026 Hardkernel Co., Ltd. */
+/dts-v1/;
+/plugin/;
+
+&c5_analog_audio {
+	status = "okay";
+};
+
+&c5_t9015 {
+	status = "okay";
+};
+
+&c5_analog_link {
+	status = "okay";
+};
