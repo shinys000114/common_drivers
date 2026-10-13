@@ -5,6 +5,7 @@ obj-$(CONFIG_AMLOGIC_RESET_MESON) = $(MODULE_NAME).o
 $(MODULE_NAME)-y += main.o reset-meson.o
 $(MODULE_NAME)-$(CONFIG_AMLOGIC_DOS_RESET_MESON) += reset-meson-dos.o
 
+obj-$(CONFIG_RESET_MESON_S7D_AUDIO) += reset-meson-s7d-audio.o
 obj-$(CONFIG_RESET_S7D_VPU) += reset-s7d-vpu.o
 
 PR_FMT = $(subst amlogic-,,$(MODULE_NAME))
