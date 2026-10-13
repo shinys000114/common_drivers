@@ -19,6 +19,7 @@
 #include <drm/drm_vblank.h>
 
 #include "s7d-crtc.h"
+#include "s7d-afbc-engine.h"
 #include "s7d-plane.h"
 
 struct s7d_crtc {
@@ -108,8 +109,25 @@ static void s7d_crtc_build_update(struct s7d_crtc_state *state)
 {
 	unsigned int count = 0, i;
 
-	memcpy(state->update, state->osd.update, sizeof(state->osd.update));
-	count += S7D_OSD_UPDATE_REG_COUNT;
+	for (i = 0; i < S7D_OSD_UPDATE_REG_COUNT; i++) {
+		u32 reg = le32_to_cpu(state->osd.update[i].reg);
+
+		/* Leave the selected AFBC MIF fixed; the other OSD stays linear. */
+		if (state->buffers.afbc.fb) {
+			u32 mask = state->buffers.afbc.plan.surface_mask;
+
+			if ((mask == BIT(0) &&
+			     (reg == 0x1a1b || reg == 0x1a14 || reg == 0x1a15 ||
+			      reg == 0x1a1c || reg == 0x1a1d || reg == 0x1a2d ||
+			      reg == 0x1a2f)) ||
+			    (mask == BIT(1) &&
+			     (reg == 0x1a3b || reg == 0x1a65 || reg == 0x1a66 ||
+			      reg == 0x1a3c || reg == 0x1a3d || reg == 0x1a4d ||
+			      reg == 0x1abd)))
+				continue;
+		}
+		state->update[count++] = state->osd.update[i];
+	}
 	if (state->video_address_only) {
 		memcpy(state->update + count, state->video.update,
 		       2 * sizeof(*state->update));
@@ -149,6 +167,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	struct drm_rect video_dst;
 	enum drm_color_encoding encoding = DRM_COLOR_YCBCR_BT709;
 	enum drm_color_range range = DRM_COLOR_YCBCR_LIMITED_RANGE;
+	bool primary_changed = false, afbc_position_changed = false;
 	int ret;
 
 	state->valid = false;
@@ -160,16 +179,13 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (!base->enable || base->vrr_enabled || base->self_refresh_active ||
 	    base->degamma_lut || base->gamma_lut || base->ctm || base->async_flip)
 		return -EINVAL;
-	/* A fault requires a full disable/enable or link-recovery modeset. */
-	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
-		return -EIO;
 	ret = drm_atomic_helper_check_crtc_primary_plane(base);
 	if (ret)
 		return ret;
 	/* Include unchanged planes so fences and buffer ownership cover the frame. */
 	drm_for_each_plane(plane, crtc->dev) {
 		const struct drm_plane_helper_funcs *funcs = plane->helper_private;
-		struct drm_plane_state *ps;
+		struct drm_plane_state *ps, *old_ps;
 		struct s7d_plane_state *checked;
 		enum s7d_plane_slot slot;
 
@@ -186,11 +202,24 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 				return ret;
 		}
 		checked = to_s7d_plane_state(ps);
+		old_ps = drm_atomic_get_old_plane_state(atomic, plane);
 		if (!ps->visible)
 			continue;
 		if (ps->crtc != crtc || !ps->fb)
 			return -EINVAL;
 		slot = s7d_plane_slot(plane);
+		if (slot == S7D_PLANE_PRIMARY)
+			primary_changed = !old_ps || old_ps->fb != ps->fb ||
+				old_ps->src_x != ps->src_x || old_ps->src_y != ps->src_y ||
+				old_ps->src_w != ps->src_w || old_ps->src_h != ps->src_h ||
+				old_ps->crtc_x != ps->crtc_x || old_ps->crtc_y != ps->crtc_y ||
+				old_ps->crtc_w != ps->crtc_w || old_ps->crtc_h != ps->crtc_h ||
+				old_ps->alpha != ps->alpha ||
+				old_ps->pixel_blend_mode != ps->pixel_blend_mode;
+		if (checked->afbc_valid)
+			afbc_position_changed = !old_ps ||
+				old_ps->crtc_x != ps->crtc_x || old_ps->crtc_y != ps->crtc_y ||
+				old_ps->crtc_w != ps->crtc_w || old_ps->crtc_h != ps->crtc_h;
 		if (slot == S7D_PLANE_VIDEO) {
 			if (!checked->video_valid)
 				return -EINVAL;
@@ -204,11 +233,39 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 			if (slot != S7D_PLANE_PRIMARY && layers[1].enabled)
 				return -ENOSPC;
 			layers[slot == S7D_PLANE_PRIMARY ? 0 : 1] = checked->layer;
+			if (checked->afbc_valid) {
+				if (state->buffers.afbc.fb)
+					return -ENOSPC;
+				state->buffers.afbc = (struct s7d_scanout_afbc) {
+					.fb = ps->fb,
+					.plan = checked->afbc,
+				};
+			}
 		}
 		state->buffers.fb[slot] = ps->fb;
 	}
 	if (!state->buffers.fb[S7D_PLANE_PRIMARY])
 		return -EINVAL;
+	if (state->buffers.afbc.fb &&
+	    (video || s7d_afbc_check_state(&state->buffers.afbc.plan) ||
+	     (state->buffers.fb[S7D_PLANE_CURSOR] &&
+	      state->buffers.afbc.plan.surface_mask != BIT(0))))
+		return -EINVAL;
+	/* Entry, owner, layout and alpha-route changes require stopped preparation. */
+	if (old && old->active) {
+		const struct s7d_scanout_afbc *before = &to_s7d_crtc_state(old)->buffers.afbc;
+		const struct s7d_scanout_afbc *after = &state->buffers.afbc;
+
+		if (!!before->fb != !!after->fb ||
+		    (after->fb &&
+		     (!s7d_afbc_same_layout(&before->plan, &after->plan) ||
+		      afbc_position_changed ||
+		      (after->plan.surface_mask == BIT(1) && primary_changed))))
+			base->mode_changed = true;
+	}
+	/* A fault requires a full disable/enable or link-recovery modeset. */
+	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
+		return -EIO;
 	if (base->mode.hdisplay != base->adjusted_mode.hdisplay ||
 	    base->mode.vdisplay != base->adjusted_mode.vdisplay)
 		return -EINVAL;
@@ -505,9 +562,7 @@ static void s7d_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_state
 	ret = s7d_crtc_arm_event(c, &state->base, false);
 	if (ret)
 		goto fail;
-	ret = s7d_scanout_submit(c->scanout, &state->buffers, state->update,
-				 state->update_count, state->video_unchanged,
-				 state->video_address_only);
+	ret = c->ops->submit(c->data, state);
 	if (ret)
 		goto fail;
 	mutex_unlock(&c->mutex);
@@ -685,7 +740,7 @@ struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *prima
 	    !s7d_plane_is_native(cursor) || cursor->dev != drm ||
 	    s7d_plane_slot(cursor) != S7D_PLANE_CURSOR ||
 	    !scanout || !scanout->rdma || !ops || !ops->check || !ops->acquire || !ops->prepare ||
-	    !ops->start || !ops->stop || !ops->release || !ops->enable_vblank ||
+	    !ops->start || !ops->submit || !ops->stop || !ops->release || !ops->enable_vblank ||
 	    !ops->disable_vblank || !ops->report_error)
 		return ERR_PTR(-EINVAL);
 	if (revision != S7D_OSD_REV_B)

@@ -18,6 +18,7 @@ struct s7d_osd_layer {
 	u16 alpha;
 	bool premult;
 	bool enabled;
+	bool afbc;
 };
 
 struct s7d_osd_pipeline_state {
@@ -30,7 +31,7 @@ u32 s7d_osd_unpack_mask(u32 reg);
 /*
  * Pure calculation for S7D Rev.B, an RGB primary and optional OSD2,
  * without scaling, with separate OSD outputs to postblend. Layouts must come
- * from s7d_osd_build_state(): this does not establish GEM ownership, fences
+ * from the checked linear or AFBC builders: this does not establish GEM ownership, fences
  * or DMA bounds. Unknown revisions
  * fail; obtain the revision before entering atomic_check, without assuming
  * that a firmware version provider is already ready.

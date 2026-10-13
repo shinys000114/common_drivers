@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
+#include <linux/align.h>
 #include <linux/bits.h>
 #include <linux/errno.h>
 #include <linux/types.h>
@@ -63,13 +64,14 @@ u32 s7d_osd_unpack_mask(u32 reg)
 
 static u32 linear_unpack(const struct s7d_osd_layer *layer)
 {
-	if (layer->enabled && layer->premult &&
+	if (layer->enabled && !layer->afbc && layer->premult &&
 	    !(layer->layout.alpha_config & BIT(14)))
 		return BIT(28);
 	return 0;
 }
 
-static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height)
+static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
+		       bool secondary)
 {
 	const struct s7d_osd_state *layout = &layer->layout;
 	const struct drm_rect *dst = &layer->dst;
@@ -77,10 +79,22 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height)
 
 	if (!layer->enabled)
 		return 0;
+	if (layer->afbc) {
+		if (layer->alpha != 256 || !layer->premult ||
+		    layout->block_config != (BIT(30) | (5 << 8)) ||
+		    (layout->alpha_config != 0x7fc2 &&
+		     layout->alpha_config != (BIT(2) | BIT(1))) ||
+		    layout->frame_addr != (secondary ? 0x00200000 : 0x00100000) ||
+		    ((layout->scope_x | layout->scope_y) & 0xffff) ||
+		    layout->stride != ALIGN((layout->scope_x >> 16) + 1, 256) / 4)
+			return -EINVAL;
+	} else if ((layout->block_config & ~0xcU) != 0x8500 ||
+		   (layout->alpha_config != 0x7fc0 && layout->alpha_config != BIT(2))) {
+		return -EINVAL;
+	}
 	if (((layout->scope_x | layout->scope_y) & 0xe000e000) ||
 	    !layout->stride || layout->stride > 0xfff || (layout->stride & 3) ||
-	    (layout->block_config & ~0xcU) != 0x8500 || layer->alpha > 256 ||
-	    (layout->alpha_config != 0x7fc0 && layout->alpha_config != BIT(2)) ||
+	    layer->alpha > 256 ||
 	    dst->x1 < 0 || dst->y1 < 0 || dst->x2 > (int)width || dst->y2 > (int)height ||
 	    dst->x2 <= dst->x1 || dst->y2 <= dst->y1)
 		return -EINVAL;
@@ -112,10 +126,11 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 	if (revision != S7D_OSD_REV_B)
 		return -EOPNOTSUPP;
 	if (!width || !height || width > 4096 || height > 4096 ||
+	    (layers[0].afbc && layers[1].enabled && layers[1].afbc) ||
 	    !layers[0].enabled || layers[0].dst.x1 || layers[0].dst.y1 ||
 	    layers[0].dst.x2 != (int)width || layers[0].dst.y2 != (int)height ||
-	    check_layer(&layers[0], width, height) ||
-	    check_layer(&layers[1], width, height))
+	    check_layer(&layers[0], width, height, false) ||
+	    check_layer(&layers[1], width, height, true))
 		return -EINVAL;
 	primary = &layers[0].layout;
 	h_scope = (width - 1) << 16;

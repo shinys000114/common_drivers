@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/amlogic/clk/s7d-hdmi-pll-rate.h>
+#include <linux/amlogic/s7d-vpu-reset.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/irq.h>
+#include <linux/jiffies.h>
 #include <linux/platform_device.h>
+#include <linux/of.h>
+#include <linux/regmap.h>
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
 
 #include <drm/drm_device.h>
-
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_vblank.h>
 
 #include "s7d-vpu.h"
@@ -53,6 +57,11 @@
 #define PIXEL_MUX		2
 #define PIXEL_PARENT		3
 #define CLOCK_ERROR_PPM		1000
+#define AFBC_TOP			0x1a0f
+#define AFBC_RAW			0x3a01
+#define AFBC_COMMAND		0x3a05
+#define AFBC_STATUS		0x3a06
+#define AFBC_SURFACES		0x3a07
 
 static u32 vpu_read(struct s7d_vpu *v, u32 reg)
 {
@@ -69,6 +78,204 @@ static int vpu_update(struct s7d_vpu *v, u32 reg, u32 mask, u32 value)
 	return 0;
 }
 
+static int s7d_vpu_reset_access(void *data)
+{
+	struct s7d_vpu *v = data;
+
+	return v->acquired ? 0 : -EHOSTDOWN;
+}
+
+static int s7d_vpu_afbc_read(void *data, u32 reg, u32 *value)
+{
+	struct s7d_vpu *v = data;
+	int ret = s7d_vpu_reset_access(v);
+
+	return ret ? ret : regmap_read(v->regmap, reg * 4, value);
+}
+
+static int s7d_vpu_afbc_write(void *data, u32 reg, u32 value)
+{
+	struct s7d_vpu *v = data;
+	int ret = s7d_vpu_reset_access(v);
+
+	if (ret)
+		return ret;
+	if (reg == AFBC_COMMAND)
+		v->afbc_command_counter = vpu_read(v, ENCP_INFO_READ);
+	return regmap_write(v->regmap, reg * 4, value);
+}
+
+static int s7d_vpu_afbc_check_start(void *data, u64 sequence, u8 field)
+{
+	struct s7d_vpu *v = data;
+	u32 before, after, fifo, fifo2, vd1, arbiter;
+
+	lockdep_assert_held(&v->frame_lock);
+	if (!v->acquired || !(vpu_read(v, ENCP_EN) & BIT(0)) ||
+	    sequence != READ_ONCE(v->scanout.vblank_seq))
+		return -EHOSTDOWN;
+	before = vpu_read(v, ENCP_INFO_READ);
+	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
+	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
+	vd1 = vpu_read(v, VD1_GEN);
+	arbiter = vpu_read(v, ASYNC_STAT);
+	after = vpu_read(v, ENCP_INFO_READ);
+	if ((before >> 29) != field || (after >> 29) != field ||
+	    ((fifo | fifo2) & OSD_FIFO_STATE) || (vd1 & (VD1_BUSY | BIT(0))) ||
+	    !(arbiter & ASYNC_IDLE) ||
+	    ((before >> 16) & 0x1fff) < v->flip_start ||
+	    ((before >> 16) & 0x1fff) > ((after >> 16) & 0x1fff) ||
+	    ((after >> 16) & 0x1fff) >= v->flip_end)
+		return -ETIMEDOUT;
+	return 0;
+}
+
+static const struct s7d_afbc_engine_io s7d_vpu_afbc_io = {
+	.read = s7d_vpu_afbc_read,
+	.write = s7d_vpu_afbc_write,
+	.check_start = s7d_vpu_afbc_check_start,
+};
+
+static void s7d_vpu_afbc_timeout(struct work_struct *work)
+{
+	struct s7d_vpu *v = container_of(to_delayed_work(work),
+				       struct s7d_vpu, afbc_timeout);
+	unsigned long flags, now;
+	int ret = 0;
+
+	spin_lock_irqsave(&v->frame_lock, flags);
+	now = jiffies;
+	if (v->afbc_enabled && v->afbc.phase == S7D_AFBC_RUNNING) {
+		if (time_before(now, v->afbc_deadline))
+			mod_delayed_work(system_wq, &v->afbc_timeout,
+					 v->afbc_deadline - now);
+		else
+			ret = s7d_afbc_engine_fail(&v->afbc, -ETIMEDOUT,
+				v->afbc.completed_epoch == v->afbc.epoch ?
+				ENCP_INFO_READ : AFBC_STATUS);
+	}
+	if (ret)
+		s7d_crtc_link_error(v->crtc, ret);
+	spin_unlock_irqrestore(&v->frame_lock, flags);
+}
+
+static void s7d_vpu_afbc_arm_timeout(struct s7d_vpu *v)
+{
+	lockdep_assert_held(&v->frame_lock);
+	v->afbc_deadline = jiffies + msecs_to_jiffies(500);
+	mod_delayed_work(system_wq, &v->afbc_timeout, msecs_to_jiffies(500));
+}
+
+static int s7d_vpu_afbc_resets(struct s7d_vpu *v)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(v->local_resets); i++) {
+		ret = reset_control_status(v->local_resets[i].rstc);
+		if (ret)
+			return ret < 0 ? ret : -EHOSTDOWN;
+	}
+	return 0;
+}
+
+static void s7d_vpu_afbc_admission(struct s7d_vpu *v)
+{
+	struct s7d_afbc_observation o;
+	u32 format, unpack;
+	unsigned int i;
+	int ret;
+
+	if (!v->afbc_available)
+		return;
+	ret = s7d_vpu_afbc_resets(v);
+	if (!ret)
+		ret = s7d_afbc_engine_read(&v->afbc, &o);
+	if (!ret && ((o.raw & GENMASK(5, 2)) || (o.status & BIT(2))))
+		ret = -EIO;
+	if (!ret && ((o.status & GENMASK(1, 0)) || (o.top & BIT(31)) || o.surfaces))
+		ret = -EBUSY;
+	v->afbc_ready_mask = 0;
+	for (i = 0; i < ARRAY_SIZE(v->afbc_admission_error); i++) {
+		const struct s7d_afbc_surface *s = s7d_afbc_surface_get(BIT(i));
+		int err = ret;
+
+		if (!err)
+			err = s7d_vpu_afbc_read(v, s->bank + 2, &format);
+		if (!err && (format & BIT(19)))
+			err = -EOPNOTSUPP;
+		if (!err)
+			err = s7d_vpu_afbc_read(v, s->unpack, &unpack);
+		if (!err && (unpack & (BIT(16) | BIT(28))))
+			err = -EOPNOTSUPP;
+		v->afbc_admission_error[i] = err;
+		if (!err)
+			v->afbc_ready_mask |= s->mask;
+	}
+}
+
+static int s7d_vpu_afbc_stop_sample(struct s7d_vpu *v)
+{
+	struct s7d_afbc_observation o;
+	int ret = s7d_afbc_engine_read(&v->afbc, &o);
+
+	return ret ? ret : s7d_afbc_engine_stop_sample(&v->afbc, &o);
+}
+
+static int s7d_vpu_afbc_stop_decode(struct s7d_vpu *v)
+{
+	int sample, ret;
+
+	ret = read_poll_timeout(s7d_vpu_afbc_stop_sample, sample, sample != 0,
+			       10, 50000, false, v);
+	return ret ? s7d_afbc_engine_fail(&v->afbc, ret, AFBC_STATUS) :
+		     (sample < 0 ? sample : 0);
+}
+
+static int s7d_vpu_afbc_stage(void *data,
+			     const struct s7d_scanout_buffers *active,
+			     const struct s7d_scanout_buffers *candidate,
+			     u64 generation)
+{
+	struct s7d_vpu *v = data;
+	struct s7d_afbc_engine *e = &v->afbc;
+
+	lockdep_assert_held(&v->frame_lock);
+	if (!candidate->afbc.fb && !active->afbc.fb)
+		return v->afbc_enabled ? -EIO : 0;
+	if (!v->afbc_enabled || !candidate->afbc.fb || !active->afbc.fb ||
+	    !e->bound_valid || e->generation != active->generation ||
+	    !s7d_afbc_same_layout(&e->bound, &active->afbc.plan) ||
+	    e->bound.header_addr != active->afbc.plan.header_addr)
+		return s7d_afbc_engine_fail(e, -EIO, AFBC_SURFACES);
+	return s7d_afbc_engine_stage(e, &candidate->afbc.plan, generation);
+}
+
+static int s7d_vpu_afbc_cancel(void *data, u64 generation)
+{
+	struct s7d_vpu *v = data;
+
+	lockdep_assert_held(&v->frame_lock);
+	return v->afbc_enabled ?
+		s7d_afbc_engine_cancel_stage(&v->afbc, generation) : 0;
+}
+
+static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
+{
+	struct s7d_vpu *v = data;
+	unsigned long flags;
+	int ret;
+
+	s7d_scanout_flush_retired(&v->scanout);
+	spin_lock_irqsave(&v->frame_lock, flags);
+	ret = s7d_scanout_submit_staged(&v->scanout, &state->buffers, state->update,
+		state->update_count, state->video_unchanged, state->video_address_only,
+		s7d_vpu_afbc_stage,
+		s7d_vpu_afbc_cancel, v);
+	spin_unlock_irqrestore(&v->frame_lock, flags);
+	return ret;
+}
+
 static bool rate_matches(unsigned long requested, unsigned long actual)
 {
 	u64 delta = requested > actual ? requested - actual : actual - requested;
@@ -82,6 +289,15 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	struct s7d_hdmi_pll_rate plan;
 	int ret;
 
+	if (state->buffers.afbc.fb) {
+		u32 mask = state->buffers.afbc.plan.surface_mask;
+
+		ret = s7d_afbc_check_state(&state->buffers.afbc.plan);
+		if (ret)
+			return ret;
+		if (!v->afbc_available || !(v->afbc_ready_mask & mask))
+			return v->afbc_admission_error[mask == BIT(0) ? 0 : 1] ?: -EOPNOTSUPP;
+	}
 	/* One unscaled RGB pixel per VPU cycle; protect this rate at prepare. */
 	if (state->pixel_rate < 25175000 || state->pixel_rate > 594000000 ||
 	    state->base.adjusted_mode.hdisplay > 4096 ||
@@ -128,6 +344,7 @@ static int s7d_vpu_acquire(void *data)
 		pm_runtime_put(v->dev);
 		return ret;
 	}
+	v->acquired = true;
 	ret = check_handoff(v);
 	if (ret)
 		goto disable_bus;
@@ -139,7 +356,7 @@ static int s7d_vpu_acquire(void *data)
 			goto disable_bus;
 		v->pixel_enabled = true;
 	}
-	v->acquired = true;
+	s7d_vpu_afbc_admission(v);
 	return 0;
 disable_bus:
 	v->acquired = false;
@@ -205,15 +422,18 @@ static int stop_encoders(struct s7d_vpu *v)
 	return 0;
 }
 
-static int s7d_vpu_stop(void *data)
+static int s7d_vpu_stop_hw(void *data)
 {
 	struct s7d_vpu *v = data;
 	static const u32 osds[] = { OSD1_CTRL, OSD2_CTRL };
 	u32 value;
 	unsigned int i;
+	const struct s7d_afbc_surface *surface = NULL;
+	bool abort_prepare = false;
 	int ret;
 
 	mask_irqs(v);
+	cancel_delayed_work_sync(&v->afbc_timeout);
 	if (!v->touched)
 		return 0;
 	if (!v->acquired)
@@ -227,9 +447,25 @@ static int s7d_vpu_stop(void *data)
 	 * running until OSD disable and outstanding reads have drained: stopping
 	 * its field/line strobes first leaves OSD_ENABLE latched on S7D.
 	 */
+	if (v->afbc_enabled) {
+		surface = s7d_afbc_surface_get(v->afbc_surface_mask);
+		if (!surface || (v->normal_unpack_owned & surface->mask))
+			return -EIO;
+		abort_prepare = s7d_afbc_engine_can_abort_prepare(&v->afbc);
+		if (!abort_prepare) {
+			ret = s7d_afbc_engine_stop_begin(&v->afbc);
+			if (ret)
+				return ret;
+		}
+	}
 	ret = s7d_rdma_quiesce(&v->rdma);
 	if (ret)
 		return ret;
+	if (v->afbc_enabled && !abort_prepare) {
+		ret = s7d_vpu_afbc_stop_decode(v);
+		if (ret)
+			return ret;
+	}
 	if (!v->osd_draining) {
 		for (i = 0; i < ARRAY_SIZE(osds); i++)
 			v->osd_free_clk[i] = vpu_read(v, osds[i]) & OSD_FREE_CLK;
@@ -278,6 +514,32 @@ static int s7d_vpu_stop(void *data)
 		v->failed_reg = ASYNC_STAT;
 		return ret;
 	}
+	if (v->afbc_enabled) {
+		if (abort_prepare) {
+			dev_err(v->dev, "AFBC unstarted prepare: %d reg %#x gen %llu readback %d expected %#x observed %#x\n",
+				v->afbc.last_error, v->afbc.failed_reg,
+				v->afbc.failed_generation, v->afbc.failed_readback,
+				v->afbc.failed_expected, v->afbc.failed_observed);
+			ret = s7d_afbc_engine_abort_prepare(&v->afbc, &v->failed_reg);
+			if (ret)
+				dev_err(v->dev, "AFBC prepare abort failed: %d reg %#x; retaining scanout resources\n",
+					ret, v->failed_reg);
+		} else {
+			ret = s7d_afbc_engine_stop_finish(&v->afbc);
+		}
+		if (ret)
+			return ret;
+		ret = vpu_update(v, OSD_PATH, surface->route_mask, 0);
+		if (!ret)
+			ret = vpu_update(v, surface->unpack, v->afbc_unpack_mask, 0);
+		if (!ret)
+			ret = vpu_update(v, surface->alpha, BIT(1), 0);
+		if (ret)
+			return ret;
+		v->afbc_enabled = false;
+		v->afbc_surface_mask = 0;
+		v->afbc_unpack_mask = 0;
+	}
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		u32 reg = i ? 0x1abd : 0x1a2f;
 
@@ -311,6 +573,16 @@ static int s7d_vpu_stop(void *data)
 	}
 	s7d_vpu_disable_pixel(v);
 	return 0;
+}
+
+static int s7d_vpu_stop(void *data)
+{
+	struct s7d_vpu *v = data;
+	int ret = s7d_vpu_stop_hw(v);
+
+	if (ret && v->afbc_enabled)
+		return s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
+	return ret;
 }
 
 static int check_handoff(struct s7d_vpu *v)
@@ -412,6 +684,9 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		u32 mask = s7d_osd_unpack_mask(reg);
 
 		if (mask) {
+			if (state->buffers.afbc.fb &&
+			    reg == state->buffers.afbc.plan.unpack.reg)
+				continue;
 			v->normal_unpack_owned |= reg == 0x1a2f ? BIT(0) : BIT(1);
 			ret = vpu_update(v, reg, mask, expected);
 			if (ret)
@@ -524,6 +799,24 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = program_output(v, state);
 	if (ret)
 		return ret;
+	if (state->buffers.afbc.fb) {
+		const struct s7d_afbc_state *p = &state->buffers.afbc.plan;
+		u64 generation = s7d_scanout_pending_generation(&v->scanout);
+
+		ret = s7d_vpu_afbc_resets(v);
+		if (ret)
+			return ret;
+		v->afbc_surface_mask = p->surface_mask;
+		v->afbc_unpack_mask = p->unpack.mask & ~GENMASK(15, 0);
+		v->afbc_enabled = true;
+		ret = s7d_afbc_engine_prepare(&v->afbc, p, generation);
+		if (!ret)
+			ret = vpu_update(v, p->route.reg, p->route.mask, p->route.value);
+		if (!ret)
+			ret = vpu_update(v, p->unpack.reg, p->unpack.mask, p->unpack.value);
+		if (ret)
+			return s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
+	}
 	v->flip_start = state->encp.flip_start;
 	v->flip_end = state->encp.flip_end;
 	/* RDMA done was acknowledged by prepare; clear stale GIC edge state. */
@@ -536,22 +829,33 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 static int s7d_vpu_start(void *data)
 {
 	struct s7d_vpu *v = data;
+	unsigned long flags;
 	int ret;
 
 	if (!v->acquired || !v->touched)
 		return -EIO;
+	spin_lock_irqsave(&v->frame_lock, flags);
 	enable_irq(v->rdma_irq);
 	v->rdma_enabled = true;
 	ret = vpu_update(v, ENCP_EN, BIT(0), BIT(0));
-	if (ret)
-		return ret;
-	ret = vpu_update(v, VD1_GEN, BIT(0), v->vd1_enable ? BIT(0) : 0);
-	if (ret)
-		return ret;
-	ret = vpu_update(v, OSD2_CTRL, BIT(0), v->osd2_enable ? BIT(0) : 0);
-	if (ret)
-		return ret;
-	return vpu_update(v, OSD1_CTRL, BIT(0), BIT(0));
+	if (!ret && v->afbc_enabled) {
+		ret = s7d_afbc_engine_start_initial(&v->afbc);
+		if (!ret) {
+			s7d_vpu_afbc_arm_timeout(v);
+			ret = s7d_scanout_afbc_started(&v->scanout,
+				v->afbc.generation, v->afbc.epoch);
+		}
+	}
+	if (!ret)
+		ret = vpu_update(v, VD1_GEN, BIT(0), v->vd1_enable ? BIT(0) : 0);
+	if (!ret)
+		ret = vpu_update(v, OSD2_CTRL, BIT(0), v->osd2_enable ? BIT(0) : 0);
+	if (!ret)
+		ret = vpu_update(v, OSD1_CTRL, BIT(0), BIT(0));
+	if (ret && v->afbc_enabled)
+		ret = s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
+	spin_unlock_irqrestore(&v->frame_lock, flags);
+	return ret;
 }
 
 static void s7d_vpu_release(void *data)
@@ -572,6 +876,15 @@ static void s7d_vpu_report_error(void *data, int error)
 
 	if (!s7d_crtc_last_error(v->crtc))
 		return;
+	if (v->afbc.phase == S7D_AFBC_ERROR)
+		dev_err(v->dev, "AFBC failed: %d reg %#x phase %u gen %llu epoch %llu ns %llu caller %pS command %#x last raw %#x status %#x top %#x surfaces %#x readback %d expected %#x observed %#x\n",
+			v->afbc.last_error, v->afbc.failed_reg, v->afbc.failed_phase,
+			v->afbc.failed_generation, v->afbc.failed_epoch,
+			v->afbc.failed_ns, (void *)v->afbc.failed_caller,
+			v->afbc_command_counter, v->afbc.observed.raw,
+			v->afbc.observed.status, v->afbc.observed.top,
+			v->afbc.observed.surfaces, v->afbc.failed_readback,
+			v->afbc.failed_expected, v->afbc.failed_observed);
 	dev_err(v->dev, "display stopped: %d, VCBUS word %#x; modeset required\n",
 		error, v->failed_reg);
 }
@@ -582,6 +895,7 @@ const struct s7d_crtc_ops s7d_vpu_crtc_ops = {
 	.acquire = s7d_vpu_acquire,
 	.prepare = s7d_vpu_prepare,
 	.start = s7d_vpu_start,
+	.submit = s7d_vpu_submit,
 	.stop = s7d_vpu_stop,
 	.release = s7d_vpu_release,
 	.enable_vblank = s7d_vpu_enable_vblank,
@@ -597,15 +911,105 @@ static void s7d_vpu_trace_frame(struct s7d_vpu *v, unsigned int kind, int result
 			       drm_crtc_vblank_count(v->crtc), result);
 }
 
+static int s7d_vpu_afbc_sample(struct s7d_vpu *v,
+			       enum s7d_rdma_result result,
+			       struct s7d_frame_state *frame,
+			       const struct s7d_afbc_frame *afbc_frame)
+{
+	struct s7d_afbc_observation o;
+	int ret;
+
+	frame->afbc_gate = v->afbc_enabled;
+	if (!v->afbc_enabled || v->afbc.phase == S7D_AFBC_PREPARED)
+		return 0;
+	if (result == S7D_RDMA_FAULT)
+		return s7d_afbc_engine_fail(&v->afbc, -EIO, 0);
+	ret = s7d_afbc_engine_read(&v->afbc, &o);
+	if (!ret)
+		ret = s7d_afbc_engine_sample(&v->afbc, afbc_frame, &o);
+	if (ret < 0)
+		return ret;
+	if (result == S7D_RDMA_COMPLETE) {
+		ret = s7d_afbc_engine_rdma_drained(&v->afbc,
+				 s7d_scanout_pending_generation(&v->scanout));
+		if (ret)
+			return s7d_afbc_engine_fail(&v->afbc, ret, 0);
+	}
+	frame->afbc_completed_generation = v->afbc.completed_generation;
+	frame->afbc_completed_epoch = v->afbc.completed_generation_epoch;
+	frame->early = false;
+	return 0;
+}
+
+static int s7d_vpu_afbc_restart(struct s7d_vpu *v,
+				const struct s7d_afbc_frame *frame)
+{
+	u64 generation, previous_generation = v->afbc.generation;
+	int ret;
+
+	if (!v->afbc_enabled || !frame->vblank ||
+	    v->afbc.phase != S7D_AFBC_RUNNING || s7d_crtc_last_error(v->crtc))
+		return 0;
+	ret = s7d_afbc_engine_restart(&v->afbc, frame);
+	if (ret == -EAGAIN || ret == -EALREADY)
+		return 0;
+	if (ret)
+		return s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
+	s7d_vpu_afbc_arm_timeout(v);
+	if (v->afbc.generation != previous_generation) {
+		generation = s7d_scanout_pending_generation(&v->scanout);
+		if (!generation || generation != v->afbc.generation)
+			return s7d_afbc_engine_fail(&v->afbc, -EIO, 0);
+		ret = s7d_scanout_afbc_started(&v->scanout, generation, v->afbc.epoch);
+		if (ret)
+			return s7d_afbc_engine_fail(&v->afbc, ret, 0);
+	}
+	return 0;
+}
+
+static void s7d_vpu_afbc_report_first(struct s7d_vpu *v, bool restart,
+		bool vblank, enum s7d_rdma_result result,
+		u32 before, u32 after, u32 fifo, u32 fifo2, u32 vd1, u32 arbiter)
+{
+	struct s7d_scanout *s = &v->scanout;
+	unsigned long flags;
+	u64 active_generation, pending_generation, active_header, pending_header;
+	u32 active_fb, pending_fb;
+	unsigned int phase;
+
+	lockdep_assert_held(&v->frame_lock);
+	spin_lock_irqsave(&s->lock, flags);
+	active_generation = s->active.generation;
+	pending_generation = s->pending.generation;
+	active_header = s->active.afbc.plan.header_addr;
+	pending_header = s->pending.afbc.plan.header_addr;
+	active_fb = s->active.afbc.fb ? s->active.afbc.fb->base.id : 0;
+	pending_fb = s->pending.afbc.fb ? s->pending.afbc.fb->base.id : 0;
+	phase = s->phase;
+	spin_unlock_irqrestore(&s->lock, flags);
+	dev_err(v->dev, "AFBC first frame fault: %s vblank %u rdma %u ns %llu caller %pS owner %u active fb %u gen %llu header %#llx pending fb %u gen %llu header %#llx bound %u gen %llu header %#llx staged %u gen %llu header %#llx native before %#x after %#x fifo %#x fifo2 %#x vd1 %#x read0 %#x\n",
+		restart ? "restart" : "sample", vblank, result,
+		v->afbc.failed_ns, (void *)v->afbc.failed_caller, phase,
+		active_fb, active_generation, active_header,
+		pending_fb, pending_generation, pending_header,
+		v->afbc.bound_valid, v->afbc.generation, v->afbc.bound.header_addr,
+		v->afbc.pending_valid, v->afbc.pending_generation,
+		v->afbc.pending.header_addr, before, after, fifo, fifo2, vd1, arbiter);
+}
+
 static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 			      enum s7d_rdma_result result)
 {
-	struct s7d_frame_state frame;
+	struct s7d_frame_state frame = {0};
+	struct s7d_afbc_frame afbc_frame;
 	unsigned long flags;
 	u32 before, after, fifo, fifo2, vd1, arbiter;
+	bool afbc_error;
+	int ret;
 
 	/* An older IRQ sample must not overtake the threaded RDMA completion. */
 	spin_lock_irqsave(&v->frame_lock, flags);
+	afbc_error = v->afbc.phase == S7D_AFBC_ERROR;
 	before = vpu_read(v, ENCP_INFO_READ);
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
 	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
@@ -621,8 +1025,28 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 		      ((before >> 16) & 0x1fff) >= v->flip_start &&
 		      ((before >> 16) & 0x1fff) <= ((after >> 16) & 0x1fff) &&
 		      ((after >> 16) & 0x1fff) < v->flip_end;
+	afbc_frame = (struct s7d_afbc_frame) {
+		.sequence = READ_ONCE(v->scanout.vblank_seq) + (vblank ? 1 : 0),
+		.field = frame.field, .vblank = vblank,
+		.idle = frame.idle, .window = frame.early,
+	};
+	ret = s7d_vpu_afbc_sample(v, result, &frame, &afbc_frame);
+	if (ret) {
+		if (!afbc_error && v->afbc.phase == S7D_AFBC_ERROR)
+			s7d_vpu_afbc_report_first(v, false, vblank, result,
+				before, after, fifo, fifo2, vd1, arbiter);
+		v->failed_reg = v->afbc.failed_reg;
+		result = S7D_RDMA_FAULT;
+	}
 	trace_s7d_frame_idle(before, after, fifo, fifo2, vd1, arbiter, vblank);
 	s7d_crtc_irq(v->crtc, vblank, result, &frame);
+	ret = s7d_vpu_afbc_restart(v, &afbc_frame);
+	if (ret) {
+		s7d_vpu_afbc_report_first(v, true, vblank, result,
+			before, after, fifo, fifo2, vd1, arbiter);
+		v->failed_reg = v->afbc.failed_reg;
+		s7d_crtc_link_error(v->crtc, ret);
+	}
 	spin_unlock_irqrestore(&v->frame_lock, flags);
 }
 
@@ -662,10 +1086,47 @@ static irqreturn_t s7d_vpu_rdma_thread(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static int s7d_vpu_local_resets_init(struct s7d_vpu *v)
+{
+	struct device_node *node;
+	int ret;
+
+	node = of_get_compatible_child(v->dev->of_node, "amlogic,s7d-vpu-reset");
+	if (!node)
+		return 0;
+	if (!of_device_is_available(node)) {
+		of_node_put(node);
+		return 0;
+	}
+	if (!IS_REACHABLE(CONFIG_RESET_S7D_VPU)) {
+		of_node_put(node);
+		return -EOPNOTSUPP;
+	}
+	ret = devm_s7d_vpu_reset_register(v->dev, v->regmap, node,
+				       s7d_vpu_reset_access, v);
+	of_node_put(node);
+	if (ret)
+		return ret;
+	v->local_resets[0].id = "afbc-regs";
+	v->local_resets[1].id = "afbc-logic";
+	v->local_resets[2].id = "afbc-arbiter-regs";
+	v->local_resets[3].id = "afbc-arbiter-logic";
+	ret = devm_reset_control_bulk_get_exclusive(v->dev,
+		ARRAY_SIZE(v->local_resets), v->local_resets);
+	if (!ret)
+		v->afbc_available = true;
+	return ret;
+}
+
 int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 		 const struct s7d_vpu_link *link)
 {
 	struct device *dev = &pdev->dev;
+	static const struct regmap_config map_config = {
+		.reg_bits = 32, .val_bits = 32, .reg_stride = 4,
+		.max_register = SZ_256K - 4,
+		.cache_type = REGCACHE_NONE, .fast_io = true,
+	};
 	struct reset_control *rdma_reset;
 	struct resource *res;
 	int ret;
@@ -675,12 +1136,20 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	v->link = *link;
 	v->dev = dev;
 	spin_lock_init(&v->frame_lock);
+	INIT_DELAYED_WORK(&v->afbc_timeout, s7d_vpu_afbc_timeout);
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vcbus");
 	if (!res || resource_size(res) != SZ_256K)
 		return -EINVAL;
 	v->regs = devm_ioremap_resource(dev, res);
 	if (IS_ERR(v->regs))
 		return PTR_ERR(v->regs);
+	v->regmap = devm_regmap_init_mmio(dev, v->regs, &map_config);
+	if (IS_ERR(v->regmap))
+		return PTR_ERR(v->regmap);
+	s7d_afbc_engine_init(&v->afbc, &s7d_vpu_afbc_io, v);
+	ret = s7d_vpu_local_resets_init(v);
+	if (ret)
+		return ret;
 	v->xtal = devm_clk_get(dev, "xtal");
 	if (IS_ERR(v->xtal))
 		return dev_err_probe(dev, PTR_ERR(v->xtal), "missing reference clock\n");
@@ -744,6 +1213,7 @@ int s7d_vpu_fini(struct s7d_vpu *v)
 	}
 	if (v->acquired)
 		return -EBUSY;
+	cancel_delayed_work_sync(&v->afbc_timeout);
 	mask_irqs(v);
 	ret = s7d_scanout_fini(&v->scanout);
 	return ret ? ret : s7d_rdma_fini(&v->rdma);

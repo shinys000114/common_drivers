@@ -7,8 +7,10 @@
 #include <linux/reset.h>
 
 #include "s7d-crtc.h"
+#include "s7d-afbc-engine.h"
 
 struct platform_device;
+struct regmap;
 
 /* HDMI owns PHY/packets. Return only after its transmitter is safely off. */
 struct s7d_vpu_link {
@@ -22,10 +24,15 @@ struct s7d_vpu {
 	struct device *dev;
 	struct s7d_vpu_link link;
 	void __iomem *regs;
+	struct regmap *regmap;
 	struct clk_bulk_data clocks[4];
 	struct clk_bulk_data pixel_route[4];
 	struct clk *xtal;
 	struct reset_control_bulk_data resets[3];
+	struct reset_control_bulk_data local_resets[4];
+	struct s7d_afbc_engine afbc;
+	struct delayed_work afbc_timeout;
+	unsigned long afbc_deadline;
 	struct s7d_rdma rdma;
 	struct s7d_scanout scanout;
 	struct drm_crtc *crtc;
@@ -39,8 +46,15 @@ struct s7d_vpu {
 	bool boot_held;
 	bool touched;
 	bool osd2_enable;
-	bool vd1_enable;
+	bool afbc_available;
+	u32 afbc_ready_mask;
+	u32 afbc_surface_mask;
+	u32 afbc_unpack_mask;
 	u8 normal_unpack_owned;
+	bool afbc_enabled;
+	int afbc_admission_error[2];
+	u32 afbc_command_counter;
+	bool vd1_enable;
 	bool pixel_protected;
 	bool core_protected;
 	bool vd1_draining;
