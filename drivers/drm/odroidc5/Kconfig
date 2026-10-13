@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config AMLOGIC_C5_NATIVE_DISPLAY
+	bool "C5 native VPU/HDMI integration (experimental)"
+	depends on AMLOGIC_C5_DISPLAY_RESOURCES
+	depends on DRM = y && I2C = y && AMLOGIC_CPU_INFO = y
+	depends on DMA_CMA && REGMAP_MMIO
+	depends on !AMLOGIC_MEDIA_ENABLE
+	select PHY_MESON_S7D_HDMI
+	select RESET_S7D_VPU
+	select DRM_KMS_HELPER
+	select DRM_GEM_DMA_HELPER
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_HDMI_HELPER
+	select DRM_BRIDGE_CONNECTOR
+	select SND_SOC_HDMI_CODEC if SND_SOC
+	help
+	  Build the S7D VPU execution path and native RGB8 TMDS bridge, with
+	  DRM EDID/SCDC helpers, CCF consumers and generic PHY ownership.
+	  Static device trees and built-in drivers only; unbind is suppressed.
+	  Register one CRTC, linear RGB primary, linear NV12/NV21 VD1/VD2 video and
+	  shared OSD2 cursor/overlay planes, and an HDMI connector.
+	  Cursor and RGB overlay cannot be visible together. Video is progressive
+	  8-bit SDR with BT.601/709 limited/full-range conversion.
+	  Each local OSD scaler supports up to 4x enlargement and 2:1 reduction,
+	  including simultaneous primary and RGB overlay scaling. Linear RGB
+	  scaling requires opaque pixels and input width up to 1920.
+	  VD1 supports up to 4x enlargement and 8x downscaling
+	  in 1080p output modes. Linear video and OSD scaling may run together
+	  within a checked combined clock budget. VD2 is unscaled up to 2048x1080;
+	  VD1 and VD2 together exclude OSD2. VD2 does not combine with AFBC.
+	  AFBC ABGR8888 supports a primary or OSD2 overlay up to 4096x2160,
+	  with opaque global alpha and optional premultiplied pixel alpha.
+	  AFBC scaling uses the same local OSD limits and uncropped source.
+	  An AFBC primary can use a linear OSD2 cursor or
+	  overlay. Only one AFBC surface is active. An opaque unscaled AFBC
+	  primary can combine with unscaled video up to 1080p at 148.5 MHz;
+	  joint primary/video changes require a stopped modeset.
+	  Requires retained firmware output on S7D revision B, with SDR RGB8 TMDS up to 594 MHz.
+	  Do not enable with legacy media/display writers. System sleep supports
+	  s2idle after native takeover, retaining the shared display domain.
+	  HDMI PCM uses SND_SOC_HDMI_CODEC with SND_SOC_MESON_S7D_HDMI_AUDIO
+	  and SND_SOC_ODROIDC5. Deep sleep, hibernation and cold HDMI SRAM
+	  initialization are not supported.
