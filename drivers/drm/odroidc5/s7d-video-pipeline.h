@@ -34,12 +34,14 @@ struct s7d_video_pipeline_state {
  * Pure progressive 8-bit NV12/NV21 state; NULL layout disables VD1.
  * GEM bounds/fences belong to the plane and scanout owners. dst is clipped,
  * even, with identity or checked SAFA enlargement. Errors leave out unchanged.
- * Apply masked setup with VENC/VD1 stopped. Preserve clock/reset fields.
+ * hold_lines delays fetch after go_field. Apply setup with VENC/VD1 stopped.
+ * Preserve clock/reset fields.
  * Append control.value with captured GEN[31] after replay updates/postblend;
  * never replay GEN busy, software-reset or manual-start bits.
  */
 int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 			     const struct drm_rect *dst,
+			     unsigned int hold_lines,
 			     struct s7d_video_pipeline_state *out);
 
 #endif

@@ -77,6 +77,7 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->video_address_only = false;
 	state->input_captured = false;
 	state->primary_submitted = false;
+	state->video_submitted = false;
 	state->other_plane_submitted = false;
 	state->connector_submitted = false;
 	state->primary_dependency = false;
@@ -104,8 +105,11 @@ void s7d_crtc_capture_input(struct drm_crtc *crtc, struct drm_atomic_state *atom
 	state->primary_submitted = drm_atomic_get_new_plane_state(atomic, crtc->primary);
 	drm_for_each_plane(plane, crtc->dev)
 		if (plane != crtc->primary && s7d_plane_is_native(plane) &&
-		    drm_atomic_get_new_plane_state(atomic, plane))
+		    drm_atomic_get_new_plane_state(atomic, plane)) {
 			state->other_plane_submitted = true;
+			if (s7d_plane_slot(plane) == S7D_PLANE_VIDEO)
+				state->video_submitted = true;
+		}
 	for_each_new_connector_in_state(atomic, connector, connector_state, i)
 		if (connector_state->crtc == crtc ||
 		    drm_atomic_get_old_connector_state(atomic, connector)->crtc == crtc)
@@ -143,12 +147,34 @@ static void s7d_crtc_check_video_update(struct s7d_crtc_state *state,
 			.csc = state->csc,
 			.postblend = state->postblend,
 		};
+	if (old && old->valid && old->base.active &&
+	    ((state->buffers.afbc.fb && state->buffers.video.fb) ||
+	     (old->buffers.afbc.fb && old->buffers.video.fb)) &&
+	    ((state->video_submitted && state->primary_submitted) ||
+	     !s7d_scanout_video_same_config(&old->buffers, &state->buffers)))
+		state->base.mode_changed = true;
 	if (!old || !old->valid || !old->base.active ||
 	    drm_atomic_crtc_needs_modeset(&state->base))
 		return;
 	state->video_unchanged = s7d_scanout_video_equal(&old->buffers, &state->buffers);
 	state->video_address_only = !state->video_unchanged &&
 		s7d_scanout_video_same_config(&old->buffers, &state->buffers);
+}
+
+static int s7d_crtc_check_afbc_video(const struct s7d_crtc_state *state)
+{
+	const struct drm_display_mode *mode = &state->base.adjusted_mode;
+
+	if (!state->buffers.afbc.fb || !state->buffers.fb[S7D_PLANE_VIDEO])
+		return 0;
+	if (state->buffers.afbc.plan.surface_mask != BIT(0) ||
+	    state->buffers.afbc.plan.osd.alpha_config != 0x7fc2 ||
+	    state->buffers.fb[S7D_PLANE_RGB] || state->video.scaler.enabled ||
+	    state->osd.scalers[0].enabled || state->osd.scalers[1].enabled ||
+	    mode->hdisplay > 1920 || mode->vdisplay > 1080 ||
+	    mode->clock > 148500 || state->encp.flip_end <= state->encp.flip_start)
+		return -EINVAL;
+	return 0;
 }
 
 static void s7d_crtc_build_update(struct s7d_crtc_state *state)
@@ -250,6 +276,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	enum drm_color_encoding encoding = DRM_COLOR_YCBCR_BT709;
 	enum drm_color_range range = DRM_COLOR_YCBCR_LIMITED_RANGE;
 	bool primary_changed = false, afbc_position_changed = false;
+	unsigned int video_hold = 8;
 	int ret;
 
 	state->valid = false;
@@ -332,12 +359,20 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (!state->buffers.fb[S7D_PLANE_PRIMARY])
 		return -EINVAL;
 	if (state->buffers.afbc.fb &&
-	    (video || s7d_afbc_check_state(&state->buffers.afbc.plan) ||
+	    (s7d_afbc_check_state(&state->buffers.afbc.plan) ||
 	     (state->buffers.fb[S7D_PLANE_CURSOR] &&
 	      state->buffers.afbc.plan.surface_mask != BIT(0))))
 		return -EINVAL;
+	if (base->mode.hdisplay != base->adjusted_mode.hdisplay ||
+	    base->mode.vdisplay != base->adjusted_mode.vdisplay)
+		return -EINVAL;
+	if (s7d_encp_build_state(&base->adjusted_mode, &state->encp) != MODE_OK)
+		return -EINVAL;
+	if (video && state->buffers.afbc.fb)
+		video_hold = state->encp.fifo_hold_lines;
 	ret = s7d_video_build_pipeline(video ? &video->video : NULL,
-				       video ? &video_dst : NULL, &state->video);
+				       video ? &video_dst : NULL, video_hold,
+				       &state->video);
 	if (ret)
 		return ret;
 	if (old && old->active &&
@@ -356,13 +391,11 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		      (after->plan.surface_mask == BIT(1) && primary_changed))))
 			base->mode_changed = true;
 	}
-	if (base->mode.hdisplay != base->adjusted_mode.hdisplay ||
-	    base->mode.vdisplay != base->adjusted_mode.vdisplay)
-		return -EINVAL;
-	if (s7d_encp_build_state(&base->adjusted_mode, &state->encp) != MODE_OK)
-		return -EINVAL;
 	ret = s7d_osd_build_pipeline(c->revision, base->adjusted_mode.hdisplay,
 				     base->adjusted_mode.vdisplay, layers, &state->osd);
+	if (ret)
+		return ret;
+	ret = s7d_crtc_check_afbc_video(state);
 	if (ret)
 		return ret;
 	if (state->buffers.afbc.fb && state->video.scaler.enabled &&

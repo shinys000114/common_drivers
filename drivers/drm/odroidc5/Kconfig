@@ -33,7 +33,9 @@ config AMLOGIC_C5_NATIVE_DISPLAY
 	  with opaque global alpha and optional premultiplied pixel alpha.
 	  AFBC scaling uses the same local OSD limits and uncropped source.
 	  An AFBC primary can use a linear OSD2 cursor or
-	  overlay. Only one AFBC surface is active; video is disabled with AFBC.
+	  overlay. Only one AFBC surface is active. An opaque unscaled AFBC
+	  primary can combine with unscaled video up to 1080p at 148.5 MHz;
+	  joint primary/video changes require a stopped modeset.
 	  Requires retained firmware output on S7D revision B, with SDR RGB8 TMDS up to 594 MHz.
 	  Do not enable with legacy media/display writers. System sleep supports
 	  s2idle after native takeover, retaining the shared display domain.

@@ -106,6 +106,19 @@ static int s7d_vpu_afbc_write(void *data, u32 reg, u32 value)
 	return regmap_write(v->regmap, reg * 4, value);
 }
 
+static bool s7d_vpu_afbc_window(u32 before, u32 after, u32 vd1,
+			       u16 start, u16 end)
+{
+	if (end <= start || (before >> 29) != (after >> 29) ||
+	    ((before >> 16) & 0x1fff) < start ||
+	    ((before >> 16) & 0x1fff) > ((after >> 16) & 0x1fff) ||
+	    ((after >> 16) & 0x1fff) >= end)
+		return false;
+	if (!(vd1 & BIT(0)))
+		return true;
+	return (vd1 & BIT(29)) && ((vd1 >> 19) & 0x3f) >= end - start + 2U;
+}
+
 static int s7d_vpu_afbc_check_start(void *data, u64 sequence, u8 field)
 {
 	struct s7d_vpu *v = data;
@@ -122,11 +135,9 @@ static int s7d_vpu_afbc_check_start(void *data, u64 sequence, u8 field)
 	arbiter = vpu_read(v, ASYNC_STAT);
 	after = vpu_read(v, ENCP_INFO_READ);
 	if ((before >> 29) != field || (after >> 29) != field ||
-	    ((fifo | fifo2) & OSD_FIFO_STATE) || (vd1 & (VD1_BUSY | BIT(0))) ||
+	    ((fifo | fifo2) & OSD_FIFO_STATE) || (vd1 & VD1_BUSY) ||
 	    !(arbiter & ASYNC_IDLE) ||
-	    ((before >> 16) & 0x1fff) < v->flip_start ||
-	    ((before >> 16) & 0x1fff) > ((after >> 16) & 0x1fff) ||
-	    ((after >> 16) & 0x1fff) >= v->flip_end)
+	    !s7d_vpu_afbc_window(before, after, vd1, v->flip_start, v->flip_end))
 		return -ETIMEDOUT;
 	return 0;
 }
@@ -280,6 +291,11 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 
 	s7d_scanout_flush_retired(&v->scanout);
 	spin_lock_irqsave(&v->frame_lock, flags);
+	if (state->buffers.afbc.fb && state->buffers.video.fb &&
+	    state->video_submitted && !state->afbc_unchanged) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 	ret = s7d_scanout_submit_staged(&v->scanout, &state->buffers, state->update,
 		state->update_count, state->video_unchanged, state->video_address_only,
 		state->afbc_unchanged,
@@ -288,6 +304,7 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 		state->afbc_decode_only ? &state->previous_afbc : NULL,
 		s7d_vpu_afbc_stage,
 		s7d_vpu_afbc_cancel, v);
+out:
 	spin_unlock_irqrestore(&v->frame_lock, flags);
 	return ret;
 }
@@ -319,6 +336,9 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	    state->base.adjusted_mode.hdisplay > 4096 ||
 	    state->base.adjusted_mode.vdisplay > 2160 ||
 	    clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
+		return -ERANGE;
+	if (state->buffers.afbc.fb && state->buffers.video.fb &&
+	    clk_get_rate(v->clocks[0].clk) < 2 * state->pixel_rate)
 		return -ERANGE;
 	ret = s7d_osd_scaler_check_mode(state->osd.scalers,
 		state->base.adjusted_mode.htotal, state->pixel_rate,
@@ -910,6 +930,9 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	v->core_protected = true;
 	if (clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
 		return -ERANGE;
+	if (state->buffers.afbc.fb && state->buffers.video.fb &&
+	    clk_get_rate(v->clocks[0].clk) < 2 * state->pixel_rate)
+		return -ERANGE;
 	ret = s7d_osd_scaler_check_mode(state->osd.scalers,
 		state->base.adjusted_mode.htotal, state->pixel_rate,
 		clk_get_rate(v->clocks[0].clk));
@@ -1167,15 +1190,15 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	frame.idle = (before >> 29) == frame.field &&
 		     !((fifo | fifo2) & OSD_FIFO_STATE) && !(vd1 & VD1_BUSY) &&
 		     (arbiter & ASYNC_IDLE);
-	/* HOLD_FIFO_LINES prevents new OSD reads throughout this window. */
+	/* Active VD1 still requires a later field before framebuffer retirement. */
 	frame.early = frame.idle && !(vd1 & BIT(0)) &&
-		      ((before >> 16) & 0x1fff) >= v->flip_start &&
-		      ((before >> 16) & 0x1fff) <= ((after >> 16) & 0x1fff) &&
-		      ((after >> 16) & 0x1fff) < v->flip_end;
+		s7d_vpu_afbc_window(before, after, vd1, v->flip_start, v->flip_end);
 	afbc_frame = (struct s7d_afbc_frame) {
 		.sequence = READ_ONCE(v->scanout.vblank_seq) + (vblank ? 1 : 0),
 		.field = frame.field, .vblank = vblank,
-		.idle = frame.idle, .window = frame.early,
+		.idle = frame.idle,
+		.window = frame.idle && s7d_vpu_afbc_window(before, after, vd1,
+							v->flip_start, v->flip_end),
 	};
 	ret = s7d_vpu_afbc_sample(v, result, &frame, &afbc_frame);
 	if (ret) {

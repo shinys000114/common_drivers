@@ -34,6 +34,7 @@ struct s7d_crtc_state {
 	bool video_address_only;
 	bool input_captured;
 	bool primary_submitted;
+	bool video_submitted;
 	bool other_plane_submitted;
 	bool connector_submitted;
 	bool primary_dependency;

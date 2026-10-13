@@ -84,6 +84,7 @@ static int check_layout(const struct s7d_video_state *layout,
 
 int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 			     const struct drm_rect *dst,
+			     unsigned int hold_lines,
 			     struct s7d_video_pipeline_state *out)
 {
 	/*
@@ -121,8 +122,11 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 	};
 	u32 width, height, color;
 
-	if (!out)
+	if (!out || !hold_lines || hold_lines > 63)
 		return -EINVAL;
+	next.setup[0].value = (VD1_GEN_VALUE & ~GENMASK(24, 19)) |
+		(hold_lines << 19);
+	next.control.value = next.setup[0].value;
 	if (!layout) {
 		*out = next;
 		return 0;
