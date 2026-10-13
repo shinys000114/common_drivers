@@ -135,6 +135,8 @@ int s7d_scanout_submit(struct s7d_scanout *s,
 	}
 	s->pending = *buffers;
 	s->phase = S7D_SCANOUT_RDMA;
+	s->vblank_valid = false;
+	s->early_complete = false;
 out:
 	spin_unlock_irqrestore(&s->lock, flags);
 	if (put)
@@ -150,8 +152,11 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 	unsigned long flags;
 
 	spin_lock_irqsave(&s->lock, flags);
-	if (vblank)
+	if (vblank) {
 		s->vblank_seq++;
+		s->vblank_field = frame->field;
+		s->vblank_valid = true;
+	}
 	if (rdma_result == S7D_RDMA_FAULT ||
 	    (rdma_result == S7D_RDMA_COMPLETE && s->phase != S7D_SCANOUT_RDMA))
 		s->fault = true;
@@ -163,13 +168,20 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 		s->phase = S7D_SCANOUT_VBLANK;
 		s->applied_field = frame->field;
 		s->wait_field = true;
-		/* A vblank supplied in this call belongs to the completion frame. */
+		s->early_complete = frame->early;
+	}
+	if (s->phase != S7D_SCANOUT_VBLANK)
+		goto out;
+	if (s->wait_field) {
+		bool early = s->early_complete && frame->early && frame->idle && s->vblank_valid &&
+			     frame->field == s->applied_field &&
+			     frame->field == s->vblank_field;
+
+		if (!early && (!vblank || !frame->idle || frame->field == s->applied_field))
+			goto out;
+	} else if (!vblank) {
 		goto out;
 	}
-	if (!vblank || s->phase != S7D_SCANOUT_VBLANK)
-		goto out;
-	if (s->wait_field && (!frame->idle || frame->field == s->applied_field))
-		goto out;
 	if (!buffers_present(&s->pending) || buffers_present(&s->retired)) {
 		s->fault = true;
 		result = S7D_SCANOUT_FAULT;
