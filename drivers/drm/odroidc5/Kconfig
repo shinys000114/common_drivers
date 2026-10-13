@@ -27,7 +27,8 @@ config AMLOGIC_C5_NATIVE_DISPLAY
 	  including simultaneous primary and RGB overlay scaling. Linear RGB
 	  scaling requires opaque pixels and input width up to 1920.
 	  Even NV12/NV21 supports up to 4x enlargement and 8x downscaling
-	  in 1080p output modes. Video and OSD scaling cannot be active together.
+	  in 1080p output modes. Linear video and OSD scaling may run together
+	  within a checked combined clock budget.
 	  AFBC ABGR8888 supports a primary or OSD2 overlay up to 4096x2160,
 	  with opaque global alpha and optional premultiplied pixel alpha.
 	  AFBC scaling uses the same local OSD limits and uncropped source.

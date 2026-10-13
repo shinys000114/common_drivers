@@ -330,6 +330,11 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 		state->pixel_rate, clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
+	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler, state->osd.scalers,
+		state->base.adjusted_mode.htotal, state->pixel_rate,
+		clk_get_rate(v->clocks[0].clk));
+	if (ret)
+		return ret;
 	/*
 	 * clk_round_rate() is constrained by the live PHY's exclusive vote.
 	 * Validate capability with the same pure planner as the CCF provider;
@@ -913,6 +918,11 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_video_scaler_check_mode(&state->video.scaler,
 		state->base.adjusted_mode.hdisplay, state->base.adjusted_mode.vdisplay,
 		state->pixel_rate, clk_get_rate(v->clocks[0].clk));
+	if (ret)
+		return ret;
+	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler, state->osd.scalers,
+		state->base.adjusted_mode.htotal, state->pixel_rate,
+		clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
 	ret = s7d_vpu_prepare_pixel(v, state->pixel_rate);

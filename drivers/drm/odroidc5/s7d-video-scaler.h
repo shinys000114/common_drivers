@@ -16,6 +16,8 @@
 #define S7D_VIDEO_SCALER_COEF_IDX_CHROMA 0x5199
 #define S7D_VIDEO_SCALER_COEF_DATA_CHROMA 0x519a
 
+struct s7d_osd_scaler_state;
+
 struct s7d_video_scaler_reg {
 	u32 reg;
 	u32 mask;
@@ -41,6 +43,10 @@ int s7d_video_scaler_build(u32 src_width, u32 src_height,
 int s7d_video_scaler_check_mode(const struct s7d_video_scaler_state *state,
 			      u32 width, u32 height, unsigned long pixel_rate,
 			      unsigned long core_rate);
+int s7d_video_osd_scaler_check_mode(const struct s7d_video_scaler_state *video,
+				    const struct s7d_osd_scaler_state *osd,
+				    u32 htotal, unsigned long pixel_rate,
+				    unsigned long core_rate);
 bool s7d_video_scaler_same_config(const struct s7d_video_scaler_state *a,
 				const struct s7d_video_scaler_state *b);
 int s7d_video_scaler_coefficient(u32 bank, u32 phase, u32 pair, u32 *out);

@@ -365,7 +365,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 				     base->adjusted_mode.vdisplay, layers, &state->osd);
 	if (ret)
 		return ret;
-	if (state->video.scaler.enabled &&
+	if (state->buffers.afbc.fb && state->video.scaler.enabled &&
 	    (state->osd.scalers[0].enabled || state->osd.scalers[1].enabled))
 		return -EINVAL;
 	if (old && old->active &&

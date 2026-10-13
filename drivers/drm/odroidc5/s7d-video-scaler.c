@@ -8,6 +8,7 @@
 #include <linux/minmax.h>
 
 #include "s7d-video-scaler.h"
+#include "s7d-osd-scaler.h"
 
 #define SET(r, m, v) { .reg = (r), .mask = (m), .value = (v) }
 
@@ -256,6 +257,58 @@ int s7d_video_scaler_check_mode(const struct s7d_video_scaler_state *state,
 	    !pixel_rate || pixel_rate > 148500000 || core_rate / 2 < pixel_rate)
 		return -ERANGE;
 	return 0;
+}
+
+static u64 scaler_clock_load(u32 input_w, u32 input_h, u32 output_w, u32 output_h,
+			     u32 htotal, unsigned long pixel_rate)
+{
+	u64 numerator = (u64)max(input_w, output_w) * max(input_h, output_h) *
+			pixel_rate * 105;
+	u64 denominator = (u64)htotal * output_h * 100;
+
+	return div64_u64(numerator + denominator - 1, denominator);
+}
+
+int s7d_video_osd_scaler_check_mode(const struct s7d_video_scaler_state *video,
+				    const struct s7d_osd_scaler_state *osd,
+				    u32 htotal, unsigned long pixel_rate,
+				    unsigned long core_rate)
+{
+	struct s7d_video_scaler_state checked;
+	u64 required;
+	unsigned int index;
+	int ret;
+
+	if (!video || !osd || !htotal || !pixel_rate || !core_rate)
+		return -EINVAL;
+	if (!video->enabled || (!osd[0].enabled && !osd[1].enabled))
+		return 0;
+	if (htotal > 8192 || pixel_rate > 148500000)
+		return -ERANGE;
+	ret = s7d_video_scaler_build(video->src_width, video->src_height,
+		video->dst_width, video->dst_height, &checked);
+	if (ret || !s7d_video_scaler_same_config(video, &checked))
+		return -EINVAL;
+	/* Conservative composition budget; the scaler engines remain independent. */
+	required = max_t(u64, (u64)pixel_rate * 2,
+		scaler_clock_load(video->src_width, video->src_height,
+			video->dst_width, video->dst_height, htotal, pixel_rate));
+	for (index = 0; index < 2; index++) {
+		const struct s7d_osd_scaler_state *s = &osd[index];
+		struct s7d_osd_scaler_state checked_osd;
+		u32 input_w = (s->input_size >> 16) + 1;
+		u32 input_h = (s->input_size & 0xffff) + 1;
+
+		if (!s->enabled)
+			continue;
+		ret = s7d_osd_scaler_build(index, input_w, input_h,
+			s->output_h + 1, s->output_v + 1, &checked_osd);
+		if (ret || !s7d_osd_scaler_same(s, &checked_osd))
+			return -EINVAL;
+		required += scaler_clock_load(input_w, input_h,
+			s->output_h + 1, s->output_v + 1, htotal, pixel_rate);
+	}
+	return required > core_rate ? -ERANGE : 0;
 }
 
 bool s7d_video_scaler_same_config(const struct s7d_video_scaler_state *a,
