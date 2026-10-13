@@ -34,3 +34,10 @@ s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) += \
 	s7d-hevc-picture.o \
 	s7d-hevc-backend.o \
 	s7d-hevc-v4l2.o
+
+s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) += \
+	s7d-jpeg-quant.o \
+	s7d-jpeg-bitstream.o \
+	s7d-jpeg-protocol.o \
+	s7d-jpeg-backend.o \
+	s7d-jpeg-v4l2.o
