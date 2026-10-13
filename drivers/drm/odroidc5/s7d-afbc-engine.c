@@ -361,14 +361,31 @@ int s7d_afbc_engine_stage(struct s7d_afbc_engine *e,
 	e->accepted_generation = generation;
 	e->pending_valid = true;
 	e->pending_ready = false;
+	e->pending_transaction = S7D_AFBC_TRANSACTION_RDMA;
 	return 0;
+}
+
+int s7d_afbc_engine_stage_decode(struct s7d_afbc_engine *e,
+				 const struct s7d_afbc_state *plan, u64 generation)
+{
+	int ret;
+
+	if (plan->surface_mask != BIT(0))
+		return -EOPNOTSUPP;
+	ret = s7d_afbc_engine_stage(e, plan, generation);
+	if (!ret) {
+		e->pending_transaction = S7D_AFBC_TRANSACTION_DECODE_ONLY;
+		e->pending_ready = true;
+	}
+	return ret;
 }
 
 int s7d_afbc_engine_rdma_drained(struct s7d_afbc_engine *e, u64 generation)
 {
 	if (e->phase != S7D_AFBC_RUNNING)
 		return e->phase == S7D_AFBC_ERROR ? e->last_error : -EINVAL;
-	if (!e->pending_valid || generation != e->pending_generation)
+	if (!e->pending_valid || generation != e->pending_generation ||
+	    e->pending_transaction != S7D_AFBC_TRANSACTION_RDMA)
 		return -EINVAL;
 	e->pending_ready = true;
 	return 0;
@@ -378,7 +395,8 @@ int s7d_afbc_engine_cancel_stage(struct s7d_afbc_engine *e, u64 generation)
 {
 	if (e->phase != S7D_AFBC_RUNNING)
 		return e->phase == S7D_AFBC_ERROR ? e->last_error : -EINVAL;
-	if (!e->pending_valid || e->pending_ready ||
+	if (!e->pending_valid ||
+	    (e->pending_ready && e->pending_transaction != S7D_AFBC_TRANSACTION_DECODE_ONLY) ||
 	    generation != e->pending_generation)
 		return -EINVAL;
 	e->pending_valid = false;

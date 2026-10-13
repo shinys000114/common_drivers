@@ -13,6 +13,11 @@ enum s7d_afbc_engine_phase {
 	S7D_AFBC_ERROR,
 };
 
+enum s7d_afbc_transaction {
+	S7D_AFBC_TRANSACTION_RDMA,
+	S7D_AFBC_TRANSACTION_DECODE_ONLY,
+};
+
 struct s7d_afbc_engine_io {
 	int (*read)(void *data, u32 reg, u32 *value);
 	int (*write)(void *data, u32 reg, u32 value);
@@ -38,6 +43,7 @@ struct s7d_afbc_engine {
 	const struct s7d_afbc_engine_io *io;
 	void *data;
 	enum s7d_afbc_engine_phase phase;
+	enum s7d_afbc_transaction pending_transaction;
 	struct s7d_afbc_state bound;
 	struct s7d_afbc_state pending;
 	struct s7d_afbc_observation observed;
@@ -86,6 +92,8 @@ int s7d_afbc_engine_prepare(struct s7d_afbc_engine *e,
 int s7d_afbc_engine_start_initial(struct s7d_afbc_engine *e);
 int s7d_afbc_engine_stage(struct s7d_afbc_engine *e,
 			   const struct s7d_afbc_state *plan, u64 generation);
+int s7d_afbc_engine_stage_decode(struct s7d_afbc_engine *e,
+				 const struct s7d_afbc_state *plan, u64 generation);
 int s7d_afbc_engine_cancel_stage(struct s7d_afbc_engine *e, u64 generation);
 int s7d_afbc_engine_rdma_drained(struct s7d_afbc_engine *e, u64 generation);
 int s7d_afbc_engine_read(struct s7d_afbc_engine *e,

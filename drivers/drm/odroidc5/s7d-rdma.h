@@ -47,6 +47,7 @@ enum s7d_rdma_result {
 int s7d_rdma_init(struct s7d_rdma *rdma, struct device *dev, void __iomem *vcbus,
 		  struct reset_control *reset);
 int s7d_rdma_prepare(struct s7d_rdma *rdma);
+int s7d_rdma_check_idle(struct s7d_rdma *rdma);
 int s7d_rdma_submit(struct s7d_rdma *rdma, const struct s7d_rdma_entry *entries,
 		    unsigned int count);
 enum s7d_rdma_result s7d_rdma_irq(struct s7d_rdma *rdma);

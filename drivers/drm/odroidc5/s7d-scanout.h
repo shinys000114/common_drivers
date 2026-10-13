@@ -25,6 +25,7 @@ struct s7d_scanout_video {
 struct s7d_scanout_afbc {
 	struct drm_framebuffer *fb;
 	struct s7d_afbc_state plan;
+	u64 generation;
 };
 
 struct s7d_scanout_buffers {
@@ -51,6 +52,12 @@ enum s7d_scanout_phase {
 	S7D_SCANOUT_IDLE,
 	S7D_SCANOUT_RDMA,
 	S7D_SCANOUT_VBLANK,
+	S7D_SCANOUT_DECODE,
+};
+
+enum s7d_scanout_transaction {
+	S7D_SCANOUT_TRANSACTION_RDMA,
+	S7D_SCANOUT_TRANSACTION_DECODE_ONLY,
 };
 
 struct s7d_scanout {
@@ -62,6 +69,7 @@ struct s7d_scanout {
 	struct s7d_scanout_buffers pending;
 	struct s7d_scanout_buffers retired;
 	enum s7d_scanout_phase phase;
+	enum s7d_scanout_transaction pending_transaction;
 	u64 vblank_seq;
 	u64 generation;
 	u64 pending_afbc_epoch;
@@ -69,6 +77,7 @@ struct s7d_scanout {
 	u8 vblank_field;
 	bool vblank_valid;
 	bool early_complete;
+	bool pending_afbc_unchanged;
 	bool wait_field;
 	bool fault;
 };
@@ -80,6 +89,8 @@ enum s7d_scanout_result {
 };
 
 void s7d_scanout_init(struct s7d_scanout *scanout, struct s7d_rdma *rdma);
+bool s7d_scanout_afbc_equal(const struct s7d_scanout_buffers *a,
+			    const struct s7d_scanout_buffers *b);
 bool s7d_scanout_video_equal(const struct s7d_scanout_buffers *a,
 			     const struct s7d_scanout_buffers *b);
 bool s7d_scanout_video_same_config(const struct s7d_scanout_buffers *a,
@@ -111,14 +122,20 @@ void s7d_scanout_flush_retired(struct s7d_scanout *scanout);
 int s7d_scanout_submit_staged(struct s7d_scanout *scanout,
 			     const struct s7d_scanout_buffers *buffers,
 			     const struct s7d_rdma_entry *entries, unsigned int count,
-			     bool video_unchanged, bool video_address_only,
+			     bool video_unchanged, bool video_address_only, bool afbc_unchanged,
+			     enum s7d_scanout_transaction transaction,
+			     const struct s7d_scanout_afbc *previous,
 			     int (*stage)(void *data,
 				const struct s7d_scanout_buffers *active,
 				const struct s7d_scanout_buffers *candidate,
-				u64 generation),
+				u64 generation,
+				enum s7d_scanout_transaction transaction),
 			     int (*cancel)(void *data, u64 generation), void *data);
 u64 s7d_scanout_pending_generation(struct s7d_scanout *scanout);
-int s7d_scanout_afbc_started(struct s7d_scanout *scanout, u64 generation, u64 epoch);
+u64 s7d_scanout_pending_afbc_generation(struct s7d_scanout *scanout);
+bool s7d_scanout_afbc_unchanged(struct s7d_scanout *scanout);
+int s7d_scanout_afbc_started(struct s7d_scanout *scanout, u64 generation, u64 epoch,
+			     u8 field);
 
 /*
  * Feed each acknowledged RDMA result and VENC vblank exactly once, whether

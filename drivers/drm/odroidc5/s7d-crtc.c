@@ -75,7 +75,53 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &state->base);
 	state->video_unchanged = false;
 	state->video_address_only = false;
+	state->input_captured = false;
+	state->primary_submitted = false;
+	state->other_plane_submitted = false;
+	state->connector_submitted = false;
+	state->primary_dependency = false;
+	state->afbc_unchanged = false;
+	state->afbc_decode_only = false;
+	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	return &state->base;
+}
+
+void s7d_crtc_capture_input(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
+{
+	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
+	struct s7d_crtc_state *state;
+	struct drm_connector *connector;
+	struct drm_connector_state *connector_state;
+	struct drm_plane *plane;
+	int i;
+
+	if (!base || !s7d_crtc_is_native(crtc))
+		return;
+	state = to_s7d_crtc_state(base);
+	if (state->input_captured)
+		return;
+	state->input_captured = true;
+	state->primary_submitted = drm_atomic_get_new_plane_state(atomic, crtc->primary);
+	drm_for_each_plane(plane, crtc->dev)
+		if (plane != crtc->primary && s7d_plane_is_native(plane) &&
+		    drm_atomic_get_new_plane_state(atomic, plane))
+			state->other_plane_submitted = true;
+	for_each_new_connector_in_state(atomic, connector, connector_state, i)
+		if (connector_state->crtc == crtc ||
+		    drm_atomic_get_old_connector_state(atomic, connector)->crtc == crtc)
+			state->connector_submitted = true;
+}
+
+void s7d_crtc_primary_dependency(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
+{
+	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
+	struct s7d_crtc_state *state;
+
+	if (!base || !s7d_crtc_is_native(crtc))
+		return;
+	state = to_s7d_crtc_state(base);
+	state->primary_dependency = true;
+	state->afbc_unchanged = false;
 }
 
 static enum drm_mode_status
@@ -155,6 +201,42 @@ static void s7d_crtc_build_update(struct s7d_crtc_state *state)
 	state->update_count = count;
 }
 
+static bool s7d_crtc_decode_only(const struct s7d_crtc_state *state,
+				 const struct s7d_crtc_state *old)
+{
+	unsigned int i;
+
+	if (!state->input_captured || !state->primary_submitted ||
+	    state->other_plane_submitted || state->connector_submitted ||
+	    !state->base.active || !state->base.enable ||
+	    !old || !old->valid || !old->base.active ||
+	    drm_atomic_crtc_needs_modeset(&state->base) ||
+	    state->base.color_mgmt_changed ||
+	    !state->buffers.afbc.fb || !old->buffers.afbc.fb ||
+	    state->buffers.afbc.plan.surface_mask != BIT(0) ||
+	    old->buffers.afbc.plan.surface_mask != BIT(0) ||
+	    state->buffers.video.fb || old->buffers.video.fb ||
+	    state->video.scaler.enabled || old->video.scaler.enabled ||
+	    state->osd.scalers[0].enabled || state->osd.scalers[1].enabled ||
+	    old->osd.scalers[0].enabled || old->osd.scalers[1].enabled ||
+	    s7d_afbc_check_state(&state->buffers.afbc.plan) ||
+	    s7d_afbc_check_state(&old->buffers.afbc.plan) ||
+	    !s7d_afbc_same_layout(&state->buffers.afbc.plan, &old->buffers.afbc.plan) ||
+	    !drm_mode_equal(&state->base.mode, &old->base.mode) ||
+	    !drm_mode_equal(&state->base.adjusted_mode, &old->base.adjusted_mode) ||
+	    state->pixel_rate != old->pixel_rate ||
+	    memcmp(&state->encp, &old->encp, sizeof(state->encp)) ||
+	    memcmp(&state->osd, &old->osd, sizeof(state->osd)) ||
+	    memcmp(&state->video, &old->video, sizeof(state->video)) ||
+	    memcmp(&state->csc, &old->csc, sizeof(state->csc)) ||
+	    memcmp(&state->postblend, &old->postblend, sizeof(state->postblend)))
+		return false;
+	for (i = 1; i < S7D_SCANOUT_MAX_PLANES; i++)
+		if (state->buffers.fb[i] != old->buffers.fb[i])
+			return false;
+	return true;
+}
+
 static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
 {
 	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
@@ -173,6 +255,9 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->valid = false;
 	state->video_unchanged = false;
 	state->video_address_only = false;
+	state->afbc_unchanged = false;
+	state->afbc_decode_only = false;
+	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	state->buffers = (struct s7d_scanout_buffers) {0};
 	if (!base->active)
 		return 0;
@@ -302,8 +387,18 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (ret)
 		return ret;
 	s7d_crtc_check_video_update(state, old ? to_s7d_crtc_state(old) : NULL);
+	state->afbc_unchanged = state->input_captured &&
+		!state->primary_submitted && !state->connector_submitted &&
+		!state->primary_dependency && old && old->active &&
+		to_s7d_crtc_state(old)->valid &&
+		!drm_atomic_crtc_needs_modeset(base) &&
+		s7d_scanout_afbc_equal(&to_s7d_crtc_state(old)->buffers, &state->buffers);
 	s7d_crtc_build_update(state);
 	state->pixel_rate = (unsigned long)base->adjusted_mode.clock * 1000;
+	state->afbc_decode_only = s7d_crtc_decode_only(state,
+		old ? to_s7d_crtc_state(old) : NULL);
+	if (state->afbc_decode_only)
+		state->previous_afbc = to_s7d_crtc_state(old)->buffers.afbc;
 	ret = c->ops->check(c->data, state);
 	if (!ret)
 		state->valid = true;

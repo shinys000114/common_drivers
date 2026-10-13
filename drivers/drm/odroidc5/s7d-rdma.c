@@ -212,6 +212,17 @@ static bool display_write_valid(u32 reg, u32 value)
 	}
 }
 
+int s7d_rdma_check_idle(struct s7d_rdma *r)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&r->lock, flags);
+	ret = !r->ready || r->fault ? -EIO : (r->pending ? -EBUSY : 0);
+	spin_unlock_irqrestore(&r->lock, flags);
+	return ret;
+}
+
 int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 		    unsigned int count)
 {

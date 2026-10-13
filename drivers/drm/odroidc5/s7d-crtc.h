@@ -27,10 +27,18 @@ struct s7d_crtc_state {
 	unsigned int update_count;
 	/* Borrowed from the checked atomic plane states until scanout takes refs. */
 	struct s7d_scanout_buffers buffers;
+	struct s7d_scanout_afbc previous_afbc;
 	unsigned long pixel_rate;
 	bool valid;
 	bool video_unchanged;
 	bool video_address_only;
+	bool input_captured;
+	bool primary_submitted;
+	bool other_plane_submitted;
+	bool connector_submitted;
+	bool primary_dependency;
+	bool afbc_unchanged;
+	bool afbc_decode_only;
 };
 
 static inline struct s7d_crtc_state *
@@ -86,6 +94,8 @@ struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *prima
 void s7d_crtc_irq(struct drm_crtc *crtc, bool vblank, enum s7d_rdma_result result,
 		  const struct s7d_frame_state *frame);
 bool s7d_crtc_is_native(const struct drm_crtc *crtc);
+void s7d_crtc_capture_input(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
+void s7d_crtc_primary_dependency(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
 int s7d_crtc_last_error(struct drm_crtc *crtc);
 /* Bridge completion/error, after atomic_enable; never used from atomic_check. */
 void s7d_crtc_link_ready(struct drm_crtc *crtc);
