@@ -153,5 +153,7 @@ struct clk_regmap _name = {						\
 
 struct regmap *meson_clk_regmap_resource(struct platform_device *pdev, struct device *dev,
 					unsigned int index);
+struct regmap *meson_clk_regmap_resource_named(struct platform_device *pdev,
+		struct device *dev, unsigned int index, const char *name);
 
 #endif /* __CLK_REGMAP_H */
