@@ -25,3 +25,15 @@ s7d-vdec-y := \
 	common/s7d-v4l2.o \
 	common/s7d-v4l2-device.o
 
+s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_ENGINE) += common/s7d-hevc-engine.o
+
+s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) += \
+	hevc/s7d-hevc-input.o \
+	hevc/s7d-hevc-dpb.o \
+	hevc/s7d-hevc-sequence.o \
+	hevc/s7d-hevc-rpm.o \
+	hevc/s7d-hevc-context.o \
+	hevc/s7d-hevc-picture.o \
+	hevc/s7d-hevc-backend.o \
+	hevc/s7d-hevc-v4l2.o
+
