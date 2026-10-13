@@ -1,0 +1,758 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Hardkernel Co., Ltd.
+
+#include <linux/bitops.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/err.h>
+#include <linux/io.h>
+#include <linux/ioport.h>
+#include <linux/mfd/syscon.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
+#include <linux/regmap.h>
+#include <linux/sizes.h>
+#include <linux/slab.h>
+
+#include "s7d-codec-dos.h"
+
+#define DOS_REG(word)		((word) * 4)
+#define DOS_MMC_CTRL1		DOS_REG(0x0002)
+#define DOS_MBOX1_MASK		DOS_REG(0x0076)
+#define DOS_MPSR			DOS_REG(0x0301)
+#define DOS_CPSR			DOS_REG(0x0321)
+#define DOS_IMEM_DMA_CTRL		DOS_REG(0x0340)
+#define DOS_LMEM_DMA_CTRL		DOS_REG(0x0350)
+#define DOS_WRRSP_LMEM		DOS_REG(0x0353)
+#define DOS_PIC_DC_MUX_CTRL	DOS_REG(0x098d)
+#define DOS_PIC_DC_CTRL		DOS_REG(0x098e)
+#define DOS_EXTIF_CFG1		DOS_REG(0x09e5)
+#define DOS_VFIFO_CTRL		DOS_REG(0x0c44)
+#define DOS_SW_RESET0		DOS_REG(0x3f00)
+#define DOS_GCLK_EN0		DOS_REG(0x3f01)
+#define DOS_MEM_PD_VDEC		DOS_REG(0x3f30)
+
+#define DOS_VDEC_GATES		GENMASK(9, 0)
+#define DOS_VDEC_COLD_RESET	0xfffffffcU
+#define DOS_VDEC_RESET		GENMASK(9, 3)
+#define DOS_CPU_RESET		(BIT(11) | BIT(12))
+#define DOS_VFIFO_ENABLE		(BIT(1) | BIT(2))
+#define DMC_REQ_CTRL		0x0000
+#define DMC_CHAN_STS		(0x00cf * 4)
+#define DMC_VDEC_PORT		BIT(8)
+#define VDEC_RATE		800000000UL
+#define VDEC_RATE_MIN		(VDEC_RATE - VDEC_RATE / 1000000)
+#define DMA_TIMEOUT_US		100000
+#define RESPONSE_TIMEOUT_US	12500
+#define DMC_TIMEOUT_US		100000
+
+struct s7d_codec_dos {
+	struct device *dev;
+	struct module *owner;
+	struct device *pd_dev;
+	struct clk *bus_clk;
+	struct clk *vdec_clk;
+	struct regmap *map;
+	struct regmap *dmc;
+	void __iomem *base;
+	resource_size_t start;
+	resource_size_t size;
+	struct mutex lock;
+	int irq;
+	bool leased;
+	bool local_access_ready;
+	bool prepared;
+	bool halted;
+	bool started;
+	bool faulted;
+	bool release_failed;
+	bool closing;
+	bool release_pin;
+};
+
+static const struct regmap_config dos_regmap_config = {
+	.reg_bits = 32,
+	.val_bits = 32,
+	.reg_stride = 4,
+	.max_register = SZ_64K - 4,
+	.cache_type = REGCACHE_NONE,
+	.fast_io = true,
+};
+
+static int dos_engine_check(enum s7d_codec_engine engine)
+{
+	if (engine == S7D_CODEC_ENGINE_VDEC)
+		return 0;
+	if (engine == S7D_CODEC_ENGINE_HEVC || engine == S7D_CODEC_ENGINE_HCODEC)
+		return -EOPNOTSUPP;
+	return -EINVAL;
+}
+
+static int dos_check(struct regmap *map, unsigned int reg, u32 mask, u32 want)
+{
+	u32 val;
+	int ret;
+
+	ret = regmap_read(map, reg, &val);
+	if (ret)
+		return ret;
+	return (val & mask) == want ? 0 : -EIO;
+}
+
+static int dos_write(struct regmap *map, unsigned int reg, u32 val)
+{
+	int ret = regmap_write(map, reg, val);
+
+	return ret ? ret : dos_check(map, reg, U32_MAX, val);
+}
+
+static int dos_update(struct regmap *map, unsigned int reg, u32 mask, u32 val)
+{
+	int ret = regmap_update_bits(map, reg, mask, val);
+
+	return ret ? ret : dos_check(map, reg, mask, val);
+}
+
+static int dos_reset(struct s7d_codec_dos *dos, u32 mask)
+{
+	u32 val;
+	int i, ret;
+
+	for (i = 0; i < 3; i++) {
+		ret = regmap_read(dos->map, DOS_SW_RESET0, &val);
+		if (ret)
+			return ret;
+	}
+	ret = regmap_update_bits(dos->map, DOS_SW_RESET0, mask, mask);
+	if (ret)
+		return ret;
+	usleep_range(20, 30);
+	ret = regmap_update_bits(dos->map, DOS_SW_RESET0, mask, 0);
+	if (ret)
+		return ret;
+	usleep_range(10, 20);
+	for (i = 0; i < 3; i++) {
+		ret = regmap_read(dos->map, DOS_SW_RESET0, &val);
+		if (ret)
+			return ret;
+	}
+	return val & mask ? -EIO : 0;
+}
+
+static int dos_prepare_access_locked(struct s7d_codec_dos *dos)
+{
+	int ret;
+
+	if (!dos->leased)
+		return -EINVAL;
+	if (dos->local_access_ready)
+		return 0;
+	if (dos->faulted || dos->release_failed || dos->closing)
+		return -EIO;
+	usleep_range(20, 30);
+	ret = dos_update(dos->map, DOS_GCLK_EN0, DOS_VDEC_GATES, DOS_VDEC_GATES);
+	if (ret)
+		goto fault;
+	ret = dos_write(dos->map, DOS_MEM_PD_VDEC, 0);
+	if (ret)
+		goto fault;
+	ret = regmap_write(dos->map, DOS_SW_RESET0, DOS_VDEC_COLD_RESET);
+	if (ret)
+		goto fault;
+	usleep_range(20, 30);
+	ret = regmap_write(dos->map, DOS_SW_RESET0, 0);
+	if (ret)
+		goto fault;
+	usleep_range(10, 20);
+	ret = dos_check(dos->map, DOS_SW_RESET0, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_write(dos->map, DOS_MEM_PD_VDEC, 0);
+	if (ret)
+		goto fault;
+	dos->local_access_ready = true;
+	return 0;
+fault:
+	dos->faulted = true;
+	dos->halted = false;
+	return ret;
+}
+
+static int dos_non_mmu(struct s7d_codec_dos *dos)
+{
+	int ret;
+
+	ret = dos_update(dos->map, DOS_MMC_CTRL1, BIT(3), 0);
+	if (ret)
+		return ret;
+	ret = dos_update(dos->map, DOS_PIC_DC_MUX_CTRL, BIT(31), 0);
+	if (ret)
+		return ret;
+	return dos_write(dos->map, DOS_EXTIF_CFG1, 0);
+}
+
+static int dos_halt_locked(struct s7d_codec_dos *dos)
+{
+	u32 val;
+	int ret;
+
+	dos->halted = false;
+	ret = dos_write(dos->map, DOS_MBOX1_MASK, 0);
+	if (ret)
+		return ret;
+	ret = dos_write(dos->map, DOS_MPSR, 0);
+	if (ret)
+		return ret;
+	ret = dos_write(dos->map, DOS_CPSR, 0);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(dos->map, DOS_IMEM_DMA_CTRL, val,
+				      !(val & BIT(15)), 10, DMA_TIMEOUT_US);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(dos->map, DOS_LMEM_DMA_CTRL, val,
+				      !(val & BIT(15)), 10, DMA_TIMEOUT_US);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(dos->map, DOS_WRRSP_LMEM, val,
+				      !(val & GENMASK(11, 0)), 10,
+				      RESPONSE_TIMEOUT_US);
+	if (ret)
+		return ret;
+	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, 0);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(dos->dmc, DMC_CHAN_STS, val,
+				      val & DMC_VDEC_PORT, 10, DMC_TIMEOUT_US);
+	if (ret)
+		return ret;
+	ret = dos_reset(dos, DOS_VDEC_RESET);
+	if (ret)
+		return ret;
+	ret = dos_reset(dos, DOS_CPU_RESET);
+	if (ret)
+		return ret;
+	ret = dos_non_mmu(dos);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->map, DOS_MBOX1_MASK, U32_MAX, 0);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->map, DOS_MPSR, U32_MAX, 0);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->map, DOS_CPSR, U32_MAX, 0);
+	if (ret)
+		return ret;
+	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, 0);
+	if (ret)
+		return ret;
+	dos->halted = true;
+	dos->prepared = false;
+	dos->started = false;
+	dos->faulted = false;
+	return 0;
+}
+
+static int dos_pic_reset(struct s7d_codec_dos *dos)
+{
+	u32 mask = 0xbfU << 24;
+	int ret;
+
+	ret = regmap_update_bits(dos->map, DOS_PIC_DC_CTRL, mask, mask);
+	if (ret)
+		return ret;
+	return dos_update(dos->map, DOS_PIC_DC_CTRL, mask, 0);
+}
+
+struct s7d_codec_dos *
+s7d_codec_dos_create(struct platform_device *pdev, struct module *owner)
+{
+	struct s7d_codec_dos *dos;
+	struct resource *res;
+	int ret;
+
+	if (!pdev || !of_device_is_compatible(pdev->dev.of_node,
+					      "amlogic,s7d-vdec"))
+		return ERR_PTR(-ENODEV);
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dos");
+	if (!res || resource_size(res) != SZ_64K)
+		return ERR_PTR(-EINVAL);
+	dos = kzalloc(sizeof(*dos), GFP_KERNEL);
+	if (!dos)
+		return ERR_PTR(-ENOMEM);
+	dos->dev = get_device(&pdev->dev);
+	dos->owner = owner;
+	mutex_init(&dos->lock);
+	dos->irq = platform_get_irq_byname(pdev, "mailbox_1");
+	if (dos->irq < 0) {
+		ret = dos->irq;
+		goto err_device;
+	}
+	dos->dmc = syscon_regmap_lookup_by_phandle(dos->dev->of_node,
+						 "amlogic,dmc-syscon");
+	if (IS_ERR(dos->dmc)) {
+		ret = PTR_ERR(dos->dmc);
+		goto err_device;
+	}
+	dos->bus_clk = clk_get(dos->dev, "dos");
+	if (IS_ERR(dos->bus_clk)) {
+		ret = PTR_ERR(dos->bus_clk);
+		goto err_device;
+	}
+	dos->vdec_clk = clk_get(dos->dev, "vdec");
+	if (IS_ERR(dos->vdec_clk)) {
+		ret = PTR_ERR(dos->vdec_clk);
+		goto err_bus_clk;
+	}
+	dos->start = res->start;
+	dos->size = resource_size(res);
+	if (!request_mem_region(dos->start, dos->size, dev_name(dos->dev))) {
+		ret = -EBUSY;
+		goto err_vdec_clk;
+	}
+	dos->base = ioremap(dos->start, dos->size);
+	if (!dos->base) {
+		ret = -ENOMEM;
+		goto err_region;
+	}
+	dos->map = regmap_init_mmio(dos->dev, dos->base, &dos_regmap_config);
+	if (IS_ERR(dos->map)) {
+		ret = PTR_ERR(dos->map);
+		goto err_map;
+	}
+	dos->pd_dev = dev_pm_domain_attach_by_name(dos->dev, "vdec");
+	if (IS_ERR_OR_NULL(dos->pd_dev)) {
+		ret = dos->pd_dev ? PTR_ERR(dos->pd_dev) : -ENODEV;
+		goto err_regmap;
+	}
+	return dos;
+
+err_regmap:
+	regmap_exit(dos->map);
+err_map:
+	iounmap(dos->base);
+err_region:
+	release_mem_region(dos->start, dos->size);
+err_vdec_clk:
+	clk_put(dos->vdec_clk);
+err_bus_clk:
+	clk_put(dos->bus_clk);
+err_device:
+	put_device(dos->dev);
+	kfree(dos);
+	return ERR_PTR(ret);
+}
+
+int s7d_codec_dos_irq(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
+{
+	int ret = dos_engine_check(engine);
+
+	return ret ? ret : dos->irq;
+}
+
+struct regmap *s7d_codec_dos_regmap(struct s7d_codec_dos *dos,
+				 enum s7d_codec_engine engine)
+{
+	int ret = dos_engine_check(engine);
+
+	return ret ? ERR_PTR(ret) : dos->map;
+}
+
+int s7d_codec_dos_hold(struct s7d_codec_dos *dos,
+		       enum s7d_codec_engine engine)
+{
+	long rounded;
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	mutex_lock(&dos->lock);
+	if (dos->leased || dos->faulted || dos->release_failed || dos->closing) {
+		ret = -EBUSY;
+		goto out;
+	}
+	rounded = clk_round_rate(dos->vdec_clk, VDEC_RATE);
+	if (rounded < 0) {
+		ret = rounded;
+		goto out;
+	}
+	if (rounded < VDEC_RATE_MIN || rounded > VDEC_RATE) {
+		ret = -ERANGE;
+		goto out;
+	}
+	ret = clk_set_rate_exclusive(dos->vdec_clk, VDEC_RATE);
+	if (ret)
+		goto out;
+	if (clk_get_rate(dos->vdec_clk) != rounded) {
+		ret = -ERANGE;
+		goto put_rate;
+	}
+	ret = clk_prepare_enable(dos->bus_clk);
+	if (ret)
+		goto put_rate;
+	ret = clk_prepare_enable(dos->vdec_clk);
+	if (ret)
+		goto disable_bus;
+	ret = pm_runtime_resume_and_get(dos->pd_dev);
+	if (ret < 0)
+		goto disable_vdec;
+	dos->leased = true;
+	dos->local_access_ready = false;
+	dos->halted = false;
+	ret = 0;
+	goto out;
+
+disable_vdec:
+	clk_disable_unprepare(dos->vdec_clk);
+disable_bus:
+	clk_disable_unprepare(dos->bus_clk);
+put_rate:
+	clk_rate_exclusive_put(dos->vdec_clk);
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_prepare_access(struct s7d_codec_dos *dos,
+			       enum s7d_codec_engine engine)
+{
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	mutex_lock(&dos->lock);
+	ret = dos_prepare_access_locked(dos);
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_prepare(struct s7d_codec_dos *dos,
+			  enum s7d_codec_engine engine)
+{
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	mutex_lock(&dos->lock);
+	if (!dos->leased || dos->faulted || dos->release_failed || dos->prepared) {
+		ret = -EBUSY;
+		goto out;
+	}
+	dos->halted = false;
+	ret = dos_prepare_access_locked(dos);
+	if (ret)
+		goto fault;
+	ret = dos_halt_locked(dos);
+	if (ret)
+		goto fault;
+	ret = dos_pic_reset(dos);
+	if (ret)
+		goto fault;
+	dos->prepared = true;
+	goto out;
+fault:
+	dos->faulted = true;
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_port_enable(struct s7d_codec_dos *dos,
+			      enum s7d_codec_engine engine)
+{
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	mutex_lock(&dos->lock);
+	if (!dos->leased || !dos->prepared || !dos->halted || dos->faulted ||
+	    dos->release_failed) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = dos_check(dos->map, DOS_MBOX1_MASK, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_MPSR, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_CPSR, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_VFIFO_CTRL, DOS_VFIFO_ENABLE, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_MMC_CTRL1, BIT(3), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_PIC_DC_MUX_CTRL, BIT(31), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_EXTIF_CFG1, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_IMEM_DMA_CTRL, BIT(15), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_LMEM_DMA_CTRL, BIT(15), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_WRRSP_LMEM, GENMASK(11, 0), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->dmc, DMC_CHAN_STS, DMC_VDEC_PORT, DMC_VDEC_PORT);
+	if (ret)
+		goto fault;
+	dos->halted = false;
+	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, DMC_VDEC_PORT);
+	if (ret)
+		goto fault;
+	goto out;
+fault:
+	dos->faulted = true;
+	dos->halted = false;
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_halt(struct s7d_codec_dos *dos,
+		       enum s7d_codec_engine engine)
+{
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	mutex_lock(&dos->lock);
+	if (!dos->leased) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = dos_prepare_access_locked(dos);
+	if (ret)
+		goto out;
+	ret = dos_halt_locked(dos);
+	if (ret)
+		dos->faulted = true;
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_start(struct s7d_codec_dos *dos,
+			enum s7d_codec_engine engine)
+{
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	mutex_lock(&dos->lock);
+	if (!dos->leased || !dos->prepared || dos->halted || dos->started ||
+	    dos->faulted || dos->release_failed || dos->closing) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = dos_check(dos->map, DOS_MBOX1_MASK, U32_MAX, 1);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_MPSR, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_CPSR, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_IMEM_DMA_CTRL, BIT(15), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_LMEM_DMA_CTRL, BIT(15), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_WRRSP_LMEM, GENMASK(11, 0), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_VFIFO_CTRL, DOS_VFIFO_ENABLE, DOS_VFIFO_ENABLE);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_MMC_CTRL1, BIT(3), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_PIC_DC_MUX_CTRL, BIT(31), 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_EXTIF_CFG1, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, DMC_VDEC_PORT);
+	if (ret)
+		goto fault;
+	dos->started = true;
+	ret = dos_reset(dos, DOS_CPU_RESET);
+	if (ret)
+		goto fault;
+	ret = dos_write(dos->map, DOS_MPSR, 1);
+	if (ret)
+		goto fault;
+	goto out;
+fault:
+	dos->faulted = true;
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_park(struct s7d_codec_dos *dos,
+		       enum s7d_codec_engine engine)
+{
+	u32 val;
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	mutex_lock(&dos->lock);
+	if (!dos->leased || !dos->prepared || dos->halted || !dos->started ||
+	    dos->faulted || dos->release_failed || dos->closing) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = dos_check(dos->map, DOS_MBOX1_MASK, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_write(dos->map, DOS_MPSR, 0);
+	if (ret)
+		goto fault;
+	ret = dos_write(dos->map, DOS_CPSR, 0);
+	if (ret)
+		goto fault;
+	ret = dos_update(dos->map, DOS_VFIFO_CTRL, DOS_VFIFO_ENABLE, 0);
+	if (ret)
+		goto fault;
+	ret = regmap_read_poll_timeout(dos->map, DOS_IMEM_DMA_CTRL, val,
+				      !(val & BIT(15)), 10, DMA_TIMEOUT_US);
+	if (ret)
+		goto fault;
+	ret = regmap_read_poll_timeout(dos->map, DOS_LMEM_DMA_CTRL, val,
+				      !(val & BIT(15)), 10, DMA_TIMEOUT_US);
+	if (ret)
+		goto fault;
+	ret = regmap_read_poll_timeout(dos->map, DOS_WRRSP_LMEM, val,
+				      !(val & GENMASK(11, 0)), 10,
+				      RESPONSE_TIMEOUT_US);
+	if (ret)
+		goto fault;
+	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, 0);
+	if (ret)
+		goto fault;
+	ret = regmap_read_poll_timeout(dos->dmc, DMC_CHAN_STS, val,
+				      val & DMC_VDEC_PORT, 10, DMC_TIMEOUT_US);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_MBOX1_MASK, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_MPSR, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_CPSR, U32_MAX, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->map, DOS_VFIFO_CTRL, DOS_VFIFO_ENABLE, 0);
+	if (ret)
+		goto fault;
+	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, 0);
+	if (ret)
+		goto fault;
+	dos->halted = true;
+	dos->prepared = false;
+	dos->started = false;
+	goto out;
+fault:
+	dos->faulted = true;
+	dos->halted = false;
+out:
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_release(struct s7d_codec_dos *dos,
+			  enum s7d_codec_engine engine)
+{
+	bool drop_pin = false;
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	mutex_lock(&dos->lock);
+	if (!dos->leased || !dos->halted || dos->faulted) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = pm_runtime_put_sync(dos->pd_dev);
+	if (ret < 0) {
+		pm_runtime_get_noresume(dos->pd_dev);
+		dos->release_failed = true;
+		if (!dos->release_pin) {
+			if (try_module_get(dos->owner))
+				dos->release_pin = true;
+			else
+				ret = -ESHUTDOWN;
+		}
+		goto out;
+	}
+	clk_disable_unprepare(dos->vdec_clk);
+	clk_disable_unprepare(dos->bus_clk);
+	clk_rate_exclusive_put(dos->vdec_clk);
+	dos->leased = false;
+	dos->local_access_ready = false;
+	dos->prepared = false;
+	dos->halted = false;
+	dos->started = false;
+	dos->release_failed = false;
+	drop_pin = dos->release_pin;
+	dos->release_pin = false;
+	ret = 0;
+out:
+	mutex_unlock(&dos->lock);
+	if (drop_pin)
+		module_put(dos->owner);
+	return ret;
+}
+
+int s7d_codec_dos_suspend_check(struct s7d_codec_dos *dos)
+{
+	int ret;
+
+	mutex_lock(&dos->lock);
+	ret = dos->leased || dos->prepared || dos->faulted ||
+	      dos->release_failed ? -EBUSY : 0;
+	mutex_unlock(&dos->lock);
+	return ret;
+}
+
+int s7d_codec_dos_destroy(struct s7d_codec_dos *dos)
+{
+	mutex_lock(&dos->lock);
+	if (dos->leased || dos->prepared || dos->faulted || dos->release_failed ||
+	    dos->release_pin) {
+		mutex_unlock(&dos->lock);
+		return -EBUSY;
+	}
+	dos->closing = true;
+	dev_pm_domain_detach(dos->pd_dev, false);
+	regmap_exit(dos->map);
+	iounmap(dos->base);
+	release_mem_region(dos->start, dos->size);
+	clk_put(dos->vdec_clk);
+	clk_put(dos->bus_clk);
+	mutex_unlock(&dos->lock);
+	put_device(dos->dev);
+	kfree(dos);
+	return 0;
+}
