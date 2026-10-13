@@ -27,6 +27,7 @@ enum s7d_h264_input_kind {
 struct s7d_h264_preflight {
 	enum s7d_h264_input_kind kind;
 	bool sequence_ready;
+	u32 picture_bytes;
 	struct s7d_h264_sps sps;
 };
 

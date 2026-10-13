@@ -243,6 +243,19 @@ static int au_trailing_bits(struct au_bits *b)
 	return b->bit == (u64)b->bytes * 8 ? 0 : -EBADMSG;
 }
 
+static int au_filler_parse(struct au_bits *b)
+{
+	u32 v;
+	int ret;
+
+	while (au_more_rbsp(b)) {
+		ret = au_get(b, 8, &v);
+		if (ret || v != 0xff)
+			return -EBADMSG;
+	}
+	return au_trailing_bits(b);
+}
+
 static bool au_find_prefix(const u8 *data, u32 bytes, u32 from,
 			   struct au_prefix *prefix)
 {
@@ -1161,6 +1174,7 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 	static const u8 aud_masks[8] = { 4, 5, 7, 0, 0, 4, 5, 7 };
 	bool has_next, seen_vcl = false, all_same_type = false;
 	bool seen_nal = false, mixed_types = false, seen_aud = false;
+	bool seen_filler = false;
 	int ret;
 
 	if (IS_ERR_OR_NULL(parser) || !data || !info || !preflight)
@@ -1178,6 +1192,7 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 	if (!draft)
 		return -ENOMEM;
 	draft->cache = parser->active;
+	draft->preflight.picture_bytes = raw_bytes;
 	rbsp = kvmalloc(raw_bytes, GFP_KERNEL);
 	if (!rbsp) {
 		ret = -ENOMEM;
@@ -1198,7 +1213,8 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 			ret = -EBADMSG;
 			goto free_all;
 		}
-		if (seen_vcl && type != 1 && type != 5) {
+		if ((seen_filler && type != 12) ||
+		    (seen_vcl && type != 1 && type != 5 && type != 12)) {
 			ret = -EOPNOTSUPP;
 			goto free_all;
 		}
@@ -1257,6 +1273,17 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 			break;
 		case 6:
 			ret = au_sei_parse(&bits);
+			break;
+		case 12:
+			if (!seen_vcl) {
+				ret = -EOPNOTSUPP;
+				break;
+			}
+			ret = au_filler_parse(&bits);
+			if (!ret && !seen_filler) {
+				draft->preflight.picture_bytes = prefix.start;
+				seen_filler = true;
+			}
 			break;
 		case 1:
 		case 5:
@@ -1525,6 +1552,7 @@ int s7d_h264_input_preflight(struct s7d_h264_input *input,
 	struct s7d_h264_input_plan plan;
 	struct s7d_v4l2_input prepared;
 	struct s7d_h264_au_info au;
+	bool trimmed = false;
 	int ret;
 
 	if (IS_ERR_OR_NULL(input) || !preflight)
@@ -1547,11 +1575,19 @@ int s7d_h264_input_preflight(struct s7d_h264_input *input,
 		return ret;
 	prepared = *buffer;
 	if (next.kind == S7D_H264_INPUT_PICTURE) {
-		ret = input_assemble(input, &prepared, &plan, &au, &next);
-		if (ret) {
-			s7d_h264_au_discard(input->au_parser);
-			return ret;
+		trimmed = next.picture_bytes < prepared.bytes;
+		if (trimmed) {
+			prepared.bytes = next.picture_bytes;
+			ret = s7d_h264_input_build_plan(&prepared, &plan);
+			if (ret)
+				goto discard;
 		}
+		ret = input_assemble(input, &prepared, &plan, &au, &next);
+		if (ret)
+			goto discard;
+		if (trimmed)
+			memset(s7d_codec_dma_cpu(prepared.memory) + prepared.bytes, 0,
+			       plan.ring_bytes - prepared.bytes);
 	}
 	input->buffer = prepared;
 	input->plan = plan;
@@ -1560,6 +1596,10 @@ int s7d_h264_input_preflight(struct s7d_h264_input *input,
 	input->preflight_ready = true;
 	*preflight = next;
 	return 0;
+
+discard:
+	s7d_h264_au_discard(input->au_parser);
+	return ret;
 }
 
 static int input_preflight_check(struct s7d_h264_input *input, u64 token)
