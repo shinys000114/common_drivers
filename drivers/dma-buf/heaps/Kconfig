@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config DMABUF_HEAPS_C5_SCANOUT
+	bool "ODROID-C5 contiguous graphics heap"
+	depends on ARCH_MESON_ODROID_COMMON && OF && DMA_CMA && DMABUF_HEAPS
+	depends on !AMLOGIC_MEDIA_ENABLE
+	help
+	  Export the board's graphics CMA reservation through standard DMA-BUF
+	  heap allocation. Preserve the heap-gfx name used by existing libMali
+	  binaries without enabling the vendor media subsystem.
+	  Built-in driver and static device trees only.
