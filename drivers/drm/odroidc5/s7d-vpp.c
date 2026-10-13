@@ -11,6 +11,7 @@
 #define ENCP_VIDEO_EN		0x1b80
 #define ENCL_VIDEO_EN		0x1ca0
 #define OSD1_CTRL_STAT		0x1a10
+#define OSD2_CTRL_STAT		0x1a30
 
 struct s7d_vpp_setting {
 	u32 reg;
@@ -44,14 +45,23 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x1dc9, 0x1fff1fff, ((width - 1) << 16) | (height - 1) },
 		{ 0x1dca, 0x0fff0fff, width - 1 },
 		{ 0x1dcb, 0x0fff0fff, height - 1 },
+		{ 0x3d08, GENMASK(13, 12) | GENMASK(11, 2), 0 },
+		{ 0x3d02, BIT(24) | BIT(23), 0 },
+		{ 0x3d05, BIT(22), 0 },
 		{ 0x1df1, 0x1fff1fff, (height << 16) | width },
 		/* Disable HDR and its independent matrix-only bypass path. */
 		{ 0x38a0, GENMASK(20, 13) | GENMASK(7, 2), 0 },
 		/* Clear enable_sync_sel too: no VSYNC is running at this point. */
 		{ 0x38db, GENMASK(1, 0), 0 }, /* HDR input matrix */
 		{ 0x38dc, GENMASK(1, 0), 0 }, /* HDR output matrix */
+		/* S7D moves the OSD2 HDR block by 0x500 from the vendor base. */
+		{ 0x6000, GENMASK(20, 13) | GENMASK(7, 2), 0 },
+		{ 0x603b, GENMASK(1, 0), 0 },
+		{ 0x603c, GENMASK(1, 0), 0 },
 		{ 0x391d, GENMASK(1, 0), 0 }, /* OSD1 matrix */
+		{ 0x392d, GENMASK(1, 0), 0 }, /* OSD2 matrix */
 		{ 0x3d6d, GENMASK(1, 0), 0 }, /* OSD1 wrap RGB->YUV matrix */
+		{ 0x3d7d, GENMASK(1, 0), 0 }, /* OSD2 wrap RGB->YUV matrix */
 		{ 0x32bd, GENMASK(1, 0), 0 }, /* POST matrix */
 		{ 0x39ad, GENMASK(1, 0), 0 }, /* POST2 matrix */
 		/* No colour enhancement, highlight, super-resolution or LUTs. */
@@ -95,7 +105,8 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 	if ((readl(vcbus + ENCP_VIDEO_EN * 4) |
 	     readl(vcbus + ENCI_VIDEO_EN * 4) |
 	     readl(vcbus + ENCL_VIDEO_EN * 4) |
-	     readl(vcbus + OSD1_CTRL_STAT * 4)) & BIT(0))
+	     readl(vcbus + OSD1_CTRL_STAT * 4) |
+	     readl(vcbus + OSD2_CTRL_STAT * 4)) & BIT(0))
 		return -EBUSY;
 
 	for (i = 0; i < ARRAY_SIZE(settings); i++) {

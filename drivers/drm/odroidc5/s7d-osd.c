@@ -19,26 +19,35 @@ int s7d_osd_build_state(struct drm_framebuffer *fb, const struct drm_rect *src,
 	struct drm_gem_dma_object *obj;
 	u64 base, bytes, end, object_end;
 	u32 x1, y1, x2, y2, color;
+	bool alpha;
 
 	if (!fb || !src || !state || !fb->format || !fb->obj[0] ||
 	    fb->modifier != DRM_FORMAT_MOD_LINEAR)
 		return -EINVAL;
 	switch (fb->format->format) {
 	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ARGB8888:
 		color = 1;
 		break;
 	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
 		color = 2;
 		break;
 	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_RGBA8888:
 		color = 0;
 		break;
 	case DRM_FORMAT_BGRX8888:
+	case DRM_FORMAT_BGRA8888:
 		color = 3;
 		break;
 	default:
 		return -EINVAL;
 	}
+	alpha = fb->format->format == DRM_FORMAT_ARGB8888 ||
+		fb->format->format == DRM_FORMAT_ABGR8888 ||
+		fb->format->format == DRM_FORMAT_RGBA8888 ||
+		fb->format->format == DRM_FORMAT_BGRA8888;
 	if (!fb->width || !fb->height ||
 	    fb->width > S7D_OSD_MAX_SIZE || fb->height > S7D_OSD_MAX_SIZE)
 		return -EINVAL;
@@ -83,6 +92,7 @@ int s7d_osd_build_state(struct drm_framebuffer *fb, const struct drm_rect *src,
 		.stride = fb->pitches[0] >> 4,
 		.scope_x = ((x2 - 1) << 16) | x1,
 		.scope_y = ((y2 - 1) << 16) | y1,
+		.alpha_config = alpha ? BIT(2) : 0x7fc0,
 	};
 	return 0;
 }

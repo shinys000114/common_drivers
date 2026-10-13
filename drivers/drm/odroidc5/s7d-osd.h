@@ -17,6 +17,7 @@ struct s7d_osd_state {
 	u32 stride;
 	u32 scope_x;
 	u32 scope_y;
+	u32 alpha_config;
 };
 
 /*

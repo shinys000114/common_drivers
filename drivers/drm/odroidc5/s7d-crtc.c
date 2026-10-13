@@ -87,11 +87,12 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
 	struct s7d_crtc_state *state = to_s7d_crtc_state(base);
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
-	struct drm_plane_state *ps;
-	struct s7d_plane_state *plane;
+	struct drm_plane *plane;
+	struct s7d_osd_layer layers[2] = {0};
 	int ret;
 
 	state->valid = false;
+	state->buffers = (struct s7d_scanout_buffers) {0};
 	if (!base->active)
 		return 0;
 	if (!base->enable || base->vrr_enabled || base->self_refresh_active ||
@@ -103,20 +104,37 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	ret = drm_atomic_helper_check_crtc_primary_plane(base);
 	if (ret)
 		return ret;
-	ps = drm_atomic_get_new_plane_state(atomic, crtc->primary);
-	if (!ps) {
-		const struct drm_plane_helper_funcs *funcs = crtc->primary->helper_private;
+	/* Include unchanged planes so fences and buffer ownership cover the frame. */
+	drm_for_each_plane(plane, crtc->dev) {
+		const struct drm_plane_helper_funcs *funcs = plane->helper_private;
+		struct drm_plane_state *ps;
+		struct s7d_plane_state *checked;
+		enum s7d_plane_slot slot;
 
-		/* Unchanged primary: acquire its state/lock and validate it too. */
-		ps = drm_atomic_get_plane_state(atomic, crtc->primary);
-		if (IS_ERR(ps))
-			return PTR_ERR(ps);
-		ret = funcs->atomic_check(crtc->primary, atomic);
-		if (ret)
-			return ret;
+		if (!s7d_plane_is_native(plane))
+			continue;
+		/* The helper checked existing states before this CRTC callback. */
+		ps = drm_atomic_get_new_plane_state(atomic, plane);
+		if (!ps) {
+			ps = drm_atomic_get_plane_state(atomic, plane);
+			if (IS_ERR(ps))
+				return PTR_ERR(ps);
+			ret = funcs->atomic_check(plane, atomic);
+			if (ret)
+				return ret;
+		}
+		checked = to_s7d_plane_state(ps);
+		if (!ps->visible)
+			continue;
+		if (ps->crtc != crtc || !ps->fb || !checked->osd_valid)
+			return -EINVAL;
+		slot = s7d_plane_slot(plane);
+		if (slot != S7D_PLANE_PRIMARY && layers[1].enabled)
+			return -ENOSPC;
+		layers[slot == S7D_PLANE_PRIMARY ? 0 : 1] = checked->layer;
+		state->buffers.fb[slot] = ps->fb;
 	}
-	plane = to_s7d_plane_state(ps);
-	if (ps->crtc != crtc || !ps->fb || !ps->visible || !plane->osd_valid)
+	if (!state->buffers.fb[S7D_PLANE_PRIMARY])
 		return -EINVAL;
 	if (base->mode.hdisplay != base->adjusted_mode.hdisplay ||
 	    base->mode.vdisplay != base->adjusted_mode.vdisplay)
@@ -124,7 +142,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (s7d_encp_build_state(&base->adjusted_mode, &state->encp) != MODE_OK)
 		return -EINVAL;
 	ret = s7d_osd_build_pipeline(c->revision, base->adjusted_mode.hdisplay,
-				     base->adjusted_mode.vdisplay, &plane->osd, &state->osd);
+				     base->adjusted_mode.vdisplay, layers, &state->osd);
 	if (ret)
 		return ret;
 	state->pixel_rate = (unsigned long)base->adjusted_mode.clock * 1000;
@@ -334,12 +352,11 @@ static void s7d_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_stat
 {
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct s7d_crtc_state *state = to_s7d_crtc_state(crtc->state);
-	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(atomic, crtc->primary);
 	int ret;
 
 	mutex_lock(&c->mutex);
 	ret = -EINVAL;
-	if (!state->valid || !ps || !ps->fb)
+	if (!state->valid || !state->buffers.fb[0])
 		goto fail;
 	ret = -EBUSY;
 	if (c->prepared)
@@ -347,7 +364,7 @@ static void s7d_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_stat
 	ret = c->ops->acquire(c->data);
 	if (ret)
 		goto fail;
-	ret = s7d_scanout_begin_initial(c->scanout, ps->fb);
+	ret = s7d_scanout_begin_initial(c->scanout, &state->buffers);
 	if (ret) {
 		c->ops->release(c->data);
 		goto fail;
@@ -387,23 +404,21 @@ static void s7d_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_state
 {
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct s7d_crtc_state *state = to_s7d_crtc_state(crtc->state);
-	struct drm_plane_state *ps;
 	int ret;
 
 	if (!state->base.active || drm_atomic_crtc_needs_modeset(&state->base))
 		return;
 	mutex_lock(&c->mutex);
-	ps = drm_atomic_get_new_plane_state(atomic, crtc->primary);
 	ret = -EIO;
 	if (READ_ONCE(c->last_error))
 		goto fail;
 	ret = -EINVAL;
-	if (!state->valid || !ps || !ps->fb)
+	if (!state->valid || !state->buffers.fb[0])
 		goto fail;
 	ret = s7d_crtc_arm_event(c, &state->base, false);
 	if (ret)
 		goto fail;
-	ret = s7d_scanout_submit(c->scanout, ps->fb, state->osd.update,
+	ret = s7d_scanout_submit(c->scanout, &state->buffers, state->osd.update,
 				 S7D_OSD_UPDATE_REG_COUNT);
 	if (ret)
 		goto fail;
@@ -571,6 +586,7 @@ static const struct drm_crtc_helper_funcs s7d_crtc_helper_funcs = {
 };
 
 struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *primary,
+			       struct drm_plane *cursor,
 			       u8 revision, struct s7d_scanout *scanout,
 			       const struct s7d_crtc_ops *ops, void *data)
 {
@@ -578,13 +594,15 @@ struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *prima
 	int ret;
 
 	if (!s7d_plane_is_primary(primary) || primary->dev != drm ||
+	    !s7d_plane_is_native(cursor) || cursor->dev != drm ||
+	    s7d_plane_slot(cursor) != S7D_PLANE_CURSOR ||
 	    !scanout || !scanout->rdma || !ops || !ops->check || !ops->acquire || !ops->prepare ||
 	    !ops->start || !ops->stop || !ops->release || !ops->enable_vblank ||
 	    !ops->disable_vblank || !ops->report_error)
 		return ERR_PTR(-EINVAL);
 	if (revision != S7D_OSD_REV_B)
 		return ERR_PTR(-EOPNOTSUPP);
-	c = drmm_crtc_alloc_with_planes(drm, struct s7d_crtc, base, primary, NULL,
+	c = drmm_crtc_alloc_with_planes(drm, struct s7d_crtc, base, primary, cursor,
 				       &s7d_crtc_funcs, "S7D ENCP");
 	if (IS_ERR(c))
 		return ERR_CAST(c);

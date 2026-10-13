@@ -257,6 +257,15 @@ static int s7d_vpu_stop(void *data)
 		v->failed_reg = ASYNC_STAT;
 		return ret;
 	}
+	for (i = 0; i < ARRAY_SIZE(osds); i++) {
+		u32 reg = i ? 0x1abd : 0x1a2f;
+
+		if (!(v->normal_unpack_owned & BIT(i)))
+			continue;
+		ret = vpu_update(v, reg, s7d_osd_unpack_mask(reg), 0);
+		if (ret)
+			return ret;
+	}
 	ret = stop_encoders(v);
 	if (ret)
 		return ret;
@@ -265,6 +274,7 @@ static int s7d_vpu_stop(void *data)
 		if (ret)
 			return ret;
 	}
+	v->normal_unpack_owned = 0;
 	if (v->pixel_protected) {
 		clk_rate_exclusive_put(v->clocks[PIXEL_CLK].clk);
 		v->pixel_protected = false;
@@ -341,18 +351,28 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 	for (i = 0; i < S7D_OSD_SETUP_REG_COUNT; i++) {
 		u32 reg = le32_to_cpu(state->osd.setup[i].reg);
 		u32 expected = le32_to_cpu(state->osd.setup[i].value);
-		u32 mask = U32_MAX;
+		u32 mask = s7d_osd_unpack_mask(reg);
 
-		if (reg == OSD1_CTRL)
+		if (mask) {
+			v->normal_unpack_owned |= reg == 0x1a2f ? BIT(0) : BIT(1);
+			ret = vpu_update(v, reg, mask, expected);
+			if (ret)
+				return ret;
+			continue;
+		}
+		mask = U32_MAX;
+		if (reg == OSD2_CTRL)
+			v->osd2_enable = expected & BIT(0);
+		if (reg == OSD1_CTRL || reg == OSD2_CTRL)
 			expected &= ~BIT(0);
 		writel(expected, v->regs + reg * 4);
 		/* Mixed status/config and Rev.B's documented alpha encoding. */
-		if (reg == OSD1_CTRL)
+		if (reg == OSD1_CTRL || reg == OSD2_CTRL)
 			mask = OSD_CFG_SYNC | GENMASK(20, 12) | GENMASK(3, 0);
-		else if (reg == 0x1a2d)
+		else if (reg == 0x1a2d || reg == 0x1a4d)
 			mask = GENMASK(15, 0);
 		else if (reg == 0x39ba)
-			expected = 0x04020000;
+			expected >>= 2;
 		if ((vpu_read(v, reg) & mask) != (expected & mask)) {
 			v->failed_reg = reg;
 			return -EIO;
@@ -446,6 +466,9 @@ static int s7d_vpu_start(void *data)
 	ret = vpu_update(v, ENCP_EN, BIT(0), BIT(0));
 	if (ret)
 		return ret;
+	ret = vpu_update(v, OSD2_CTRL, BIT(0), v->osd2_enable ? BIT(0) : 0);
+	if (ret)
+		return ret;
 	return vpu_update(v, OSD1_CTRL, BIT(0), BIT(0));
 }
 
@@ -497,18 +520,19 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 {
 	struct s7d_frame_state frame;
 	unsigned long flags;
-	u32 before, after, fifo, arbiter;
+	u32 before, after, fifo, fifo2, arbiter;
 
 	/* An older IRQ sample must not overtake the threaded RDMA completion. */
 	spin_lock_irqsave(&v->frame_lock, flags);
 	before = vpu_read(v, ENCP_INFO_READ);
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
+	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
 	arbiter = vpu_read(v, ASYNC_STAT);
 	after = vpu_read(v, ENCP_INFO_READ);
 	frame.field = after >> 29;
 	frame.idle = (before >> 29) == frame.field &&
-		     !(fifo & OSD_FIFO_STATE) && (arbiter & ASYNC_IDLE);
-	trace_s7d_frame_idle(before, after, fifo, arbiter, vblank);
+		     !((fifo | fifo2) & OSD_FIFO_STATE) && (arbiter & ASYNC_IDLE);
+	trace_s7d_frame_idle(before, after, fifo, fifo2, arbiter, vblank);
 	s7d_crtc_irq(v->crtc, vblank, result, &frame);
 	spin_unlock_irqrestore(&v->frame_lock, flags);
 }
@@ -563,7 +587,7 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	v->dev = dev;
 	spin_lock_init(&v->frame_lock);
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vcbus");
-	if (!res || resource_size(res) != SZ_64K)
+	if (!res || resource_size(res) != SZ_256K)
 		return -EINVAL;
 	v->regs = devm_ioremap_resource(dev, res);
 	if (IS_ERR(v->regs))

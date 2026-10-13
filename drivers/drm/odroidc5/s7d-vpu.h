@@ -38,6 +38,8 @@ struct s7d_vpu {
 	bool pixel_enabled;
 	bool boot_held;
 	bool touched;
+	bool osd2_enable;
+	u8 normal_unpack_owned;
 	bool pixel_protected;
 	bool core_protected;
 	u32 failed_reg;
