@@ -4,6 +4,8 @@
 #ifndef S7D_CODEC_DOS_H
 #define S7D_CODEC_DOS_H
 
+#include <linux/types.h>
+
 #include "s7d-codec-types.h"
 
 struct module;
@@ -30,10 +32,16 @@ int s7d_codec_dos_prepare(struct s7d_codec_dos *dos,
 /* Firmware/input DMA backing and descriptors must already have live refs. */
 int s7d_codec_dos_port_enable(struct s7d_codec_dos *dos,
 			      enum s7d_codec_engine engine);
+/* Post-TEE workspace setup; issues IQIT reset before protocol configuration. */
+int s7d_codec_dos_hevc_init(struct s7d_codec_dos *dos);
+/* Process context; the caller arms/joins its IRQ, and owns mailbox clear. */
+int s7d_codec_dos_hevc_irq_mask(struct s7d_codec_dos *dos, bool enable);
+/* Caller has pinned/staged the frame input and completed DMA visibility. */
+int s7d_codec_dos_hevc_input_enable(struct s7d_codec_dos *dos);
 /* Process context only; this does not synchronize the caller's IRQ or work. */
 int s7d_codec_dos_halt(struct s7d_codec_dos *dos,
 		       enum s7d_codec_engine engine);
-/* Keeps context registers until the caller saves them; IRQ/work stay caller-owned. */
+/* VDEC context stop only; HEVC park/resume remains unsupported. */
 int s7d_codec_dos_park(struct s7d_codec_dos *dos,
 		       enum s7d_codec_engine engine);
 /* Caller holds firmware/context/backing refs and an armed mailbox/FIFO. */

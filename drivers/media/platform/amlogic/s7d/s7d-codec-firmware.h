@@ -14,6 +14,8 @@ struct s7d_codec_firmware_job;
 
 enum s7d_codec_firmware {
 	S7D_CODEC_FIRMWARE_H264_MH264,
+	/* Non-MMU HEVC; the initial backend selects Main8/DW 0x10. */
+	S7D_CODEC_FIRMWARE_HEVC,
 };
 
 struct s7d_codec_firmware_owner *
@@ -58,6 +60,9 @@ void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job);
 
 /*
  * Caller holds a powered, idle engine; zero acknowledges only the TEE load.
+ * HEVC runtime captures SCRATCH_8 after success under that same lease. Its
+ * opaque TEE-supplied value is never a kernel DMA allocation. The selected
+ * post-load IQIT and normal CPU-start resets remain within that load sequence.
  * Reload after full halt/reset, power loss, firmware replacement, lease change
  * or load failure. On failure, retain references until DOS halt proves idle.
  */

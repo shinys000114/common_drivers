@@ -22,6 +22,8 @@
 
 #define S7D_TEE_FW_H264_MH264	15
 #define S7D_TEE_CORE_VDEC		0
+#define S7D_TEE_FW_HEVC		16
+#define S7D_TEE_CORE_HEVC		2
 
 enum s7d_codec_firmware_state {
 	S7D_FIRMWARE_EMPTY,
@@ -253,6 +255,28 @@ void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job)
 	module_put(module);
 }
 
+static int firmware_load_hevc(struct device *dev)
+{
+	int ret;
+
+	if (!tee_enabled())
+		return -EOPNOTSUPP;
+
+	ret = tee_config_device_state_lock(DMC_DEV_ID_HEVC, 0);
+	if (ret != TEEC_SUCCESS) {
+		dev_err(dev, "HEVC nonsecure policy failed, TEE status %#x\n", (u32)ret);
+		return -EIO;
+	}
+
+	ret = tee_load_video_fw_swap(S7D_TEE_FW_HEVC, S7D_TEE_CORE_HEVC, true);
+	if (ret != TEEC_SUCCESS) {
+		dev_err(dev, "HEVC firmware load failed, TEE status %#x\n", (u32)ret);
+		return -EIO;
+	}
+
+	return 0;
+}
+
 int s7d_codec_firmware_load(struct device *dev, enum s7d_codec_engine engine,
 			    enum s7d_codec_firmware firmware)
 {
@@ -260,6 +284,8 @@ int s7d_codec_firmware_load(struct device *dev, enum s7d_codec_engine engine,
 
 	if (!dev)
 		return -EINVAL;
+	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_HEVC)
+		return firmware_load_hevc(dev);
 	if (engine != S7D_CODEC_ENGINE_VDEC ||
 	    firmware != S7D_CODEC_FIRMWARE_H264_MH264)
 		return -EOPNOTSUPP;
@@ -293,8 +319,10 @@ int s7d_codec_firmware_prepare_for_engine(struct s7d_codec_firmware_owner *owner
 	*out = NULL;
 	if (!owner)
 		return -EINVAL;
-	if (engine != S7D_CODEC_ENGINE_VDEC ||
-	    firmware != S7D_CODEC_FIRMWARE_H264_MH264)
+	if (!((engine == S7D_CODEC_ENGINE_VDEC &&
+	       firmware == S7D_CODEC_FIRMWARE_H264_MH264) ||
+	      (engine == S7D_CODEC_ENGINE_HEVC &&
+	       firmware == S7D_CODEC_FIRMWARE_HEVC)))
 		return -EOPNOTSUPP;
 
 	return s7d_codec_firmware_prepare(owner, session, lease_epoch, out);

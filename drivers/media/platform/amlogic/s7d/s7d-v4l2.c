@@ -136,6 +136,31 @@ static int s7d_placeholder(const struct s7d_v4l2_codec *codec,
 
 	width = clamp_t(u32, width, 64, codec->max_width);
 	height = clamp_t(u32, height, 64, codec->max_height);
+	if (codec->engine == S7D_CODEC_ENGINE_HEVC) {
+		struct s7d_codec_colour colour = { };
+		struct s7d_codec_layout next = {
+			.format = S7D_CODEC_CAPTURE_NV12M, .plane_count = 2,
+			.coded_width = ALIGN(width, 2), .coded_height = ALIGN(height, 2),
+			.visible_width = ALIGN(width, 2), .visible_height = ALIGN(height, 2),
+			.storage_height = ALIGN(height, S7D_CODEC_STORAGE_ALIGNMENT),
+			.dpb_limit = 1, .dpb_slots = 1, .current_slots = 2,
+			.min_capture_buffers = 3,
+		};
+		int ret;
+
+		next.pitch[0] = ALIGN(width, S7D_CODEC_STORAGE_ALIGNMENT);
+		next.pitch[1] = next.pitch[0];
+		next.size[1] = ALIGN(next.pitch[0] * next.storage_height / 2, PAGE_SIZE);
+		next.size[0] = next.size[1] * 2;
+		next.total_size = next.size[0] + next.size[1];
+		ret = s7d_codec_resolve_colour(&colour, next.coded_width, next.coded_height,
+					     &next.colourimetry);
+		if (!ret)
+			ret = s7d_codec_validate_layout(&next);
+		if (!ret)
+			*layout = next;
+		return ret;
+	}
 	sps.mb_width = DIV_ROUND_UP(width, 16);
 	sps.mb_height = DIV_ROUND_UP(height, 16);
 	return s7d_h264_build_layout(&sps, fourcc == V4L2_PIX_FMT_NV21M ?
@@ -150,8 +175,12 @@ bool s7d_v4l2_codec_valid(const struct s7d_v4l2_codec *codec)
 	    codec->max_input_size > S7D_OUTPUT_MAX_SIZE ||
 	    !IS_ALIGNED(codec->max_input_size, PAGE_SIZE))
 		return false;
-	return codec->engine == S7D_CODEC_ENGINE_VDEC &&
-		codec->output_format == V4L2_PIX_FMT_H264;
+	if (codec->engine == S7D_CODEC_ENGINE_VDEC)
+		return codec->output_format == V4L2_PIX_FMT_H264;
+	return codec->engine == S7D_CODEC_ENGINE_HEVC &&
+		codec->output_format == V4L2_PIX_FMT_HEVC && !codec->nv21 &&
+		codec->max_width <= 1920 && codec->max_height <= 1080 &&
+		codec->max_input_size <= SZ_2M;
 }
 
 int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *format)

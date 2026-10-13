@@ -68,7 +68,8 @@ static int s7d_backend_ready(struct s7d_v4l2_device *device)
 
 static const char *s7d_v4l2_device_name(struct s7d_v4l2_device *device)
 {
-	return "S7D H.264 Decoder";
+	return device->factory.codec.engine == S7D_CODEC_ENGINE_HEVC ?
+		"S7D HEVC First-IDR Decoder" : "S7D H.264 Decoder";
 }
 
 static struct s7d_v4l2_context *s7d_file_context(void *priv)
