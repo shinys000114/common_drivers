@@ -6,13 +6,25 @@
 #include <drm/drm_crtc.h>
 
 #include "s7d-encp.h"
+#include "s7d-csc.h"
 #include "s7d-osd-pipeline.h"
+#include "s7d-postblend.h"
 #include "s7d-scanout.h"
+#include "s7d-video-pipeline.h"
+
+#define S7D_CRTC_UPDATE_REG_COUNT (S7D_OSD_UPDATE_REG_COUNT + \
+	S7D_VIDEO_UPDATE_REG_COUNT + S7D_CSC_MATRIX_REG_COUNT + \
+	S7D_POSTBLEND_REG_COUNT + 1)
 
 struct s7d_crtc_state {
 	struct drm_crtc_state base;
 	struct s7d_encp_state encp;
 	struct s7d_osd_pipeline_state osd;
+	struct s7d_video_pipeline_state video;
+	struct s7d_csc_state csc;
+	struct s7d_postblend_state postblend;
+	struct s7d_rdma_entry update[S7D_CRTC_UPDATE_REG_COUNT];
+	unsigned int update_count;
 	/* Borrowed from the checked atomic plane states until scanout takes refs. */
 	struct s7d_scanout_buffers buffers;
 	unsigned long pixel_rate;

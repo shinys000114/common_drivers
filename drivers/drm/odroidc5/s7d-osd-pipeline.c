@@ -105,7 +105,7 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height,
 	};
 	const struct s7d_osd_state *primary;
 	u32 h_scope, v_scope, secondary_h = 0x1fff1fff, secondary_v = 0x043a0439;
-	u32 size, blend = 0x807f4413, alpha, secondary_ctrl = 0x00100004;
+	u32 size, blend = 0x807f4413 | BIT(25), alpha, secondary_ctrl = 0x00100004;
 
 	if (!layers || !state)
 		return -EINVAL;

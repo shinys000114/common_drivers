@@ -29,15 +29,16 @@ u32 s7d_osd_unpack_mask(u32 reg);
 
 /*
  * Pure calculation for S7D Rev.B, an RGB primary and optional OSD2,
- * without scaling. Layouts must come from s7d_osd_build_state(): this does
- * not establish GEM ownership, fences or DMA bounds. Unknown revisions
+ * without scaling, with separate OSD outputs to postblend. Layouts must come
+ * from s7d_osd_build_state(): this does not establish GEM ownership, fences
+ * or DMA bounds. Unknown revisions
  * fail; obtain the revision before entering atomic_check, without assuming
  * that a firmware version provider is already ready.
  *
  * setup configures the OSD MIFs and blend block. Apply it with
  * VENC stopped and all other fetchers/triggers quiesced under exclusive VPU
  * ownership. It does NOT prepare SRAM, arbitration, GFCD/scaler bypass,
- * colour processing, postblend, ENCP, clocks or the HDMI bridge.
+ * colour processing, the primary postblend route, ENCP, clocks or HDMI.
  *
  * update is for a frame change at unchanged output dimensions on an
  * already configured pipeline, via the CRTC's synchronized RDMA path.

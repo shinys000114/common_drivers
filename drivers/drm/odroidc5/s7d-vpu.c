@@ -29,6 +29,10 @@
 #define OSD_PATH		0x1a0e
 #define VD1_BLEND		0x1dfb
 #define VD2_BLEND		0x1dfc
+#define VD1_PATH		0x1a0a
+#define VD1_GEN			0x4800
+#define VD1_BUSY		BIT(17)
+#define VD1_FREE_CLK		BIT(31)
 #define VENC_MUX		0x271a
 #define ENCP_INFO_READ		0x271d
 #define HDMI_SETTING		0x271b
@@ -205,7 +209,6 @@ static int s7d_vpu_stop(void *data)
 {
 	struct s7d_vpu *v = data;
 	static const u32 osds[] = { OSD1_CTRL, OSD2_CTRL };
-	u32 free_clk[ARRAY_SIZE(osds)];
 	u32 value;
 	unsigned int i;
 	int ret;
@@ -227,12 +230,30 @@ static int s7d_vpu_stop(void *data)
 	ret = s7d_rdma_quiesce(&v->rdma);
 	if (ret)
 		return ret;
+	if (!v->osd_draining) {
+		for (i = 0; i < ARRAY_SIZE(osds); i++)
+			v->osd_free_clk[i] = vpu_read(v, osds[i]) & OSD_FREE_CLK;
+		v->osd_draining = true;
+	}
+	if (!v->vd1_draining) {
+		v->vd1_free_clk = vpu_read(v, VD1_GEN) & VD1_FREE_CLK;
+		v->vd1_draining = true;
+	}
+	/* Keep VD1 running until its state machines and READ0 have drained. */
+	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK | BIT(30) | BIT(7) | BIT(0), VD1_FREE_CLK);
+	if (ret)
+		return ret;
+	ret = readl_poll_timeout(v->regs + VD1_GEN * 4, value,
+				!(value & VD1_BUSY), 10, 50000);
+	if (ret) {
+		v->failed_reg = VD1_GEN;
+		return ret;
+	}
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		/*
 		 * Keep the local OSD clock running until disable reaches OSD_ENABLE and DMA
 		 * drains (S905X5M, VIU_OSD1_CTRL_STAT ENABLE_FREE_CLK).
 		 */
-		free_clk[i] = vpu_read(v, osds[i]) & OSD_FREE_CLK;
 		ret = vpu_update(v, osds[i], OSD_CFG_SYNC | OSD_FREE_CLK | BIT(0),
 				 OSD_FREE_CLK);
 		if (ret)
@@ -269,11 +290,16 @@ static int s7d_vpu_stop(void *data)
 	ret = stop_encoders(v);
 	if (ret)
 		return ret;
+	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK, v->vd1_free_clk);
+	if (ret)
+		return ret;
+	v->vd1_draining = false;
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
-		ret = vpu_update(v, osds[i], OSD_FREE_CLK, free_clk[i]);
+		ret = vpu_update(v, osds[i], OSD_FREE_CLK, v->osd_free_clk[i]);
 		if (ret)
 			return ret;
 	}
+	v->osd_draining = false;
 	v->normal_unpack_owned = 0;
 	if (v->pixel_protected) {
 		clk_rate_exclusive_put(v->clocks[PIXEL_CLK].clk);
@@ -304,7 +330,9 @@ static int check_handoff(struct s7d_vpu *v)
 	 * The provider profile excludes Linux video/capture and legacy writers.
 	 */
 	if ((vpu_read(v, OSD_PATH) & (BIT(14) | GENMASK(12, 9) | GENMASK(7, 0))) ||
-	    ((vpu_read(v, VD1_BLEND) | vpu_read(v, VD2_BLEND)) & 0x0f0f))
+	    (vpu_read(v, VD1_PATH) & 0x007dff00) ||
+	    (!v->touched &&
+	     ((vpu_read(v, VD1_BLEND) | vpu_read(v, VD2_BLEND)) & 0x0f0f)))
 		return -EOPNOTSUPP;
 	/* ENCP FIFO must use cts_vpu_clk, not an unowned vpu_clkc route. */
 	if (vpu_read(v, VENC_CLK) & BIT(0))
@@ -325,6 +353,36 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 
 	ret = s7d_vpp_setup(v->regs, state->base.adjusted_mode.hdisplay,
 			    state->base.adjusted_mode.vdisplay, &v->failed_reg);
+	if (ret)
+		return ret;
+	for (i = 0; i < S7D_VIDEO_SETUP_REG_COUNT; i++) {
+		const struct s7d_video_reg_setting *s = &state->video.setup[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {
+		const struct s7d_csc_reg *s = &state->csc.matrix[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < S7D_CSC_CONTROL_REG_COUNT; i++) {
+		const struct s7d_csc_reg *s = &state->csc.control[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	ret = vpu_update(v, 0x1d76, GENMASK(8, 0), 256);
+	if (ret)
+		return ret;
+	ret = vpu_update(v, 0x3968, GENMASK(23, 0), 0);
+	if (ret)
+		return ret;
+	ret = vpu_update(v, 0x3969, 0x1ffff9ff, 0);
 	if (ret)
 		return ret;
 	for (i = 0; i < S7D_ENCP_REG_COUNT; i++) {
@@ -378,7 +436,22 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 			return -EIO;
 		}
 	}
-	return 0;
+	for (i = 0; i < state->video.update_count; i++) {
+		ret = vpu_update(v, le32_to_cpu(state->video.update[i].reg), U32_MAX,
+				 le32_to_cpu(state->video.update[i].value));
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < S7D_POSTBLEND_REG_COUNT; i++) {
+		ret = vpu_update(v, le32_to_cpu(state->postblend.regs[i].reg), U32_MAX,
+				 le32_to_cpu(state->postblend.regs[i].value));
+		if (ret)
+			return ret;
+	}
+	v->vd1_enable = state->video.control.value & BIT(0);
+	return vpu_update(v, state->video.control.reg,
+			  state->video.control.mask | BIT(30),
+			  state->video.control.value & ~BIT(0));
 }
 
 static int s7d_vpu_prepare_pixel(struct s7d_vpu *v, unsigned long rate)
@@ -466,6 +539,9 @@ static int s7d_vpu_start(void *data)
 	ret = vpu_update(v, ENCP_EN, BIT(0), BIT(0));
 	if (ret)
 		return ret;
+	ret = vpu_update(v, VD1_GEN, BIT(0), v->vd1_enable ? BIT(0) : 0);
+	if (ret)
+		return ret;
 	ret = vpu_update(v, OSD2_CTRL, BIT(0), v->osd2_enable ? BIT(0) : 0);
 	if (ret)
 		return ret;
@@ -520,19 +596,21 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 {
 	struct s7d_frame_state frame;
 	unsigned long flags;
-	u32 before, after, fifo, fifo2, arbiter;
+	u32 before, after, fifo, fifo2, vd1, arbiter;
 
 	/* An older IRQ sample must not overtake the threaded RDMA completion. */
 	spin_lock_irqsave(&v->frame_lock, flags);
 	before = vpu_read(v, ENCP_INFO_READ);
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
 	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
+	vd1 = vpu_read(v, VD1_GEN);
 	arbiter = vpu_read(v, ASYNC_STAT);
 	after = vpu_read(v, ENCP_INFO_READ);
 	frame.field = after >> 29;
 	frame.idle = (before >> 29) == frame.field &&
-		     !((fifo | fifo2) & OSD_FIFO_STATE) && (arbiter & ASYNC_IDLE);
-	trace_s7d_frame_idle(before, after, fifo, fifo2, arbiter, vblank);
+		     !((fifo | fifo2) & OSD_FIFO_STATE) && !(vd1 & VD1_BUSY) &&
+		     (arbiter & ASYNC_IDLE);
+	trace_s7d_frame_idle(before, after, fifo, fifo2, vd1, arbiter, vblank);
 	s7d_crtc_irq(v->crtc, vblank, result, &frame);
 	spin_unlock_irqrestore(&v->frame_lock, flags);
 }

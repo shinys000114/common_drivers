@@ -39,9 +39,14 @@ struct s7d_vpu {
 	bool boot_held;
 	bool touched;
 	bool osd2_enable;
+	bool vd1_enable;
 	u8 normal_unpack_owned;
 	bool pixel_protected;
 	bool core_protected;
+	bool vd1_draining;
+	bool osd_draining;
+	u32 vd1_free_clk;
+	u32 osd_free_clk[2];
 	u32 failed_reg;
 };
 
