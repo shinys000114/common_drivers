@@ -33,3 +33,13 @@ config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
 config VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	bool
 
+config VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL
+	bool "Amlogic S7D experimental JPEG encoder"
+	depends on VIDEO_AMLOGIC_S7D
+	default n
+	help
+	  Register an additional standard V4L2 memory-to-memory JPEG encoder.
+	  The initial path accepts contiguous progressive NV12/NV21 up to
+	  1920x1080 through MMAP buffers and provides baseline 8-bit JPEG with
+	  the standard compression quality control. Hardware validation is
+	  incomplete. Leave this disabled for normal decoder-only operation.
