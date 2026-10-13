@@ -4799,6 +4799,13 @@ static int kbase_platform_device_probe(struct platform_device *pdev)
 	}
 
 	kbdev->dev = &pdev->dev;
+	/*
+	 * Initialize vendor DMA-BUF tracking before publishing the device or
+	 * entering any probe path that can fail and free kbdev.
+	 */
+	kbdev->kbase_dmabuf_list.dma_buf = NULL;
+	INIT_LIST_HEAD(&kbdev->kbase_dmabuf_list.dmabuf_list);
+	mutex_init(&kbdev->kbase_dmabuf_lock);
 
 #if IS_ENABLED(CONFIG_REGULATOR)
 #if (KERNEL_VERSION(6, 0, 0) <= LINUX_VERSION_CODE)
@@ -4847,9 +4854,6 @@ static int kbase_platform_device_probe(struct platform_device *pdev)
 			mutex_unlock(&kbdev->pm.lock);
 		}
 	}
-	kbdev->kbase_dmabuf_list.dma_buf = NULL;
-	INIT_LIST_HEAD(&kbdev->kbase_dmabuf_list.dmabuf_list);
-	mutex_init(&kbdev->kbase_dmabuf_lock);
 	return err;
 }
 
