@@ -22,12 +22,15 @@ struct s7d_csc_state {
 };
 
 /*
- * Initial matrix/control setup requires VENC and VD1 quiesced. Preserve bits
- * outside each mask. Later matrix updates may use validated RDMA; controls
- * stay outside its replay list. This does not prepare fetch/scaler/blend.
+ * Initial matrix/control setup requires VENC and the target video path quiesced.
+ * Preserve bits outside each mask. Later matrix updates may use validated RDMA;
+ * controls stay outside its replay list. This does not prepare fetch/scaler/blend.
  * Errors leave state unchanged; no registers are read or written.
  */
 int s7d_csc_build_state(enum drm_color_encoding encoding,
+			enum drm_color_range range, struct s7d_csc_state *state);
+
+int s7d_csc_build_video2_state(enum drm_color_encoding encoding,
 			enum drm_color_range range, struct s7d_csc_state *state);
 
 /* Matrix masks only; controls and unknown registers return zero. */

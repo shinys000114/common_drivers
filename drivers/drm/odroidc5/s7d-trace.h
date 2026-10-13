@@ -31,15 +31,16 @@ TRACE_EVENT(s7d_frame,
 );
 
 TRACE_EVENT(s7d_frame_idle,
-	TP_PROTO(u32 before, u32 after, u32 fifo, u32 fifo2, u32 vd1, u32 arbiter,
+	TP_PROTO(u32 before, u32 after, u32 fifo, u32 fifo2, u32 vd1, u32 vd2, u32 arbiter,
 		 bool vblank),
-	TP_ARGS(before, after, fifo, fifo2, vd1, arbiter, vblank),
+	TP_ARGS(before, after, fifo, fifo2, vd1, vd2, arbiter, vblank),
 	TP_STRUCT__entry(
 		__field(u32, before)
 		__field(u32, after)
 		__field(u32, fifo)
 		__field(u32, fifo2)
 		__field(u32, vd1)
+		__field(u32, vd2)
 		__field(u32, arbiter)
 		__field(bool, vblank)
 	),
@@ -49,12 +50,13 @@ TRACE_EVENT(s7d_frame_idle,
 		__entry->fifo = fifo;
 		__entry->fifo2 = fifo2;
 		__entry->vd1 = vd1;
+		__entry->vd2 = vd2;
 		__entry->arbiter = arbiter;
 		__entry->vblank = vblank;
 	),
-	TP_printk("before=%#x after=%#x fifo=%#x fifo2=%#x vd1=%#x arbiter=%#x vblank=%u",
+	TP_printk("before=%#x after=%#x fifo=%#x fifo2=%#x vd1=%#x vd2=%#x arbiter=%#x vblank=%u",
 		  __entry->before, __entry->after, __entry->fifo,
-		  __entry->fifo2, __entry->vd1, __entry->arbiter, __entry->vblank)
+		  __entry->fifo2, __entry->vd1, __entry->vd2, __entry->arbiter, __entry->vblank)
 );
 #endif
 

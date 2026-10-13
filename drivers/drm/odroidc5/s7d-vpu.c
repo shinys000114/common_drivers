@@ -36,6 +36,8 @@
 #define VD2_BLEND		0x1dfc
 #define VD1_PATH		0x1a0a
 #define VD1_GEN			0x4800
+#define VD2_GEN			0x4880
+#define VD2_PATH		0x1a0b
 #define VD1_BUSY		BIT(17)
 #define VD1_FREE_CLK		BIT(31)
 #define VENC_MUX		0x271a
@@ -106,7 +108,7 @@ static int s7d_vpu_afbc_write(void *data, u32 reg, u32 value)
 	return regmap_write(v->regmap, reg * 4, value);
 }
 
-static bool s7d_vpu_afbc_window(u32 before, u32 after, u32 vd1,
+static bool s7d_vpu_afbc_window(u32 before, u32 after, u32 vd1, u32 vd2,
 			       u16 start, u16 end)
 {
 	if (end <= start || (before >> 29) != (after >> 29) ||
@@ -114,15 +116,17 @@ static bool s7d_vpu_afbc_window(u32 before, u32 after, u32 vd1,
 	    ((before >> 16) & 0x1fff) > ((after >> 16) & 0x1fff) ||
 	    ((after >> 16) & 0x1fff) >= end)
 		return false;
-	if (!(vd1 & BIT(0)))
-		return true;
-	return (vd1 & BIT(29)) && ((vd1 >> 19) & 0x3f) >= end - start + 2U;
+	if ((vd1 & BIT(0)) && (!(vd1 & BIT(29)) ||
+	    ((vd1 >> 19) & 0x3f) < end - start + 2U))
+		return false;
+	return !(vd2 & BIT(0)) || ((vd2 & BIT(29)) &&
+		((vd2 >> 19) & 0x3f) >= end - start + 2U);
 }
 
 static int s7d_vpu_afbc_check_start(void *data, u64 sequence, u8 field)
 {
 	struct s7d_vpu *v = data;
-	u32 before, after, fifo, fifo2, vd1, arbiter;
+	u32 before, after, fifo, fifo2, vd1, vd2, arbiter;
 
 	lockdep_assert_held(&v->frame_lock);
 	if (!v->acquired || !(vpu_read(v, ENCP_EN) & BIT(0)) ||
@@ -132,12 +136,13 @@ static int s7d_vpu_afbc_check_start(void *data, u64 sequence, u8 field)
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
 	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
 	vd1 = vpu_read(v, VD1_GEN);
+	vd2 = vpu_read(v, VD2_GEN);
 	arbiter = vpu_read(v, ASYNC_STAT);
 	after = vpu_read(v, ENCP_INFO_READ);
 	if ((before >> 29) != field || (after >> 29) != field ||
-	    ((fifo | fifo2) & OSD_FIFO_STATE) || (vd1 & VD1_BUSY) ||
+	    ((fifo | fifo2) & OSD_FIFO_STATE) || ((vd1 | vd2) & VD1_BUSY) ||
 	    !(arbiter & ASYNC_IDLE) ||
-	    !s7d_vpu_afbc_window(before, after, vd1, v->flip_start, v->flip_end))
+	    !s7d_vpu_afbc_window(before, after, vd1, vd2, v->flip_start, v->flip_end))
 		return -ETIMEDOUT;
 	return 0;
 }
@@ -322,6 +327,8 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	struct s7d_hdmi_pll_rate plan;
 	int ret;
 
+	if (state->buffers.video2.fb && state->buffers.afbc.fb)
+		return -EINVAL;
 	if (state->buffers.afbc.fb) {
 		u32 mask = state->buffers.afbc.plan.surface_mask;
 
@@ -477,6 +484,7 @@ static int s7d_vpu_stop_hw(void *data)
 {
 	struct s7d_vpu *v = data;
 	static const u32 osds[] = { OSD1_CTRL, OSD2_CTRL };
+	static const u32 videos[] = { VD1_GEN, VD2_GEN };
 	u32 value;
 	unsigned int i;
 	const struct s7d_afbc_surface *surface = NULL;
@@ -522,19 +530,23 @@ static int s7d_vpu_stop_hw(void *data)
 			v->osd_free_clk[i] = vpu_read(v, osds[i]) & OSD_FREE_CLK;
 		v->osd_draining = true;
 	}
-	if (!v->vd1_draining) {
-		v->vd1_free_clk = vpu_read(v, VD1_GEN) & VD1_FREE_CLK;
-		v->vd1_draining = true;
+	for (i = 0; i < ARRAY_SIZE(videos); i++) {
+		if (!v->video_draining[i]) {
+			v->video_free_clk[i] = vpu_read(v, videos[i]) & VD1_FREE_CLK;
+			v->video_draining[i] = true;
+		}
+		ret = vpu_update(v, videos[i], VD1_FREE_CLK | BIT(30) | BIT(7) | BIT(0),
+				 VD1_FREE_CLK);
+		if (ret)
+			return ret;
 	}
-	/* Keep VD1 running until its state machines and READ0 have drained. */
-	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK | BIT(30) | BIT(7) | BIT(0), VD1_FREE_CLK);
-	if (ret)
-		return ret;
-	ret = readl_poll_timeout(v->regs + VD1_GEN * 4, value,
-				!(value & VD1_BUSY), 10, 50000);
-	if (ret) {
-		v->failed_reg = VD1_GEN;
-		return ret;
+	for (i = 0; i < ARRAY_SIZE(videos); i++) {
+		ret = readl_poll_timeout(v->regs + videos[i] * 4, value,
+					!(value & (VD1_BUSY | BIT(0))), 10, 50000);
+		if (ret) {
+			v->failed_reg = videos[i];
+			return ret;
+		}
 	}
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		/*
@@ -612,10 +624,12 @@ static int s7d_vpu_stop_hw(void *data)
 		v->osd_scaler_route_owned = false;
 		v->osd_scaler_route_saved = 0;
 	}
-	ret = vpu_update(v, VD1_GEN, VD1_FREE_CLK, v->vd1_free_clk);
-	if (ret)
-		return ret;
-	v->vd1_draining = false;
+	for (i = 0; i < ARRAY_SIZE(videos); i++) {
+		ret = vpu_update(v, videos[i], VD1_FREE_CLK, v->video_free_clk[i]);
+		if (ret)
+			return ret;
+		v->video_draining[i] = false;
+	}
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		ret = vpu_update(v, osds[i], OSD_FREE_CLK, v->osd_free_clk[i]);
 		if (ret)
@@ -663,6 +677,8 @@ static int check_handoff(struct s7d_vpu *v)
 	 */
 	if ((vpu_read(v, OSD_PATH) & (BIT(14) | GENMASK(12, 9) | GENMASK(7, 0))) ||
 	    (vpu_read(v, VD1_PATH) & 0x007dff00) ||
+	    (vpu_read(v, VD2_PATH) & 0x007dfe00) ||
+	    (vpu_read(v, 0x1d26) & BIT(27)) ||
 	    (!v->touched &&
 	     ((vpu_read(v, VD1_BLEND) | vpu_read(v, VD2_BLEND)) & 0x0f0f)))
 		return -EOPNOTSUPP;
@@ -775,6 +791,13 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		if (ret)
 			return ret;
 	}
+	for (i = 0; i < S7D_VIDEO_SETUP_REG_COUNT; i++) {
+		const struct s7d_video_reg_setting *s = &state->video2.setup[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
 	ret = program_video_scaler(v, &state->video.scaler);
 	if (ret)
 		return ret;
@@ -792,6 +815,26 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		if (ret)
 			return ret;
 	}
+	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {
+		const struct s7d_csc_reg *s = &state->csc2.matrix[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < S7D_CSC_CONTROL_REG_COUNT; i++) {
+		const struct s7d_csc_reg *s = &state->csc2.control[i];
+
+		ret = vpu_update(v, s->reg, s->mask, s->value);
+		if (ret)
+			return ret;
+	}
+	ret = vpu_update(v, 0x1d26, BIT(27) | GENMASK(26, 18), 256 << 18);
+	if (ret)
+		return ret;
+	ret = vpu_update(v, 0x58b0, GENMASK(28, 0), BIT(0));
+	if (ret)
+		return ret;
 	ret = vpu_update(v, 0x1d76, GENMASK(8, 0), 256);
 	if (ret)
 		return ret;
@@ -868,16 +911,28 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		if (ret)
 			return ret;
 	}
+	for (i = 0; i < state->video2.update_count; i++) {
+		ret = vpu_update(v, le32_to_cpu(state->video2.update[i].reg), U32_MAX,
+				 le32_to_cpu(state->video2.update[i].value));
+		if (ret)
+			return ret;
+	}
 	for (i = 0; i < S7D_POSTBLEND_REG_COUNT; i++) {
 		ret = vpu_update(v, le32_to_cpu(state->postblend.regs[i].reg), U32_MAX,
 				 le32_to_cpu(state->postblend.regs[i].value));
 		if (ret)
 			return ret;
 	}
-	v->vd1_enable = state->video.control.value & BIT(0);
-	return vpu_update(v, state->video.control.reg,
-			  state->video.control.mask | BIT(30),
-			  state->video.control.value & ~BIT(0));
+	v->video_enable[0] = state->video.control.value & BIT(0);
+	v->video_enable[1] = state->video2.control.value & BIT(0);
+	ret = vpu_update(v, state->video.control.reg,
+			 state->video.control.mask | BIT(30),
+			 state->video.control.value & ~BIT(0));
+	if (ret)
+		return ret;
+	return vpu_update(v, state->video2.control.reg,
+			  state->video2.control.mask | BIT(30),
+			  state->video2.control.value & ~BIT(0));
 }
 
 static int s7d_vpu_prepare_pixel(struct s7d_vpu *v, unsigned long rate)
@@ -1012,7 +1067,9 @@ static int s7d_vpu_start(void *data)
 		}
 	}
 	if (!ret)
-		ret = vpu_update(v, VD1_GEN, BIT(0), v->vd1_enable ? BIT(0) : 0);
+		ret = vpu_update(v, VD1_GEN, BIT(0), v->video_enable[0] ? BIT(0) : 0);
+	if (!ret)
+		ret = vpu_update(v, VD2_GEN, BIT(0), v->video_enable[1] ? BIT(0) : 0);
 	if (!ret)
 		ret = vpu_update(v, OSD2_CTRL, BIT(0), v->osd2_enable ? BIT(0) : 0);
 	if (!ret)
@@ -1173,7 +1230,7 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	struct s7d_frame_state frame = {0};
 	struct s7d_afbc_frame afbc_frame;
 	unsigned long flags;
-	u32 before, after, fifo, fifo2, vd1, arbiter;
+	u32 before, after, fifo, fifo2, vd1, vd2, arbiter;
 	bool afbc_error;
 	int ret;
 
@@ -1184,20 +1241,21 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
 	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
 	vd1 = vpu_read(v, VD1_GEN);
+	vd2 = vpu_read(v, VD2_GEN);
 	arbiter = vpu_read(v, ASYNC_STAT);
 	after = vpu_read(v, ENCP_INFO_READ);
 	frame.field = after >> 29;
 	frame.idle = (before >> 29) == frame.field &&
-		     !((fifo | fifo2) & OSD_FIFO_STATE) && !(vd1 & VD1_BUSY) &&
+		     !((fifo | fifo2) & OSD_FIFO_STATE) && !((vd1 | vd2) & VD1_BUSY) &&
 		     (arbiter & ASYNC_IDLE);
-	/* Active VD1 still requires a later field before framebuffer retirement. */
-	frame.early = frame.idle && !(vd1 & BIT(0)) &&
-		s7d_vpu_afbc_window(before, after, vd1, v->flip_start, v->flip_end);
+	/* Any active video MIF requires a later field before framebuffer retirement. */
+	frame.early = frame.idle && !((vd1 | vd2) & BIT(0)) &&
+		s7d_vpu_afbc_window(before, after, vd1, vd2, v->flip_start, v->flip_end);
 	afbc_frame = (struct s7d_afbc_frame) {
 		.sequence = READ_ONCE(v->scanout.vblank_seq) + (vblank ? 1 : 0),
 		.field = frame.field, .vblank = vblank,
 		.idle = frame.idle,
-		.window = frame.idle && s7d_vpu_afbc_window(before, after, vd1,
+		.window = frame.idle && s7d_vpu_afbc_window(before, after, vd1, vd2,
 							v->flip_start, v->flip_end),
 	};
 	ret = s7d_vpu_afbc_sample(v, result, &frame, &afbc_frame);
@@ -1208,7 +1266,7 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 		v->failed_reg = v->afbc.failed_reg;
 		result = S7D_RDMA_FAULT;
 	}
-	trace_s7d_frame_idle(before, after, fifo, fifo2, vd1, arbiter, vblank);
+	trace_s7d_frame_idle(before, after, fifo, fifo2, vd1, vd2, arbiter, vblank);
 	s7d_crtc_irq(v->crtc, vblank, result, &frame);
 	ret = s7d_vpu_afbc_restart(v, &afbc_frame);
 	if (ret) {

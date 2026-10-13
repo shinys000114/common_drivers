@@ -103,7 +103,10 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	     drm_rect_width(&base->dst) != base->crtc_w ||
 	     drm_rect_height(&base->dst) != base->crtc_h))
 		return -EINVAL;
-	if (plane->slot == S7D_PLANE_VIDEO) {
+	if (plane->slot == S7D_PLANE_VIDEO || plane->slot == S7D_PLANE_VIDEO2) {
+		if (plane->slot == S7D_PLANE_VIDEO2 &&
+		    (base->fb->width > 2048 || base->fb->height > 1080))
+			return -EINVAL;
 		ret = s7d_video_build_state(base->fb, &base->src, plane->dma_mask,
 					    &state->video);
 		if (!ret)
@@ -278,7 +281,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	case S7D_PLANE_RGB:
 		type = DRM_PLANE_TYPE_OVERLAY;
 		name = "S7D OSD2 overlay";
-		zpos = 2;
+		zpos = 3;
 		if (afbc_supported) {
 			funcs = &s7d_rgb_plane_funcs;
 			plane_modifiers = rgb_modifiers;
@@ -287,12 +290,13 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	case S7D_PLANE_CURSOR:
 		type = DRM_PLANE_TYPE_CURSOR;
 		name = "S7D OSD2 cursor";
-		zpos = 3;
+		zpos = 4;
 		break;
 	case S7D_PLANE_VIDEO:
+	case S7D_PLANE_VIDEO2:
 		type = DRM_PLANE_TYPE_OVERLAY;
-		name = "S7D VD1";
-		zpos = 1;
+		name = slot == S7D_PLANE_VIDEO ? "S7D VD1" : "S7D VD2";
+		zpos = slot == S7D_PLANE_VIDEO ? 1 : 2;
 		plane_formats = video_formats;
 		format_count = ARRAY_SIZE(video_formats);
 		break;
@@ -311,7 +315,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	ret = drm_plane_create_zpos_immutable_property(&plane->base, zpos);
 	if (ret)
 		return ERR_PTR(ret);
-	if (slot == S7D_PLANE_VIDEO) {
+	if (slot == S7D_PLANE_VIDEO || slot == S7D_PLANE_VIDEO2) {
 		ret = drm_plane_create_color_properties(&plane->base,
 			BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709),
 			BIT(DRM_COLOR_YCBCR_LIMITED_RANGE) | BIT(DRM_COLOR_YCBCR_FULL_RANGE),

@@ -13,6 +13,7 @@
 #define OSD1_CTRL_STAT		0x1a10
 #define OSD2_CTRL_STAT		0x1a30
 #define VD1_GEN_REG		0x4800
+#define VD2_GEN_REG		0x4880
 
 struct s7d_vpp_setting {
 	u32 reg;
@@ -39,6 +40,7 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x1a0e, BIT(14) | GENMASK(12, 9) | GENMASK(7, 0), 0 },
 		/* VD1 linear MIF, no DI/AFBC/filmgrain, preserving its clock byte. */
 		{ 0x1a0a, 0x007dff00, 0 },
+		{ 0x1a0b, 0x007dfe00, 0 },
 		{ 0x4870, GENMASK(1, 0), BIT(0) }, /* Filmgrain bypass */
 		{ 0x1dab, GENMASK(11, 0), 0x440 },
 		/* Bypass OSD/video Dolby paths, with unsigned 12-bit extension. */
@@ -59,6 +61,9 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x383b, GENMASK(1, 0), 0 },
 		{ 0x383c, GENMASK(1, 0), 0 },
 		{ 0x329d, GENMASK(1, 0), 0 }, /* VD1 matrix */
+		{ 0x3850, GENMASK(20, 13) | GENMASK(7, 2), 0 },
+		{ 0x388b, GENMASK(1, 0), 0 },
+		{ 0x388c, GENMASK(1, 0), 0 },
 		{ 0x38a0, GENMASK(20, 13) | GENMASK(7, 2), 0 },
 		/* Clear enable_sync_sel too: no VSYNC is running at this point. */
 		{ 0x38db, GENMASK(1, 0), 0 }, /* HDR input matrix */
@@ -96,6 +101,8 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x1d95, 0x3fff3fff, 0 }, /* Post unsigned/signed conversion */
 		{ 0x1dd9, GENMASK(29, 0), GENMASK(29, 0) }, /* Full-range clip top */
 		{ 0x1dda, GENMASK(29, 0), 0 }, /* Full-range clip bottom */
+		{ 0x1de3, GENMASK(29, 0), GENMASK(29, 0) },
+		{ 0x1de4, GENMASK(29, 0), 0 },
 		{ 0x1d21, 0x3fff3fff, (height << 16) | width },
 		{ 0x1da5, 0x1fff1fff, (width << 16) | height },
 		{ 0x1d22, GENMASK(15, 0), 0x0808 }, /* Pre/post hold lines */
@@ -116,7 +123,8 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 	     readl(vcbus + OSD1_CTRL_STAT * 4) |
 	     readl(vcbus + OSD2_CTRL_STAT * 4)) & BIT(0))
 		return -EBUSY;
-	if (readl(vcbus + VD1_GEN_REG * 4) & (BIT(17) | BIT(0)))
+	if ((readl(vcbus + VD1_GEN_REG * 4) |
+	     readl(vcbus + VD2_GEN_REG * 4)) & (BIT(17) | BIT(0)))
 		return -EBUSY;
 
 	for (i = 0; i < ARRAY_SIZE(settings); i++) {

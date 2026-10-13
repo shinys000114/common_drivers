@@ -13,15 +13,17 @@
 #include "s7d-video-pipeline.h"
 
 #define S7D_CRTC_UPDATE_REG_COUNT (S7D_OSD_UPDATE_REG_COUNT + \
-	S7D_VIDEO_UPDATE_REG_COUNT + S7D_CSC_MATRIX_REG_COUNT + \
-	S7D_POSTBLEND_REG_COUNT + 1)
+	2 * (S7D_VIDEO_UPDATE_REG_COUNT + S7D_CSC_MATRIX_REG_COUNT + 1) + \
+	S7D_POSTBLEND_REG_COUNT)
 
 struct s7d_crtc_state {
 	struct drm_crtc_state base;
 	struct s7d_encp_state encp;
 	struct s7d_osd_pipeline_state osd;
 	struct s7d_video_pipeline_state video;
+	struct s7d_video_pipeline_state video2;
 	struct s7d_csc_state csc;
+	struct s7d_csc_state csc2;
 	struct s7d_postblend_state postblend;
 	struct s7d_rdma_entry update[S7D_CRTC_UPDATE_REG_COUNT];
 	unsigned int update_count;

@@ -19,16 +19,10 @@ static bool buffers_present(const struct s7d_scanout_buffers *buffers)
 	return false;
 }
 
-static bool video_owned(const struct s7d_scanout_buffers *buffers)
+static bool video_owned(const struct s7d_scanout_buffers *buffers,
+			const struct s7d_scanout_video *video, unsigned int slot)
 {
-	unsigned int i;
-
-	if (!buffers->video.fb)
-		return false;
-	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
-		if (buffers->fb[i] == buffers->video.fb)
-			return true;
-	return false;
+	return video->fb && buffers->fb[slot] == video->fb;
 }
 
 static bool afbc_owned(const struct s7d_scanout_buffers *buffers)
@@ -55,51 +49,64 @@ bool s7d_scanout_afbc_equal(const struct s7d_scanout_buffers *a,
 		a->afbc.plan.header_addr == b->afbc.plan.header_addr;
 }
 
-bool s7d_scanout_video_same_config(const struct s7d_scanout_buffers *a,
-				   const struct s7d_scanout_buffers *b)
+static bool video_same_config(const struct s7d_scanout_buffers *a,
+			      const struct s7d_scanout_buffers *b,
+			      const struct s7d_scanout_video *x,
+			      const struct s7d_scanout_video *y, unsigned int slot)
 {
-	unsigned int i;
+	unsigned int i, count = slot == S7D_PLANE_VIDEO ?
+		S7D_VIDEO_UPDATE_REG_COUNT : S7D_VIDEO2_UPDATE_REG_COUNT;
+	u32 base = slot == S7D_PLANE_VIDEO ? 0x4820 : 0x48a0;
 
-	if (!video_owned(a) || !video_owned(b) ||
-	    a->video.pipeline.update_count != S7D_VIDEO_UPDATE_REG_COUNT ||
-	    b->video.pipeline.update_count != S7D_VIDEO_UPDATE_REG_COUNT ||
-	    !(a->video.pipeline.control.value & BIT(0)) ||
-	    memcmp(a->video.pipeline.setup, b->video.pipeline.setup,
-		   sizeof(a->video.pipeline.setup)) ||
-	    memcmp(&a->video.pipeline.control, &b->video.pipeline.control,
-		   sizeof(a->video.pipeline.control)) ||
-	    memcmp(&a->video.pipeline.scaler, &b->video.pipeline.scaler,
-		   sizeof(a->video.pipeline.scaler)) ||
-	    memcmp(&a->video.csc, &b->video.csc, sizeof(a->video.csc)))
+	if (!x->fb && !y->fb)
+		return true;
+	if (!video_owned(a, x, slot) || !video_owned(b, y, slot) ||
+	    x->pipeline.update_count != count || y->pipeline.update_count != count ||
+	    !(x->pipeline.control.value & BIT(0)) ||
+	    memcmp(x->pipeline.setup, y->pipeline.setup, sizeof(x->pipeline.setup)) ||
+	    memcmp(&x->pipeline.control, &y->pipeline.control, sizeof(x->pipeline.control)) ||
+	    memcmp(&x->pipeline.scaler, &y->pipeline.scaler, sizeof(x->pipeline.scaler)) ||
+	    memcmp(&x->csc, &y->csc, sizeof(x->csc)))
 		return false;
-	for (i = 0; i < S7D_VIDEO_UPDATE_REG_COUNT; i++) {
-		const struct s7d_rdma_entry *x = &a->video.pipeline.update[i];
-		const struct s7d_rdma_entry *y = &b->video.pipeline.update[i];
+	for (i = 0; i < count; i++) {
+		const struct s7d_rdma_entry *r = &x->pipeline.update[i];
+		const struct s7d_rdma_entry *t = &y->pipeline.update[i];
 
-		if (x->reg != y->reg ||
-		    (i < 2 ? le32_to_cpu(x->reg) != 0x4820 + i : x->value != y->value))
+		if (r->reg != t->reg ||
+		    (i < 2 ? le32_to_cpu(r->reg) != base + i : r->value != t->value))
 			return false;
 	}
 	for (i = 0; i < S7D_POSTBLEND_REG_COUNT; i++) {
-		const struct s7d_rdma_entry *x = &a->video.postblend.regs[i];
-		const struct s7d_rdma_entry *y = &b->video.postblend.regs[i];
-		u32 mask = le32_to_cpu(x->reg) == 0x1dfe ? BIT(10) : 0;
+		const struct s7d_rdma_entry *r = &x->postblend.regs[i];
+		const struct s7d_rdma_entry *t = &y->postblend.regs[i];
+		u32 mask = le32_to_cpu(r->reg) == 0x1dfe ? BIT(10) : 0;
 
-		if (x->reg != y->reg)
-			return false;
-		/* Only the OSD2 source 4 enable may differ. */
-		if (le32_to_cpu(x->value ^ y->value) & ~mask)
+		if (r->reg != t->reg || (le32_to_cpu(r->value ^ t->value) & ~mask))
 			return false;
 	}
 	return true;
 }
 
+bool s7d_scanout_video_same_config(const struct s7d_scanout_buffers *a,
+				   const struct s7d_scanout_buffers *b)
+{
+	return video_same_config(a, b, &a->video, &b->video, S7D_PLANE_VIDEO) &&
+		video_same_config(a, b, &a->video2, &b->video2, S7D_PLANE_VIDEO2);
+}
+
+static bool video_equal(const struct s7d_scanout_video *x,
+			const struct s7d_scanout_video *y)
+{
+	return x->fb == y->fb && (!x->fb ||
+		(x->pipeline.update[0].value == y->pipeline.update[0].value &&
+		 x->pipeline.update[1].value == y->pipeline.update[1].value));
+}
+
 bool s7d_scanout_video_equal(const struct s7d_scanout_buffers *a,
 			     const struct s7d_scanout_buffers *b)
 {
-	return a->video.fb == b->video.fb && s7d_scanout_video_same_config(a, b) &&
-		a->video.pipeline.update[0].value == b->video.pipeline.update[0].value &&
-		a->video.pipeline.update[1].value == b->video.pipeline.update[1].value;
+	return s7d_scanout_video_same_config(a, b) &&
+		video_equal(&a->video, &b->video) && video_equal(&a->video2, &b->video2);
 }
 
 static void buffers_get(const struct s7d_scanout_buffers *buffers)
@@ -111,26 +118,26 @@ static void buffers_get(const struct s7d_scanout_buffers *buffers)
 			drm_framebuffer_get(buffers->fb[i]);
 }
 
-static void buffers_put(const struct s7d_scanout_buffers *buffers)
+static void buffers_put(struct drm_framebuffer *const buffers[S7D_SCANOUT_MAX_PLANES])
 {
 	unsigned int i;
 
 	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
-		if (buffers->fb[i])
-			drm_framebuffer_put(buffers->fb[i]);
+		if (buffers[i])
+			drm_framebuffer_put(buffers[i]);
 }
 
 static void s7d_scanout_retire(struct work_struct *work)
 {
 	struct s7d_scanout *s = container_of(work, struct s7d_scanout, retire_work);
-	struct s7d_scanout_buffers retired;
+	struct drm_framebuffer *retired[S7D_SCANOUT_MAX_PLANES];
 	unsigned long flags;
 
 	spin_lock_irqsave(&s->lock, flags);
-	retired = s->retired;
+	memcpy(retired, s->retired.fb, sizeof(retired));
 	s->retired = (struct s7d_scanout_buffers) {0};
 	spin_unlock_irqrestore(&s->lock, flags);
-	buffers_put(&retired);
+	buffers_put(retired);
 }
 
 void s7d_scanout_init(struct s7d_scanout *s, struct s7d_rdma *rdma)
@@ -148,7 +155,8 @@ int s7d_scanout_begin_initial(struct s7d_scanout *s,
 
 	if (!buffers || !buffers_present(buffers))
 		return -EINVAL;
-	if ((buffers->video.fb && !video_owned(buffers)) ||
+	if ((buffers->video.fb && !video_owned(buffers, &buffers->video, S7D_PLANE_VIDEO)) ||
+	    (buffers->video2.fb && !video_owned(buffers, &buffers->video2, S7D_PLANE_VIDEO2)) ||
 	    (buffers->afbc.fb && !afbc_owned(buffers)))
 		return -EINVAL;
 	flush_work(&s->retire_work);
@@ -284,7 +292,8 @@ int s7d_scanout_submit_staged(struct s7d_scanout *s,
 	    (video_unchanged && video_address_only) ||
 	    (transaction != S7D_SCANOUT_TRANSACTION_RDMA &&
 	     transaction != S7D_SCANOUT_TRANSACTION_DECODE_ONLY) ||
-	    (buffers->video.fb && !video_owned(buffers)) ||
+	    (buffers->video.fb && !video_owned(buffers, &buffers->video, S7D_PLANE_VIDEO)) ||
+	    (buffers->video2.fb && !video_owned(buffers, &buffers->video2, S7D_PLANE_VIDEO2)) ||
 	    (buffers->afbc.fb && (!afbc_owned(buffers) || !stage)))
 		return -EINVAL;
 	spin_lock_irqsave(&s->lock, flags);
@@ -315,6 +324,7 @@ int s7d_scanout_submit_staged(struct s7d_scanout *s,
 		    buffers->afbc.plan.surface_mask != BIT(0) ||
 		    s->active.afbc.plan.surface_mask != BIT(0) ||
 		    buffers->video.fb || s->active.video.fb ||
+		    buffers->video2.fb || s->active.video2.fb ||
 		    !s7d_afbc_same_layout(&s->active.afbc.plan, &buffers->afbc.plan)) {
 			ret = -EINVAL;
 			goto out;
@@ -477,7 +487,8 @@ void s7d_scanout_fail(struct s7d_scanout *s)
 
 int s7d_scanout_quiesce(struct s7d_scanout *s)
 {
-	struct s7d_scanout_buffers active, pending;
+	struct drm_framebuffer *active[S7D_SCANOUT_MAX_PLANES];
+	struct drm_framebuffer *pending[S7D_SCANOUT_MAX_PLANES];
 	unsigned long flags;
 	int ret;
 
@@ -488,8 +499,8 @@ int s7d_scanout_quiesce(struct s7d_scanout *s)
 		return ret;
 	flush_work(&s->retire_work);
 	spin_lock_irqsave(&s->lock, flags);
-	active = s->active;
-	pending = s->pending;
+	memcpy(active, s->active.fb, sizeof(active));
+	memcpy(pending, s->pending.fb, sizeof(pending));
 	s->active = (struct s7d_scanout_buffers) {0};
 	s->pending = (struct s7d_scanout_buffers) {0};
 	s->phase = S7D_SCANOUT_STOPPED;
@@ -499,8 +510,8 @@ int s7d_scanout_quiesce(struct s7d_scanout *s)
 	s->wait_field = false;
 	s->fault = false;
 	spin_unlock_irqrestore(&s->lock, flags);
-	buffers_put(&active);
-	buffers_put(&pending);
+	buffers_put(active);
+	buffers_put(pending);
 	return 0;
 }
 

@@ -54,12 +54,12 @@ struct s7d_vpu {
 	bool afbc_enabled;
 	int afbc_admission_error[2];
 	u32 afbc_command_counter;
-	bool vd1_enable;
+	bool video_enable[2];
 	bool pixel_protected;
 	bool core_protected;
-	bool vd1_draining;
+	bool video_draining[2];
 	bool osd_draining;
-	u32 vd1_free_clk;
+	u32 video_free_clk[2];
 	u32 osd_free_clk[2];
 	u32 osd_scaler_route_saved;
 	bool osd_scaler_route_owned;

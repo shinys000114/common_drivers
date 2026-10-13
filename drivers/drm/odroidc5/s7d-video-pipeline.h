@@ -12,6 +12,7 @@
 
 #define S7D_VIDEO_SETUP_REG_COUNT 14
 #define S7D_VIDEO_UPDATE_REG_COUNT 12
+#define S7D_VIDEO2_UPDATE_REG_COUNT 11
 
 /* The only inherited GEN field that may enter a replay descriptor. */
 #define S7D_VIDEO_GEN_REPLAY_PRESERVE_MASK BIT(31)
@@ -43,5 +44,9 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 			     const struct drm_rect *dst,
 			     unsigned int hold_lines,
 			     struct s7d_video_pipeline_state *out);
+
+int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
+			       const struct drm_rect *dst,
+			       struct s7d_video_pipeline_state *out);
 
 #endif

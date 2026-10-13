@@ -23,6 +23,7 @@ struct s7d_rdma {
 	/* Protects ready/pending/fault, the descriptor table and MMIO vs IRQ. */
 	spinlock_t lock;
 	u32 vd1_free_clk;
+	u32 vd2_free_clk;
 	bool ready;
 	bool pending;
 	bool fault;

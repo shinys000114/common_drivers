@@ -107,7 +107,8 @@ void s7d_crtc_capture_input(struct drm_crtc *crtc, struct drm_atomic_state *atom
 		if (plane != crtc->primary && s7d_plane_is_native(plane) &&
 		    drm_atomic_get_new_plane_state(atomic, plane)) {
 			state->other_plane_submitted = true;
-			if (s7d_plane_slot(plane) == S7D_PLANE_VIDEO)
+			if (s7d_plane_slot(plane) == S7D_PLANE_VIDEO ||
+			    s7d_plane_slot(plane) == S7D_PLANE_VIDEO2)
 				state->video_submitted = true;
 		}
 	for_each_new_connector_in_state(atomic, connector, connector_state, i)
@@ -136,17 +137,36 @@ s7d_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode)
 	return s7d_encp_build_state(mode, &state);
 }
 
+static void s7d_crtc_snapshot_video(struct s7d_scanout_video *out,
+				    struct drm_framebuffer *fb,
+				    const struct s7d_video_pipeline_state *video,
+				    const struct s7d_csc_state *csc,
+				    const struct s7d_postblend_state *postblend)
+{
+	*out = (struct s7d_scanout_video) {0};
+	if (!fb)
+		return;
+	out->fb = fb;
+	memcpy(out->pipeline.setup, video->setup, sizeof(video->setup));
+	memcpy(out->pipeline.update, video->update, sizeof(video->update));
+	out->pipeline.update_count = video->update_count;
+	out->pipeline.control = video->control;
+	out->pipeline.scaler.src_width = video->scaler.src_width;
+	out->pipeline.scaler.src_height = video->scaler.src_height;
+	out->pipeline.scaler.dst_width = video->scaler.dst_width;
+	out->pipeline.scaler.dst_height = video->scaler.dst_height;
+	out->pipeline.scaler.enabled = video->scaler.enabled;
+	out->csc = *csc;
+	out->postblend = *postblend;
+}
+
 static void s7d_crtc_check_video_update(struct s7d_crtc_state *state,
 				      const struct s7d_crtc_state *old)
 {
-	state->buffers.video = (struct s7d_scanout_video) {0};
-	if (state->buffers.fb[S7D_PLANE_VIDEO])
-		state->buffers.video = (struct s7d_scanout_video) {
-			.fb = state->buffers.fb[S7D_PLANE_VIDEO],
-			.pipeline = state->video,
-			.csc = state->csc,
-			.postblend = state->postblend,
-		};
+	s7d_crtc_snapshot_video(&state->buffers.video, state->buffers.fb[S7D_PLANE_VIDEO],
+		&state->video, &state->csc, &state->postblend);
+	s7d_crtc_snapshot_video(&state->buffers.video2, state->buffers.fb[S7D_PLANE_VIDEO2],
+		&state->video2, &state->csc2, &state->postblend);
 	if (old && old->valid && old->base.active &&
 	    ((state->buffers.afbc.fb && state->buffers.video.fb) ||
 	     (old->buffers.afbc.fb && old->buffers.video.fb)) &&
@@ -165,6 +185,8 @@ static int s7d_crtc_check_afbc_video(const struct s7d_crtc_state *state)
 {
 	const struct drm_display_mode *mode = &state->base.adjusted_mode;
 
+	if (state->buffers.afbc.fb && state->buffers.fb[S7D_PLANE_VIDEO2])
+		return -EINVAL;
 	if (!state->buffers.afbc.fb || !state->buffers.fb[S7D_PLANE_VIDEO])
 		return 0;
 	if (state->buffers.afbc.plan.surface_mask != BIT(0) ||
@@ -200,30 +222,37 @@ static void s7d_crtc_build_update(struct s7d_crtc_state *state)
 		}
 		state->update[count++] = state->osd.update[i];
 	}
-	if (state->video_address_only) {
-		memcpy(state->update + count, state->video.update,
-		       2 * sizeof(*state->update));
-		count += 2;
-	} else if (!state->video_unchanged) {
-		memcpy(state->update + count, state->video.update,
-		       state->video.update_count * sizeof(*state->update));
-		count += state->video.update_count;
-		for (i = 0; state->video.update_count && i < S7D_CSC_MATRIX_REG_COUNT; i++) {
+	for (i = 0; i < 2; i++) {
+		const struct s7d_video_pipeline_state *video = i ? &state->video2 : &state->video;
+		const struct s7d_csc_state *csc = i ? &state->csc2 : &state->csc;
+		unsigned int j, n = state->video_address_only ?
+			(video->update_count ? 2 : 0) : video->update_count;
+
+		if (state->video_unchanged)
+			continue;
+		memcpy(state->update + count, video->update, n * sizeof(*state->update));
+		count += n;
+		if (state->video_address_only)
+			continue;
+		for (j = 0; video->update_count && j < S7D_CSC_MATRIX_REG_COUNT; j++)
 			state->update[count++] = (struct s7d_rdma_entry) {
-				.reg = cpu_to_le32(state->csc.matrix[i].reg),
-				.value = cpu_to_le32(state->csc.matrix[i].value),
+				.reg = cpu_to_le32(csc->matrix[j].reg),
+				.value = cpu_to_le32(csc->matrix[j].value),
+			};
+	}
+	memcpy(state->update + count, state->postblend.regs, sizeof(state->postblend.regs));
+	count += S7D_POSTBLEND_REG_COUNT;
+	/* Select the blend sources before disabling fetch, or enabling a new input. */
+	if (!state->video_unchanged && !state->video_address_only)
+		for (i = 0; i < 2; i++) {
+			const struct s7d_video_pipeline_state *video =
+				i ? &state->video2 : &state->video;
+
+			state->update[count++] = (struct s7d_rdma_entry) {
+				.reg = cpu_to_le32(video->control.reg),
+				.value = cpu_to_le32(video->control.value),
 			};
 		}
-	}
-	memcpy(state->update + count, state->postblend.regs,
-	       sizeof(state->postblend.regs));
-	count += S7D_POSTBLEND_REG_COUNT;
-	/* Block the blend source before disabling fetch; enable after its setup. */
-	if (!state->video_unchanged && !state->video_address_only)
-		state->update[count++] = (struct s7d_rdma_entry) {
-			.reg = cpu_to_le32(state->video.control.reg),
-			.value = cpu_to_le32(state->video.control.value),
-		};
 	state->update_count = count;
 }
 
@@ -242,6 +271,7 @@ static bool s7d_crtc_decode_only(const struct s7d_crtc_state *state,
 	    state->buffers.afbc.plan.surface_mask != BIT(0) ||
 	    old->buffers.afbc.plan.surface_mask != BIT(0) ||
 	    state->buffers.video.fb || old->buffers.video.fb ||
+	    state->buffers.video2.fb || old->buffers.video2.fb ||
 	    state->video.scaler.enabled || old->video.scaler.enabled ||
 	    state->osd.scalers[0].enabled || state->osd.scalers[1].enabled ||
 	    old->osd.scalers[0].enabled || old->osd.scalers[1].enabled ||
@@ -255,6 +285,8 @@ static bool s7d_crtc_decode_only(const struct s7d_crtc_state *state,
 	    memcmp(&state->osd, &old->osd, sizeof(state->osd)) ||
 	    memcmp(&state->video, &old->video, sizeof(state->video)) ||
 	    memcmp(&state->csc, &old->csc, sizeof(state->csc)) ||
+	    memcmp(&state->video2, &old->video2, sizeof(state->video2)) ||
+	    memcmp(&state->csc2, &old->csc2, sizeof(state->csc2)) ||
 	    memcmp(&state->postblend, &old->postblend, sizeof(state->postblend)))
 		return false;
 	for (i = 1; i < S7D_SCANOUT_MAX_PLANES; i++)
@@ -271,10 +303,12 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct drm_plane *plane;
 	struct s7d_osd_layer layers[2] = {0};
-	const struct s7d_plane_state *video = NULL;
-	struct drm_rect video_dst;
+	const struct s7d_plane_state *video = NULL, *video2 = NULL;
+	struct drm_rect video_dst, video2_dst;
 	enum drm_color_encoding encoding = DRM_COLOR_YCBCR_BT709;
 	enum drm_color_range range = DRM_COLOR_YCBCR_LIMITED_RANGE;
+	enum drm_color_encoding encoding2 = DRM_COLOR_YCBCR_BT709;
+	enum drm_color_range range2 = DRM_COLOR_YCBCR_LIMITED_RANGE;
 	bool primary_changed = false, afbc_position_changed = false;
 	unsigned int video_hold = 8;
 	int ret;
@@ -332,7 +366,14 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 			afbc_position_changed = !old_ps ||
 				old_ps->crtc_x != ps->crtc_x || old_ps->crtc_y != ps->crtc_y ||
 				old_ps->crtc_w != ps->crtc_w || old_ps->crtc_h != ps->crtc_h;
-		if (slot == S7D_PLANE_VIDEO) {
+		if (slot == S7D_PLANE_VIDEO2) {
+			if (!checked->video_valid)
+				return -EINVAL;
+			video2 = checked;
+			video2_dst = ps->dst;
+			encoding2 = ps->color_encoding;
+			range2 = ps->color_range;
+		} else if (slot == S7D_PLANE_VIDEO) {
 			if (!checked->video_valid)
 				return -EINVAL;
 			video = checked;
@@ -379,6 +420,10 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	    !s7d_video_scaler_same_config(&to_s7d_crtc_state(old)->video.scaler,
 					  &state->video.scaler))
 		base->mode_changed = true;
+	ret = s7d_video_build_vd2_pipeline(video2 ? &video2->video : NULL,
+		video2 ? &video2_dst : NULL, &state->video2);
+	if (ret)
+		return ret;
 	/* Entry, owner, layout and alpha-route changes require stopped preparation. */
 	if (old && old->active) {
 		const struct s7d_scanout_afbc *before = &to_s7d_crtc_state(old)->buffers.afbc;
@@ -413,10 +458,13 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	ret = s7d_csc_build_state(encoding, range, &state->csc);
 	if (ret)
 		return ret;
+	ret = s7d_csc_build_video2_state(encoding2, range2, &state->csc2);
+	if (ret)
+		return ret;
 	ret = s7d_postblend_build_state(base->adjusted_mode.hdisplay,
 		base->adjusted_mode.vdisplay, video ? &video_dst : NULL,
 		state->video.scaler.src_width, state->video.scaler.src_height,
-		layers[1].enabled, &state->postblend);
+		video2 ? &video2_dst : NULL, layers[1].enabled, &state->postblend);
 	if (ret)
 		return ret;
 	s7d_crtc_check_video_update(state, old ? to_s7d_crtc_state(old) : NULL);

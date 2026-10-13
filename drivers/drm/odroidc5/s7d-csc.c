@@ -23,6 +23,13 @@ u32 s7d_csc_reg_mask(u32 reg)
 	case 0x3295:
 	case 0x3296:
 	case 0x3297:
+	case 0x3852:
+	case 0x3853:
+	case 0x3854:
+	case 0x3855:
+	case 0x3857:
+	case 0x3858:
+	case 0x3859:
 		return CSC_COEFF_PAIR_MASK;
 	case 0x3294:
 		return GENMASK(18, 16) | GENMASK(12, 0);
@@ -34,6 +41,16 @@ u32 s7d_csc_reg_mask(u32 reg)
 	case 0x329a:
 	case 0x329c:
 		return GENMASK(11, 0);
+	case 0x3856:
+		return GENMASK(12, 0);
+	case 0x386a:
+		return GENMASK(19, 3);
+	case 0x385a:
+	case 0x385c:
+		return GENMASK(26, 16) | GENMASK(10, 0);
+	case 0x385b:
+	case 0x385d:
+		return GENMASK(10, 0);
 	default:
 		return 0;
 	}
@@ -114,6 +131,40 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 	};
 	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++)
 		next.matrix[i].mask = s7d_csc_reg_mask(next.matrix[i].reg);
+	*state = next;
+	return 0;
+}
+
+int s7d_csc_build_video2_state(enum drm_color_encoding encoding,
+			enum drm_color_range range, struct s7d_csc_state *state)
+{
+	static const u32 matrix_regs[S7D_CSC_MATRIX_REG_COUNT] = {
+		0x3852, 0x3853, 0x3854, 0x3855, 0x3856, 0x3857, 0x3858,
+		0x3859, 0x386a, 0x385a, 0x385b, 0x385c, 0x385d,
+	};
+	static const struct s7d_csc_reg controls[S7D_CSC_CONTROL_REG_COUNT] = {
+		{0x3850, GENMASK(20, 13) | GENMASK(7, 2), 0},
+		{0x1a0c, BIT(5) | BIT(1), BIT(1)},
+		{0x388c, GENMASK(1, 0), 0},
+		{0x388b, GENMASK(1, 0), BIT(0)},
+		{0x3850, BIT(16) | BIT(14), BIT(16) | BIT(14)},
+	};
+	struct s7d_csc_state next;
+	unsigned int i;
+	int ret;
+
+	if (!state)
+		return -EINVAL;
+	ret = s7d_csc_build_state(encoding, range, &next);
+	if (ret)
+		return ret;
+	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {
+		next.matrix[i].reg = matrix_regs[i];
+		next.matrix[i].mask = s7d_csc_reg_mask(matrix_regs[i]);
+		next.matrix[i].value &= next.matrix[i].mask;
+	}
+	for (i = 0; i < S7D_CSC_CONTROL_REG_COUNT; i++)
+		next.control[i] = controls[i];
 	*state = next;
 	return 0;
 }

@@ -116,6 +116,7 @@ int s7d_rdma_prepare(struct s7d_rdma *r)
 		ret = -EIO;
 	} else {
 		r->vd1_free_clk = rdma_read(r, 0x4800) & BIT(31);
+		r->vd2_free_clk = rdma_read(r, 0x4880) & BIT(31);
 		r->fault = false;
 		r->ready = true;
 	}
@@ -152,6 +153,12 @@ static bool display_write_valid(u32 reg, u32 value)
 	case 0x1df8:
 	case 0x1d1c:
 	case 0x1d1d:
+	case 0x1d1e:
+	case 0x1d1f:
+	case 0x4883:
+	case 0x4884:
+	case 0x4885:
+	case 0x4886:
 	case 0x4803:
 	case 0x4804:
 	case 0x4805:
@@ -182,25 +189,40 @@ static bool display_write_valid(u32 reg, u32 value)
 		return (value >> 16) && (value >> 16) <= 4096 &&
 		       (value & 0xffff) && (value & 0xffff) <= 4096;
 	case 0x1dfe:
-		return value == BIT(20) || value == (BIT(20) | (4 << 8));
+		return value == BIT(20) || value == (BIT(20) | (4 << 8)) ||
+		       value == (BIT(20) | (2 << 8));
 	case 0x1dfb:
 		return value == BIT(16) || value == (BIT(16) | BIT(4) | BIT(0));
 	case 0x1dfc:
 		return value == (3 << 8);
 	case 0x1dfd:
-		return value == BIT(20) || value == (BIT(20) | (1 << 8));
+		return value == BIT(20) || value == (BIT(20) | (1 << 8)) ||
+		       value == (BIT(20) | (2 << 8));
+	case 0x4880:
 	case 0x4800:
 		return value == 0x38400052 || value == 0x38400053;
+	case 0x4899:
 	case 0x4819:
 		return value == 1 || value == 2;
+	case 0x48a0:
+	case 0x48a1:
 	case 0x4820:
 	case 0x4821:
 		return true;
+	case 0x48a3:
 	case 0x4823:
 		return !(value & ~0x1fff1fffU) &&
 		       (value & 0x1fff) && (value >> 16);
+	case 0x48a4:
 	case 0x4824:
 		return !(value & ~0x11fffU) && (value & BIT(16)) && (value & 0x1fff);
+	case 0x489e:
+		return (value >> 16) >= 2 && (value >> 16) <= 2048 &&
+		       !(value & BIT(16)) && (value & 0xffff) == (value >> 17);
+	case 0x1df0:
+		return (value >> 16) >= 2 && (value >> 16) <= 1080 &&
+		       (value & 0xffff) >= 2 && (value & 0xffff) <= 2048 &&
+		       !(value & 0x10001);
 	case 0x481e:
 		return (value >> 16) >= 2 && (value >> 16) <= 4096 &&
 		       !(value & BIT(16)) && (value & 0xffff) == (value >> 17);
@@ -282,6 +304,8 @@ int s7d_rdma_submit(struct s7d_rdma *r, const struct s7d_rdma_entry *entries,
 			value |= rdma_read(r, reg) & ~mask;
 		else if (reg == 0x4800)
 			value |= r->vd1_free_clk;
+		else if (reg == 0x4880)
+			value |= r->vd2_free_clk;
 		r->table[i].value = cpu_to_le32(value);
 	}
 	dma_wmb();

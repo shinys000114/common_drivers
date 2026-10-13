@@ -158,3 +158,40 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 	*out = next;
 	return 0;
 }
+
+int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
+			       const struct drm_rect *dst,
+			       struct s7d_video_pipeline_state *out)
+{
+	struct s7d_video_pipeline_state next;
+	unsigned int i;
+	int ret;
+
+	if (!out)
+		return -EINVAL;
+	ret = s7d_video_build_pipeline(layout, dst, 8, &next);
+	if (ret)
+		return ret;
+	if (layout && (next.scaler.enabled || next.scaler.src_width > 2048 ||
+		       next.scaler.src_height > 1080))
+		return -EINVAL;
+	/* S7D selects the same MIF layout at 0x4880 and a separate VD2 PPS. */
+	for (i = 0; i < S7D_VIDEO_SETUP_REG_COUNT; i++) {
+		if (next.setup[i].reg == VPP_SC_MISC) {
+			next.setup[i].reg = 0x3958;
+			next.setup[i].mask = BIT(24) | GENMASK(22, 15);
+		} else {
+			next.setup[i].reg += 0x80;
+		}
+	}
+	next.control.reg += 0x80;
+	for (i = 0; i < 10 && i < next.update_count; i++)
+		next.update[i].reg = cpu_to_le32(le32_to_cpu(next.update[i].reg) + 0x80);
+	if (layout) {
+		next.update[10] = (struct s7d_rdma_entry)REG(0x1df0,
+			(next.scaler.src_height << 16) | next.scaler.src_width);
+		next.update_count = S7D_VIDEO2_UPDATE_REG_COUNT;
+	}
+	*out = next;
+	return 0;
+}

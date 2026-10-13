@@ -13,11 +13,22 @@
 
 struct drm_framebuffer;
 
-#define S7D_SCANOUT_MAX_PLANES 4
+#define S7D_SCANOUT_MAX_PLANES 5
+
+struct s7d_video_scanout_pipeline {
+	struct s7d_video_reg_setting setup[S7D_VIDEO_SETUP_REG_COUNT];
+	struct s7d_rdma_entry update[S7D_VIDEO_UPDATE_REG_COUNT];
+	unsigned int update_count;
+	struct s7d_video_reg_setting control;
+	/* The checked scaler plan is deterministic from these dimensions. */
+	struct {
+		u32 src_width, src_height, dst_width, dst_height, enabled;
+	} scaler;
+};
 
 struct s7d_scanout_video {
 	struct drm_framebuffer *fb;
-	struct s7d_video_pipeline_state pipeline;
+	struct s7d_video_scanout_pipeline pipeline;
 	struct s7d_csc_state csc;
 	struct s7d_postblend_state postblend;
 };
@@ -30,8 +41,9 @@ struct s7d_scanout_afbc {
 
 struct s7d_scanout_buffers {
 	struct drm_framebuffer *fb[S7D_SCANOUT_MAX_PLANES];
-	/* video.fb aliases an owned fb[] reference. */
+	/* Each video fb aliases its corresponding owned fb[] reference. */
 	struct s7d_scanout_video video;
+	struct s7d_scanout_video video2;
 	/* afbc.fb aliases an owned fb[] reference. */
 	struct s7d_scanout_afbc afbc;
 	u64 generation;

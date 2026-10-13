@@ -15,6 +15,7 @@ enum s7d_plane_slot {
 	S7D_PLANE_RGB,
 	S7D_PLANE_VIDEO,
 	S7D_PLANE_CURSOR,
+	S7D_PLANE_VIDEO2,
 };
 
 struct s7d_plane_state {
