@@ -94,11 +94,38 @@
 				sound-dai = <&c5_native_hdmi>;
 			};
 		};
+		c5_analog_link: analog {
+			status = "disabled";
+			cpu {
+				sound-dai = <&c5_analog_audio>;
+			};
+			codec {
+				sound-dai = <&c5_t9015>;
+			};
+		};
+
+		c5_spdif_link: spdif {
+			status = "disabled";
+			cpu {
+				sound-dai = <&c5_spdif_audio>;
+			};
+			codec {
+				sound-dai = <&c5_spdif_codec>;
+			};
+		};
+	};
+
+	c5_spdif_codec: spdif-dit {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
 	};
 
 	soc {
 		c5_audio: audio-controller@fe330000 {
 			compatible = "amlogic,s7d-audio";
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
 			reg = <0 0xfe330000 0 0x1000>;
 			clocks = <&clkc CLKID_SYS_AUDIO>;
 			clock-names = "pclk";
@@ -135,6 +162,55 @@
 				resets = <&c5_audio_reset S7D_AUDIO_RESET_FRDDRA>,
 					 <&c5_audio_reset S7D_AUDIO_RESET_TDMOUTB>;
 				reset-names = "fifo", "tdm";
+			};
+
+			c5_analog_audio: analog-audio {
+				compatible = "amlogic,s7d-analog-audio";
+				status = "disabled";
+				#sound-dai-cells = <0>;
+				interrupts = <GIC_SPI 37 IRQ_TYPE_EDGE_RISING>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_DDR_ARB>,
+					 <&c5_audio_clkc CLKID_AUDIO_GATE_FRDDRB>,
+					 <&c5_audio_clkc CLKID_AUDIO_GATE_TDMOUTC>,
+					 <&c5_audio_clkc CLKID_AUDIO_MCLK_C>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_MST_C_SCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_MST_C_LRCLK>;
+				clock-names = "arb", "fifo", "tdm", "mclk", "bclk", "lrclk";
+				resets = <&c5_audio_reset S7D_AUDIO_RESET_FRDDRB>,
+					 <&c5_audio_reset S7D_AUDIO_RESET_TDMOUTC>,
+					 <&c5_audio_reset S7D_AUDIO_RESET_TOACODEC>;
+				reset-names = "fifo", "tdm", "route";
+			};
+
+			c5_t9015: codec@fe01a000 {
+				compatible = "amlogic,s7d-t9015";
+				status = "disabled";
+				#sound-dai-cells = <0>;
+				reg = <0 0xfe01a000 0 0x24>;
+				clocks = <&clkc CLKID_SYS_ACODEC>;
+				clock-names = "pclk";
+				resets = <&reset RESET_ACODEC>;
+				reset-names = "acodec";
+			};
+
+			c5_spdif_audio: spdif-audio {
+				compatible = "amlogic,s7d-spdif-audio";
+				status = "disabled";
+				#sound-dai-cells = <0>;
+				interrupts = <GIC_SPI 38 IRQ_TYPE_EDGE_RISING>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_DDR_ARB>,
+					 <&c5_audio_clkc CLKID_AUDIO_GATE_FRDDRC>,
+					 <&c5_audio_clkc CLKID_AUDIO_GATE_SPDIFOUT_A>,
+					 <&c5_audio_clkc CLKID_AUDIO_SPDIFOUT_A>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_SPDIF_A_SEL>,
+					 <&clkc CLKID_HIFI1_PLL>, <&clkc CLKID_HIFI_PLL>;
+				clock-names = "arb", "fifo", "tdm", "mclk",
+					      "mclk-sel", "pll-44k", "pll-48k";
+				resets = <&c5_audio_reset S7D_AUDIO_RESET_FRDDRC>,
+					 <&c5_audio_reset S7D_AUDIO_RESET_SPDIFOUT>;
+				reset-names = "fifo", "spdif";
+				pinctrl-names = "default";
+				pinctrl-0 = <&spdif_out_a_h4_pins>;
 			};
 
 			c5_audio_reset: reset-controller {

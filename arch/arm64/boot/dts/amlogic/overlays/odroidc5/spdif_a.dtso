@@ -1,6 +1,12 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/* Copyright (c) 2026 Hardkernel Co., Ltd. */
 /dts-v1/;
 /plugin/;
 
-&spdifa {
+&c5_spdif_audio {
+	status = "okay";
+};
+
+&c5_spdif_link {
 	status = "okay";
 };
