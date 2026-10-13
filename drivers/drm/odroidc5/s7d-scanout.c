@@ -90,7 +90,8 @@ static bool video_same_config(const struct s7d_scanout_buffers *a,
 bool s7d_scanout_video_same_config(const struct s7d_scanout_buffers *a,
 				   const struct s7d_scanout_buffers *b)
 {
-	return video_same_config(a, b, &a->video, &b->video, S7D_PLANE_VIDEO) &&
+	return (a->video.fb || a->video2.fb) &&
+		video_same_config(a, b, &a->video, &b->video, S7D_PLANE_VIDEO) &&
 		video_same_config(a, b, &a->video2, &b->video2, S7D_PLANE_VIDEO2);
 }
 
