@@ -78,10 +78,11 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	struct s7d_hdmi_pll_rate plan;
 	int ret;
 
-	/* First-screen qualification: RGB8 up to 1080p, no 4K bandwidth claim. */
-	if (state->pixel_rate < 25175000 || state->pixel_rate > 148500000 ||
-	    state->base.adjusted_mode.hdisplay > 1920 ||
-	    state->base.adjusted_mode.vdisplay > 1080)
+	/* One unscaled RGB pixel per VPU cycle; protect this rate at prepare. */
+	if (state->pixel_rate < 25175000 || state->pixel_rate > 594000000 ||
+	    state->base.adjusted_mode.hdisplay > 4096 ||
+	    state->base.adjusted_mode.vdisplay > 2160 ||
+	    clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
 		return -ERANGE;
 	/*
 	 * clk_round_rate() is constrained by the live PHY's exclusive vote.
@@ -268,6 +269,10 @@ static int s7d_vpu_stop(void *data)
 		clk_rate_exclusive_put(v->clocks[PIXEL_CLK].clk);
 		v->pixel_protected = false;
 	}
+	if (v->core_protected) {
+		clk_rate_exclusive_put(v->clocks[0].clk);
+		v->core_protected = false;
+	}
 	s7d_vpu_disable_pixel(v);
 	return 0;
 }
@@ -400,6 +405,12 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_vpu_stop(v);
 	if (ret)
 		return ret;
+	ret = clk_rate_exclusive_get(v->clocks[0].clk);
+	if (ret)
+		return ret;
+	v->core_protected = true;
+	if (clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
+		return -ERANGE;
 	ret = s7d_vpu_prepare_pixel(v, state->pixel_rate);
 	if (ret)
 		return ret;
