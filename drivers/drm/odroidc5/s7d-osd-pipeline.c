@@ -75,7 +75,7 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 {
 	const struct s7d_osd_state *layout = &layer->layout;
 	const struct drm_rect *dst = &layer->dst;
-	u32 x_start, x_end, y_start, y_end;
+	u32 x_start, x_end, y_start, y_end, cpp = 4;
 	int ret;
 
 	if (!layer->enabled)
@@ -88,6 +88,14 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 		    layout->frame_addr != (secondary ? 0x00200000 : 0x00100000) ||
 		    ((layout->scope_x | layout->scope_y) & 0xffff) ||
 		    layout->stride != ALIGN((layout->scope_x >> 16) + 1, 256) / 4)
+			return -EINVAL;
+	} else if (layout->block_config == 0x8408) {
+		cpp = 2;
+		if (layout->alpha_config != 0x7fc1)
+			return -EINVAL;
+	} else if (layout->block_config == 0x8700 || layout->block_config == 0x8714) {
+		cpp = 3;
+		if (layout->alpha_config != 0x7fc0)
 			return -EINVAL;
 	} else if ((layout->block_config & ~0xcU) != 0x8500 ||
 		   (layout->alpha_config != 0x7fc0 && layout->alpha_config != BIT(2))) {
@@ -104,7 +112,7 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 	y_start = layout->scope_y & 0x1fff;
 	y_end = layout->scope_y >> 16;
 	if (x_end < x_start || y_end < y_start ||
-	    (x_end + 1) * 4 > layout->stride * 16)
+	    (x_end + 1) * cpp > layout->stride * 16)
 		return -EINVAL;
 	ret = s7d_osd_scaler_build(secondary, x_end - x_start + 1,
 				   y_end - y_start + 1, drm_rect_width(dst),
@@ -112,7 +120,7 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 	if (ret)
 		return ret;
 	if (scaler->enabled && !layer->afbc &&
-	    (layer->alpha != 256 || layout->alpha_config != 0x7fc0))
+	    (layer->alpha != 256 || (layout->alpha_config & ~BIT(0)) != 0x7fc0))
 		return -EINVAL;
 	return 0;
 }

@@ -18,7 +18,7 @@ int s7d_osd_build_state(struct drm_framebuffer *fb, const struct drm_rect *src,
 {
 	struct drm_gem_dma_object *obj;
 	u64 base, bytes, end, object_end;
-	u32 x1, y1, x2, y2, color;
+	u32 x1, y1, x2, y2, color, block_mode = 5, cpp = 4, expand = 0;
 	bool alpha;
 
 	if (!fb || !src || !state || !fb->format || !fb->obj[0] ||
@@ -40,6 +40,18 @@ int s7d_osd_build_state(struct drm_framebuffer *fb, const struct drm_rect *src,
 	case DRM_FORMAT_BGRX8888:
 	case DRM_FORMAT_BGRA8888:
 		color = 3;
+		break;
+	case DRM_FORMAT_RGB565:
+		block_mode = 4;
+		color = 2;
+		cpp = 2;
+		expand = BIT(0);
+		break;
+	case DRM_FORMAT_RGB888:
+	case DRM_FORMAT_BGR888:
+		block_mode = 7;
+		color = fb->format->format == DRM_FORMAT_RGB888 ? 0 : 5;
+		cpp = 3;
 		break;
 	default:
 		return -EINVAL;
@@ -67,7 +79,7 @@ int s7d_osd_build_state(struct drm_framebuffer *fb, const struct drm_rect *src,
 	 * The vendor programs only the low 12 stride bits, in 16-byte units.
 	 */
 	if (!IS_ALIGNED(fb->pitches[0], S7D_OSD_PITCH_ALIGN) ||
-	    fb->pitches[0] < fb->width * 4 ||
+	    fb->pitches[0] < fb->width * cpp ||
 	    (fb->pitches[0] >> 4) > 0xfff)
 		return -EINVAL;
 	obj = drm_fb_dma_get_gem_obj(fb, 0);
@@ -87,12 +99,12 @@ int s7d_osd_build_state(struct drm_framebuffer *fb, const struct drm_rect *src,
 
 	/* Base stays at the framebuffer origin; source cropping uses W1/W2. */
 	*state = (struct s7d_osd_state) {
-		.block_config = BIT(15) | (5 << 8) | (color << 2),
+		.block_config = BIT(15) | (block_mode << 8) | (color << 2),
 		.frame_addr = base >> 4,
 		.stride = fb->pitches[0] >> 4,
 		.scope_x = ((x2 - 1) << 16) | x1,
 		.scope_y = ((y2 - 1) << 16) | y1,
-		.alpha_config = alpha ? BIT(2) : 0x7fc0,
+		.alpha_config = (alpha ? BIT(2) : 0x7fc0) | expand,
 	};
 	return 0;
 }

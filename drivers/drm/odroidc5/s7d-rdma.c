@@ -132,7 +132,8 @@ static bool display_write_valid(u32 reg, u32 value)
 	switch (reg) {
 	case 0x1a1b:
 	case 0x1a3b:
-		return (value & ~0xcU) == 0x8500;
+		return (value & ~0xcU) == 0x8500 || value == 0x8408 ||
+		       value == 0x8700 || value == 0x8714;
 	case 0x1a14:
 	case 0x1a65:
 		return true;
@@ -164,7 +165,7 @@ static bool display_write_valid(u32 reg, u32 value)
 		return !value || value == BIT(28);
 	case 0x1a2d:
 	case 0x1a4d:
-		return value == 0x7fc0 || value == BIT(2);
+		return value == 0x7fc0 || value == 0x7fc1 || value == BIT(2);
 	case 0x1a30:
 		return value == 0x00100004 || value == 0x00100005;
 	case 0x39ba:

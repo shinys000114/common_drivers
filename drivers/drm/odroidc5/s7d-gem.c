@@ -15,7 +15,7 @@ int s7d_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 	int ret;
 
 	if (!args->width || !args->height || args->flags ||
-	    (args->bpp != 8 && args->bpp != 32) ||
+	    (args->bpp != 8 && args->bpp != 16 && args->bpp != 24 && args->bpp != 32) ||
 	    args->width > S7D_OSD_MAX_SIZE || args->height > S7D_OSD_MAX_SIZE)
 		return -EINVAL;
 

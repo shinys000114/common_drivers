@@ -134,9 +134,10 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		if (ret)
 			return ret;
 		if (base->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE)
-			state->layer.layout.alpha_config = 0x7fc0;
+			state->layer.layout.alpha_config =
+				(state->layer.layout.alpha_config & BIT(0)) | 0x7fc0;
 		if (scaled && (base->alpha != DRM_BLEND_ALPHA_OPAQUE ||
-			       state->layer.layout.alpha_config != 0x7fc0))
+			       (state->layer.layout.alpha_config & ~BIT(0)) != 0x7fc0))
 			return -EINVAL;
 	}
 	state->layer.dst = base->dst;
@@ -247,6 +248,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		DRM_FORMAT_RGBX8888, DRM_FORMAT_BGRX8888,
 		DRM_FORMAT_ARGB8888, DRM_FORMAT_ABGR8888,
 		DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
+		DRM_FORMAT_RGB565, DRM_FORMAT_RGB888, DRM_FORMAT_BGR888,
 	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	static const u64 rgb_modifiers[] = {
