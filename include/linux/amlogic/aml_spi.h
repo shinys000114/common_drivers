@@ -286,6 +286,8 @@ struct spicc_device {
 	spinlock_t			lock; /* for unexpect interrupt */
 #ifdef CONFIG_ARCH_MESON_ODROID_COMMON
 	atomic_t			transfer_active;
+	u32				irq_status;
+	int				irq;
 #endif
 #ifdef MESON_SPICC_HW_IF
 	void (*dirspi_complete)(void *context);

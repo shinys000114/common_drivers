@@ -802,6 +802,44 @@ static void spicc_deconfig_desc_one_transfer(struct spicc_device *spicc,
 }
 
 #ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+static int spicc_wait_dma_idle(struct spicc_device *spicc, bool completed)
+{
+	union spicc_cfg_start start;
+	unsigned long flags;
+	u32 sts, desc_h;
+	bool waited = false;
+
+	/* Stop IRQ consumers before inspecting and acknowledging final status. */
+	spicc_writel(spicc, 0, SPICC_REG_IRQ_ENABLE);
+	spicc_readl(spicc, SPICC_REG_IRQ_ENABLE);
+	synchronize_irq(spicc->irq);
+	sts = spicc->irq_status;
+	for (;;) {
+		sts |= spicc_readl(spicc, SPICC_REG_IRQ_STS);
+		start.d32 = spicc_readl(spicc, SPICC_REG_CFG_START);
+		desc_h = spicc_readl(spicc, SPICC_REG_DESC_LIST_H);
+		if ((sts & SPICC_DESC_CHAIN_DONE) && !start.b.pending &&
+		    !(desc_h & SPICC_DESC_PENDING))
+			break;
+
+		/* No documented abort drains AXI: retain all mappings until EOC. */
+		if (!waited)
+			dev_err(&spicc->pdev->dev,
+				"DMA not finished; retaining buffers until chain completion\n");
+		waited = true;
+		usleep_range(1000, 2000);
+	}
+
+	spin_lock_irqsave(&spicc->lock, flags);
+	spicc->pending = false;
+	spicc_writel(spicc, sts, SPICC_REG_IRQ_STS);
+	spin_unlock_irqrestore(&spicc->lock, flags);
+
+	if (sts & SPICC_STATUS_ERROR)
+		return -EIO;
+	return !completed && waited ? -ETIMEDOUT : 0;
+}
+
 static void spicc_desc_pending(struct spicc_device *spicc,
 			       dma_addr_t desc_paddr,
 			       int desc_num,
@@ -862,24 +900,29 @@ static int meson_spicc_transfer_descs(struct spicc_device *spicc,
 			spi_controller_is_target(spicc->controller) ?
 			MAX_SCHEDULE_TIMEOUT : msecs_to_jiffies(ms));
 
-	spin_lock_irqsave(&spicc->lock, flags);
-	spicc->pending = false;
-	spicc_set_cs(spi, false);
-	spin_unlock_irqrestore(&spicc->lock, flags);
-
-	if (ret) {
-		ret = spicc->status ? -EIO : 0;
+	if (!spi_controller_is_target(spicc->controller)) {
+		ret = spicc_wait_dma_idle(spicc, ret);
+		spicc_set_cs(spi, false);
 	} else {
-		sts = spicc_readl(spicc, SPICC_REG_IRQ_STS);
-		if (sts)
-			spicc_writel(spicc, sts, SPICC_REG_IRQ_STS);
+		spin_lock_irqsave(&spicc->lock, flags);
+		spicc->pending = false;
+		spicc_set_cs(spi, false);
+		spin_unlock_irqrestore(&spicc->lock, flags);
 
-		ret = -ETIMEDOUT;
-		if (spicc->data->clk_gate_ctrl) {
-			if (sts & SPICC_STATUS_ERROR)
-				ret = -EIO;
-			else if (sts & SPICC_DESC_CHAIN_DONE)
-				ret = 0;
+		if (ret) {
+			ret = spicc->status ? -EIO : 0;
+		} else {
+			sts = spicc_readl(spicc, SPICC_REG_IRQ_STS);
+			if (sts)
+				spicc_writel(spicc, sts, SPICC_REG_IRQ_STS);
+
+			ret = -ETIMEDOUT;
+			if (spicc->data->clk_gate_ctrl) {
+				if (sts & SPICC_STATUS_ERROR)
+					ret = -EIO;
+				else if (sts & SPICC_DESC_CHAIN_DONE)
+					ret = 0;
+			}
 		}
 	}
 
@@ -1063,6 +1106,12 @@ static void spicc_desc_pending(struct spicc_device *spicc,
 		irq = 0;
 	}
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	spicc_writel(spicc, 0, SPICC_REG_IRQ_ENABLE);
+	spicc_writel(spicc, spicc_readl(spicc, SPICC_REG_IRQ_STS),
+		     SPICC_REG_IRQ_STS);
+	spicc->irq_status = 0;
+#endif
 	spicc_writel(spicc, irq, SPICC_REG_IRQ_ENABLE);
 	spicc_writel(spicc, cfg_spi, SPICC_REG_CFG_SPI);
 	spicc_writel(spicc, desc_l, SPICC_REG_DESC_LIST_L);
@@ -1078,6 +1127,10 @@ static irqreturn_t meson_spicc_irq(int irq, void *data)
 	spin_lock_irqsave(&spicc->lock, flags);
 
 	sts = spicc_readl(spicc, SPICC_REG_IRQ_STS);
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	if (spicc->pending)
+		spicc->irq_status |= sts;
+#endif
 	spicc->status = sts & SPICC_STATUS_ERROR;
 	if (!spicc->pending) {
 		spicc_writel(spicc, sts, SPICC_REG_IRQ_STS);
@@ -1216,6 +1269,13 @@ static int meson_spicc_transfer_one_message(struct spi_controller *ctlr,
 			spi_controller_is_target(spicc->controller) ?
 			MAX_SCHEDULE_TIMEOUT : msecs_to_jiffies(ms));
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	if (!spi_controller_is_target(spicc->controller)) {
+		ret = spicc_wait_dma_idle(spicc, ret);
+		spicc_set_cs(msg->spi, false);
+		goto unmap_descs;
+	}
+#endif
 	spin_lock_irqsave(&spicc->lock, flags);
 	spicc->pending = false;
 	spicc_set_cs(msg->spi, false);
@@ -1237,6 +1297,9 @@ static int meson_spicc_transfer_one_message(struct spi_controller *ctlr,
 		}
 	}
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+unmap_descs:
+#endif
 	dma_unmap_single(dev, descs_paddr, descs_len, DMA_TO_DEVICE);
 end:
 	desc = descs;
@@ -1829,6 +1892,9 @@ static int meson_spicc_probe(struct platform_device *pdev)
 
 	irq_flags = of_property_read_bool(pdev->dev.of_node, "amlogic,level-high-to-gic")
 			? 0 : IRQF_TRIGGER_RISING;
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	spicc->irq = irq;
+#endif
 	ret = devm_request_irq(&pdev->dev, irq, meson_spicc_irq,
 			       irq_flags, NULL, spicc);
 	if (ret) {
