@@ -835,6 +835,22 @@ int s7d_h264_dpb_flush_output(struct s7d_h264_dpb *dpb)
 	return ret;
 }
 
+int s7d_h264_dpb_finish_sequence(struct s7d_h264_dpb *dpb, bool discard_prior)
+{
+	int ret;
+
+	if (!dpb)
+		return -EINVAL;
+	if (dpb->failed)
+		return dpb->failed;
+	if (dpb->active_slot >= 0)
+		return -EBUSY;
+	ret = discard_prior ? discard_prior_pictures(dpb) : output_pictures(dpb, true);
+	if (ret)
+		dpb->failed = ret;
+	return ret;
+}
+
 int s7d_h264_dpb_get_state(const struct s7d_h264_dpb *dpb,
 			   const struct s7d_codec_session *original_session,
 			   struct s7d_h264_dpb_state *state)

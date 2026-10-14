@@ -47,6 +47,12 @@ struct s7d_v4l2_drain {
 	u64 last_input_token;
 };
 
+struct s7d_v4l2_reconfigure {
+	u64 epoch;
+	u64 input_token;
+	u64 generation;
+};
+
 struct s7d_v4l2_backend_ops {
 	/* Other-worker notifications may precede serialized request returns. */
 	/* Requests must not call frontend notifications inline. */
@@ -72,6 +78,12 @@ struct s7d_v4l2_backend_ops {
 	int (*reset)(void *priv);
 	/* Optional native same-parameter seek; only with no live stream epoch. */
 	int (*clear_stream)(void *priv);
+	int (*reconfigure_stop)(void *priv, const struct s7d_v4l2_reconfigure *change);
+	int (*reconfigure_restore)(void *priv, struct s7d_codec_session *session,
+				   struct s7d_v4l2_context *context,
+				   struct s7d_codec_dma *staging,
+				   const struct s7d_v4l2_reconfigure *change,
+				   u64 generation);
 };
 
 /* A private component: it neither registers a video node nor supplies a backend. */
@@ -123,6 +135,10 @@ int s7d_v4l2_input_done(struct s7d_v4l2_context *context, u64 token, int status)
 int s7d_v4l2_error(struct s7d_v4l2_context *context, int error);
 int s7d_v4l2_drain_done(struct s7d_v4l2_context *context, u64 epoch, u64 token);
 /* Explicit cancellation identity, distinct from a completed operation error. */
+int s7d_v4l2_reconfigure_result(struct s7d_v4l2_context *context,
+				const struct s7d_codec_layout *layout,
+				const struct s7d_v4l2_reconfigure *change,
+				bool *cancelled);
 int s7d_v4l2_sequence_result(struct s7d_v4l2_context *context,
 			     const struct s7d_codec_layout *layout, bool *cancelled);
 int s7d_v4l2_input_done_result(struct s7d_v4l2_context *context,

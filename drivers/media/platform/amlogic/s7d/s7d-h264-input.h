@@ -14,6 +14,8 @@ struct s7d_v4l2_input;
 struct s7d_vdec_runtime;
 struct s7d_h264_input;
 struct s7d_h264_parameters;
+struct s7d_h264_input_checkpoint;
+struct s7d_codec_dma;
 struct s7d_h264_slice;
 struct s7d_v4l2_drain;
 
@@ -22,6 +24,8 @@ struct s7d_v4l2_drain;
 #define S7D_H264_PARAMETERS_MAX_BYTES (64U * 1024U)
 #define S7D_H264_ASSEMBLY_MAX_BYTES \
 	(S7D_H264_PREFIX_MAX_BYTES + S7D_H264_PARAMETERS_MAX_BYTES)
+#define S7D_H264_CHECKPOINT_MAX_BYTES \
+	(16U * 1024U * 1024U + S7D_H264_ASSEMBLY_MAX_BYTES)
 
 enum s7d_h264_input_kind {
 	S7D_H264_INPUT_HEADERS,
@@ -59,6 +63,13 @@ struct s7d_h264_au_info {
 	u8 cavlc_tail_bits;
 	bool idr;
 	bool reference;
+	bool no_output_of_prior_pics;
+	bool long_term_reference;
+};
+
+struct s7d_h264_checkpoint_id {
+	u64 input_token;
+	u64 generation;
 };
 
 struct s7d_h264_input_plan {
@@ -100,6 +111,22 @@ struct s7d_h264_input *
 s7d_h264_input_create(struct s7d_codec_dos *dos, struct s7d_codec_session *session,
 		      struct s7d_h264_parameters *parameters, bool hunting);
 int s7d_h264_input_destroy(struct s7d_h264_input *input);
+struct s7d_h264_input_checkpoint *s7d_h264_input_checkpoint_create(void);
+/* CPU-only transfer; caller retains all old DMA and proves its physical stop. */
+/* Successful take makes the old input terminal and eligible for destroy. */
+int s7d_h264_input_checkpoint_take(struct s7d_h264_input_checkpoint *checkpoint,
+				 struct s7d_h264_input *input,
+				 const struct s7d_h264_checkpoint_id *id);
+/* Fresh input, unchanged accepted bank, and a newer caller generation only. */
+/* Restored buffer is s7d_v4l2_input; failure leaves state, DMA and outputs intact. */
+int s7d_h264_input_checkpoint_restore(struct s7d_h264_input_checkpoint *checkpoint,
+				    struct s7d_h264_input *input,
+				    struct s7d_codec_dma *memory,
+				    const struct s7d_h264_checkpoint_id *source,
+				    u64 generation,
+				    struct s7d_v4l2_input *buffer,
+				    struct s7d_h264_preflight *preflight);
+void s7d_h264_input_checkpoint_discard(struct s7d_h264_input_checkpoint **checkpoint);
 /* CPU-only; retain this token and backing until acceptance, cancel or park. */
 int s7d_h264_input_preflight(struct s7d_h264_input *input,
 			    const struct s7d_v4l2_input *buffer,

@@ -157,6 +157,8 @@ struct au_slice {
 	bool idr;
 	bool reference;
 	bool all_same_type;
+	bool no_output_of_prior_pics;
+	bool long_term_reference;
 };
 
 /* Every reader checks the original RBSP size; it never reads padding. */
@@ -889,13 +891,21 @@ static int au_pred_weights(struct au_bits *b, u32 l0, u32 l1)
 	return 0;
 }
 
-static int au_marking(struct au_bits *b, bool idr, u32 max_pic_num)
+static int au_marking(struct au_bits *b, struct au_slice *slice, u32 max_pic_num)
 {
 	u32 flag, i, op, v;
 	int ret;
 
-	if (idr)
-		return au_skip(b, 2);
+	if (slice->idr) {
+		ret = au_get(b, 1, &flag);
+		if (ret)
+			return ret;
+		slice->no_output_of_prior_pics = flag;
+		ret = au_get(b, 1, &flag);
+		if (!ret)
+			slice->long_term_reference = flag;
+		return ret;
+	}
 	ret = au_get(b, 1, &flag);
 	if (ret || !flag)
 		return ret;
@@ -1036,7 +1046,7 @@ static int au_slice_parse(struct au_bits *b, const struct au_cache *cache,
 			return ret;
 	}
 	if (slice->reference) {
-		ret = au_marking(b, slice->idr, max_pic_num);
+		ret = au_marking(b, slice, max_pic_num);
 		if (ret)
 			return ret;
 	}
@@ -1083,7 +1093,9 @@ static bool au_same_picture(const struct s7d_h264_au_info *info,
 	return info->pps_id == slice->pps_id &&
 	       info->frame_num == slice->frame_num &&
 	       info->idr == slice->idr &&
-	       (!slice->idr || info->idr_pic_id == slice->idr_pic_id) &&
+	       (!slice->idr || (info->idr_pic_id == slice->idr_pic_id &&
+		info->no_output_of_prior_pics == slice->no_output_of_prior_pics &&
+		info->long_term_reference == slice->long_term_reference)) &&
 	       info->reference == slice->reference &&
 	       (info->poc_type == 2 ||
 		(info->poc_lsb == slice->poc_lsb &&
@@ -1112,6 +1124,8 @@ static void au_info_first(struct s7d_h264_au_info *info,
 	info->delta_bottom = slice->delta_bottom;
 	info->idr = slice->idr;
 	info->reference = slice->reference;
+	info->no_output_of_prior_pics = slice->no_output_of_prior_pics;
+	info->long_term_reference = slice->long_term_reference;
 }
 
 struct s7d_h264_parameters *s7d_h264_parameters_create(void)
@@ -1679,6 +1693,24 @@ struct s7d_h264_input {
 	bool draining;
 };
 
+struct s7d_h264_input_checkpoint {
+	struct s7d_h264_parameters *parameters;
+	struct au_pending *pending;
+	struct s7d_v4l2_input buffer;
+	struct s7d_h264_au_info au;
+	struct s7d_h264_checkpoint_id id;
+	struct s7d_v4l2_drain drain;
+	u8 *data;
+	u8 *prefix;
+	u64 last_consumed_token;
+	u64 last_drain_epoch;
+	u32 prefix_bytes;
+	u32 prefix_nals;
+	bool draining;
+	bool ready;
+	bool consumed;
+};
+
 int s7d_h264_input_build_plan(const struct s7d_v4l2_input *input,
 			    struct s7d_h264_input_plan *plan)
 {
@@ -2035,6 +2067,271 @@ static int input_preflight_check(struct s7d_h264_input *input, u64 token)
 	return 0;
 }
 
+static struct s7d_h264_parameters *
+checkpoint_parameters_clone(const struct s7d_h264_parameters *parameters)
+{
+	struct s7d_h264_parameters *copy;
+	const struct au_raw *raw;
+	struct au_raw *slot;
+	u32 i, bytes = 0;
+	int ret = -EBADMSG;
+
+	copy = s7d_h264_parameters_create();
+	if (IS_ERR(copy))
+		return copy;
+	copy->cache = parameters->cache;
+	copy->raw_bytes = parameters->raw_bytes;
+	copy->selected_sps = parameters->selected_sps;
+	copy->selected_pps = parameters->selected_pps;
+	copy->selected_valid = parameters->selected_valid;
+	for (i = 0; i < AU_SPS_COUNT + AU_PPS_COUNT; i++) {
+		raw = i < AU_SPS_COUNT ? &parameters->sps[i] :
+			&parameters->pps[i - AU_SPS_COUNT];
+		slot = i < AU_SPS_COUNT ? &copy->sps[i] :
+			&copy->pps[i - AU_SPS_COUNT];
+		if (!raw->data) {
+			if (raw->bytes)
+				goto failed;
+			continue;
+		}
+		if (!raw->bytes || check_add_overflow(bytes, raw->bytes, &bytes) ||
+		    bytes > S7D_H264_PARAMETERS_MAX_BYTES)
+			goto failed;
+		slot->data = kvmalloc(raw->bytes, GFP_KERNEL);
+		if (!slot->data) {
+			ret = -ENOMEM;
+			goto failed;
+		}
+		memcpy(slot->data, raw->data, raw->bytes);
+		slot->bytes = raw->bytes;
+	}
+	if (bytes != parameters->raw_bytes)
+		goto failed;
+	return copy;
+failed:
+	s7d_h264_parameters_destroy(copy);
+	return ERR_PTR(ret);
+}
+
+static bool checkpoint_parameters_same(const struct s7d_h264_parameters *a,
+				       const struct s7d_h264_parameters *b)
+{
+	const struct au_raw *left, *right;
+	u32 i;
+
+	if (memcmp(&a->cache, &b->cache, sizeof(a->cache)) ||
+	    a->raw_bytes != b->raw_bytes || a->selected_sps != b->selected_sps ||
+	    a->selected_pps != b->selected_pps || a->selected_valid != b->selected_valid)
+		return false;
+	for (i = 0; i < AU_SPS_COUNT + AU_PPS_COUNT; i++) {
+		left = i < AU_SPS_COUNT ? &a->sps[i] : &a->pps[i - AU_SPS_COUNT];
+		right = i < AU_SPS_COUNT ? &b->sps[i] : &b->pps[i - AU_SPS_COUNT];
+		if (left->bytes != right->bytes || !!left->data != !!right->data ||
+		    (left->bytes && memcmp(left->data, right->data, left->bytes)))
+			return false;
+	}
+	return true;
+}
+
+struct s7d_h264_input_checkpoint *s7d_h264_input_checkpoint_create(void)
+{
+	struct s7d_h264_input_checkpoint *checkpoint;
+
+	checkpoint = kzalloc(sizeof(*checkpoint), GFP_KERNEL);
+	return checkpoint ? checkpoint : ERR_PTR(-ENOMEM);
+}
+
+void s7d_h264_input_checkpoint_discard(struct s7d_h264_input_checkpoint **owner)
+{
+	struct s7d_h264_input_checkpoint *checkpoint;
+
+	if (!owner)
+		return;
+	checkpoint = *owner;
+	*owner = NULL;
+	if (IS_ERR_OR_NULL(checkpoint))
+		return;
+	s7d_h264_parameters_destroy(checkpoint->parameters);
+	au_pending_free(checkpoint->pending);
+	kvfree(checkpoint->prefix);
+	kvfree(checkpoint->data);
+	kfree(checkpoint);
+}
+
+int s7d_h264_input_checkpoint_take(struct s7d_h264_input_checkpoint *checkpoint,
+				 struct s7d_h264_input *input,
+				 const struct s7d_h264_checkpoint_id *id)
+{
+	struct s7d_h264_parameters *parameters;
+	struct s7d_h264_au_parser *parser;
+	u8 *data;
+	int ret;
+
+	if (IS_ERR_OR_NULL(checkpoint) || IS_ERR_OR_NULL(input) ||
+	    !id || !id->input_token || !id->generation)
+		return -EINVAL;
+	if (checkpoint->consumed)
+		return -ESTALE;
+	if (checkpoint->ready)
+		return -EBUSY;
+	if (input->terminal)
+		return -ESHUTDOWN;
+	if (input->faulted)
+		return -EIO;
+	ret = input_preflight_check(input, id->input_token);
+	if (ret)
+		return ret;
+	parser = input->au_parser;
+	if (input->configured || input->enabled || input->picture_ready ||
+	    parser->pending->preflight.kind != S7D_H264_INPUT_PICTURE || !input->au.idr)
+		return -EOPNOTSUPP;
+	if (id->generation == U64_MAX)
+		return -EOVERFLOW;
+	if (input->buffer.bytes > S7D_H264_CHECKPOINT_MAX_BYTES)
+		return -E2BIG;
+	parameters = checkpoint_parameters_clone(parser->parameters);
+	if (IS_ERR(parameters))
+		return PTR_ERR(parameters);
+	data = kvmalloc(input->buffer.bytes, GFP_KERNEL);
+	if (!data) {
+		s7d_h264_parameters_destroy(parameters);
+		return -ENOMEM;
+	}
+	memcpy(data, s7d_codec_dma_cpu(input->buffer.memory), input->buffer.bytes);
+	checkpoint->parameters = parameters;
+	checkpoint->pending = parser->pending;
+	checkpoint->prefix = parser->prefix;
+	checkpoint->prefix_bytes = parser->prefix_bytes;
+	checkpoint->prefix_nals = parser->prefix_nals;
+	checkpoint->data = data;
+	checkpoint->buffer = input->buffer;
+	checkpoint->buffer.memory = NULL;
+	checkpoint->au = input->au;
+	checkpoint->id = *id;
+	checkpoint->drain = input->drain;
+	checkpoint->last_consumed_token = input->last_consumed_token;
+	checkpoint->last_drain_epoch = input->last_drain_epoch;
+	checkpoint->draining = input->draining;
+	checkpoint->ready = true;
+	parser->pending = NULL;
+	parser->prefix = NULL;
+	parser->prefix_bytes = 0;
+	parser->prefix_nals = 0;
+	input_clear(input);
+	input->terminal = true;
+	return 0;
+}
+
+int s7d_h264_input_checkpoint_restore(struct s7d_h264_input_checkpoint *checkpoint,
+				    struct s7d_h264_input *input,
+				    struct s7d_codec_dma *memory,
+				    const struct s7d_h264_checkpoint_id *source,
+				    u64 generation,
+				    struct s7d_v4l2_input *buffer,
+				    struct s7d_h264_preflight *preflight)
+{
+	struct s7d_h264_au_parser view = {};
+	struct s7d_h264_au_info au;
+	struct s7d_h264_preflight checked;
+	struct s7d_h264_input_plan plan;
+	struct s7d_v4l2_input restored;
+	const struct au_raw *sps, *pps;
+	u8 *assembled, *cpu;
+	u32 payload_bytes, replay, aud_end;
+	size_t bytes, padded;
+	int ret;
+
+	if (IS_ERR_OR_NULL(checkpoint) || IS_ERR_OR_NULL(input) || IS_ERR_OR_NULL(memory) ||
+	    !source || !buffer || !preflight)
+		return -EINVAL;
+	if (!checkpoint->ready || checkpoint->consumed ||
+	    source->input_token != checkpoint->id.input_token ||
+	    source->generation != checkpoint->id.generation ||
+	    generation <= checkpoint->id.generation)
+		return -ESTALE;
+	if (input->active || input->preflight_ready || input->faulted || input->terminal ||
+	    input->hw_prepared || input->configured || input->enabled || input->picture_ready ||
+	    input->last_token || input->last_consumed_token || input->last_completed_token ||
+	    input->last_drain_epoch || input->draining || input->au_parser->pending ||
+	    input->au_parser->prefix || input->au_parser->prefix_bytes)
+		return -EBUSY;
+	if (!checkpoint_parameters_same(checkpoint->parameters, input->au_parser->parameters))
+		return -ESTALE;
+	view.parameters = checkpoint->parameters;
+	view.pending = checkpoint->pending;
+	au = checkpoint->au;
+	sps = au_raw_get(&view, view.pending, true, au.sps_id);
+	pps = au_raw_get(&view, view.pending, false, au.pps_id);
+	if (!sps->data || !pps->data || !sps->bytes || !pps->bytes ||
+	    check_add_overflow(sps->bytes, pps->bytes, &replay) ||
+	    replay > S7D_H264_PARAMETERS_MAX_BYTES)
+		return -EBADMSG;
+	aud_end = view.pending->aud_end;
+	if (aud_end > checkpoint->buffer.bytes)
+		return -EBADMSG;
+	ret = input_hunt_bytes(checkpoint->data, checkpoint->buffer.bytes, aud_end,
+			       NULL, &payload_bytes);
+	if (ret)
+		return ret;
+	if (check_add_overflow((size_t)aud_end, (size_t)replay, &bytes) ||
+	    check_add_overflow(bytes, (size_t)payload_bytes, &bytes) ||
+	    bytes > S7D_H264_CHECKPOINT_MAX_BYTES ||
+	    check_add_overflow(bytes, (size_t)INPUT_ALIGNMENT, &padded))
+		return -EOVERFLOW;
+	restored = checkpoint->buffer;
+	restored.memory = memory;
+	restored.bytes = bytes;
+	restored.padded_bytes = bytes < PAGE_SIZE ?
+		PAGE_ALIGN(padded) : ALIGN(bytes, INPUT_ALIGNMENT) + INPUT_ALIGNMENT;
+	ret = s7d_h264_input_build_plan(&restored, &plan);
+	if (ret)
+		return ret;
+	assembled = kvmalloc(bytes, GFP_KERNEL);
+	if (!assembled)
+		return -ENOMEM;
+	memcpy(assembled, checkpoint->data, aud_end);
+	memcpy(assembled + aud_end, sps->data, sps->bytes);
+	memcpy(assembled + aud_end + sps->bytes, pps->data, pps->bytes);
+	ret = input_hunt_bytes(checkpoint->data, checkpoint->buffer.bytes, aud_end,
+			       assembled + aud_end + replay, &payload_bytes);
+	if (!ret)
+		ret = input_hunt_validate(&view, assembled, bytes, &au, &checked);
+	if (ret) {
+		kvfree(assembled);
+		return ret;
+	}
+	/* All failures precede the DMA copy and the single ownership transfer. */
+	cpu = s7d_codec_dma_cpu(memory);
+	memcpy(cpu, assembled, bytes);
+	memset(cpu + bytes, 0, plan.ring_bytes - bytes);
+	input->buffer = restored;
+	input->plan = plan;
+	input->au = au;
+	input->last_token = source->input_token;
+	input->last_consumed_token = checkpoint->last_consumed_token;
+	input->last_drain_epoch = checkpoint->last_drain_epoch;
+	input->drain = checkpoint->drain;
+	input->draining = checkpoint->draining;
+	input->preflight_ready = true;
+	input->au_parser->pending = checkpoint->pending;
+	input->au_parser->prefix = checkpoint->prefix;
+	input->au_parser->prefix_bytes = checkpoint->prefix_bytes;
+	input->au_parser->prefix_nals = checkpoint->prefix_nals;
+	input->au_parser->hunting = true;
+	checkpoint->pending = NULL;
+	checkpoint->prefix = NULL;
+	checkpoint->ready = false;
+	checkpoint->consumed = true;
+	s7d_h264_parameters_destroy(checkpoint->parameters);
+	checkpoint->parameters = NULL;
+	kvfree(checkpoint->data);
+	checkpoint->data = NULL;
+	kvfree(assembled);
+	*buffer = restored;
+	*preflight = checked;
+	return 0;
+}
+
 int s7d_h264_input_accept_headers(struct s7d_h264_input *input, u64 token,
 				 struct s7d_h264_input_return *returned)
 {
@@ -2354,6 +2651,8 @@ int s7d_h264_input_confirm_slice(struct s7d_h264_input *input, u64 token,
 	    slice->type != type[au->slice_type[ordinal]] ||
 	    slice->frame_num != au->frame_num || slice->idr != au->idr ||
 	    slice->reference != au->reference || slice->poc_type != au->poc_type ||
+	    slice->no_output_of_prior_pics != au->no_output_of_prior_pics ||
+	    slice->long_term_reference != au->long_term_reference ||
 	    slice->log2_frame_num != au->log2_frame_num ||
 	    slice->max_references != au->max_references ||
 	    (au->poc_type == 0 && (slice->log2_poc_lsb != au->log2_poc_lsb ||

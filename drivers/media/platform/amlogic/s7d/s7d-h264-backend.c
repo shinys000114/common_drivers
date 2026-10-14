@@ -74,6 +74,12 @@ struct s7d_h264_backend {
 	u8 slice_rpm[S7D_H264_MAILBOX_RPM_BYTES];
 	struct s7d_v4l2_input input;
 	struct s7d_v4l2_drain drain;
+	struct s7d_v4l2_reconfigure change;
+	struct s7d_h264_sequence next_sequence;
+	struct s7d_h264_input_checkpoint *checkpoint;
+	u64 change_epoch;
+	bool change_pending;
+	bool change_stopped;
 	struct work_struct protocol_work;
 	struct work_struct executor_work;
 	struct delayed_work timeout_work;
@@ -239,6 +245,24 @@ static int backend_notify_sequence(struct s7d_h264_backend *backend, bool *cance
 	return ret;
 }
 
+static int backend_notify_reconfigure(struct s7d_h264_backend *backend, bool *cancelled)
+{
+	int ret = -ESHUTDOWN;
+
+	mutex_lock(&backend->notifications);
+	if (READ_ONCE(backend->closing) || READ_ONCE(backend->decoder->shutdown)) {
+		*cancelled = true;
+	} else if (!backend->frontend) {
+		ret = -ESTALE;
+	} else {
+		ret = s7d_v4l2_reconfigure_result(backend->frontend,
+					      &backend->next_sequence.layout,
+					      &backend->change, cancelled);
+	}
+	mutex_unlock(&backend->notifications);
+	return ret;
+}
+
 static int backend_notify_input(struct s7d_h264_backend *backend, u64 token, int status,
 				bool *cancelled)
 {
@@ -342,6 +366,49 @@ static int backend_set_host_sequence(struct s7d_h264_backend *backend,
 	backend->sequence = sequence;
 	backend->sequence_valid = true;
 	*notify = true;
+	return 0;
+}
+
+static int backend_hold_reconfigure(struct s7d_h264_backend *backend)
+{
+	struct s7d_h264_sequence next = { .sps = backend->au.sps };
+	const struct s7d_codec_layout *old = &backend->sequence.layout;
+	const struct s7d_codec_layout *layout = &next.layout;
+	int ret;
+
+	lockdep_assert_held(&backend->decoder->transaction);
+	if (!backend->au.idr || backend->hunting || !backend->sequence_syntax_valid ||
+	    !backend->hardware_started || !backend->captures || !backend->generation ||
+	    backend->input_staging || backend->config_waiting || backend->slice_waiting ||
+	    backend->timeout_armed || backend->change_pending ||
+	    backend->sequence_poc_type != backend->au.poc_type ||
+	    backend->sequence_log2_frame_num != backend->au.log2_frame_num ||
+	    backend->sequence_log2_poc_lsb != backend->au.log2_poc_lsb)
+		return -EOPNOTSUPP;
+	if ((next.sps.profile_idc == 66 || next.sps.profile_idc == 77) &&
+	    next.sps.level_idc == 11)
+		return -EOPNOTSUPP;
+	backend_normalize_sps(&next.sps);
+	ret = s7d_h264_build_layout(&next.sps, S7D_CODEC_CAPTURE_NV12M,
+				    H264_EXTRA_SURFACES, &next.layout);
+	if (ret)
+		return ret;
+	if (old->coded_width == layout->coded_width && old->coded_height == layout->coded_height &&
+	    old->visible_left == layout->visible_left && old->visible_top == layout->visible_top &&
+	    old->visible_width == layout->visible_width &&
+	    old->visible_height == layout->visible_height &&
+	    old->min_capture_buffers == layout->min_capture_buffers)
+		return -EOPNOTSUPP;
+	if (backend->change_epoch == U64_MAX)
+		return -EOVERFLOW;
+	backend->change = (struct s7d_v4l2_reconfigure) {
+		.epoch = ++backend->change_epoch,
+		.input_token = backend->input.token,
+		.generation = backend->generation,
+	};
+	backend->next_sequence = next;
+	backend->change_pending = true;
+	backend->capture_blocked = true;
 	return 0;
 }
 
@@ -818,7 +885,7 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 	struct s7d_h264_input_return returned;
 	struct s7d_h264_preflight preflight;
 	u64 token;
-	bool notify = false, completed = false, start = false, resume = false;
+	bool notify = false, changed = false, completed = false, start = false, resume = false;
 	int ret, status = 0;
 
 	lockdep_assert_not_held(&decoder->transaction);
@@ -855,7 +922,8 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 						ret = -ESTALE;
 					completed = !ret;
 				} else {
-					ret = -EOPNOTSUPP;
+					ret = backend_hold_reconfigure(backend);
+					changed = !ret;
 				}
 			}
 		} else if (!ret && preflight.kind == S7D_H264_INPUT_HEADERS) {
@@ -884,7 +952,7 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 			backend->input_staging = false;
 		}
 	}
-	if (!ret && !completed && backend->captures) {
+	if (!ret && !completed && !changed && backend->captures) {
 		if (!backend->input_picture || !backend->sequence_valid) {
 			ret = -ESTALE;
 		} else {
@@ -901,6 +969,8 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 		if (ret)
 			return ret;
 	}
+	if (changed)
+		return backend_notify_reconfigure(backend, cancelled);
 	if (completed)
 		return backend_notify_input(backend, token, status, cancelled);
 	if (!start)
@@ -1521,13 +1591,12 @@ static int backend_release_epoch(struct s7d_h264_backend *backend)
 	return 0;
 }
 
-static int backend_reset(void *priv)
+static int backend_reset_epoch(struct s7d_h264_backend *backend, bool keep_change)
 {
-	struct s7d_h264_backend *backend = priv;
 	struct s7d_h264_decoder *decoder = backend->decoder;
 	int ret;
 
-	mutex_lock(&decoder->clients);
+	lockdep_assert_held(&decoder->clients);
 	if (decoder->shutdown || !READ_ONCE(backend->closing)) {
 		ret = decoder->shutdown ? -ESHUTDOWN : -EBUSY;
 		goto out;
@@ -1587,7 +1656,168 @@ static int backend_reset(void *priv)
 	backend->drain_pending = false;
 	backend->drain_notified = false;
 	backend->timeout_armed = false;
+	if (!keep_change) {
+		s7d_h264_input_checkpoint_discard(&backend->checkpoint);
+		memset(&backend->change, 0, sizeof(backend->change));
+		memset(&backend->next_sequence, 0, sizeof(backend->next_sequence));
+		backend->change_pending = false;
+		backend->change_stopped = false;
+	}
 	WRITE_ONCE(backend->closing, false);
+	mutex_unlock(&decoder->transaction);
+out:
+	return ret;
+}
+
+static int backend_reset(void *priv)
+{
+	struct s7d_h264_backend *backend = priv;
+	int ret;
+
+	mutex_lock(&backend->decoder->clients);
+	ret = backend_reset_epoch(backend, false);
+	mutex_unlock(&backend->decoder->clients);
+	return ret;
+}
+
+static bool backend_change_matches(struct s7d_h264_backend *backend,
+				   const struct s7d_v4l2_reconfigure *change)
+{
+	return change && change->epoch && backend->change_pending &&
+	       change->epoch == backend->change.epoch &&
+	       change->input_token == backend->change.input_token &&
+	       change->generation == backend->change.generation;
+}
+
+static int backend_reconfigure_stop(void *priv, const struct s7d_v4l2_reconfigure *change)
+{
+	struct s7d_h264_backend *backend = priv;
+	struct s7d_h264_decoder *decoder = backend->decoder;
+	struct s7d_h264_input_checkpoint *checkpoint = NULL;
+	struct s7d_h264_dpb_state state;
+	struct s7d_h264_checkpoint_id id;
+	int ret;
+
+	mutex_lock(&decoder->clients);
+	mutex_lock(&decoder->transaction);
+	ret = backend_check(backend);
+	if (!ret && (!backend_change_matches(backend, change) || backend->change_stopped ||
+		     backend->checkpoint || !backend->stream || !backend->session ||
+		     !backend->input_pending || !backend->input_preflight ||
+		     !backend->input_picture || backend->input_staging ||
+		     change->input_token != backend->input.token ||
+		     change->generation != backend->generation || !backend->au.idr ||
+		     !backend->dpb || !backend->dispatch_blocked))
+		ret = -ESTALE;
+	if (!ret)
+		ret = s7d_vdec_runtime_check_parked(decoder->runtime, backend->session,
+						backend->previous_input, backend->previous_write,
+						backend->park_epoch);
+	if (!ret)
+		ret = s7d_h264_dpb_get_state(backend->dpb, backend->session, &state);
+	if (!ret && (state.failure || state.active_slot >= 0 ||
+		     state.generation != change->generation))
+		ret = state.failure ? state.failure : -ESTALE;
+	if (!ret) {
+		checkpoint = s7d_h264_input_checkpoint_create();
+		if (IS_ERR(checkpoint)) {
+			ret = PTR_ERR(checkpoint);
+			checkpoint = NULL;
+		}
+	}
+	id = (struct s7d_h264_checkpoint_id) {
+		.input_token = backend->change.input_token,
+		.generation = backend->change.generation,
+	};
+	if (!ret)
+		ret = s7d_h264_input_checkpoint_take(checkpoint, backend->stream, &id);
+	if (!ret) {
+		backend->checkpoint = checkpoint;
+		checkpoint = NULL;
+		backend->input_pending = false;
+		backend->input_preflight = false;
+		backend->input_picture = false;
+		backend->input_staging = false;
+		ret = s7d_h264_dpb_finish_sequence(backend->dpb,
+						backend->au.no_output_of_prior_pics);
+		if (!ret)
+			ret = s7d_h264_dpb_get_state(backend->dpb, backend->session, &state);
+		if (!ret && (state.failure || state.active_slot >= 0 ||
+			     state.complete_unpublished || state.generation != change->generation))
+			ret = state.failure ? state.failure : -ESTALE;
+	}
+	s7d_h264_input_checkpoint_discard(&checkpoint);
+	mutex_unlock(&decoder->transaction);
+	if (ret)
+		goto out;
+	backend_detach(backend);
+	ret = backend_reset_epoch(backend, true);
+	if (!ret) {
+		mutex_lock(&decoder->transaction);
+		backend->change_stopped = true;
+		mutex_unlock(&decoder->transaction);
+	}
+out:
+	mutex_unlock(&decoder->clients);
+	return ret;
+}
+
+static int backend_reconfigure_restore(void *priv, struct s7d_codec_session *session,
+				       struct s7d_v4l2_context *frontend,
+				       struct s7d_codec_dma *staging,
+				       const struct s7d_v4l2_reconfigure *change,
+				       u64 generation)
+{
+	struct s7d_h264_backend *backend = priv;
+	struct s7d_h264_decoder *decoder = backend->decoder;
+	struct s7d_h264_checkpoint_id id;
+	struct s7d_h264_preflight preflight;
+	struct s7d_v4l2_input restored;
+	int ret;
+
+	mutex_lock(&decoder->clients);
+	mutex_lock(&decoder->transaction);
+	ret = backend_check(backend);
+	if (!ret && (!backend_change_matches(backend, change) || !backend->change_stopped ||
+		     !backend->checkpoint || backend->session || backend->stream ||
+		     !session || !frontend || !staging || generation <= change->generation))
+		ret = -ESTALE;
+	mutex_unlock(&decoder->transaction);
+	if (ret)
+		goto out;
+	ret = backend_prepare(backend, session, frontend);
+	if (ret)
+		goto out;
+	mutex_lock(&decoder->transaction);
+	id = (struct s7d_h264_checkpoint_id) {
+		.input_token = change->input_token,
+		.generation = change->generation,
+	};
+	ret = s7d_h264_input_checkpoint_restore(backend->checkpoint, backend->stream,
+						staging, &id, generation, &restored, &preflight);
+	if (!ret) {
+		backend->input = restored;
+		backend->input_pending = true;
+		backend->input_preflight = true;
+		backend->input_picture = preflight.kind == S7D_H264_INPUT_PICTURE;
+		backend->initial_token = restored.token;
+		backend->last_submitted = restored.token;
+		backend->initial_complete = true;
+		backend->sequence = backend->next_sequence;
+		backend->sequence_valid = true;
+		backend->sequence_syntax_valid = false;
+		ret = s7d_h264_input_get_au(backend->stream, restored.token, &backend->au);
+		if (!ret && (!backend->input_picture || !backend->au.idr ||
+			     !backend_same_sps(&backend->sequence.sps, &backend->au.sps, false)))
+			ret = -ESTALE;
+		if (!ret) {
+			s7d_h264_input_checkpoint_discard(&backend->checkpoint);
+			backend->change_pending = false;
+			backend->change_stopped = false;
+			memset(&backend->change, 0, sizeof(backend->change));
+			memset(&backend->next_sequence, 0, sizeof(backend->next_sequence));
+		}
+	}
 	mutex_unlock(&decoder->transaction);
 out:
 	mutex_unlock(&decoder->clients);
@@ -1613,6 +1843,11 @@ static int backend_clear_stream(void *priv)
 		     work_busy(&backend->timeout_work.work)))
 		ret = -EBUSY;
 	if (!ret) {
+		s7d_h264_input_checkpoint_discard(&backend->checkpoint);
+		memset(&backend->change, 0, sizeof(backend->change));
+		memset(&backend->next_sequence, 0, sizeof(backend->next_sequence));
+		backend->change_pending = false;
+		backend->change_stopped = false;
 		s7d_h264_parameters_clear(backend->parameters);
 		memset(&backend->sequence, 0, sizeof(backend->sequence));
 		backend->sequence_valid = false;
@@ -1639,6 +1874,8 @@ static const struct s7d_v4l2_backend_ops frontend_ops = {
 	.detach = backend_detach,
 	.reset = backend_reset,
 	.clear_stream = backend_clear_stream,
+	.reconfigure_stop = backend_reconfigure_stop,
+	.reconfigure_restore = backend_reconfigure_restore,
 };
 
 static int backend_factory_ready(void *priv)
@@ -1698,6 +1935,7 @@ static void backend_factory_destroy(void *priv, void *instance)
 	if (ret)
 		goto retained;
 	mutex_lock(&decoder->transaction);
+	s7d_h264_input_checkpoint_discard(&backend->checkpoint);
 	s7d_h264_parameters_destroy(backend->parameters);
 	backend->parameters = NULL;
 	mutex_unlock(&decoder->transaction);
