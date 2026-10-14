@@ -6,6 +6,10 @@
 #ifndef __AML_SPI_H_
 #define __AML_SPI_H_
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+#include <linux/atomic.h>
+
+#endif
 #define SPI_INVALID_CS		((s8)-1)
 #define MESON_SPI_CS_CNT_MAX	4
 #define SPICC_DEFAULT_CS	0
@@ -280,6 +284,9 @@ struct spicc_device {
 	bool				keep_ready;
 	bool				pending;
 	spinlock_t			lock; /* for unexpect interrupt */
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	atomic_t			transfer_active;
+#endif
 #ifdef MESON_SPICC_HW_IF
 	void (*dirspi_complete)(void *context);
 	void *dirspi_context;

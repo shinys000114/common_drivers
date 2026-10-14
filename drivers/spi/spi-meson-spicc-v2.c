@@ -165,6 +165,10 @@ static inline int spicc_sem_down_read(struct spicc_device *spicc)
 {
 	int ret;
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	if (atomic_cmpxchg(&spicc->transfer_active, 0, 1))
+		return 0;
+#endif
 	if (spicc->ready)
 		return 1;
 
@@ -172,6 +176,10 @@ static inline int spicc_sem_down_read(struct spicc_device *spicc)
 	if (ret) {
 		spicc_writel(spicc, 0, SPICC_REG_CFG_READY);
 		spicc->ready = true;
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	} else {
+		atomic_set_release(&spicc->transfer_active, 0);
+#endif
 	}
 
 	return ret;
@@ -179,11 +187,19 @@ static inline int spicc_sem_down_read(struct spicc_device *spicc)
 
 static inline void spicc_sem_up_write(struct spicc_device *spicc)
 {
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	if (spicc->ready && !spicc->keep_ready) {
+		spicc_writel(spicc, 1, SPICC_REG_CFG_READY);
+		spicc->ready = false;
+	}
+	atomic_set_release(&spicc->transfer_active, 0);
+#else
 	if (!spicc->ready || spicc->keep_ready)
 		return;
 
 	spicc_writel(spicc, 1, SPICC_REG_CFG_READY);
 	spicc->ready = false;
+#endif
 }
 
 static void spicc_set_cs(struct spi_device *spi, bool enable)
@@ -1846,6 +1862,9 @@ static int meson_spicc_probe(struct platform_device *pdev)
 	}
 
 	spin_lock_init(&spicc->lock);
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	atomic_set(&spicc->transfer_active, 0);
+#endif
 	init_completion(&spicc->completion);
 
 	spicc->cfg_spi.d32 = 0;
