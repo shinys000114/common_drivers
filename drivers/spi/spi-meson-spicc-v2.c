@@ -210,18 +210,37 @@ static void spicc_set_cs(struct spi_device *spi, bool enable)
 static int spicc_set_speed(struct spicc_device *spicc, uint speed_hz)
 {
 	u32 div;
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	int ret;
+#endif
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	if (!speed_hz)
+		return spicc->actual_speed_hz ? 0 : -EINVAL;
+	if (speed_hz == spicc->speed_hz && spicc->pclk_rate)
+		return 0;
+
+	ret = clk_set_rate(spicc->sclk, speed_hz);
+	if (ret)
+		return ret;
+#else
 	if (!speed_hz || (speed_hz == spicc->speed_hz && spicc->pclk_rate))
 		return 0;
 
 	spicc->speed_hz = speed_hz;
 	clk_set_rate(spicc->sclk, speed_hz);
+#endif
 	/* Store the div for the descriptor mode */
 	div = FIELD_GET(SPICC_CLK_DIV_MASK,
 			spicc_readl(spicc, SPICC_REG_CFG_BUS));
 	spicc->cfg_bus.b.clk_div = div;
 	spicc->actual_speed_hz = clk_get_rate(spicc->sclk);
 	spicc->pclk_rate = clk_get_rate(spicc->spi_clk);
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	if (!spicc->actual_speed_hz || !spicc->pclk_rate)
+		return -EINVAL;
+	spicc->speed_hz = speed_hz;
+#endif
 	if (spicc->data->cs_hold_ctrl_conflict_with_keep_ss)
 		spicc->cs_hold_min_in_pclk = 0;
 	else
@@ -233,6 +252,24 @@ static int spicc_set_speed(struct spicc_device *spicc, uint speed_hz)
 	return 0;
 }
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+static u64 spicc_xfer_time_us(struct spicc_device *spicc, unsigned int len)
+{
+	/* Byte mode inserts one SCLK between bytes (S905X5M, section 12.4.5). */
+	return DIV_ROUND_UP_ULL(9ULL * len * USEC_PER_SEC,
+			      spicc->actual_speed_hz);
+}
+
+static unsigned long spicc_timeout_ms(u64 time_us)
+{
+	u64 ms = DIV_ROUND_UP_ULL(time_us, USEC_PER_MSEC);
+
+	/* Match the SPI core's scheduling/IRQ tolerance, without overflowing. */
+	ms = min_t(u64, ms, (UINT_MAX - 200) / 2);
+	return 2 * ms + 200;
+}
+
+#else
 static inline unsigned long spicc_xfer_time_max(struct spicc_device *spicc,
 						int len)
 {
@@ -246,6 +283,7 @@ static inline unsigned long spicc_xfer_time_max(struct spicc_device *spicc,
 
 	return ms;
 }
+#endif
 
 #ifdef SPICC_DEBUG_EN
 static void meson_spicc_dump(struct spicc_device *spicc,
@@ -453,6 +491,30 @@ static void meson_spicc_config_cs_hold(struct spicc_device *spicc,
 	}
 }
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+static u64 spicc_cs_time_us(struct spicc_device *spicc,
+			   struct spicc_descriptor *descs, int desc_num,
+			   bool is_desc_cs_hold)
+{
+	struct spicc_descriptor *last = descs + desc_num - 1;
+	u64 clocks = (u64)spicc->cfg_spi.b.cs_hold * desc_num;
+	int i;
+
+	/* Conservatively include setup/hold for every descriptor in the chain. */
+	for (i = 0; i < desc_num; i++) {
+		u64 setup = descs[i].cfg_bus.b.cs_setup;
+
+		setup += spicc->cfg_spi.b.cs_setup_extend << 4;
+		clocks += setup * (descs[i].cfg_bus.b.clk_div + 1);
+	}
+	if (is_desc_cs_hold)
+		clocks += 9ULL * last->cfg_start.b.block_num *
+			  (last->cfg_bus.b.clk_div + 1);
+
+	return DIV_ROUND_UP_ULL(clocks * USEC_PER_SEC, spicc->pclk_rate);
+}
+
+#endif
 static int meson_spicc_config(struct spicc_device *spicc,
 			      struct spi_device *spi)
 {
@@ -559,7 +621,14 @@ static int spicc_config_desc_one_transfer(struct spicc_device *spicc,
 	memset(desc, 0, sizeof(*desc));
 	if (exdesc)
 		memset(exdesc, 0, sizeof(*exdesc));
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	ret = spicc_set_speed(spicc, xfer->speed_hz);
+	if (ret)
+		return ret;
+	xfer->effective_speed_hz = spicc->actual_speed_hz;
+#else
 	spicc_set_speed(spicc, xfer->speed_hz);
+#endif
 	desc->cfg_start.d32 = spicc->cfg_start.d32;
 	desc->cfg_bus.d32 = spicc->cfg_bus.d32;
 
@@ -831,14 +900,13 @@ static int meson_spicc_transfer_segment(struct spicc_device *spicc,
 	struct spi_transfer *xfer;
 	struct spicc_descriptor *descs, *desc;
 	struct spicc_descriptor_extra *exdescs, *exdesc;
-	unsigned long ms = 0;
+	u64 time_us = 0;
 	int desc_num = 0, descs_len;
 	bool is_desc_cs_hold;
 	int ret;
 
 	for (xfer = first; ; xfer = list_next_entry(xfer, transfer_list)) {
 		desc_num++;
-		ms += spicc_xfer_time_max(spicc, xfer->len);
 		if (xfer == last)
 			break;
 	}
@@ -868,6 +936,7 @@ static int meson_spicc_transfer_segment(struct spicc_device *spicc,
 			dev_err(dev, "config descriptor failed\n");
 			goto end;
 		}
+		time_us += spicc_xfer_time_us(spicc, xfer->len);
 
 		if (is_last_xfer)
 			break;
@@ -877,10 +946,11 @@ static int meson_spicc_transfer_segment(struct spicc_device *spicc,
 	meson_spicc_config_cs_setup(spicc, desc, &spicc->cs_setup);
 	desc = descs + desc_num - 1;
 	meson_spicc_config_cs_hold(spicc, is_desc_cs_hold, desc, &spicc->cs_hold);
+	time_us += spicc_cs_time_us(spicc, descs, desc_num, is_desc_cs_hold);
 	meson_spicc_dump(spicc, descs, exdescs, desc_num);
 
 	ret = meson_spicc_transfer_descs(spicc, msg->spi, descs, desc_num,
-					 descs_len, ms);
+					 descs_len, spicc_timeout_ms(time_us));
 end:
 	desc = descs;
 	exdesc = exdescs;
@@ -1029,7 +1099,12 @@ static int meson_spicc_transfer_one_message(struct spi_controller *ctlr,
 	struct spicc_device *spicc = spi_controller_get_devdata(ctlr);
 	struct device *dev = &spicc->pdev->dev;
 	struct spicc_controller_data *cdata = msg->spi->controller_data;
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	u64 time_us = 0;
+	unsigned long ms;
+#else
 	unsigned long ms = spicc_xfer_time_max(spicc, msg->frame_length);
+#endif
 	struct spi_transfer *xfer;
 	struct spicc_descriptor *descs, *desc;
 	struct spicc_descriptor_extra *exdescs, *exdesc;
@@ -1090,12 +1165,19 @@ static int meson_spicc_transfer_one_message(struct spi_controller *ctlr,
 			dev_err(dev, "config descriptor failed\n");
 			goto end;
 		}
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+		time_us += spicc_xfer_time_us(spicc, xfer->len);
+#endif
 	}
 
 	desc = descs;
 	meson_spicc_config_cs_setup(spicc, desc, &spicc->cs_setup);
 	desc = descs + desc_num - 1;
 	meson_spicc_config_cs_hold(spicc, is_desc_cs_hold, desc, &spicc->cs_hold);
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	time_us += spicc_cs_time_us(spicc, descs, desc_num, is_desc_cs_hold);
+	ms = spicc_timeout_ms(time_us);
+#endif
 	meson_spicc_dump(spicc, descs, exdescs, desc_num);
 
 	descs_paddr = dma_map_single(dev, (void *)descs,
@@ -1342,8 +1424,16 @@ static int dirspi_async(struct spi_device *spi,
 	if (complete)
 		return 1;
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	ret = spicc_wait_complete(spicc, SPICC_DESC_CHAIN_DONE,
+			msecs_to_jiffies(spicc_timeout_ms(
+				spicc_xfer_time_us(spicc, len) +
+				spicc_cs_time_us(spicc, spicc->dirspi_desc,
+						 desc_num, is_desc_cs_hold))));
+#else
 	ret = spicc_wait_complete(spicc, SPICC_DESC_CHAIN_DONE,
 			msecs_to_jiffies(spicc_xfer_time_max(spicc, len)));
+#endif
 
 	spin_lock_irqsave(&spicc->lock, flags);
 	spicc->pending = false;
