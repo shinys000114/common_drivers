@@ -22,6 +22,7 @@ struct s7d_afbc_engine_io {
 	int (*read)(void *data, u32 reg, u32 *value);
 	int (*write)(void *data, u32 reg, u32 value);
 	int (*check_start)(void *data, u64 sequence, u8 field);
+	int (*reset_idle)(void *data);
 };
 
 struct s7d_afbc_observation {
@@ -111,5 +112,8 @@ int s7d_afbc_engine_stop_finish(struct s7d_afbc_engine *e);
 bool s7d_afbc_engine_can_abort_prepare(const struct s7d_afbc_engine *e);
 /* First config failure only; caller has drained native RDMA/OSD reads. */
 int s7d_afbc_engine_abort_prepare(struct s7d_afbc_engine *e, u32 *failed_reg);
+bool s7d_afbc_engine_can_recover_detiling(const struct s7d_afbc_engine *e);
+/* Process context, after IRQ/work exclusion and RDMA/OSD/AXI drain. */
+int s7d_afbc_engine_recover_detiling(struct s7d_afbc_engine *e, u32 *failed_reg);
 
 #endif

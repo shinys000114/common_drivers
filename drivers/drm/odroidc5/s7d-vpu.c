@@ -17,8 +17,11 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_vblank.h>
 
+#include <dt-bindings/reset/amlogic,s7d-vpu-reset.h>
+
 #include "s7d-vpu.h"
 #include "s7d-vpp.h"
+#include "s7d-plane.h"
 
 #define CREATE_TRACE_POINTS
 #include "s7d-trace.h"
@@ -147,10 +150,13 @@ static int s7d_vpu_afbc_check_start(void *data, u64 sequence, u8 field)
 	return 0;
 }
 
+static int s7d_vpu_afbc_reset_idle(void *data);
+
 static const struct s7d_afbc_engine_io s7d_vpu_afbc_io = {
 	.read = s7d_vpu_afbc_read,
 	.write = s7d_vpu_afbc_write,
 	.check_start = s7d_vpu_afbc_check_start,
+	.reset_idle = s7d_vpu_afbc_reset_idle,
 };
 
 static void s7d_vpu_afbc_timeout(struct work_struct *work)
@@ -194,6 +200,93 @@ static int s7d_vpu_afbc_resets(struct s7d_vpu *v)
 			return ret < 0 ? ret : -EHOSTDOWN;
 	}
 	return 0;
+}
+
+static bool s7d_vpu_afbc_fault_owned(struct s7d_vpu *v)
+{
+	struct s7d_scanout *s = &v->scanout;
+	unsigned long flags;
+	unsigned int i, slot = v->afbc.bound.surface_mask == BIT(0) ?
+		S7D_PLANE_PRIMARY : S7D_PLANE_RGB;
+	bool owned;
+
+	spin_lock_irqsave(&s->lock, flags);
+	owned = s->fault && s->phase == S7D_SCANOUT_IDLE &&
+		v->afbc_surface_mask == v->afbc.bound.surface_mask &&
+		v->afbc_unpack_mask == (v->afbc.bound.unpack.mask & ~GENMASK(15, 0)) &&
+		s->active.afbc.fb && s->active.fb[slot] == s->active.afbc.fb &&
+		s->active.afbc.generation == v->afbc.generation &&
+		s->active.generation >= s->active.afbc.generation &&
+		s->generation >= s->active.generation &&
+		!s->pending_afbc_epoch &&
+		!s7d_afbc_check_state(&s->active.afbc.plan) &&
+		s7d_afbc_same_layout(&s->active.afbc.plan, &v->afbc.bound) &&
+		s->active.afbc.plan.header_addr == v->afbc.bound.header_addr;
+	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
+		if (s->pending.fb[i] || s->retired.fb[i])
+			owned = false;
+	spin_unlock_irqrestore(&s->lock, flags);
+	return owned;
+}
+
+static int s7d_vpu_afbc_reset_check(struct s7d_vpu *v, u32 reg, u32 mask, u32 expected)
+{
+	u32 value;
+	int ret;
+
+	v->failed_reg = reg;
+	ret = s7d_vpu_afbc_read(v, reg, &value);
+	return ret ? ret : (value & mask) == expected ? 0 : -EBUSY;
+}
+
+static int s7d_vpu_afbc_reset_idle(void *data)
+{
+	struct s7d_vpu *v = data;
+	struct reset_control *reset = v->local_resets[S7D_VPU_RESET_AFBCD_LOGIC].rstc;
+	static const u32 osds[] = { OSD1_CTRL, OSD2_CTRL };
+	static const u32 videos[] = { VD1_GEN, VD2_GEN };
+	unsigned int i;
+	int ret;
+
+	if (!v->acquired || !s7d_vpu_afbc_fault_owned(v))
+		return -EHOSTDOWN;
+	v->failed_reg = 0;
+	ret = reset_control_status(v->rdma.reset);
+	if (ret != 1)
+		return ret < 0 ? ret : -EBUSY;
+	v->failed_reg = 0x1a01;
+	ret = s7d_vpu_afbc_resets(v);
+	if (ret)
+		return ret;
+	ret = s7d_vpu_afbc_reset_check(v, RDARB_MODE_L2, GENMASK(18, 16), 0);
+	for (i = 0; !ret && i < ARRAY_SIZE(videos); i++)
+		ret = s7d_vpu_afbc_reset_check(v, videos[i], VD1_BUSY | BIT(0), 0);
+	for (i = 0; !ret && i < ARRAY_SIZE(osds); i++) {
+		ret = s7d_vpu_afbc_reset_check(v, osds[i], OSD_ACTUAL_EN | BIT(0), 0);
+		if (!ret)
+			ret = s7d_vpu_afbc_reset_check(v, osds[i] + OSD_FIFO_OFFSET,
+						      OSD_FIFO_STATE, 0);
+	}
+	if (!ret)
+		ret = s7d_vpu_afbc_reset_check(v, ASYNC_STAT, ASYNC_IDLE, ASYNC_IDLE);
+	if (!ret)
+		ret = s7d_vpu_afbc_reset_check(v, AFBC_STATUS, U32_MAX, BIT(2));
+	if (!ret)
+		ret = s7d_vpu_afbc_reset_check(v, AFBC_TOP, BIT(31) | BIT(23), BIT(23));
+	if (ret)
+		return ret;
+	v->failed_reg = 0x1a01;
+	ret = reset_control_assert(reset);
+	if (ret)
+		return ret;
+	ret = reset_control_status(reset);
+	if (ret != 1)
+		return ret < 0 ? ret : -EIO;
+	ret = reset_control_deassert(reset);
+	if (ret)
+		return ret;
+	ret = reset_control_status(reset);
+	return ret < 0 ? ret : ret ? -EIO : 0;
 }
 
 static void s7d_vpu_afbc_admission(struct s7d_vpu *v)
@@ -489,6 +582,7 @@ static int s7d_vpu_stop_hw(void *data)
 	unsigned int i;
 	const struct s7d_afbc_surface *surface = NULL;
 	bool abort_prepare = false;
+	bool recover_detiling = false;
 	int ret;
 
 	mask_irqs(v);
@@ -511,7 +605,9 @@ static int s7d_vpu_stop_hw(void *data)
 		if (!surface || (v->normal_unpack_owned & surface->mask))
 			return -EIO;
 		abort_prepare = s7d_afbc_engine_can_abort_prepare(&v->afbc);
-		if (!abort_prepare) {
+		recover_detiling = s7d_afbc_engine_can_recover_detiling(&v->afbc) &&
+			s7d_vpu_afbc_fault_owned(v);
+		if (!abort_prepare && !recover_detiling) {
 			ret = s7d_afbc_engine_stop_begin(&v->afbc);
 			if (ret)
 				return ret;
@@ -520,7 +616,7 @@ static int s7d_vpu_stop_hw(void *data)
 	ret = s7d_rdma_quiesce(&v->rdma);
 	if (ret)
 		return ret;
-	if (v->afbc_enabled && !abort_prepare) {
+	if (v->afbc_enabled && !abort_prepare && !recover_detiling) {
 		ret = s7d_vpu_afbc_stop_decode(v);
 		if (ret)
 			return ret;
@@ -587,6 +683,15 @@ static int s7d_vpu_stop_hw(void *data)
 			if (ret)
 				dev_err(v->dev, "AFBC prepare abort failed: %d reg %#x; retaining scanout resources\n",
 					ret, v->failed_reg);
+		} else if (recover_detiling) {
+			u32 fault_reg = v->afbc.failed_reg;
+
+			dev_err(v->dev, "AFBC detiling fault: gen %llu epoch %llu raw %#x status %#x; resetting drained decoder\n",
+				v->afbc.failed_generation, v->afbc.failed_epoch,
+				v->afbc.observed.raw, v->afbc.observed.status);
+			ret = s7d_afbc_engine_recover_detiling(&v->afbc, &v->failed_reg);
+			if (!ret)
+				v->failed_reg = fault_reg;
 		} else {
 			ret = s7d_afbc_engine_stop_finish(&v->afbc);
 		}
@@ -655,7 +760,7 @@ static int s7d_vpu_stop(void *data)
 	int ret = s7d_vpu_stop_hw(v);
 
 	if (ret && v->afbc_enabled)
-		return s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
+		s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
 	return ret;
 }
 
@@ -1137,8 +1242,12 @@ static void s7d_vpu_report_error(void *data, int error)
 			v->afbc.observed.status, v->afbc.observed.top,
 			v->afbc.observed.surfaces, v->afbc.failed_readback,
 			v->afbc.failed_expected, v->afbc.failed_observed);
-	dev_err(v->dev, "display stopped: %d, VCBUS word %#x; modeset required\n",
-		error, v->failed_reg);
+	if (v->acquired)
+		dev_err(v->dev, "display stop incomplete: %d, VCBUS word %#x; scanout resources retained\n",
+			error, v->failed_reg);
+	else
+		dev_err(v->dev, "display stopped: %d, VCBUS word %#x; full modeset required\n",
+			error, v->failed_reg);
 }
 
 const struct s7d_crtc_ops s7d_vpu_crtc_ops = {

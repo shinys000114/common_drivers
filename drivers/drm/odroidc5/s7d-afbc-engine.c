@@ -19,6 +19,7 @@
 #define AFBC_READOUT		BIT(0)
 #define AFBC_SWAPPED		BIT(1)
 #define AFBC_RAW_ERROR		GENMASK(5, 2)
+#define AFBC_DETILING_ERROR	BIT(3)
 #define AFBC_ACTIVE		BIT(0)
 #define AFBC_SWAPPING		BIT(1)
 #define AFBC_ERROR_STATUS	BIT(2)
@@ -658,5 +659,141 @@ int s7d_afbc_engine_abort_prepare(struct s7d_afbc_engine *e, u32 *failed_reg)
 	e->pending_valid = false;
 	e->pending_ready = false;
 	e->phase = S7D_AFBC_STOPPED;
+	return 0;
+}
+
+bool s7d_afbc_engine_can_recover_detiling(const struct s7d_afbc_engine *e)
+{
+	return e->phase == S7D_AFBC_ERROR && e->last_error == -EIO &&
+		e->failed_phase == S7D_AFBC_RUNNING &&
+		(e->failed_reg == AFBC_RAW || e->failed_reg == AFBC_STATUS) &&
+		e->bound_valid && !e->pending_valid && e->generation &&
+		e->accepted_generation == e->generation &&
+		e->failed_generation == e->generation && e->epoch &&
+		e->failed_epoch == e->epoch && e->epoch != ~(u64)0 &&
+		!s7d_afbc_check_state(&e->bound) && e->io->reset_idle &&
+		(e->observed.raw & AFBC_RAW_ERROR) == AFBC_DETILING_ERROR &&
+		!(e->observed.raw & ~(AFBC_DETILING_ERROR | AFBC_READOUT | AFBC_SWAPPED)) &&
+		e->observed.status == AFBC_ERROR_STATUS &&
+		inactive(&e->observed) &&
+		(e->observed.top & AFBC_MANUAL_RESET) &&
+		e->observed.surfaces == e->bound.surface_mask;
+}
+
+static int fault_read(struct s7d_afbc_engine *e, u32 reg, u32 *value, u32 *failed_reg)
+{
+	*failed_reg = reg;
+	return e->io->read(e->data, reg, value);
+}
+
+static int fault_idle(struct s7d_afbc_engine *e, u32 *failed_reg)
+{
+	const struct s7d_afbc_surface *s = s7d_afbc_surface_get(e->bound.surface_mask);
+	u32 value;
+	int ret;
+
+	ret = fault_read(e, s->ctrl, &value, failed_reg);
+	if (ret)
+		return ret;
+	if (value & (BIT(0) | OSD_ACTUAL_ENABLE))
+		return -EBUSY;
+	ret = fault_read(e, s->fifo, &value, failed_reg);
+	if (ret)
+		return ret;
+	if (value & OSD_FIFO_BUSY)
+		return -EBUSY;
+	ret = fault_read(e, READ0_STATUS, &value, failed_reg);
+	if (ret)
+		return ret;
+	return value & BIT(0) ? 0 : -EBUSY;
+}
+
+int s7d_afbc_engine_recover_detiling(struct s7d_afbc_engine *e, u32 *failed_reg)
+{
+	struct s7d_afbc_observation o;
+	u64 accepted_generation = e->accepted_generation, epoch = e->epoch;
+	u32 value, clear;
+	int ret;
+
+	if (!s7d_afbc_engine_can_recover_detiling(e))
+		return e->phase == S7D_AFBC_ERROR ? e->last_error : -EINVAL;
+	ret = fault_read(e, AFBC_RAW, &o.raw, failed_reg);
+	if (ret)
+		return ret;
+	if ((o.raw & AFBC_RAW_ERROR) != AFBC_DETILING_ERROR ||
+	    (o.raw & ~(AFBC_DETILING_ERROR | AFBC_READOUT | AFBC_SWAPPED)))
+		return -EIO;
+	ret = fault_read(e, AFBC_STATUS, &o.status, failed_reg);
+	if (ret)
+		return ret;
+	if (o.status != AFBC_ERROR_STATUS)
+		return -EBUSY;
+	ret = fault_read(e, AFBC_TOP, &o.top, failed_reg);
+	if (ret)
+		return ret;
+	if ((o.top & AFBC_TOP_ACTIVE) || !(o.top & AFBC_MANUAL_RESET))
+		return -EBUSY;
+	ret = fault_read(e, AFBC_SURFACES, &o.surfaces, failed_reg);
+	if (ret)
+		return ret;
+	if (o.surfaces != e->bound.surface_mask)
+		return -EIO;
+	ret = fault_idle(e, failed_reg);
+	if (ret)
+		return ret;
+	*failed_reg = 0x1a01;
+	ret = e->io->reset_idle(e->data);
+	if (ret)
+		return ret;
+	ret = fault_read(e, AFBC_RAW, &value, failed_reg);
+	if (ret)
+		return ret;
+	if (value & ~(AFBC_DETILING_ERROR | AFBC_READOUT | AFBC_SWAPPED))
+		return -EIO;
+	clear = value;
+	ret = fault_read(e, AFBC_STATUS, &value, failed_reg);
+	if (ret)
+		return ret;
+	if (value)
+		return -EIO;
+	ret = fault_read(e, AFBC_TOP, &value, failed_reg);
+	if (ret)
+		return ret;
+	if ((value & AFBC_TOP_ACTIVE) || !(value & AFBC_MANUAL_RESET))
+		return -EIO;
+	*failed_reg = AFBC_SURFACES;
+	ret = e->io->write(e->data, AFBC_SURFACES, 0);
+	if (!ret)
+		ret = fault_read(e, AFBC_SURFACES, &value, failed_reg);
+	if (ret)
+		return ret;
+	if (value)
+		return -EIO;
+	*failed_reg = AFBC_CLEAR;
+	ret = e->io->write(e->data, AFBC_CLEAR, clear);
+	if (!ret)
+		ret = fault_read(e, AFBC_RAW, &value, failed_reg);
+	if (ret)
+		return ret;
+	if (value)
+		return -EIO;
+	ret = fault_read(e, AFBC_STATUS, &value, failed_reg);
+	if (ret)
+		return ret;
+	if (value)
+		return -EIO;
+	ret = fault_read(e, AFBC_TOP, &value, failed_reg);
+	if (ret)
+		return ret;
+	if ((value & AFBC_TOP_ACTIVE) || !(value & AFBC_MANUAL_RESET))
+		return -EIO;
+	ret = fault_idle(e, failed_reg);
+	if (ret)
+		return ret;
+	/* Discard completion authority without reusing generation or epoch. */
+	s7d_afbc_engine_init(e, e->io, e->data);
+	e->accepted_generation = accepted_generation;
+	e->epoch = epoch;
+	*failed_reg = 0;
 	return 0;
 }
