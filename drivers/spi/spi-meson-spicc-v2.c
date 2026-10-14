@@ -1128,8 +1128,7 @@ static irqreturn_t meson_spicc_irq(int irq, void *data)
 
 	sts = spicc_readl(spicc, SPICC_REG_IRQ_STS);
 #ifdef CONFIG_ARCH_MESON_ODROID_COMMON
-	if (spicc->pending)
-		spicc->irq_status |= sts;
+	spicc->irq_status |= sts;
 #endif
 	spicc->status = sts & SPICC_STATUS_ERROR;
 	if (!spicc->pending) {
