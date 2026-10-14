@@ -422,8 +422,10 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (ret)
 		return ret;
 	if (old && old->active &&
-	    !s7d_video_scaler_same_config(&to_s7d_crtc_state(old)->video.scaler,
-					  &state->video.scaler))
+	    (!s7d_video_scaler_same_config(&to_s7d_crtc_state(old)->video.scaler,
+					   &state->video.scaler) ||
+	     memcmp(to_s7d_crtc_state(old)->video.setup, state->video.setup,
+		    sizeof(state->video.setup))))
 		base->mode_changed = true;
 	ret = s7d_video_build_vd2_pipeline(video2 ? &video2->video : NULL,
 		video2 ? &video2_dst : NULL, &state->video2);

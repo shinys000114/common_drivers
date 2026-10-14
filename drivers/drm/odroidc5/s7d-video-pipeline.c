@@ -52,11 +52,13 @@ static int check_layout(const struct s7d_video_state *layout,
 {
 	u32 x_start, x_end, y_start, y_end;
 	u32 chroma_x, chroma_y;
+	bool packed = layout->format == DRM_FORMAT_UYVY;
 
 	if (!dst || (layout->format != DRM_FORMAT_NV12 &&
-		     layout->format != DRM_FORMAT_NV21) ||
+		     layout->format != DRM_FORMAT_NV21 && !packed) ||
 	    !layout->stride[0] || layout->stride[0] > 0x1fff ||
-	    !layout->stride[1] || layout->stride[1] > 0x1fff ||
+	    (packed ? layout->stride[1] || layout->frame_addr[1] :
+	     !layout->stride[1] || layout->stride[1] > 0x1fff) ||
 	    ((layout->scope_x[0] | layout->scope_x[1] |
 	      layout->scope_y[0] | layout->scope_y[1]) & ~0x1fff1fffU) ||
 	    dst->x1 < 0 || dst->y1 < 0 || dst->x2 > 8192 || dst->y2 > 8192 ||
@@ -70,11 +72,12 @@ static int check_layout(const struct s7d_video_state *layout,
 	if (x_end < x_start || y_end < y_start ||
 	    ((x_start | y_start | (x_end + 1) | (y_end + 1)) & 1) ||
 	    x_end >= S7D_VIDEO_MAX_WIDTH || y_end >= S7D_VIDEO_MAX_HEIGHT ||
-	    x_end + 1 > layout->stride[0] * 16 ||
-	    x_end + 1 > layout->stride[1] * 16)
+	    (x_end + 1) * (packed ? 2 : 1) > layout->stride[0] * 16 ||
+	    (!packed && x_end + 1 > layout->stride[1] * 16))
 		return -EINVAL;
 	chroma_x = ((x_end >> 1) << 16) | (x_start >> 1);
-	chroma_y = ((y_end >> 1) << 16) | (y_start >> 1);
+	chroma_y = packed ? layout->scope_y[0] :
+		((y_end >> 1) << 16) | (y_start >> 1);
 	*width = x_end - x_start + 1;
 	*height = y_end - y_start + 1;
 	if (layout->scope_x[1] != chroma_x || layout->scope_y[1] != chroma_y)
@@ -136,7 +139,14 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 	if (s7d_video_scaler_build(width, height, drm_rect_width(dst),
 				   drm_rect_height(dst), &next.scaler))
 		return -EINVAL;
-	color = layout->format == DRM_FORMAT_NV12 ? 2 : 1;
+	if (layout->format == DRM_FORMAT_UYVY) {
+		next.setup[0].value = (next.setup[0].value & ~BIT(1)) | BIT(14);
+		next.control.value = next.setup[0].value;
+		next.setup[2].value = 0x30310c20;
+		color = 0;
+	} else {
+		color = layout->format == DRM_FORMAT_NV12 ? 2 : 1;
+	}
 	/* SC2/T7 linear access requires STRIDE1[16], outside the stride. */
 	next.update[0] = (struct s7d_rdma_entry)REG(VD1_BADDR_Y, layout->frame_addr[0]);
 	next.update[1] = (struct s7d_rdma_entry)REG(VD1_BADDR_CB, layout->frame_addr[1]);
@@ -168,6 +178,8 @@ int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
 	int ret;
 
 	if (!out)
+		return -EINVAL;
+	if (layout && layout->format == DRM_FORMAT_UYVY)
 		return -EINVAL;
 	ret = s7d_video_build_pipeline(layout, dst, 8, &next);
 	if (ret)

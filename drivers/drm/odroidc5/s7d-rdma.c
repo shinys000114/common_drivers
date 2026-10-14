@@ -199,23 +199,28 @@ static bool display_write_valid(u32 reg, u32 value)
 		return value == BIT(20) || value == (BIT(20) | (1 << 8)) ||
 		       value == (BIT(20) | (2 << 8));
 	case 0x4880:
-	case 0x4800:
 		return value == 0x38400052 || value == 0x38400053;
+	case 0x4800:
+		return value == 0x38400052 || value == 0x38400053 ||
+		       value == 0x38404050 || value == 0x38404051;
 	case 0x4899:
-	case 0x4819:
 		return value == 1 || value == 2;
+	case 0x4819:
+		return value <= 2;
 	case 0x48a0:
 	case 0x48a1:
 	case 0x4820:
 	case 0x4821:
 		return true;
 	case 0x48a3:
-	case 0x4823:
 		return !(value & ~0x1fff1fffU) &&
 		       (value & 0x1fff) && (value >> 16);
+	case 0x4823:
+		return !(value & ~0x1fff1fffU) && (value & 0x1fff);
 	case 0x48a4:
-	case 0x4824:
 		return !(value & ~0x11fffU) && (value & BIT(16)) && (value & 0x1fff);
+	case 0x4824:
+		return !(value & ~0x11fffU) && (value & BIT(16));
 	case 0x489e:
 		return (value >> 16) >= 2 && (value >> 16) <= 2048 &&
 		       !(value & BIT(16)) && (value & 0xffff) == (value >> 17);
