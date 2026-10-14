@@ -41,6 +41,8 @@ struct s7d_v4l2_buffer {
 	struct s7d_codec_surface *surface;
 	u64 token;
 	u64 generation;
+	/* Independent from the surface generation, which may be rebound. */
+	u64 completion_epoch;
 };
 
 struct s7d_v4l2_context {
@@ -59,6 +61,7 @@ struct s7d_v4l2_context {
 	spinlock_t state_lock;
 	struct work_struct run_work;
 	struct work_struct drain_work;
+	struct delayed_work rebind_work;
 	struct s7d_codec_layout layout;
 	struct v4l2_pix_format_mplane output;
 	struct v4l2_pix_format_mplane capture;
@@ -71,6 +74,10 @@ struct s7d_v4l2_context {
 	u64 initial_token;
 	u64 drain_token;
 	u64 drain_epoch;
+	u64 completion_epoch;
+	u64 last_dequeued_epoch;
+	u64 cancelled_input_token;
+	u64 cancelled_drain_epoch;
 	u32 capture_sequence;
 	int stop_error;
 	bool sequence_valid;
@@ -81,11 +88,17 @@ struct s7d_v4l2_context {
 	bool capture_ready;
 	bool capture_stopping;
 	bool capture_only_stop;
+	bool capture_layout_retained;
+	bool rebind_pending;
 	bool drain_requested;
 	bool last_pending;
 	bool last_completing;
 	bool retired;
 };
+
+static int s7d_clear_stream_locked(struct s7d_v4l2_context *ctx);
+static int s7d_capture_rebind(struct s7d_v4l2_context *ctx);
+static void s7d_rebind_work(struct work_struct *work);
 
 static struct s7d_v4l2_buffer *s7d_buffer(struct vb2_buffer *vb)
 {
@@ -269,14 +282,25 @@ int s7d_v4l2_set_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format
 			goto unlock;
 	}
 	spin_lock_irqsave(&ctx->state_lock, flags);
-	if (ctx->retired || (s7d_output(format->type) && ctx->prepared) ||
-	    (s7d_capture(format->type) && ctx->capture_streaming)) {
+	if (ctx->retired || (ctx->ops.clear_stream && ctx->state == S7D_V4L2_FAILED) ||
+	    (s7d_output(format->type) && ctx->prepared) ||
+	    (s7d_capture(format->type) && ctx->capture_streaming))
 		ret = -EBUSY;
-	} else if (s7d_output(format->type)) {
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	if (ret)
+		goto unlock;
+	if (s7d_output(format->type)) {
+		ret = s7d_clear_stream_locked(ctx);
+		if (ret)
+			goto unlock;
+	}
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	if (s7d_output(format->type)) {
 		ctx->output = format->fmt.pix_mp;
 		ctx->layout = placeholder;
 		s7d_capture_format(&placeholder, &ctx->capture);
 		ctx->sequence_valid = false;
+		ctx->capture_layout_retained = false;
 	} else {
 		ctx->capture = format->fmt.pix_mp;
 		ctx->layout.format = ctx->capture.pixelformat == V4L2_PIX_FMT_NV21M ?
@@ -379,10 +403,22 @@ static bool s7d_can_submit_locked(struct s7d_v4l2_context *ctx,
 		return false;
 	if (ctx->state == S7D_V4L2_INITIALIZING)
 		return true;
+	if (ctx->ops.clear_stream && ctx->capture_streaming &&
+	    ctx->state == S7D_V4L2_DRAINING && !ctx->capture_ready)
+		return buffer->token <= ctx->drain_token;
 	if (!ctx->capture_streaming || !ctx->capture_ready)
 		return false;
 	return ctx->state == S7D_V4L2_DECODING ||
 	       (ctx->state == S7D_V4L2_DRAINING && buffer->token <= ctx->drain_token);
+}
+
+static bool s7d_can_drain_locked(struct s7d_v4l2_context *ctx)
+{
+	return !ctx->retired && !ctx->capture_stopping && ctx->prepared &&
+	       ctx->output_streaming && ctx->capture_streaming &&
+	       (ctx->capture_ready || ctx->ops.clear_stream) && !ctx->initial_pending &&
+	       ctx->state == S7D_V4L2_DRAINING && !ctx->drain_requested &&
+	       !ctx->active_input && ctx->last_consumed_token == ctx->drain_token;
 }
 
 static void s7d_device_run(void *priv)
@@ -391,14 +427,15 @@ static void s7d_device_run(void *priv)
 	unsigned long flags;
 
 	spin_lock_irqsave(&ctx->state_lock, flags);
+	if (!ctx->retired && !ctx->capture_stopping && ctx->prepared &&
+	    ctx->output_streaming && ctx->capture_streaming && ctx->sequence_valid &&
+	    ctx->rebind_pending && !ctx->initial_pending && !ctx->drain_requested &&
+	    !ctx->last_pending && !ctx->last_completing && ctx->state != S7D_V4L2_STOPPED)
+		mod_delayed_work(system_unbound_wq, &ctx->rebind_work, 0);
 	if (!ctx->retired &&
 	    s7d_can_submit_locked(ctx, v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx)))
 		queue_work(system_unbound_wq, &ctx->run_work);
-	if (!ctx->retired && !ctx->capture_stopping && ctx->prepared &&
-	    ctx->output_streaming &&
-	    ctx->capture_streaming && ctx->capture_ready &&
-	    ctx->state == S7D_V4L2_DRAINING && !ctx->drain_requested &&
-	    !ctx->active_input && ctx->last_consumed_token == ctx->drain_token)
+	if (s7d_can_drain_locked(ctx))
 		queue_work(system_unbound_wq, &ctx->drain_work);
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 }
@@ -437,8 +474,18 @@ static int s7d_retire(struct s7d_v4l2_context *ctx)
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	retired = ctx->retired;
 	ret = ctx->stop_error;
-	if (ctx->active_input)
-		s7d_claim_input_locked(ctx, ctx->active_input->token, false);
+	if (!retired) {
+		if (ctx->active_input) {
+			u64 token = ctx->active_input->token;
+
+			if (s7d_claim_input_locked(ctx, token, false))
+				ctx->cancelled_input_token = token;
+		}
+		if (ctx->state == S7D_V4L2_DRAINING && ctx->drain_requested &&
+		    !ctx->active_input && !ctx->last_pending && !ctx->last_completing &&
+		    ctx->last_consumed_token == ctx->drain_token)
+			ctx->cancelled_drain_epoch = ctx->drain_epoch;
+	}
 	ctx->retired = true;
 	ctx->state = S7D_V4L2_FAILED;
 	ctx->output_streaming = false;
@@ -465,10 +512,11 @@ static int s7d_stop(struct s7d_v4l2_context *ctx)
 
 	cancel_work_sync(&ctx->run_work);
 	cancel_work_sync(&ctx->drain_work);
+	cancel_delayed_work_sync(&ctx->rebind_work);
 	return ret;
 }
 
-static int s7d_reset(struct s7d_v4l2_context *ctx)
+static int s7d_reset(struct s7d_v4l2_context *ctx, bool capture_streaming)
 {
 	struct s7d_codec_session *session;
 	struct s7d_v4l2_buffer *buffer;
@@ -481,6 +529,12 @@ static int s7d_reset(struct s7d_v4l2_context *ctx)
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	ret = ctx->stop_error;
 	if (!ctx->retired || ret) {
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		goto unlock;
+	}
+	if (ctx->ops.clear_stream && ctx->session &&
+	    (ctx->generation == U64_MAX || ctx->completion_epoch == U64_MAX)) {
+		ret = ctx->stop_error = -EOVERFLOW;
 		spin_unlock_irqrestore(&ctx->state_lock, flags);
 		goto unlock;
 	}
@@ -511,9 +565,18 @@ static int s7d_reset(struct s7d_v4l2_context *ctx)
 	if (session)
 		s7d_codec_session_put(session);
 	v4l2_m2m_clear_state(ctx->fh.m2m_ctx);
+	vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	ctx->prepared = false;
-	ctx->sequence_valid = false;
+	if (!ctx->ops.clear_stream)
+		ctx->sequence_valid = false;
+	if (ctx->ops.clear_stream && session) {
+		ctx->generation++;
+		ctx->completion_epoch++;
+	}
+	ctx->last_dequeued_epoch = 0;
+	ctx->cancelled_input_token = 0;
+	ctx->cancelled_drain_epoch = 0;
 	ctx->active_input = NULL;
 	ctx->last_consumed_token = ctx->next_input_token;
 	ctx->initial_token = 0;
@@ -522,15 +585,115 @@ static int s7d_reset(struct s7d_v4l2_context *ctx)
 	ctx->drain_requested = false;
 	ctx->last_pending = false;
 	ctx->last_completing = false;
-	ctx->capture_sequence = 0;
+	if (!capture_streaming)
+		ctx->capture_sequence = 0;
 	ctx->capture_stopping = false;
 	ctx->capture_only_stop = false;
+	ctx->capture_streaming = capture_streaming;
+	ctx->capture_ready = false;
+	ctx->rebind_pending = false;
 	ctx->state = S7D_V4L2_IDLE;
 	ctx->retired = false;
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 unlock:
 	mutex_unlock(&ctx->retire_lock);
 	return ret;
+}
+
+/* Caller holds the native queue lock; generic buffer release must succeed first. */
+static int s7d_clear_stream_locked(struct s7d_v4l2_context *ctx)
+{
+	unsigned long flags;
+	int ret;
+
+	lockdep_assert_held(&ctx->queue_lock);
+	if (!ctx->ops.clear_stream)
+		return 0;
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	ret = ctx->retired || ctx->state == S7D_V4L2_FAILED || ctx->stop_error ?
+		-ESHUTDOWN : ctx->session || ctx->prepared ? -EBUSY : 0;
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	if (ret)
+		return ret;
+	mutex_lock(&ctx->backend_lock);
+	ret = ctx->ops.clear_stream(ctx->backend);
+	mutex_unlock(&ctx->backend_lock);
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	ctx->sequence_valid = false;
+	ctx->capture_layout_retained =
+		vb2_get_num_buffers(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)) != 0;
+	ctx->initial_pending = false;
+	ctx->initial_token = 0;
+	ctx->last_consumed_token = ctx->next_input_token;
+	ctx->drain_token = 0;
+	ctx->drain_requested = false;
+	ctx->last_pending = false;
+	ctx->last_completing = false;
+	ctx->last_dequeued_epoch = 0;
+	ctx->cancelled_input_token = 0;
+	ctx->cancelled_drain_epoch = 0;
+	ctx->rebind_pending = false;
+	ctx->state = S7D_V4L2_IDLE;
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	v4l2_m2m_clear_state(ctx->fh.m2m_ctx);
+	vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+	return 0;
+}
+
+int s7d_v4l2_reqbufs(struct s7d_v4l2_context *ctx, struct file *file,
+		     struct v4l2_requestbuffers *request)
+{
+	unsigned long flags;
+	bool clear;
+	int ret;
+
+	lockdep_assert_held(&ctx->queue_lock);
+	if (!s7d_output(request->type) && !s7d_capture(request->type))
+		return -EINVAL;
+	clear = s7d_output(request->type) && !request->count;
+	ret = v4l2_m2m_reqbufs(file, ctx->fh.m2m_ctx, request);
+	if (ret)
+		return ret;
+	if (clear)
+		return s7d_clear_stream_locked(ctx);
+	if (s7d_capture(request->type) && !request->count) {
+		spin_lock_irqsave(&ctx->state_lock, flags);
+		ctx->capture_layout_retained = false;
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+	}
+	return 0;
+}
+
+int s7d_v4l2_dqbuf(struct s7d_v4l2_context *ctx, struct file *file,
+		   struct v4l2_buffer *result)
+{
+	struct vb2_queue *q;
+	struct vb2_buffer *vb;
+	unsigned long flags;
+	bool stale = false;
+	int ret;
+
+	lockdep_assert_held(&ctx->queue_lock);
+	if (!s7d_output(result->type) && !s7d_capture(result->type))
+		return -EINVAL;
+	ret = v4l2_m2m_dqbuf(file, ctx->fh.m2m_ctx, result);
+	if (ret || !s7d_capture(result->type) || !(result->flags & V4L2_BUF_FLAG_LAST))
+		return ret;
+	q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	vb = vb2_get_buffer(q, result->index);
+	if (!vb)
+		return -EIO;
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	if (s7d_buffer(vb)->completion_epoch == ctx->completion_epoch)
+		ctx->last_dequeued_epoch = ctx->completion_epoch;
+	else if (ctx->last_dequeued_epoch != ctx->completion_epoch)
+		stale = true;
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	if (stale)
+		vb2_clear_last_buffer_dequeued(q);
+	return 0;
 }
 
 static bool s7d_queues_idle(struct s7d_v4l2_context *ctx)
@@ -618,6 +781,7 @@ static int s7d_capture_release(struct s7d_v4l2_context *ctx)
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	cancel_work_sync(&ctx->run_work);
 	cancel_work_sync(&ctx->drain_work);
+	cancel_delayed_work_sync(&ctx->rebind_work);
 	mutex_lock(&ctx->backend_lock);
 	ret = ctx->ops.capture_stop(ctx->backend, generation);
 	if (ret)
@@ -664,7 +828,15 @@ int s7d_v4l2_streamoff(struct s7d_v4l2_context *ctx, struct file *file,
 
 	if (!s7d_output(type) && !s7d_capture(type))
 		return -EINVAL;
-	if (s7d_capture(type) && ctx->session && ctx->sequence_valid && !ctx->retired) {
+	if (s7d_capture(type) && ctx->ops.clear_stream && !ctx->session &&
+	    !ctx->retired) {
+		spin_lock_irqsave(&ctx->state_lock, flags);
+		ctx->capture_streaming = false;
+		ctx->capture_ready = false;
+		ctx->capture_sequence = 0;
+		ctx->capture_only_stop = true;
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+	} else if (s7d_capture(type) && ctx->session && ctx->sequence_valid && !ctx->retired) {
 		ret = s7d_capture_release(ctx);
 		if (!ret)
 			ctx->capture_only_stop = true;
@@ -681,7 +853,7 @@ int s7d_v4l2_streamoff(struct s7d_v4l2_context *ctx, struct file *file,
 		spin_unlock_irqrestore(&ctx->state_lock, flags);
 		return ret;
 	}
-	ret = s7d_reset(ctx);
+	ret = s7d_reset(ctx, false);
 	if (ret) {
 		vb2_queue_error(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx));
 		vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
@@ -715,6 +887,7 @@ static void s7d_frame_ready(void *priv, const struct s7d_codec_frame *frame)
 	if (vbuf->flags & V4L2_BUF_FLAG_TIMECODE)
 		vbuf->timecode = frame->timestamp_meta.timecode;
 	vbuf->sequence = ctx->capture_sequence++;
+	buffer->completion_epoch = ctx->completion_epoch;
 	vbuf->field = V4L2_FIELD_NONE;
 	vbuf->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
 			 V4L2_BUF_FLAG_BFRAME | V4L2_BUF_FLAG_ERROR | V4L2_BUF_FLAG_LAST);
@@ -733,31 +906,36 @@ static void s7d_frame_ready(void *priv, const struct s7d_codec_frame *frame)
 	v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
 }
 
-int s7d_v4l2_sequence(struct s7d_v4l2_context *ctx,
-		      const struct s7d_codec_layout *sequence)
+int s7d_v4l2_sequence_result(struct s7d_v4l2_context *ctx,
+			     const struct s7d_codec_layout *sequence, bool *cancelled)
 {
 	struct v4l2_event event = { .type = V4L2_EVENT_SOURCE_CHANGE };
 	struct s7d_codec_layout layout;
 	unsigned long flags;
 	int ret;
 
+	if (cancelled)
+		*cancelled = false;
 	ret = s7d_codec_validate_layout(sequence);
 	if (ret)
 		return ret;
 	layout = *sequence;
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	layout.format = ctx->layout.format;
-	if (ctx->retired || !ctx->output_streaming) {
+	if (!cancelled && (ctx->retired || !ctx->output_streaming)) {
 		ret = -ESHUTDOWN;
-	} else if (ctx->sequence_valid &&
-		   !memcmp(&ctx->layout, &layout, sizeof(layout))) {
+	} else if ((ctx->sequence_valid || ctx->capture_layout_retained) &&
+	    memcmp(&ctx->layout, &layout, sizeof(layout))) {
+		ret = -EOPNOTSUPP;
+	} else if (!ctx->sequence_valid && ctx->generation == U64_MAX) {
+		ret = -EOVERFLOW;
+	} else if (ctx->retired || !ctx->output_streaming) {
+		if (cancelled)
+			*cancelled = true;
+		ret = -ESHUTDOWN;
+	} else if (ctx->sequence_valid) {
 		spin_unlock_irqrestore(&ctx->state_lock, flags);
 		return 0;
-	} else if (ctx->sequence_valid) {
-		/* A changed sequence still requires DPB draining and reconfiguration. */
-		ret = -EOPNOTSUPP;
-	} else if (ctx->generation == U64_MAX) {
-		ret = -EOVERFLOW;
 	} else {
 		ctx->layout = layout;
 		s7d_capture_format(&layout, &ctx->capture);
@@ -765,7 +943,12 @@ int s7d_v4l2_sequence(struct s7d_v4l2_context *ctx,
 		ctx->output.height = layout.coded_height;
 		ctx->sequence_valid = true;
 		ctx->generation++;
-		ctx->state = S7D_V4L2_CAPTURE_SETUP;
+		if (ctx->state != S7D_V4L2_DRAINING)
+			ctx->state = S7D_V4L2_CAPTURE_SETUP;
+		if (ctx->ops.clear_stream && ctx->capture_streaming) {
+			ctx->rebind_pending = true;
+			mod_delayed_work(system_unbound_wq, &ctx->rebind_work, 0);
+		}
 	}
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	if (!ret) {
@@ -773,6 +956,12 @@ int s7d_v4l2_sequence(struct s7d_v4l2_context *ctx,
 		v4l2_event_queue_fh(&ctx->fh, &event);
 	}
 	return ret;
+}
+
+int s7d_v4l2_sequence(struct s7d_v4l2_context *ctx,
+		      const struct s7d_codec_layout *sequence)
+{
+	return s7d_v4l2_sequence_result(ctx, sequence, NULL);
 }
 
 static int s7d_capture_ctrl(struct v4l2_ctrl *ctrl)
@@ -851,22 +1040,58 @@ static int s7d_queue_setup(struct vb2_queue *q, unsigned int *buffers,
 	return 0;
 }
 
+/* Pinning the descriptor does not transfer user ownership or change payload. */
+static int s7d_pin_capture(struct s7d_v4l2_context *ctx, struct vb2_buffer *vb)
+{
+	struct s7d_v4l2_buffer *buffer = s7d_buffer(vb);
+	struct s7d_codec_surface_request request = {
+		.surface_id = vb->index,
+		.num_planes = 2,
+		.dma_alignment = S7D_CODEC_STORAGE_ALIGNMENT,
+	};
+	unsigned long flags;
+	unsigned int i;
+	int ret;
+
+	lockdep_assert_held(&ctx->queue_lock);
+	request.generation = ctx->generation;
+	if (!ctx->session || !request.generation || !ctx->sequence_valid)
+		return -EAGAIN;
+	if (vb->index >= S7D_CODEC_MAX_CAPTURE_BUFFERS)
+		return -ENOSPC;
+	if (buffer->surface)
+		return buffer->generation == request.generation ? 0 : -EOPNOTSUPP;
+	if (vb->num_planes != 2)
+		return -EINVAL;
+	for (i = 0; i < 2; i++) {
+		request.min_size[i] = ctx->capture.plane_fmt[i].sizeimage;
+		if (vb2_plane_size(vb, i) < request.min_size[i])
+			return -EINVAL;
+	}
+	ret = s7d_codec_vb2_pin(ctx->session, vb, &request, &buffer->surface);
+	if (ret)
+		return ret;
+	buffer->generation = request.generation;
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	ctx->surface[vb->index] = buffer;
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	return 0;
+}
+
 static int s7d_buf_prepare(struct vb2_buffer *vb)
 {
 	struct s7d_v4l2_context *ctx = vb2_get_drv_priv(vb->vb2_queue);
-	struct s7d_v4l2_buffer *buffer = s7d_buffer(vb);
-	struct s7d_codec_surface_request request = {};
 	struct v4l2_pix_format_mplane format;
 	unsigned long flags;
 	unsigned int i;
-	bool valid;
+	bool valid, detached;
 	int ret;
 
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	format = vb->vb2_queue->is_output ? ctx->output : ctx->capture;
 	ret = ctx->retired ? -ESHUTDOWN : 0;
-	request.generation = ctx->generation;
 	valid = ctx->sequence_valid;
+	detached = ctx->ops.clear_stream && !ctx->capture_ready;
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	if (ret)
 		return ret;
@@ -882,27 +1107,125 @@ static int s7d_buf_prepare(struct vb2_buffer *vb)
 			return -EINVAL;
 		return 0;
 	}
-	if (!ctx->session || !request.generation || !valid)
+	if ((!ctx->session || !ctx->generation || !valid) && !detached)
 		return -EAGAIN;
 	if (vb->index >= S7D_CODEC_MAX_CAPTURE_BUFFERS)
 		return -ENOSPC;
 	for (i = 0; i < 2; i++)
 		vb2_set_plane_payload(vb, i, 0);
-	if (buffer->surface)
-		return buffer->generation == request.generation ? 0 : -EOPNOTSUPP;
-	request.surface_id = vb->index;
-	request.num_planes = 2;
-	request.dma_alignment = S7D_CODEC_STORAGE_ALIGNMENT;
-	for (i = 0; i < 2; i++)
-		request.min_size[i] = format.plane_fmt[i].sizeimage;
-	ret = s7d_codec_vb2_pin(ctx->session, vb, &request, &buffer->surface);
-	if (ret)
-		return ret;
-	buffer->generation = request.generation;
+	/* Users may requeue CAPTURE while its new OUTPUT epoch is absent. */
+	if (!ctx->session || !ctx->generation || !valid)
+		return 0;
+	return s7d_pin_capture(ctx, vb);
+}
+
+/* Every allocated slot gets a descriptor; only ACTIVE slots grant DMA ownership. */
+static int s7d_capture_rebind(struct s7d_v4l2_context *ctx)
+{
+	struct s7d_v4l2_capture_buffer pool[S7D_CODEC_MAX_CAPTURE_BUFFERS];
+	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	struct s7d_codec_layout layout;
+	struct s7d_v4l2_buffer *buffer;
+	struct vb2_buffer *vb;
+	unsigned long flags;
+	unsigned int i, count = 0;
+	u64 generation;
+	bool ready, fresh;
+	int ret;
+
+	lockdep_assert_held(&ctx->queue_lock);
+	mutex_lock(&ctx->backend_lock);
 	spin_lock_irqsave(&ctx->state_lock, flags);
-	ctx->surface[vb->index] = buffer;
+	ready = ctx->rebind_pending && !ctx->retired && !ctx->capture_stopping &&
+		ctx->prepared && ctx->output_streaming && ctx->capture_streaming &&
+		ctx->sequence_valid && !ctx->initial_pending && ctx->session &&
+		!ctx->drain_requested && !ctx->last_pending && !ctx->last_completing &&
+		ctx->state != S7D_V4L2_STOPPED;
+	layout = ctx->layout;
+	generation = ctx->generation;
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
-	return 0;
+	ret = 0;
+	if (!ready)
+		goto unlock;
+	for (i = 0; i < q->max_num_buffers; i++) {
+		vb = vb2_get_buffer(q, i);
+		if (!vb)
+			continue;
+		if (count == ARRAY_SIZE(pool)) {
+			ret = -ENOSPC;
+			goto unlock;
+		}
+		buffer = s7d_buffer(vb);
+		fresh = !buffer->surface;
+		ret = s7d_pin_capture(ctx, vb);
+		if (ret)
+			goto unlock;
+		if (fresh && vb->state == VB2_BUF_STATE_ACTIVE) {
+			ret = s7d_codec_surface_queue(buffer->surface);
+			if (ret)
+				goto unlock;
+		}
+		pool[count++] = (struct s7d_v4l2_capture_buffer) {
+			.surface = buffer->surface,
+			.surface_id = i,
+			.generation = generation,
+		};
+	}
+	if (count < layout.min_capture_buffers) {
+		ret = -ENOBUFS;
+		goto unlock;
+	}
+	ret = ctx->ops.capture_start(ctx->backend, &layout, generation, pool, count);
+	if (ret) {
+		ret = ret < 0 ? ret : -EIO;
+		goto unlock;
+	}
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	if (ctx->retired || ctx->state == S7D_V4L2_FAILED || !ctx->prepared ||
+	    !ctx->output_streaming || !ctx->capture_streaming || ctx->capture_stopping) {
+		ret = -ESHUTDOWN;
+	} else {
+		ctx->rebind_pending = false;
+		ctx->capture_ready = true;
+		if (ctx->state != S7D_V4L2_DRAINING)
+			ctx->state = S7D_V4L2_DECODING;
+	}
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+unlock:
+	mutex_unlock(&ctx->backend_lock);
+	return ret;
+}
+
+static void s7d_rebind_work(struct work_struct *work)
+{
+	struct s7d_v4l2_context *ctx = container_of(to_delayed_work(work),
+					struct s7d_v4l2_context, rebind_work);
+	unsigned long flags;
+	bool pending;
+	int ret;
+
+	/* STREAMOFF joins us with queue_lock held, so never wait on that lock. */
+	if (!mutex_trylock(&ctx->queue_lock)) {
+		spin_lock_irqsave(&ctx->state_lock, flags);
+		pending = ctx->rebind_pending && !ctx->retired && !ctx->capture_stopping &&
+			ctx->prepared && ctx->output_streaming && ctx->capture_streaming &&
+			ctx->sequence_valid && !ctx->initial_pending && !ctx->drain_requested &&
+			!ctx->last_pending && !ctx->last_completing &&
+			ctx->state != S7D_V4L2_STOPPED;
+		if (pending)
+			mod_delayed_work(system_unbound_wq, &ctx->rebind_work, 1);
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		return;
+	}
+	ret = s7d_capture_rebind(ctx);
+	if (ret) {
+		s7d_retire(ctx);
+		vb2_queue_error(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx));
+		vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+	}
+	mutex_unlock(&ctx->queue_lock);
+	if (!ret)
+		s7d_device_run(ctx);
 }
 
 static void s7d_complete_last(struct s7d_v4l2_context *ctx)
@@ -910,7 +1233,7 @@ static void s7d_complete_last(struct s7d_v4l2_context *ctx)
 	struct vb2_v4l2_buffer *buffer = NULL;
 	struct v4l2_event event = { .type = V4L2_EVENT_EOS };
 	unsigned long flags;
-	bool pending;
+	bool pending, unbound;
 	unsigned int i;
 	unsigned int attempts;
 	int ret;
@@ -920,6 +1243,7 @@ static void s7d_complete_last(struct s7d_v4l2_context *ctx)
 		ctx->capture_streaming && !ctx->retired;
 	if (pending)
 		ctx->last_completing = true;
+	unbound = ctx->ops.clear_stream && !ctx->capture_ready;
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	if (!pending)
 		return;
@@ -927,7 +1251,10 @@ static void s7d_complete_last(struct s7d_v4l2_context *ctx)
 		buffer = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
 		if (!buffer)
 			break;
-		ret = s7d_codec_surface_return_queued(s7d_buffer(&buffer->vb2_buf)->surface);
+		if (unbound && !s7d_buffer(&buffer->vb2_buf)->surface)
+			ret = 0;
+		else
+			ret = s7d_codec_surface_return_queued(s7d_buffer(&buffer->vb2_buf)->surface);
 		if (!ret)
 			break;
 		v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, buffer);
@@ -943,6 +1270,7 @@ static void s7d_complete_last(struct s7d_v4l2_context *ctx)
 	}
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	ctx->last_pending = false;
+	s7d_buffer(&buffer->vb2_buf)->completion_epoch = ctx->completion_epoch;
 	ctx->state = S7D_V4L2_STOPPED;
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	for (i = 0; i < 2; i++)
@@ -959,12 +1287,13 @@ static void s7d_buf_queue(struct vb2_buffer *vb)
 	struct s7d_v4l2_context *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	struct s7d_v4l2_buffer *buffer = s7d_buffer(vb);
 	unsigned long flags;
-	bool streaming, retired, last;
+	bool streaming, retired, last, ready;
 	int ret = 0;
 
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	retired = ctx->retired;
 	streaming = ctx->capture_streaming;
+	ready = ctx->capture_ready && ctx->prepared && !ctx->capture_stopping;
 	last = ctx->last_pending;
 	if (vb->vb2_queue->is_output && !retired) {
 		if (ctx->next_input_token == U64_MAX)
@@ -978,7 +1307,8 @@ static void s7d_buf_queue(struct vb2_buffer *vb)
 		return;
 	}
 	if (!vb->vb2_queue->is_output) {
-		ret = s7d_codec_surface_queue(buffer->surface);
+		ret = buffer->surface ? s7d_codec_surface_queue(buffer->surface) :
+			ctx->ops.clear_stream && !ready ? 0 : -EAGAIN;
 		if (ret) {
 			v4l2_m2m_buf_done(&buffer->m2m.vb, VB2_BUF_STATE_ERROR);
 			return;
@@ -993,7 +1323,7 @@ static void s7d_buf_queue(struct vb2_buffer *vb)
 		s7d_complete_last(ctx);
 		return;
 	}
-	if (streaming) {
+	if (streaming && ready) {
 		mutex_lock(&ctx->backend_lock);
 		ret = ctx->ops.capture_queue(ctx->backend, buffer->surface,
 					     vb->index, buffer->generation);
@@ -1026,6 +1356,13 @@ static void s7d_sync_initial(struct s7d_v4l2_context *ctx, u64 token)
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	ctx->initial_pending = false;
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	ret = s7d_capture_rebind(ctx);
+	if (ret) {
+		s7d_stop(ctx);
+		vb2_queue_error(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx));
+		vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+		return;
+	}
 	s7d_device_run(ctx);
 }
 
@@ -1066,7 +1403,8 @@ static int s7d_start_streaming(struct vb2_queue *q, unsigned int count)
 		if (ret)
 			goto return_queued;
 		if (check_add_overflow((size_t)ctx->output.plane_fmt[0].sizeimage,
-				      (size_t)(S7D_H264_PREFIX_MAX_BYTES + SZ_16K +
+				      (size_t)((ctx->ops.clear_stream ? S7D_H264_ASSEMBLY_MAX_BYTES :
+					       S7D_H264_PREFIX_MAX_BYTES) + SZ_16K +
 					      PAGE_SIZE + L1_CACHE_BYTES),
 				      &capacity)) {
 			ret = -EOVERFLOW;
@@ -1088,10 +1426,26 @@ static int s7d_start_streaming(struct vb2_queue *q, unsigned int count)
 		if (ret)
 			goto failed;
 		spin_lock_irqsave(&ctx->state_lock, flags);
+		if (ctx->retired || (ctx->ops.clear_stream && ctx->state == S7D_V4L2_FAILED)) {
+			spin_unlock_irqrestore(&ctx->state_lock, flags);
+			ret = -ESHUTDOWN;
+			goto failed;
+		}
 		ctx->initial_token = initial_token;
-		ctx->initial_pending = true;
+		ctx->initial_pending = !(ctx->ops.clear_stream && valid);
 		ctx->prepared = true;
+		if (ctx->ops.clear_stream && valid) {
+			ctx->state = S7D_V4L2_CAPTURE_SETUP;
+			ctx->rebind_pending = ctx->capture_streaming;
+		}
 		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		if (ctx->ops.clear_stream && valid) {
+			ret = s7d_capture_rebind(ctx);
+			if (ret)
+				goto failed;
+			s7d_device_run(ctx);
+			return 0;
+		}
 		s7d_device_run(ctx);
 		/* Published input may already be DONE/ERROR; start must not fail now. */
 		s7d_sync_initial(ctx, initial_token);
@@ -1100,6 +1454,17 @@ static int s7d_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (!valid || !ctx->session || count < layout.min_capture_buffers) {
 		ret = -EAGAIN;
 		goto return_queued;
+	}
+	if (ctx->ops.clear_stream) {
+		spin_lock_irqsave(&ctx->state_lock, flags);
+		ctx->capture_streaming = true;
+		ctx->rebind_pending = true;
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		ret = s7d_capture_rebind(ctx);
+		if (ret)
+			goto failed;
+		s7d_device_run(ctx);
+		return 0;
 	}
 	mutex_lock(&ctx->backend_lock);
 	for (i = 0; i < S7D_CODEC_MAX_CAPTURE_BUFFERS; i++) {
@@ -1127,6 +1492,9 @@ static int s7d_start_streaming(struct vb2_queue *q, unsigned int count)
 	return 0;
 failed:
 	s7d_stop(ctx);
+	if (ctx->ops.clear_stream &&
+	    vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+		vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
 return_queued:
 	s7d_return_buffers(ctx, q, VB2_BUF_STATE_QUEUED);
 	return ret < 0 ? ret : -EIO;
@@ -1138,14 +1506,26 @@ static void s7d_stop_streaming(struct vb2_queue *q)
 	struct vb2_queue *peer = q->is_output ?
 		v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx) :
 		v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
+	unsigned long flags;
+	bool seek, capture_streaming;
 	int ret;
 
 	if (!q->is_output && ctx->capture_only_stop) {
 		s7d_return_buffers(ctx, q, VB2_BUF_STATE_ERROR);
 		return;
 	}
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	seek = q->is_output && ctx->ops.clear_stream && !ctx->retired &&
+		ctx->state != S7D_V4L2_FAILED && !ctx->stop_error && !q->error && !peer->error;
+	capture_streaming = ctx->capture_streaming;
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	ret = s7d_stop(ctx);
 	s7d_return_buffers(ctx, q, VB2_BUF_STATE_ERROR);
+	if (seek && !ret) {
+		ret = s7d_reset(ctx, capture_streaming);
+		if (!ret)
+			return;
+	}
 	if (ret) {
 		dev_err(ctx->dev, "decoder stop failed: %d; memory retained\n", ret);
 		vb2_queue_error(q);
@@ -1309,10 +1689,7 @@ static void s7d_drain_work(struct work_struct *work)
 
 	mutex_lock(&ctx->backend_lock);
 	spin_lock_irqsave(&ctx->state_lock, flags);
-	ready = ctx->state == S7D_V4L2_DRAINING && !ctx->retired &&
-		!ctx->capture_stopping &&
-		!ctx->drain_requested && !ctx->active_input &&
-		ctx->last_consumed_token == ctx->drain_token;
+	ready = s7d_can_drain_locked(ctx);
 	request.last_input_token = ctx->drain_token;
 	request.epoch = ctx->drain_epoch;
 	if (ready)
@@ -1327,12 +1704,22 @@ static void s7d_drain_work(struct work_struct *work)
 	}
 }
 
-int s7d_v4l2_input_done(struct s7d_v4l2_context *ctx, u64 token, int status)
+int s7d_v4l2_input_done_result(struct s7d_v4l2_context *ctx, u64 token, int status,
+			       bool *cancelled)
 {
 	struct s7d_v4l2_buffer *buffer;
 	unsigned long flags;
 
+	if (cancelled)
+		*cancelled = false;
 	spin_lock_irqsave(&ctx->state_lock, flags);
+	if (cancelled && ctx->retired && token && token > ctx->last_consumed_token &&
+	    token == ctx->cancelled_input_token) {
+		ctx->cancelled_input_token = 0;
+		*cancelled = true;
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		return -ESHUTDOWN;
+	}
 	buffer = s7d_claim_input_locked(ctx, token, true);
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	if (!buffer)
@@ -1342,6 +1729,11 @@ int s7d_v4l2_input_done(struct s7d_v4l2_context *ctx, u64 token, int status)
 			  VB2_BUF_STATE_DONE);
 	s7d_device_run(ctx);
 	return 0;
+}
+
+int s7d_v4l2_input_done(struct s7d_v4l2_context *ctx, u64 token, int status)
+{
+	return s7d_v4l2_input_done_result(ctx, token, status, NULL);
 }
 
 int s7d_v4l2_error(struct s7d_v4l2_context *ctx, int error)
@@ -1365,11 +1757,23 @@ int s7d_v4l2_error(struct s7d_v4l2_context *ctx, int error)
 	return 0;
 }
 
-int s7d_v4l2_drain_done(struct s7d_v4l2_context *ctx, u64 epoch, u64 token)
+int s7d_v4l2_drain_done_result(struct s7d_v4l2_context *ctx, u64 epoch, u64 token,
+			       bool *cancelled)
 {
 	unsigned long flags;
 
+	if (cancelled)
+		*cancelled = false;
 	spin_lock_irqsave(&ctx->state_lock, flags);
+	if (cancelled && ctx->retired && epoch && epoch == ctx->cancelled_drain_epoch &&
+	    ctx->drain_requested && !ctx->active_input && !ctx->last_pending &&
+	    !ctx->last_completing && epoch == ctx->drain_epoch &&
+	    token == ctx->drain_token && token == ctx->last_consumed_token) {
+		ctx->cancelled_drain_epoch = 0;
+		*cancelled = true;
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		return -ESHUTDOWN;
+	}
 	if (ctx->retired || ctx->state != S7D_V4L2_DRAINING ||
 	    !ctx->drain_requested || ctx->active_input || token != ctx->drain_token ||
 	    token != ctx->last_consumed_token || epoch != ctx->drain_epoch ||
@@ -1381,6 +1785,11 @@ int s7d_v4l2_drain_done(struct s7d_v4l2_context *ctx, u64 epoch, u64 token)
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	s7d_complete_last(ctx);
 	return 0;
+}
+
+int s7d_v4l2_drain_done(struct s7d_v4l2_context *ctx, u64 epoch, u64 token)
+{
+	return s7d_v4l2_drain_done_result(ctx, epoch, token, NULL);
 }
 
 int s7d_v4l2_decoder_cmd(struct s7d_v4l2_context *ctx,
@@ -1431,7 +1840,8 @@ int s7d_v4l2_decoder_cmd(struct s7d_v4l2_context *ctx,
 			vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
 			v4l2_m2m_clear_state(ctx->fh.m2m_ctx);
 			spin_lock_irqsave(&ctx->state_lock, flags);
-			ctx->state = S7D_V4L2_DECODING;
+			ctx->state = ctx->capture_ready ? S7D_V4L2_DECODING :
+				ctx->sequence_valid ? S7D_V4L2_CAPTURE_SETUP : S7D_V4L2_INITIALIZING;
 			ctx->drain_requested = false;
 			spin_unlock_irqrestore(&ctx->state_lock, flags);
 		}
@@ -1473,6 +1883,8 @@ s7d_v4l2_context_create(struct device *dev, struct video_device *video,
 	spin_lock_init(&ctx->state_lock);
 	INIT_WORK(&ctx->run_work, s7d_run_work);
 	INIT_WORK(&ctx->drain_work, s7d_drain_work);
+	INIT_DELAYED_WORK(&ctx->rebind_work, s7d_rebind_work);
+	ctx->completion_epoch = 1;
 	ctx->output.width = 1920;
 	ctx->output.height = 1080;
 	ctx->output.pixelformat = codec->output_format;

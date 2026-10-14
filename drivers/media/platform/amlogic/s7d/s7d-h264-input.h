@@ -13,20 +13,26 @@ struct s7d_codec_session;
 struct s7d_v4l2_input;
 struct s7d_vdec_runtime;
 struct s7d_h264_input;
+struct s7d_h264_parameters;
 struct s7d_h264_slice;
 struct s7d_v4l2_drain;
 
 #define S7D_H264_AU_MAX_SLICES 128U
 #define S7D_H264_PREFIX_MAX_BYTES (64U * 1024U)
+#define S7D_H264_PARAMETERS_MAX_BYTES (64U * 1024U)
+#define S7D_H264_ASSEMBLY_MAX_BYTES \
+	(S7D_H264_PREFIX_MAX_BYTES + S7D_H264_PARAMETERS_MAX_BYTES)
 
 enum s7d_h264_input_kind {
 	S7D_H264_INPUT_HEADERS,
 	S7D_H264_INPUT_PICTURE,
+	S7D_H264_INPUT_SKIP,
 };
 
 struct s7d_h264_preflight {
 	enum s7d_h264_input_kind kind;
 	bool sequence_ready;
+	int skip_status;
 	u32 picture_bytes;
 	struct s7d_h264_sps sps;
 };
@@ -85,9 +91,14 @@ struct s7d_h264_input_return {
 
 int s7d_h264_input_build_plan(const struct s7d_v4l2_input *input,
 			    struct s7d_h264_input_plan *plan);
+/* CPU-only accepted state; serialized with its borrowing hardware epoch. */
+struct s7d_h264_parameters *s7d_h264_parameters_create(void);
+void s7d_h264_parameters_clear(struct s7d_h264_parameters *parameters);
+void s7d_h264_parameters_destroy(struct s7d_h264_parameters *parameters);
 /* The backend serializes calls and retains its original DOS/session/DMA refs. */
 struct s7d_h264_input *
-s7d_h264_input_create(struct s7d_codec_dos *dos, struct s7d_codec_session *session);
+s7d_h264_input_create(struct s7d_codec_dos *dos, struct s7d_codec_session *session,
+		      struct s7d_h264_parameters *parameters, bool hunting);
 int s7d_h264_input_destroy(struct s7d_h264_input *input);
 /* CPU-only; retain this token and backing until acceptance, cancel or park. */
 int s7d_h264_input_preflight(struct s7d_h264_input *input,
@@ -96,6 +107,13 @@ int s7d_h264_input_preflight(struct s7d_h264_input *input,
 /* The backend validates initial sequence metadata before acceptance. */
 int s7d_h264_input_accept_headers(struct s7d_h264_input *input, u64 token,
 				 struct s7d_h264_input_return *returned);
+/* CPU-only HUNT completion; no firmware entry, park proof or terminal state. */
+int s7d_h264_input_accept_skip(struct s7d_h264_input *input, u64 token,
+			     struct s7d_h264_input_return *returned);
+/* HUNT sequence rejection before hardware entry; discard all draft changes. */
+int s7d_h264_input_reject_picture(struct s7d_h264_input *input, u64 token,
+				int status,
+				struct s7d_h264_input_return *returned);
 /* Error-only CPU cancellation; any hardware-active input remains retained. */
 int s7d_h264_input_cancel_preflight(struct s7d_h264_input *input, u64 token,
 				   int status,

@@ -65,6 +65,7 @@ struct s7d_codec_firmware_job {
 	u32 cancel_id;
 	int status;
 	bool retired;
+	bool cancelled;
 };
 
 static void firmware_job_work(struct work_struct *work)
@@ -74,11 +75,20 @@ static void firmware_job_work(struct work_struct *work)
 	struct s7d_codec_bundle_view view;
 	int ret;
 
-	ret = atomic_read(&job->cancel) ? -ECANCELED :
-		request_firmware_direct(&job->firmware, "video/video_ucode.bin", job->dev);
-	if (!ret)
-		ret = atomic_read(&job->cancel) ? -ECANCELED :
-			s7d_codec_bundle_parse(job->firmware->data, job->firmware->size, &view);
+	if (atomic_read(&job->cancel)) {
+		job->cancelled = true;
+		ret = -ECANCELED;
+	} else {
+		ret = request_firmware_direct(&job->firmware, "video/video_ucode.bin", job->dev);
+	}
+	if (!ret) {
+		if (atomic_read(&job->cancel)) {
+			job->cancelled = true;
+			ret = -ECANCELED;
+		} else {
+			ret = s7d_codec_bundle_parse(job->firmware->data, job->firmware->size, &view);
+		}
+	}
 	if (!ret)
 		ret = s7d_codec_tee_upload(job->dev, &view, job->cancel_id,
 					 &job->cancel, &job->result);
@@ -211,6 +221,30 @@ int s7d_codec_firmware_job_join(struct s7d_codec_firmware_job *job)
 	wait_for_completion(&job->done);
 	flush_work(&job->work);
 	return job->status;
+}
+
+int s7d_codec_firmware_job_join_result(struct s7d_codec_firmware_job *job,
+				       struct s7d_codec_session *session,
+				       u64 lease_epoch, bool *cancelled)
+{
+	int ret;
+
+	if (!cancelled)
+		return -EINVAL;
+	*cancelled = false;
+	if (!job || !session || !lease_epoch)
+		return -EINVAL;
+	ret = s7d_codec_firmware_job_join(job);
+	if (job->session != session || job->lease_epoch != lease_epoch)
+		return -ESTALE;
+	if (ret != -ECANCELED)
+		return ret;
+	if (job->result.linux_status)
+		return job->result.linux_status < 0 ? job->result.linux_status : -EIO;
+	if (job->result.close_status)
+		return job->result.close_status < 0 ? job->result.close_status : -EIO;
+	*cancelled = job->cancelled || job->result.cancelled;
+	return ret;
 }
 
 void s7d_codec_firmware_retire(struct s7d_codec_firmware_owner *owner,

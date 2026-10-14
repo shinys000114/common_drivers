@@ -70,6 +70,8 @@ struct s7d_v4l2_backend_ops {
 	void (*detach)(void *priv);
 	/* Joined work and a stopped session precede release of this stream epoch. */
 	int (*reset)(void *priv);
+	/* Optional native same-parameter seek; only with no live stream epoch. */
+	int (*clear_stream)(void *priv);
 };
 
 /* A private component: it neither registers a video node nor supplies a backend. */
@@ -108,6 +110,11 @@ int s7d_v4l2_streamon(struct s7d_v4l2_context *context, struct file *file,
 int s7d_v4l2_streamoff(struct s7d_v4l2_context *context, struct file *file,
 		     enum v4l2_buf_type type);
 
+int s7d_v4l2_reqbufs(struct s7d_v4l2_context *context, struct file *file,
+		     struct v4l2_requestbuffers *request);
+int s7d_v4l2_dqbuf(struct s7d_v4l2_context *context, struct file *file,
+		   struct v4l2_buffer *buffer);
+
 /* Process context; core frame notification alone is allowed under its mutex. */
 int s7d_v4l2_sequence(struct s7d_v4l2_context *context,
 		      const struct s7d_codec_layout *layout);
@@ -115,5 +122,12 @@ int s7d_v4l2_input_done(struct s7d_v4l2_context *context, u64 token, int status)
 /* Notification only; retirement joins the backend before returning buffers. */
 int s7d_v4l2_error(struct s7d_v4l2_context *context, int error);
 int s7d_v4l2_drain_done(struct s7d_v4l2_context *context, u64 epoch, u64 token);
+/* Explicit cancellation identity, distinct from a completed operation error. */
+int s7d_v4l2_sequence_result(struct s7d_v4l2_context *context,
+			     const struct s7d_codec_layout *layout, bool *cancelled);
+int s7d_v4l2_input_done_result(struct s7d_v4l2_context *context,
+			       u64 token, int status, bool *cancelled);
+int s7d_v4l2_drain_done_result(struct s7d_v4l2_context *context,
+			       u64 epoch, u64 token, bool *cancelled);
 
 #endif

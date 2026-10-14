@@ -56,6 +56,10 @@ void s7d_codec_firmware_job_put(struct s7d_codec_firmware_job *job);
 void s7d_codec_firmware_job_stop(struct s7d_codec_firmware_job *job);
 /* Join without runtime control or backend transaction held. */
 int s7d_codec_firmware_job_join(struct s7d_codec_firmware_job *job);
+/* Joined result for the exact owner; cancellation never hides Linux/close faults. */
+int s7d_codec_firmware_job_join_result(struct s7d_codec_firmware_job *job,
+				       struct s7d_codec_session *session,
+				       u64 lease_epoch, bool *cancelled);
 /* Only the creator releases custody, outside runtime/backend lifecycle locks. */
 void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job);
 

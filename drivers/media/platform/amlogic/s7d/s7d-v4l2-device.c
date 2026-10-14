@@ -138,6 +138,17 @@ static int s7d_streamoff(struct file *file, void *priv, enum v4l2_buf_type type)
 	return s7d_v4l2_streamoff(s7d_file_context(priv), file, type);
 }
 
+static int s7d_reqbufs(struct file *file, void *priv,
+		       struct v4l2_requestbuffers *request)
+{
+	return s7d_v4l2_reqbufs(s7d_file_context(priv), file, request);
+}
+
+static int s7d_dqbuf(struct file *file, void *priv, struct v4l2_buffer *buffer)
+{
+	return s7d_v4l2_dqbuf(s7d_file_context(priv), file, buffer);
+}
+
 static const struct v4l2_ioctl_ops s7d_ioctl_ops = {
 	.vidioc_querycap = s7d_querycap,
 	.vidioc_enum_fmt_vid_out = s7d_enum_format,
@@ -153,12 +164,12 @@ static const struct v4l2_ioctl_ops s7d_ioctl_ops = {
 	.vidioc_decoder_cmd = s7d_decoder_cmd,
 	.vidioc_subscribe_event = s7d_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
-	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_reqbufs = s7d_reqbufs,
 	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
 	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
 	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
-	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
+	.vidioc_dqbuf = s7d_dqbuf,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 	.vidioc_streamon = s7d_streamon,
 	.vidioc_streamoff = s7d_streamoff,

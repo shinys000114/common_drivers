@@ -111,29 +111,42 @@ static int runtime_mask(struct s7d_vdec_runtime *runtime, u32 mask)
 	return ret ? ret : runtime_check(runtime, VDEC_MBOX1_MASK, mask);
 }
 
-static int runtime_arming_check(struct s7d_vdec_runtime *runtime)
+static int runtime_transition_locked(struct s7d_vdec_runtime *runtime, bool *cancelled)
+{
+	*cancelled = false;
+	if (runtime->irq_error)
+		return runtime->irq_error;
+	if (runtime->stop_requested || runtime->preload_abort) {
+		*cancelled = true;
+		return -ESHUTDOWN;
+	}
+	return 0;
+}
+
+static int runtime_arming_check(struct s7d_vdec_runtime *runtime, bool *cancelled)
 {
 	unsigned long flags;
 	int ret;
 
 	spin_lock_irqsave(&runtime->lock, flags);
+	*cancelled = false;
 	ret = runtime->irq_error;
-	if (!ret && (runtime->stop_requested || runtime->preload_abort ||
-		     runtime->state != VDEC_ARMING ||
+	if (!ret && (runtime->state != VDEC_ARMING ||
 		     !runtime->irq_accept || !runtime->irq_enabled))
 		ret = -EIO;
+	if (!ret)
+		ret = runtime_transition_locked(runtime, cancelled);
 	spin_unlock_irqrestore(&runtime->lock, flags);
 	return ret;
 }
 
-static int runtime_transition_check(struct s7d_vdec_runtime *runtime)
+static int runtime_transition_check(struct s7d_vdec_runtime *runtime, bool *cancelled)
 {
 	unsigned long flags;
 	int ret;
 
 	spin_lock_irqsave(&runtime->lock, flags);
-	ret = runtime->stop_requested || runtime->preload_abort ?
-		-ESHUTDOWN : runtime->irq_error;
+	ret = runtime_transition_locked(runtime, cancelled);
 	spin_unlock_irqrestore(&runtime->lock, flags);
 	return ret;
 }
@@ -193,8 +206,7 @@ static irqreturn_t runtime_irq_thread(int irq, void *data)
 	spin_lock_irqsave(&runtime->lock, flags);
 	dispatch = runtime->irq_accept;
 	error = runtime->irq_error;
-	if (error && !runtime->error_delivered &&
-	    (runtime->state == VDEC_ARMING || runtime->state == VDEC_RUNNING)) {
+	if (error && !runtime->error_delivered) {
 		runtime->error_delivered = true;
 		dispatch = true;
 	}
@@ -259,11 +271,12 @@ static void runtime_retire_preload(struct s7d_vdec_runtime *runtime,
 
 static int runtime_preload_locked(struct s7d_vdec_runtime *runtime,
 				  struct s7d_codec_session *session,
-				  struct s7d_codec_firmware_job **custody)
+				  struct s7d_codec_firmware_job **custody,
+				  bool *cancelled)
 {
 	struct s7d_codec_firmware_job *job;
 	unsigned long flags;
-	u64 epoch = runtime->lease_epoch;
+	u64 epoch = runtime->lease_epoch, firmware_epoch;
 	bool queued;
 	int ret;
 
@@ -274,17 +287,19 @@ static int runtime_preload_locked(struct s7d_vdec_runtime *runtime,
 		if (ret)
 			return ret;
 	}
+	firmware_epoch = runtime->firmware_epoch;
 	ret = s7d_codec_firmware_prepare(runtime->firmware, session,
-					 runtime->firmware_epoch, &job);
+					 firmware_epoch, &job);
 	if (ret || !job)
-		return ret ? ret : runtime_transition_check(runtime);
+		return ret ? ret : runtime_transition_check(runtime, cancelled);
 	*custody = job;
 	spin_lock_irqsave(&runtime->lock, flags);
-	if (runtime->session != session || runtime->lease_epoch != epoch ||
-	    runtime->state != VDEC_PREPARING || runtime->stop_requested ||
-	    runtime->preload_abort || runtime->preload_job) {
+	ret = runtime->session != session || runtime->lease_epoch != epoch ||
+		runtime->preload_job || runtime->state != VDEC_PREPARING ?
+		-ESTALE : runtime_transition_locked(runtime, cancelled);
+	if (ret) {
 		spin_unlock_irqrestore(&runtime->lock, flags);
-		return -ESHUTDOWN;
+		return ret;
 	}
 	s7d_codec_firmware_job_get(job);
 	runtime->preload_job = job;
@@ -297,14 +312,21 @@ static int runtime_preload_locked(struct s7d_vdec_runtime *runtime,
 		return -EIO;
 	}
 	mutex_unlock(&runtime->control);
-	ret = s7d_codec_firmware_job_join(job);
+	ret = s7d_codec_firmware_job_join_result(job, session, firmware_epoch,
+					       cancelled);
 	mutex_lock(&runtime->control);
 	runtime_retire_preload(runtime, job);
 	spin_lock_irqsave(&runtime->lock, flags);
-	if (!ret && (runtime->session != session || runtime->lease_epoch != epoch ||
-		     runtime->state != VDEC_PREPARING || runtime->stop_requested ||
-		     runtime->preload_abort))
-		ret = -ESHUTDOWN;
+	if (*cancelled && runtime->irq_error) {
+		*cancelled = false;
+		ret = runtime->irq_error;
+	}
+	if (!ret && (runtime->session != session || runtime->lease_epoch != epoch))
+		ret = -ESTALE;
+	if (!ret)
+		ret = runtime_transition_locked(runtime, cancelled);
+	if (!ret && runtime->state != VDEC_PREPARING)
+		ret = -ESTALE;
 	spin_unlock_irqrestore(&runtime->lock, flags);
 	return ret;
 }
@@ -522,20 +544,24 @@ free:
 }
 
 int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
-			     struct s7d_codec_session *session)
+			     struct s7d_codec_session *session, bool *cancelled)
 {
 	struct s7d_codec_firmware_job *custody = NULL;
 	unsigned long flags;
 	int ret, stopped;
 
+	if (!cancelled)
+		return -EINVAL;
+	*cancelled = false;
+
 	if (!session)
 		return -EINVAL;
 	mutex_lock(&runtime->control);
 	spin_lock_irqsave(&runtime->lock, flags);
-	if (runtime->state != VDEC_PARKED || runtime->session ||
-	    runtime->stop_requested || runtime->preload_abort) {
+	ret = runtime->state != VDEC_PARKED || runtime->session ?
+		-EBUSY : runtime_transition_locked(runtime, cancelled);
+	if (ret) {
 		spin_unlock_irqrestore(&runtime->lock, flags);
-		ret = -EBUSY;
 		goto out;
 	}
 	s7d_codec_session_get(session);
@@ -545,16 +571,16 @@ int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 	ret = s7d_codec_dos_prepare(runtime->dos, S7D_CODEC_ENGINE_VDEC);
 	if (ret)
 		goto fail;
-	ret = runtime_errno(runtime->ops.stage(runtime->priv, session, runtime->map));
+	ret = runtime_errno(runtime->ops.stage(runtime->priv, session, runtime->map, cancelled));
 	if (ret)
 		goto fail;
-	ret = runtime_transition_check(runtime);
+	ret = runtime_transition_check(runtime, cancelled);
 	if (ret)
 		goto fail;
 	ret = s7d_codec_dos_port_enable(runtime->dos, S7D_CODEC_ENGINE_VDEC);
 	if (ret)
 		goto fail;
-	ret = runtime_preload_locked(runtime, session, &custody);
+	ret = runtime_preload_locked(runtime, session, &custody, cancelled);
 	if (ret)
 		goto fail;
 	ret = s7d_codec_firmware_load(runtime->dev, S7D_CODEC_ENGINE_VDEC,
@@ -563,10 +589,10 @@ int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 		s7d_codec_firmware_invalidate(runtime->firmware);
 		goto fail;
 	}
-	ret = runtime_transition_check(runtime);
+	ret = runtime_transition_check(runtime, cancelled);
 	if (ret)
 		goto fail;
-	ret = runtime_errno(runtime->ops.configure(runtime->priv, runtime->map));
+	ret = runtime_errno(runtime->ops.configure(runtime->priv, runtime->map, cancelled));
 	if (ret)
 		goto fail;
 	ret = runtime_check(runtime, VDEC_MBOX1_MASK, 0);
@@ -579,7 +605,7 @@ int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 	if (ret)
 		goto fail;
 	spin_lock_irqsave(&runtime->lock, flags);
-	ret = runtime->stop_requested || runtime->preload_abort ? -ESHUTDOWN : 0;
+	ret = runtime_transition_locked(runtime, cancelled);
 	if (!ret)
 		runtime->state = VDEC_PREPARED;
 	spin_unlock_irqrestore(&runtime->lock, flags);
@@ -588,6 +614,10 @@ int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 	goto out;
 fail:
 	stopped = runtime_quiesce_locked(runtime);
+	if (stopped && *cancelled) {
+		*cancelled = false;
+		ret = stopped;
+	}
 	if (stopped)
 		dev_err(runtime->dev, "VDEC prepare error %d, stop unproved %d\n", ret, stopped);
 out:
@@ -599,17 +629,20 @@ out:
 	return ret;
 }
 
-static int runtime_start_locked(struct s7d_vdec_runtime *runtime)
+static int runtime_start_locked(struct s7d_vdec_runtime *runtime, bool *cancelled)
 {
 	unsigned long flags;
 	int ret, stopped;
 
 	spin_lock_irqsave(&runtime->lock, flags);
-	if (runtime->state != VDEC_PREPARED || runtime->irq_enabled ||
-	    runtime->irq_error || !runtime->session || runtime->stop_requested ||
-	    runtime->preload_abort) {
-		spin_unlock_irqrestore(&runtime->lock, flags);
+	ret = runtime->irq_error;
+	if (!ret && (runtime->state != VDEC_PREPARED || runtime->irq_enabled ||
+		     !runtime->session))
 		ret = -EBUSY;
+	if (!ret)
+		ret = runtime_transition_locked(runtime, cancelled);
+	if (ret) {
+		spin_unlock_irqrestore(&runtime->lock, flags);
 		goto out;
 	}
 	runtime->state = VDEC_ARMING;
@@ -625,33 +658,32 @@ static int runtime_start_locked(struct s7d_vdec_runtime *runtime)
 	runtime->irq_enabled = true;
 	spin_unlock_irqrestore(&runtime->lock, flags);
 	enable_irq(runtime->irq);
-	ret = runtime_arming_check(runtime);
+	ret = runtime_arming_check(runtime, cancelled);
 	if (ret)
 		goto fail;
 	ret = runtime_mask(runtime, 1);
 	if (ret)
 		goto fail;
-	ret = runtime_arming_check(runtime);
+	ret = runtime_arming_check(runtime, cancelled);
 	if (ret)
 		goto fail;
-	ret = runtime_errno(runtime->ops.enable_input(runtime->priv, runtime->map));
+	ret = runtime_errno(runtime->ops.enable_input(runtime->priv, runtime->map, cancelled));
 	if (ret)
 		goto fail;
-	ret = runtime_arming_check(runtime);
+	ret = runtime_arming_check(runtime, cancelled);
 	if (ret)
 		goto fail;
 	ret = s7d_codec_dos_start(runtime->dos, S7D_CODEC_ENGINE_VDEC);
 	if (ret)
 		goto fail;
-	ret = runtime_arming_check(runtime);
+	ret = runtime_arming_check(runtime, cancelled);
 	if (ret)
 		goto fail;
-	ret = runtime_errno(runtime->ops.kick(runtime->priv, runtime->map));
+	ret = runtime_errno(runtime->ops.kick(runtime->priv, runtime->map, cancelled));
 	if (ret)
 		goto fail;
 	spin_lock_irqsave(&runtime->lock, flags);
-	ret = runtime->stop_requested || runtime->preload_abort ?
-		-ESHUTDOWN : runtime->irq_error;
+	ret = runtime_transition_locked(runtime, cancelled);
 	if (!ret)
 		runtime->state = VDEC_RUNNING;
 	spin_unlock_irqrestore(&runtime->lock, flags);
@@ -660,18 +692,26 @@ static int runtime_start_locked(struct s7d_vdec_runtime *runtime)
 	goto out;
 fail:
 	stopped = runtime_quiesce_locked(runtime);
+	if (stopped && *cancelled) {
+		*cancelled = false;
+		ret = stopped;
+	}
 	if (stopped)
 		dev_err(runtime->dev, "VDEC start error %d, stop unproved %d\n", ret, stopped);
 out:
 	return ret;
 }
 
-int s7d_vdec_runtime_start(struct s7d_vdec_runtime *runtime)
+int s7d_vdec_runtime_start(struct s7d_vdec_runtime *runtime, bool *cancelled)
 {
 	int ret;
 
+	if (!cancelled)
+		return -EINVAL;
+	*cancelled = false;
+
 	mutex_lock(&runtime->control);
-	ret = runtime_start_locked(runtime);
+	ret = runtime_start_locked(runtime, cancelled);
 	mutex_unlock(&runtime->control);
 	return ret;
 }
@@ -711,7 +751,8 @@ static int runtime_picture_state(struct s7d_h264_input *input,
 int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 			  struct s7d_codec_session *session,
 			  struct s7d_h264_input *input, struct s7d_h264_dpb *dpb,
-			  u64 input_token, u64 write_token, u64 *park_epoch)
+			  u64 input_token, u64 write_token, u64 *park_epoch,
+			  bool *cancelled)
 {
 	struct s7d_h264_dpb_state state, parked;
 	unsigned long flags;
@@ -719,14 +760,21 @@ int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 	bool disable;
 	int ret, stopped;
 
+	if (!cancelled)
+		return -EINVAL;
+	*cancelled = false;
+
 	if (!session || !input || !dpb || !input_token || !write_token || !park_epoch)
 		return -EINVAL;
 	mutex_lock(&runtime->control);
 	spin_lock_irqsave(&runtime->lock, flags);
-	if (runtime->state != VDEC_RUNNING || runtime->session != session ||
-	    runtime->stop_requested || runtime->preload_abort || runtime->irq_error ||
-	    !runtime->irq_accept || !runtime->irq_enabled) {
+	ret = runtime->session != session ? -ESTALE : runtime->irq_error;
+	if (!ret && (runtime->state != VDEC_RUNNING ||
+		     !runtime->irq_accept || !runtime->irq_enabled))
 		ret = -EBUSY;
+	if (!ret)
+		ret = runtime_transition_locked(runtime, cancelled);
+	if (ret) {
 		spin_unlock_irqrestore(&runtime->lock, flags);
 		goto out;
 	}
@@ -745,8 +793,7 @@ int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 		goto out;
 	}
 	spin_lock_irqsave(&runtime->lock, flags);
-	ret = runtime->stop_requested || runtime->preload_abort ?
-		-ESHUTDOWN : runtime->irq_error;
+	ret = runtime_transition_locked(runtime, cancelled);
 	if (ret) {
 		spin_unlock_irqrestore(&runtime->lock, flags);
 		mutex_unlock(runtime->transaction);
@@ -769,7 +816,7 @@ int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 		ret = stopped;
 	if (ret)
 		goto fail;
-	ret = runtime_transition_check(runtime);
+	ret = runtime_transition_check(runtime, cancelled);
 	if (ret)
 		goto fail;
 	ret = s7d_codec_dos_park(runtime->dos, S7D_CODEC_ENGINE_VDEC);
@@ -785,12 +832,11 @@ int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 	if (ret)
 		goto fail;
 	ret = runtime_errno(runtime->ops.save_context(runtime->priv, runtime->map,
-						     session, input_token, write_token));
+						     session, input_token, write_token, cancelled));
 	if (ret)
 		goto fail;
 	spin_lock_irqsave(&runtime->lock, flags);
-	ret = runtime->stop_requested || runtime->preload_abort ?
-		-ESHUTDOWN : runtime->irq_error;
+	ret = runtime_transition_locked(runtime, cancelled);
 	if (!ret) {
 		runtime->park_sequence = epoch;
 		runtime->park_epoch = epoch;
@@ -810,6 +856,10 @@ int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 	goto out;
 fail:
 	stopped = runtime_quiesce_locked(runtime);
+	if (stopped && *cancelled) {
+		*cancelled = false;
+		ret = stopped;
+	}
 	if (stopped)
 		dev_err(runtime->dev, "VDEC park error %d, stop unproved %d\n", ret, stopped);
 out:
@@ -834,7 +884,8 @@ int s7d_vdec_runtime_check_parked(struct s7d_vdec_runtime *runtime,
 
 int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 			    struct s7d_codec_session *session, u64 input_token,
-			    u64 write_token, u64 park_epoch, u64 next_input_token)
+			    u64 write_token, u64 park_epoch, u64 next_input_token,
+			    bool *cancelled)
 {
 	struct s7d_codec_firmware_job *custody = NULL;
 	struct s7d_h264_au_info au;
@@ -845,12 +896,19 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 	u64 generation;
 	int ret, stopped;
 
+	if (!cancelled)
+		return -EINVAL;
+	*cancelled = false;
+
 	if (!session || !input_token || !write_token || !park_epoch ||
 	    next_input_token <= input_token)
 		return -EINVAL;
 	mutex_lock(&runtime->control);
 	spin_lock_irqsave(&runtime->lock, flags);
-	ret = runtime_parked_check(runtime, session, input_token, write_token, park_epoch);
+	ret = runtime->session != session || runtime->park_token != input_token ||
+		runtime->park_write != write_token || runtime->park_epoch != park_epoch ||
+		runtime->state != VDEC_AU_PARKED || runtime->irq_accept || runtime->irq_enabled ?
+		-ESTALE : runtime_transition_locked(runtime, cancelled);
 	if (ret) {
 		spin_unlock_irqrestore(&runtime->lock, flags);
 		goto out;
@@ -873,7 +931,7 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 	ret = s7d_codec_dos_prepare(runtime->dos, S7D_CODEC_ENGINE_VDEC);
 	if (ret)
 		goto fail;
-	ret = runtime_errno(runtime->ops.stage(runtime->priv, session, runtime->map));
+	ret = runtime_errno(runtime->ops.stage(runtime->priv, session, runtime->map, cancelled));
 	if (ret)
 		goto fail;
 	mutex_lock(runtime->transaction);
@@ -881,13 +939,13 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 	mutex_unlock(runtime->transaction);
 	if (ret)
 		goto fail;
-	ret = runtime_transition_check(runtime);
+	ret = runtime_transition_check(runtime, cancelled);
 	if (ret)
 		goto fail;
 	ret = s7d_codec_dos_port_enable(runtime->dos, S7D_CODEC_ENGINE_VDEC);
 	if (ret)
 		goto fail;
-	ret = runtime_preload_locked(runtime, session, &custody);
+	ret = runtime_preload_locked(runtime, session, &custody, cancelled);
 	if (ret)
 		goto fail;
 	ret = s7d_codec_firmware_load(runtime->dev, S7D_CODEC_ENGINE_VDEC,
@@ -896,12 +954,12 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 		s7d_codec_firmware_invalidate(runtime->firmware);
 		goto fail;
 	}
-	ret = runtime_transition_check(runtime);
+	ret = runtime_transition_check(runtime, cancelled);
 	if (ret)
 		goto fail;
 	ret = runtime_errno(runtime->ops.restore_context(runtime->priv, runtime->map,
 					 session, input_token, write_token, park_epoch,
-					 next_input_token));
+					 next_input_token, cancelled));
 	if (ret)
 		goto fail;
 	ret = runtime_check(runtime, VDEC_MBOX1_MASK, 0);
@@ -914,17 +972,20 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 	if (ret)
 		goto fail;
 	spin_lock_irqsave(&runtime->lock, flags);
-	ret = runtime->stop_requested || runtime->preload_abort ?
-		-ESHUTDOWN : runtime->irq_error;
+	ret = runtime_transition_locked(runtime, cancelled);
 	if (!ret)
 		runtime->state = VDEC_PREPARED;
 	spin_unlock_irqrestore(&runtime->lock, flags);
 	if (ret)
 		goto fail;
-	ret = runtime_start_locked(runtime);
+	ret = runtime_start_locked(runtime, cancelled);
 	goto out;
 fail:
 	stopped = runtime_quiesce_locked(runtime);
+	if (stopped && *cancelled) {
+		*cancelled = false;
+		ret = stopped;
+	}
 	if (stopped)
 		dev_err(runtime->dev, "VDEC resume error %d, stop unproved %d\n", ret, stopped);
 out:
