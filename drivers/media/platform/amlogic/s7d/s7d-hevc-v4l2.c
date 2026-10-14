@@ -13,18 +13,11 @@
 
 #include "s7d-hevc-backend.h"
 #include "s7d-hevc-context.h"
+#include "s7d-hevc-input.h"
 #include "s7d-hevc-sequence.h"
 #include "s7d-hevc-v4l2.h"
 #include "s7d-codec-dos.h"
 #include "s7d-v4l2-device.h"
-
-#define HEVC_PARAMETER_BYTES SZ_64K
-#define HEVC_PREFIX_BYTES 16U
-
-struct hevc_parameter {
-	u8 *data;
-	size_t bytes;
-};
 
 struct hevc_backend {
 	struct s7d_hevc_v4l2 *adapter;
@@ -37,12 +30,15 @@ struct hevc_backend {
 	struct s7d_v4l2_input input;
 	struct s7d_v4l2_drain drain;
 	struct s7d_v4l2_capture_buffer capture[S7D_HEVC_MAX_CAPTURE_BUFFERS];
-	struct hevc_parameter parameter[3];
+	struct s7d_hevc_input_bank *bank;
+	struct s7d_hevc_input *prepared;
+	struct s7d_hevc_input_result view;
 	struct s7d_hevc_sps sps;
 	struct s7d_codec_layout layout;
 	u8 *au;
 	size_t au_bytes;
 	u64 generation;
+	u64 parameter_epoch;
 	u64 last_submitted;
 	u64 last_completed;
 	u64 initial_token;
@@ -54,7 +50,7 @@ struct hevc_backend {
 	bool initial_complete;
 	bool sequence_valid;
 	bool sequence_notified;
-	bool picture_done;
+	bool decoder_bound;
 	bool capture_blocked;
 	bool execution_attempted;
 	bool drain_pending;
@@ -72,58 +68,6 @@ struct s7d_hevc_v4l2 {
 	struct hevc_backend *active;
 	bool closing;
 };
-
-static size_t hevc_start_code(const u8 *data, size_t bytes, size_t pos)
-{
-	if (bytes - pos < 3 || data[pos] || data[pos + 1])
-		return 0;
-	if (data[pos + 2] == 1)
-		return 3;
-	return bytes - pos >= 4 && !data[pos + 2] && data[pos + 3] == 1 ? 4 : 0;
-}
-
-static int hevc_rbsp_prefix(const u8 *data, size_t bytes, u8 prefix[], u32 *count)
-{
-	u32 zeros = 0, kept = 0;
-	size_t i;
-
-	for (i = 0; i < bytes; i++) {
-		if (zeros >= 2 && data[i] <= 3) {
-			if (data[i] != 3 || i + 1 == bytes || data[i + 1] > 3)
-				return -EBADMSG;
-			zeros = 0;
-			continue;
-		}
-		if (kept < HEVC_PREFIX_BYTES)
-			prefix[kept++] = data[i];
-		zeros = data[i] ? 0 : zeros + 1;
-	}
-	*count = kept;
-	return kept ? 0 : -EBADMSG;
-}
-
-static int hevc_ue(const u8 *data, u32 bytes, u32 *bit, u32 *value)
-{
-	u32 zeros = 0, result = 1;
-	bool one = false;
-
-	while (*bit < bytes * 8) {
-		one = data[*bit / 8] & (0x80 >> (*bit & 7));
-		(*bit)++;
-		if (one)
-			break;
-		if (++zeros > 31)
-			return -EBADMSG;
-	}
-	if (!one || zeros > bytes * 8 - *bit)
-		return -EBADMSG;
-	while (zeros--) {
-		result = (result << 1) | !!(data[*bit / 8] & (0x80 >> (*bit & 7)));
-		(*bit)++;
-	}
-	*value = result - 1;
-	return 0;
-}
 
 static bool hevc_same_sps(const struct s7d_hevc_sps *a,
 			  const struct s7d_hevc_sps *b)
@@ -147,6 +91,7 @@ static bool hevc_same_sps(const struct s7d_hevc_sps *a,
 	       a->log2_max_poc_lsb == b->log2_max_poc_lsb &&
 	       a->max_dec_pic_buffering == b->max_dec_pic_buffering &&
 	       a->num_reorder_pics == b->num_reorder_pics &&
+	       a->max_latency_increase_plus1 == b->max_latency_increase_plus1 &&
 	       a->separate_colour_plane == b->separate_colour_plane &&
 	       a->interlaced_source == b->interlaced_source &&
 	       a->field_seq == b->field_seq &&
@@ -156,192 +101,128 @@ static bool hevc_same_sps(const struct s7d_hevc_sps *a,
 	       a->colour.flags == b->colour.flags;
 }
 
-static int hevc_check_parameters(const struct hevc_parameter parameter[],
-				 const struct s7d_hevc_sps *sps, bool valid)
+static void hevc_input_release(struct hevc_backend *backend)
 {
-	u8 prefix[HEVC_PREFIX_BYTES];
-	u32 count, bit = 0, pps, id;
-	int ret;
-
-	if (valid && parameter[0].data && (parameter[0].data[6] >> 4) != sps->vps_id)
-		return -EBADMSG;
-	if (!parameter[2].data)
-		return 0;
-	ret = hevc_rbsp_prefix(parameter[2].data + 6, parameter[2].bytes - 6,
-			       prefix, &count);
-	if (!ret)
-		ret = hevc_ue(prefix, count, &bit, &pps);
-	if (!ret)
-		ret = hevc_ue(prefix, count, &bit, &id);
-	if (!ret && (pps > 63 || id >= 8 || (valid && id != sps->sps_id)))
-		ret = -EBADMSG;
-	return ret;
+	s7d_hevc_input_release(backend->prepared);
+	backend->prepared = NULL;
+	kvfree(backend->au);
+	backend->au = NULL;
+	backend->au_bytes = 0;
+	memset(&backend->view, 0, sizeof(backend->view));
 }
 
 static int hevc_metadata(struct hevc_backend *backend)
 {
-	struct hevc_parameter next[3];
-	struct s7d_hevc_sps sps = backend->sps, checked;
+	struct s7d_hevc_input *prepared = NULL;
+	const struct s7d_hevc_input_result *view;
 	struct s7d_codec_layout layout = backend->layout;
 	const u8 *data = s7d_codec_dma_cpu(backend->input.memory);
-	const u8 *idr = NULL;
-	size_t bytes = backend->input.bytes, idr_bytes = 0, pos = 0, total = 0;
-	u32 seen = 0, nals = 0, i;
+	size_t prefix, total;
 	u8 *au = NULL;
-	bool valid = backend->sequence_valid;
-	int ret = 0;
+	int ret;
 
 	lockdep_assert_held(&backend->lock);
-	if (!data || !bytes || bytes > S7D_HEVC_INPUT_MAX_BYTES || backend->au)
+	if (!backend->bank || backend->prepared || !data || !backend->input.bytes)
 		return -EINVAL;
-	memcpy(next, backend->parameter, sizeof(next));
-	while (pos < bytes && !hevc_start_code(data, bytes, pos) && !data[pos])
-		pos++;
-	while (pos < bytes) {
-		u8 prefix[HEVC_PREFIX_BYTES];
-		u32 type, prefix_bytes;
-		size_t code = hevc_start_code(data, bytes, pos);
-		size_t start = pos + code, end;
-
-		if (!code || ++nals > 64) {
-			ret = -EBADMSG;
-			goto out;
-		}
-		for (pos = start; pos < bytes; pos++)
-			if (hevc_start_code(data, bytes, pos))
-				break;
-		end = pos;
-		while (end > start && !data[end - 1])
-			end--;
-		if (end - start < 3 || (data[start] & 0x81) || data[start + 1] != 1) {
-			ret = -EBADMSG;
-			goto out;
-		}
-		type = (data[start] >> 1) & 0x3f;
-		ret = hevc_rbsp_prefix(data + start + 2, end - start - 2,
-				       prefix, &prefix_bytes);
-		if (ret)
-			goto out;
-		if (type >= 32 && type <= 34) {
-			u32 index = type - 32;
-
-			if (idr || (seen & BIT(index)) || end - start > HEVC_PARAMETER_BYTES) {
-				ret = -EOPNOTSUPP;
-				goto out;
-			}
-			next[index].data = kmalloc(end - start + 4, GFP_KERNEL);
-			if (!next[index].data) {
-				ret = -ENOMEM;
-				goto out;
-			}
-			next[index].bytes = end - start + 4;
-			memcpy(next[index].data, "\0\0\0\1", 4);
-			memcpy(next[index].data + 4, data + start, end - start);
-			seen |= BIT(index);
-			if (index == 1) {
-				ret = s7d_hevc_parse_sps(data + start, end - start, &sps);
-				if (!ret && (sps.sps_id >= 8 || sps.max_sub_layers != 1))
-					ret = -EOPNOTSUPP;
-				if (!ret && valid && !hevc_same_sps(&backend->sps, &sps))
-					ret = -EOPNOTSUPP;
-				if (!ret)
-					ret = s7d_hevc_build_layout(&sps, S7D_CODEC_CAPTURE_NV12M,
-							    0, &layout);
-				if (ret)
-					goto out;
-				valid = true;
-			}
-		} else if (type == 19 || type == 20) {
-			if (idr) {
-				ret = -EOPNOTSUPP;
-				goto out;
-			}
-			idr = data + start;
-			idr_bytes = end - start;
-		} else if (type != 35 && type != 39 && type != 40) {
-			ret = -EOPNOTSUPP;
-			goto out;
-		}
-	}
-	if (!nals) {
-		ret = -EBADMSG;
-		goto out;
-	}
-	ret = hevc_check_parameters(next, &sps, valid);
+	ret = s7d_hevc_input_prepare(backend->bank, data, backend->input.bytes, &prepared);
 	if (ret)
-		goto out;
-	if (idr) {
-		if (!valid || !next[0].data || !next[1].data || !next[2].data) {
+		return ret;
+	view = s7d_hevc_input_view(prepared);
+	if (!view) {
+		ret = -EPROTO;
+		goto failed;
+	}
+	if (view->sequence) {
+		ret = s7d_hevc_build_layout(&view->sequence->sps,
+					    S7D_CODEC_CAPTURE_NV12M, 0, &layout);
+		if (!ret && backend->sequence_valid &&
+		    !hevc_same_sps(&backend->sps, &view->sequence->sps))
+			ret = -EOPNOTSUPP;
+		if (ret)
+			goto failed;
+	}
+	if (view->kind == S7D_HEVC_INPUT_PICTURE) {
+		if (!view->sequence || !view->slice.parameter_epoch) {
 			ret = -EBADMSG;
-			goto out;
+			goto failed;
 		}
-		for (i = 0; i < 3; i++)
-			if (check_add_overflow(total, next[i].bytes, &total)) {
-				ret = -EOVERFLOW;
-				goto out;
-			}
-		if (check_add_overflow(total, idr_bytes + 4, &total) ||
+		if (backend->parameter_epoch &&
+		    view->slice.parameter_epoch != backend->parameter_epoch) {
+			ret = -EOPNOTSUPP;
+			goto failed;
+		}
+		prefix = s7d_hevc_input_prefix_bytes(prepared);
+		if (!prefix || check_add_overflow(prefix, view->bytes, &total) ||
 		    total > S7D_HEVC_INPUT_MAX_BYTES) {
 			ret = -E2BIG;
-			goto out;
+			goto failed;
 		}
 		au = kvmalloc(total, GFP_KERNEL);
 		if (!au) {
 			ret = -ENOMEM;
-			goto out;
+			goto failed;
 		}
-		pos = 0;
-		for (i = 0; i < 3; i++) {
-			memcpy(au + pos, next[i].data, next[i].bytes);
-			pos += next[i].bytes;
-		}
-		memcpy(au + pos, "\0\0\0\1", 4);
-		memcpy(au + pos + 4, idr, idr_bytes);
-		ret = s7d_hevc_input_validate_annexb(au, total, &checked);
-		if (!ret && !hevc_same_sps(&checked, &sps))
-			ret = -EBADMSG;
+		ret = s7d_hevc_input_copy_prefix(prepared, au, total);
 		if (ret)
-			goto out;
+			goto failed;
+		memcpy(au + prefix, view->data, view->bytes);
+	} else {
+		total = 0;
 	}
-	for (i = 0; i < 3; i++)
-		if (seen & BIT(i)) {
-			kfree(backend->parameter[i].data);
-			backend->parameter[i] = next[i];
-		}
-	backend->sps = sps;
-	backend->layout = layout;
-	backend->sequence_valid = valid;
+	ret = s7d_hevc_input_commit(backend->bank, prepared);
+	if (ret)
+		goto failed;
+	if (view->sequence) {
+		backend->sps = view->sequence->sps;
+		backend->layout = layout;
+		backend->sequence_valid = true;
+	}
+	backend->prepared = prepared;
+	backend->view = *view;
 	backend->au = au;
 	backend->au_bytes = total;
+	if (au) {
+		backend->view.data = au;
+		backend->view.bytes = total;
+		backend->parameter_epoch = view->slice.parameter_epoch;
+	}
 	return 0;
-out:
-	for (i = 0; i < 3; i++)
-		if (seen & BIT(i))
-			kfree(next[i].data);
+failed:
 	kvfree(au);
+	s7d_hevc_input_release(prepared);
 	return ret;
 }
 
-static int hevc_notify_sequence(struct hevc_backend *backend)
+static int hevc_notify_sequence(struct hevc_backend *backend, bool *cancelled)
 {
-	int ret = -ESHUTDOWN;
+	int ret;
 
+	*cancelled = false;
 	mutex_lock(&backend->notifications);
-	if (backend->frontend && !READ_ONCE(backend->closing))
-		ret = s7d_v4l2_sequence(backend->frontend, &backend->layout);
+	if (backend->frontend && !READ_ONCE(backend->closing)) {
+		ret = s7d_v4l2_sequence_result(backend->frontend, &backend->layout, cancelled);
+	} else {
+		*cancelled = true;
+		ret = -ECANCELED;
+	}
 	mutex_unlock(&backend->notifications);
 	return ret;
 }
 
-static int hevc_notify_input(struct hevc_backend *backend, u64 token, int status)
+static int hevc_notify_input(struct hevc_backend *backend, u64 token, int status,
+			     bool *cancelled)
 {
-	int ret = -ESHUTDOWN;
+	int ret;
 
+	*cancelled = false;
 	mutex_lock(&backend->notifications);
 	if (backend->frontend && !READ_ONCE(backend->closing)) {
 		if (status)
 			s7d_v4l2_error(backend->frontend, status);
-		ret = s7d_v4l2_input_done(backend->frontend, token, status);
+		ret = s7d_v4l2_input_done_result(backend->frontend, token, status, cancelled);
+	} else {
+		*cancelled = true;
+		ret = -ECANCELED;
 	}
 	mutex_unlock(&backend->notifications);
 	return ret;
@@ -357,9 +238,10 @@ static void hevc_notify_error(struct hevc_backend *backend, int error)
 
 static int hevc_complete_input(struct hevc_backend *backend, u64 token, int status)
 {
-	int ret = hevc_notify_input(backend, token, status);
+	bool cancelled;
+	int ret = hevc_notify_input(backend, token, status, &cancelled);
 
-	if (ret && ret != -ESHUTDOWN) {
+	if (ret && !cancelled) {
 		mutex_lock(&backend->lock);
 		backend->failure = ret;
 		mutex_unlock(&backend->lock);
@@ -372,7 +254,8 @@ static void hevc_work(struct work_struct *work)
 {
 	struct hevc_backend *backend = container_of(work, struct hevc_backend, work);
 	struct s7d_hevc_decode_result result;
-	u64 token;
+	u64 token = 0;
+	bool cancelled;
 	int ret;
 
 	for (;;) {
@@ -386,11 +269,15 @@ static void hevc_work(struct work_struct *work)
 				goto failed;
 			backend->preflight = true;
 			mutex_unlock(&backend->lock);
+			cancelled = false;
 			ret = backend->sequence_valid && !backend->sequence_notified ?
-				hevc_notify_sequence(backend) : 0;
+				hevc_notify_sequence(backend, &cancelled) : 0;
 			mutex_lock(&backend->lock);
-			if (ret)
+			if (ret) {
+				if (backend->closing && cancelled)
+					goto unlock;
 				goto failed;
+			}
 			backend->sequence_notified = backend->sequence_valid;
 			if (token == backend->initial_token)
 				backend->initial_complete = true;
@@ -400,47 +287,73 @@ static void hevc_work(struct work_struct *work)
 			}
 			backend->input_pending = false;
 			backend->last_completed = token;
+			hevc_input_release(backend);
 			mutex_unlock(&backend->lock);
 			if (hevc_complete_input(backend, token, 0))
 				return;
 			continue;
 		}
 		if (backend->input_pending && backend->au && backend->captures) {
-			struct s7d_v4l2_capture_buffer capture = backend->capture[0];
-			u8 *au = backend->au;
-			size_t bytes = backend->au_bytes;
-			u64 timestamp = backend->input.timestamp_ns;
+			bool bound = backend->decoder_bound;
 
 			token = backend->input.token;
+
 			backend->execution_attempted = true;
 			mutex_unlock(&backend->lock);
-			ret = s7d_hevc_decoder_decode_surface(backend->adapter->decoder,
-				backend->session, au, bytes, capture.surface,
-				capture.surface_id, capture.generation, timestamp, &result);
+			if (!bound) {
+				ret = s7d_hevc_decoder_bind(backend->adapter->decoder, backend->session,
+					&backend->sps, &backend->layout, backend->generation,
+					backend->parameter_epoch, backend->capture, backend->captures);
+				mutex_lock(&backend->lock);
+				if (!ret)
+					backend->decoder_bound = true;
+				mutex_unlock(&backend->lock);
+			} else {
+				ret = 0;
+			}
+			result = (struct s7d_hevc_decode_result) { };
+			if (!ret)
+				ret = s7d_hevc_decoder_decode(backend->adapter->decoder,
+					backend->session, &backend->view, token,
+					backend->input.timestamp_ns, &backend->input.timestamp_meta, &result);
 			mutex_lock(&backend->lock);
-			if (ret)
+			if (ret) {
+				if (result.cancelled && backend->closing)
+					goto unlock;
 				goto failed;
-			backend->picture_done = true;
+			}
 			backend->input_pending = false;
 			backend->last_completed = token;
-			backend->au = NULL;
-			backend->au_bytes = 0;
+			hevc_input_release(backend);
 			mutex_unlock(&backend->lock);
-			kvfree(au);
 			if (hevc_complete_input(backend, token, 0))
 				return;
 			continue;
 		}
 		if (backend->drain_pending && !backend->drain_notified) {
 			struct s7d_v4l2_drain drain = backend->drain;
+			u32 published = 0;
 
+			if (backend->input_pending || drain.last_input_token != backend->last_completed)
+				goto unlock;
 			mutex_unlock(&backend->lock);
-			mutex_lock(&backend->notifications);
-			ret = backend->frontend && !READ_ONCE(backend->closing) ?
-				s7d_v4l2_drain_done(backend->frontend, drain.epoch,
-						    drain.last_input_token) : -ESHUTDOWN;
-			mutex_unlock(&backend->notifications);
+			cancelled = false;
+			ret = backend->decoder_bound ?
+				s7d_hevc_decoder_drain(backend->adapter->decoder,
+						backend->session, &published, &cancelled) : 0;
+			if (!ret) {
+				mutex_lock(&backend->notifications);
+				cancelled = false;
+				if (backend->frontend && !READ_ONCE(backend->closing))
+					ret = s7d_v4l2_drain_done_result(backend->frontend,
+						drain.epoch, drain.last_input_token, &cancelled);
+				else
+					cancelled = true;
+				mutex_unlock(&backend->notifications);
+			}
 			mutex_lock(&backend->lock);
+			if (cancelled && backend->closing)
+				goto unlock;
 			if (ret) {
 				backend->failure = ret;
 				mutex_unlock(&backend->lock);
@@ -455,11 +368,13 @@ unlock:
 failed:
 		backend->failure = ret;
 		backend->input_pending = false;
+		hevc_input_release(backend);
 		mutex_unlock(&backend->lock);
 		hevc_complete_input(backend, token, ret);
 		return;
 	}
 }
+
 
 static int hevc_prepare(void *priv, struct s7d_codec_session *session,
 			struct s7d_v4l2_context *frontend)
@@ -496,8 +411,6 @@ static int hevc_submit(void *priv, const struct s7d_v4l2_input *input)
 	} else if (!input || !input->memory || !input->bytes ||
 		   input->bytes > S7D_HEVC_INPUT_MAX_BYTES || !input->token) {
 		ret = -EINVAL;
-	} else if (backend->picture_done) {
-		ret = -EOPNOTSUPP;
 	} else if (backend->input_pending || backend->drain_pending ||
 		   input->token <= backend->last_submitted) {
 		ret = -EBUSY;
@@ -646,8 +559,11 @@ static int hevc_capture_queue(void *priv, struct s7d_codec_surface *surface,
 		if (backend->capture[i].surface == surface &&
 		    backend->capture[i].surface_id == surface_id &&
 		    backend->capture[i].generation == generation) {
-			ret = 0;
-			queue_work(system_unbound_wq, &backend->work);
+			ret = backend->decoder_bound ?
+				s7d_hevc_decoder_capture_queue(backend->adapter->decoder,
+							surface, surface_id, generation) : 0;
+			if (!ret)
+				queue_work(system_unbound_wq, &backend->work);
 			break;
 		}
 out:
@@ -664,7 +580,7 @@ static int hevc_drain(void *priv, const struct s7d_v4l2_drain *request)
 	if (backend->closing || backend->failure) {
 		ret = backend->failure ? backend->failure : -ESHUTDOWN;
 	} else if (!request || !request->epoch || backend->input_pending ||
-		   backend->drain_pending || !backend->picture_done ||
+		   backend->drain_pending ||
 		   request->last_input_token != backend->last_completed) {
 		ret = -EBUSY;
 	} else {
@@ -678,7 +594,20 @@ static int hevc_drain(void *priv, const struct s7d_v4l2_drain *request)
 
 static int hevc_resume(void *priv)
 {
-	return -EOPNOTSUPP;
+	struct hevc_backend *backend = priv;
+	int ret = 0;
+
+	mutex_lock(&backend->lock);
+	if (backend->closing || backend->failure || backend->input_pending ||
+	    !backend->drain_notified) {
+		ret = backend->failure ? backend->failure : -EBUSY;
+	} else {
+		memset(&backend->drain, 0, sizeof(backend->drain));
+		backend->drain_pending = false;
+		backend->drain_notified = false;
+	}
+	mutex_unlock(&backend->lock);
+	return ret;
 }
 
 static void hevc_detach(void *priv)
@@ -699,7 +628,6 @@ static void hevc_detach(void *priv)
 static int hevc_release_epoch(struct hevc_backend *backend)
 {
 	struct s7d_codec_session *session;
-	u32 i;
 	int ret;
 
 	lockdep_assert_held(&backend->adapter->clients);
@@ -707,6 +635,9 @@ static int hevc_release_epoch(struct hevc_backend *backend)
 		return -EBUSY;
 	if (backend->session) {
 		ret = s7d_codec_session_stop(backend->session);
+		if (!ret)
+			ret = s7d_hevc_decoder_stream_close(backend->adapter->decoder,
+							backend->session);
 		if (ret)
 			return ret;
 	}
@@ -715,13 +646,8 @@ static int hevc_release_epoch(struct hevc_backend *backend)
 		backend->adapter->active = NULL;
 	session = backend->session;
 	backend->session = NULL;
-	for (i = 0; i < 3; i++) {
-		kfree(backend->parameter[i].data);
-		backend->parameter[i] = (struct hevc_parameter) { };
-	}
-	kvfree(backend->au);
-	backend->au = NULL;
-	backend->au_bytes = 0;
+	hevc_input_release(backend);
+	backend->decoder_bound = false;
 	mutex_unlock(&backend->lock);
 	if (session)
 		s7d_codec_session_put(session);
@@ -732,8 +658,12 @@ static int hevc_reset(void *priv)
 {
 	struct hevc_backend *backend = priv;
 	struct s7d_hevc_v4l2 *adapter = backend->adapter;
+	struct s7d_hevc_input_bank *bank;
 	int ret;
 
+	bank = s7d_hevc_input_bank_create();
+	if (IS_ERR(bank))
+		return PTR_ERR(bank);
 	mutex_lock(&adapter->clients);
 	ret = adapter->closing ? -ESHUTDOWN : hevc_release_epoch(backend);
 	if (!ret) {
@@ -743,7 +673,11 @@ static int hevc_reset(void *priv)
 		memset(&backend->sps, 0, sizeof(backend->sps));
 		memset(&backend->layout, 0, sizeof(backend->layout));
 		memset(backend->capture, 0, sizeof(backend->capture));
+		s7d_hevc_input_bank_destroy(backend->bank);
+		backend->bank = bank;
+		bank = NULL;
 		backend->generation = 0;
+		backend->parameter_epoch = 0;
 		backend->last_submitted = 0;
 		backend->last_completed = 0;
 		backend->initial_token = 0;
@@ -754,7 +688,7 @@ static int hevc_reset(void *priv)
 		backend->initial_complete = false;
 		backend->sequence_valid = false;
 		backend->sequence_notified = false;
-		backend->picture_done = false;
+		backend->decoder_bound = false;
 		backend->capture_blocked = false;
 		backend->execution_attempted = false;
 		backend->drain_pending = false;
@@ -763,6 +697,7 @@ static int hevc_reset(void *priv)
 		mutex_unlock(&backend->lock);
 	}
 	mutex_unlock(&adapter->clients);
+	s7d_hevc_input_bank_destroy(bank);
 	return ret;
 }
 
@@ -798,9 +733,17 @@ static void *hevc_factory_create(void *priv)
 	backend = kzalloc(sizeof(*backend), GFP_KERNEL);
 	if (!backend)
 		return ERR_PTR(-ENOMEM);
+	backend->bank = s7d_hevc_input_bank_create();
+	if (IS_ERR(backend->bank)) {
+		int ret = PTR_ERR(backend->bank);
+
+		kfree(backend);
+		return ERR_PTR(ret);
+	}
 	mutex_lock(&adapter->clients);
 	if (adapter->closing || !try_module_get(adapter->owner)) {
 		mutex_unlock(&adapter->clients);
+		s7d_hevc_input_bank_destroy(backend->bank);
 		kfree(backend);
 		return ERR_PTR(-ESHUTDOWN);
 	}
@@ -829,6 +772,7 @@ static void hevc_factory_destroy(void *priv, void *instance)
 	}
 	list_del(&backend->node);
 	mutex_unlock(&adapter->clients);
+	s7d_hevc_input_bank_destroy(backend->bank);
 	module_put(adapter->owner);
 	kfree(backend);
 }

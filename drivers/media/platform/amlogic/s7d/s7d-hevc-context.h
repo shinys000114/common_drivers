@@ -43,6 +43,14 @@ struct s7d_hevc_workspace {
 	u32 aux_suffix_bytes;
 };
 
+struct s7d_hevc_context_au {
+	const u8 *data;
+	size_t bytes;
+	const struct s7d_hevc_sps *sps;
+	u64 lease_epoch;
+	u64 input_token;
+};
+
 struct s7d_hevc_input_plan {
 	u32 start;
 	/* HEVC ring uses an exclusive end, unlike the VLD FIFO. */
@@ -54,21 +62,31 @@ struct s7d_hevc_input_plan {
 	u64 token;
 };
 
-/* VPS/SPS/PPS/one first-slice IDR19/20, layer0/temporal id1, SPS ID < 8. */
-int s7d_hevc_input_validate_annexb(const u8 *data, size_t bytes,
-				   struct s7d_hevc_sps *sps);
-/* Pure allocation: caller already owns an OPEN HEVC session. */
+/* Persistent stream; slot count is the registered CAPTURE pool size. */
 struct s7d_hevc_context *
-s7d_hevc_context_create(struct s7d_codec_session *session,
-			const struct s7d_hevc_sps *sps, size_t input_capacity);
-/* Join all users first. Session core owns DMA free/quarantine after quiesce. */
-void s7d_hevc_context_release(struct s7d_hevc_context *context);
+s7d_hevc_context_create_stream(struct s7d_codec_session *session,
+			       const struct s7d_hevc_sps *sps,
+			       size_t input_capacity, u32 slot_count,
+			       u64 lease_epoch);
+/* All calls are serialized by the executor; join DPB/IRQ/work before destroy. */
+int s7d_hevc_context_destroy_stream(struct s7d_hevc_context *context,
+				  u64 lease_epoch);
+int s7d_hevc_context_mv_slot(const struct s7d_hevc_context *context,
+			   u64 lease_epoch, u32 slot,
+			   struct s7d_hevc_dma_region *region);
+/* Pass actual DOS full-halt status and completed IRQ join for this input. */
+int s7d_hevc_context_mark_idle(struct s7d_hevc_context *context,
+			     u64 lease_epoch, u64 input_token,
+			     int halt_status, bool irq_joined);
+/* AU is the syntax layer's validated immutable copy; no payload rewriting. */
+int s7d_hevc_context_stage_au(struct s7d_hevc_context *context,
+			    const struct s7d_hevc_context_au *au,
+			    struct s7d_hevc_input_plan *plan);
+/* Call before any firmware/protocol/picture MMIO, including partial attempts. */
+int s7d_hevc_context_begin(struct s7d_hevc_context *context,
+			  u64 lease_epoch, u64 input_token);
 const struct s7d_hevc_workspace *
 s7d_hevc_context_workspace(const struct s7d_hevc_context *context);
-/* Copy before validating; immutable single AU, only one successful stage. */
-int s7d_hevc_context_stage(struct s7d_hevc_context *context,
-			   const u8 *data, size_t bytes, u64 token,
-			   struct s7d_hevc_input_plan *plan);
 /* Serialized calls: parent proves CPU/fetch stopped; four addresses only. */
 int s7d_hevc_context_program_input(struct s7d_hevc_context *context,
 				   struct regmap *map);

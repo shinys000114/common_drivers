@@ -8,9 +8,12 @@
 #include <linux/unaligned.h>
 
 #include "s7d-hevc-rpm.h"
+#include "s7d-hevc-input.h"
 #include "s7d-hevc-sequence.h"
 
 enum s7d_hevc_rpm_word {
+	RPM_ACTIVE_L0 = 0x10,
+	RPM_ACTIVE_L1 = 0x11,
 	RPM_SLICE_TYPE = 0x12,
 	RPM_TEMPORAL_MVP = 0x13,
 	RPM_DEPENDENT_SLICE = 0x14,
@@ -20,17 +23,21 @@ enum s7d_hevc_rpm_word {
 	RPM_MIN_CB_MINUS3 = 0x19,
 	RPM_CTB_DIFF = 0x1a,
 	RPM_POC_LOG2_MINUS4 = 0x1b,
+	RPM_POC_LSB = 0x1c,
+	RPM_COL_FROM_L0 = 0x1d,
+	RPM_COL_INDEX = 0x1e,
 	RPM_REORDER = 0x21,
+	RPM_MODIFICATION = 0x22,
 	RPM_TILES = 0x23,
 	RPM_TILE_COLUMNS_MINUS1 = 0x24,
 	RPM_TILE_ROWS_MINUS1 = 0x25,
-	RPM_MISC_FLAGS = 0x3a,
 	RPM_FIRST_SLICE = 0x41,
 	RPM_TEMPORAL_ID_PLUS1 = 0x42,
 	RPM_NAL_TYPE = 0x43,
 	RPM_BIT_DEPTH = 0x48,
 	RPM_PROFILE_ETC = 0x49,
 	RPM_SEI_FRAME_FIELD = 0x4a,
+	RPM_MODIFICATION_LIST = 0x4c,
 	RPM_CROP_FLAG = 0x6c,
 	RPM_CROP_LEFT = 0x6d,
 	RPM_CROP_RIGHT = 0x6e,
@@ -39,6 +46,136 @@ enum s7d_hevc_rpm_word {
 	RPM_CHROMA = 0x71,
 	RPM_DPB_MINUS1 = 0x76,
 };
+
+static bool hevc_slice_same(const struct s7d_hevc_slice_info *a,
+			    const struct s7d_hevc_slice_info *b)
+{
+	u32 i, list;
+
+	if (a->nal_type != b->nal_type || a->temporal_id_plus1 != b->temporal_id_plus1 ||
+	    a->slice_type != b->slice_type || a->poc_lsb != b->poc_lsb ||
+	    a->slice_address != b->slice_address || a->rps_count != b->rps_count ||
+	    a->first_slice != b->first_slice || a->dependent_slice != b->dependent_slice ||
+	    a->temporal_mvp != b->temporal_mvp ||
+	    a->collocated_from_l0 != b->collocated_from_l0 ||
+	    a->collocated_ref_idx != b->collocated_ref_idx)
+		return false;
+	for (i = 0; i < a->rps_count; i++)
+		if (a->rps[i].delta_poc != b->rps[i].delta_poc ||
+		    a->rps[i].used != b->rps[i].used ||
+		    a->rps[i].long_term != b->rps[i].long_term)
+			return false;
+	for (list = 0; list < 2; list++) {
+		if (a->active[list] != b->active[list] ||
+		    a->modification[list] != b->modification[list])
+			return false;
+		if (a->modification[list])
+			for (i = 0; i < a->active[list]; i++)
+				if (a->modification_index[list][i] != b->modification_index[list][i])
+					return false;
+	}
+	return true;
+}
+
+int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
+			     const struct s7d_hevc_sps *host,
+			     const struct s7d_hevc_slice_info *cpu,
+			     struct s7d_hevc_slice_info *slice)
+{
+	struct s7d_hevc_slice_info next = { };
+	struct s7d_hevc_geometry geometry;
+	u32 i, list, offset = 0, used = 0;
+	const u16 *word;
+	int ret;
+
+	if (!rpm || !host || !cpu || !slice)
+		return -EINVAL;
+	ret = s7d_hevc_rpm_check_sequence(rpm, host, &geometry);
+	if (ret)
+		return ret;
+	if (cpu->rps_count > S7D_HEVC_RPS_ENTRIES || cpu->active[0] > 16 || cpu->active[1] > 16)
+		return -EINVAL;
+	word = rpm->word;
+	next.nal_type = word[RPM_NAL_TYPE];
+	next.temporal_id_plus1 = word[RPM_TEMPORAL_ID_PLUS1];
+	next.slice_type = word[RPM_SLICE_TYPE];
+	next.first_slice = word[RPM_FIRST_SLICE];
+	next.dependent_slice = word[RPM_DEPENDENT_SLICE];
+	next.slice_address = word[RPM_SLICE_ADDRESS];
+	next.temporal_mvp = word[RPM_TEMPORAL_MVP];
+	if (next.slice_type > 2 ||
+	    (next.nal_type != 0 && next.nal_type != 1 &&
+	     !(next.nal_type >= 6 && next.nal_type <= 9) &&
+	     !(next.nal_type >= 16 && next.nal_type <= 21)))
+		return -EOPNOTSUPP;
+	if (next.nal_type >= 16 && next.slice_type != 2)
+		return -EPROTO;
+	if (next.nal_type != 19 && next.nal_type != 20) {
+		next.poc_lsb = word[RPM_POC_LSB];
+		if (next.poc_lsb >= (1U << host->log2_max_poc_lsb))
+			return -EPROTO;
+		for (i = 0; i < S7D_HEVC_RPS_ENTRIES; i++) {
+			u16 entry = word[i];
+			s32 delta;
+
+			if (entry == 0x8000)
+				break;
+			if (entry & BIT(15))
+				return -EPROTO;
+			if (entry & BIT(14))
+				return -EOPNOTSUPP;
+			delta = entry & 0xfff;
+			if (entry & BIT(12))
+				delta -= 4096;
+			if (!delta)
+				return -EPROTO;
+			next.rps[i].delta_poc = delta;
+			next.rps[i].used = !!(entry & BIT(13));
+			used += next.rps[i].used;
+			next.rps_count++;
+		}
+		if (next.rps_count >= host->max_dec_pic_buffering)
+			return -EPROTO;
+	}
+	if (next.slice_type != 2) {
+		if (!used || word[RPM_MODIFICATION] & ~3U)
+			return -EPROTO;
+		for (list = 0; list < (next.slice_type == 0 ? 2U : 1U); list++) {
+			next.active[list] = word[RPM_ACTIVE_L0 + list];
+			if (!next.active[list] || next.active[list] > S7D_HEVC_RPS_ENTRIES)
+				return -EPROTO;
+			next.modification[list] = word[RPM_MODIFICATION] & BIT(list);
+			if (next.modification[list]) {
+				for (i = 0; i < next.active[list]; i++) {
+					u32 index = word[RPM_MODIFICATION_LIST + offset++];
+
+					if (index >= used)
+						return -EPROTO;
+					next.modification_index[list][i] = index;
+				}
+			}
+		}
+		next.collocated_from_l0 = next.slice_type == 1;
+		if (next.temporal_mvp) {
+			if (next.slice_type == 0) {
+				if (word[RPM_COL_FROM_L0] > 1)
+					return -EPROTO;
+				next.collocated_from_l0 = word[RPM_COL_FROM_L0];
+			}
+			if (next.active[!next.collocated_from_l0] > 1)
+				next.collocated_ref_idx = word[RPM_COL_INDEX];
+			if (next.collocated_ref_idx >= next.active[!next.collocated_from_l0])
+				return -EPROTO;
+		}
+	}
+	next.no_output_of_prior_pics = cpu->no_output_of_prior_pics;
+	next.pic_output_flag = cpu->pic_output_flag;
+	next.parameter_epoch = cpu->parameter_epoch;
+	if (!hevc_slice_same(&next, cpu))
+		return -ESTALE;
+	*slice = next;
+	return 0;
+}
 
 int s7d_hevc_rpm_parse(const void *snapshot, size_t bytes,
 		       bool efficiency_mode, struct s7d_hevc_rpm *rpm)
@@ -85,18 +222,17 @@ static int s7d_hevc_host_check(const struct s7d_hevc_sps *host)
 	return 0;
 }
 
-int s7d_hevc_rpm_plan_idr(const struct s7d_hevc_rpm *rpm,
-			  const struct s7d_hevc_sps *host,
-			  struct s7d_hevc_idr_plan *plan)
+int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
+			       const struct s7d_hevc_sps *host,
+			       struct s7d_hevc_geometry *geometry)
 {
-	struct s7d_hevc_idr_plan next = { };
+	struct s7d_hevc_geometry next;
 	const u16 *word;
 	u32 crop[4] = { };
-	u32 min_cb, ctb, poc_log2;
-	u32 i;
+	u32 min_cb, ctb, poc_log2, i;
 	int ret;
 
-	if (!rpm || !host || !plan)
+	if (!rpm || !host || !geometry)
 		return -EINVAL;
 	ret = s7d_hevc_host_check(host);
 	if (ret)
@@ -107,13 +243,10 @@ int s7d_hevc_rpm_plan_idr(const struct s7d_hevc_rpm *rpm,
 	    word[RPM_CROP_FLAG] > 1 || word[RPM_MIN_CB_MINUS3] > 3 ||
 	    word[RPM_CTB_DIFF] > 3 || word[RPM_POC_LOG2_MINUS4] > 12)
 		return -EPROTO;
-	if (word[RPM_SLICE_TYPE] != 2 || word[RPM_FIRST_SLICE] != 1 ||
-	    word[RPM_DEPENDENT_SLICE] || word[RPM_SLICE_ADDRESS] ||
-	    word[RPM_TEMPORAL_MVP] || word[RPM_TEMPORAL_ID_PLUS1] != 1 ||
-	    (word[RPM_NAL_TYPE] != 19 && word[RPM_NAL_TYPE] != 20) ||
-	    word[RPM_TILES] || word[RPM_TILE_COLUMNS_MINUS1] ||
-	    word[RPM_TILE_ROWS_MINUS1] || (word[RPM_BIT_DEPTH] & 0xff) ||
-	    (word[RPM_PROFILE_ETC] & BIT(2)) ||
+	if (word[RPM_FIRST_SLICE] != 1 || word[RPM_DEPENDENT_SLICE] ||
+	    word[RPM_SLICE_ADDRESS] || word[RPM_TEMPORAL_ID_PLUS1] != 1 ||
+	    word[RPM_TILES] || word[RPM_TILE_COLUMNS_MINUS1] || word[RPM_TILE_ROWS_MINUS1] ||
+	    (word[RPM_BIT_DEPTH] & 0xff) || (word[RPM_PROFILE_ETC] & BIT(2)) ||
 	    ((word[RPM_SEI_FRAME_FIELD] & BIT(8)) &&
 	     (word[RPM_SEI_FRAME_FIELD] & GENMASK(6, 3))))
 		return -EOPNOTSUPP;
@@ -139,9 +272,7 @@ int s7d_hevc_rpm_plan_idr(const struct s7d_hevc_rpm *rpm,
 	next.ctb_columns = DIV_ROUND_UP(next.coded_width, next.ctb_size);
 	next.ctb_rows = DIV_ROUND_UP(next.coded_height, next.ctb_size);
 	next.ctb_count = next.ctb_columns * next.ctb_rows;
-	next.nal_unit_type = word[RPM_NAL_TYPE];
-	next.misc_flags = word[RPM_MISC_FLAGS];
-	*plan = next;
+	*geometry = next;
 	return 0;
 }
 
@@ -191,28 +322,5 @@ int s7d_hevc_classify_status(u32 status, enum s7d_hevc_event *event)
 		return -EPROTO;
 	}
 	*event = next;
-	return 0;
-}
-
-int s7d_hevc_check_picture_done(const struct s7d_hevc_idr_plan *plan,
-			       const struct s7d_hevc_picture_done *done)
-{
-	enum s7d_hevc_event event;
-	int ret;
-
-	if (!plan || !done || !plan->ctb_count || !done->max_shift_bytes)
-		return -EINVAL;
-	ret = s7d_hevc_classify_status(done->status, &event);
-	if (ret)
-		return ret;
-	if (event != S7D_HEVC_EVENT_PICTURE_DATA)
-		return -EAGAIN;
-	if (!done->header_armed || done->accepted_headers != 1)
-		return -EPROTO;
-	if (done->error_latched || (done->shift_status & BIT(15)) ||
-	    (done->parser_lcu_start & GENMASK(23, 0)) != plan->ctb_count - 1 ||
-	    !done->shift_byte_count ||
-	    done->shift_byte_count > done->max_shift_bytes)
-		return -EBADMSG;
 	return 0;
 }

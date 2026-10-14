@@ -19,11 +19,6 @@ struct hevc_bits {
 	int error;
 };
 
-struct hevc_rps {
-	u32 count;
-	s32 delta[HEVC_MAX_DPB];
-};
-
 static u32 hevc_get(struct hevc_bits *b, u32 count)
 {
 	u32 value = 0, i;
@@ -143,29 +138,37 @@ static void hevc_scaling_list(struct hevc_bits *b)
 		}
 }
 
-static void hevc_rps_sort(struct hevc_rps *rps)
+static void hevc_rps_sort(struct s7d_hevc_st_rps *rps)
 {
 	u32 i, j, negative = 0;
 	s32 value;
+	bool used;
 
 	for (i = 1; i < rps->count; i++) {
 		value = rps->delta[i];
-		for (j = i; j && rps->delta[j - 1] > value; j--)
+		used = rps->used[i];
+		for (j = i; j && rps->delta[j - 1] > value; j--) {
 			rps->delta[j] = rps->delta[j - 1];
+			rps->used[j] = rps->used[j - 1];
+		}
 		rps->delta[j] = value;
+		rps->used[j] = used;
 	}
 	while (negative < rps->count && rps->delta[negative] < 0)
 		negative++;
 	for (i = 0; i < negative / 2; i++) {
 		value = rps->delta[i];
+		used = rps->used[i];
 		rps->delta[i] = rps->delta[negative - i - 1];
+		rps->used[i] = rps->used[negative - i - 1];
 		rps->delta[negative - i - 1] = value;
+		rps->used[negative - i - 1] = used;
 	}
 }
 
 static void hevc_short_term_rps(struct hevc_bits *b, u32 index,
-			      const struct hevc_rps *previous,
-			      struct hevc_rps *rps)
+			      const struct s7d_hevc_st_rps *previous,
+			      struct s7d_hevc_st_rps *rps)
 {
 	u32 i, negative, positive, step;
 	s32 delta, value;
@@ -181,10 +184,13 @@ static void hevc_short_term_rps(struct hevc_bits *b, u32 index,
 			if (!use_delta)
 				continue;
 			value = delta + (i < previous->count ? previous->delta[i] : 0);
+			if (!value)
+				continue;
 			if (rps->count == HEVC_MAX_DPB) {
 				b->error = -EBADMSG;
 				return;
 			}
+			rps->used[rps->count] = used;
 			rps->delta[rps->count++] = value;
 		}
 		hevc_rps_sort(rps);
@@ -195,14 +201,14 @@ static void hevc_short_term_rps(struct hevc_bits *b, u32 index,
 	value = 0;
 	for (i = 0; i < negative; i++) {
 		value -= (s32)hevc_ue(b, 32767) + 1;
+		rps->used[rps->count] = hevc_get(b, 1);
 		rps->delta[rps->count++] = value;
-		hevc_skip(b, 1);
 	}
 	value = 0;
 	for (i = 0; i < positive; i++) {
 		value += (s32)hevc_ue(b, 32767) + 1;
+		rps->used[rps->count] = hevc_get(b, 1);
 		rps->delta[rps->count++] = value;
-		hevc_skip(b, 1);
 	}
 }
 
@@ -302,11 +308,14 @@ static void hevc_vui(struct hevc_bits *b, struct s7d_hevc_sps *sps)
 		b->error = -EOPNOTSUPP;
 }
 
-static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps)
+static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps,
+			 struct s7d_hevc_sequence *sequence)
 {
-	struct hevc_rps previous = { 0 }, next_rps;
+	struct s7d_hevc_st_rps previous = { 0 }, next_rps;
 	u32 start, i, j, buffering[HEVC_MAX_SUB_LAYERS] = { 0 };
 	u32 reorder[HEVC_MAX_SUB_LAYERS] = { 0 };
+	u32 latency[HEVC_MAX_SUB_LAYERS] = { 0 };
+	bool flag;
 	u32 min_tb, max_tb, max_inter, max_intra, rps_count, luma, chroma;
 	u32 min_pcm, max_pcm, last;
 
@@ -337,13 +346,14 @@ static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps)
 	for (i = start; i <= last; i++) {
 		buffering[i] = hevc_ue(b, HEVC_MAX_DPB - 1) + 1;
 		reorder[i] = hevc_ue(b, buffering[i] - 1);
-		hevc_ue(b, U32_MAX - 1);
+		latency[i] = hevc_ue(b, U32_MAX - 1);
 		if (i > start && (buffering[i] < buffering[i - 1] ||
 				  reorder[i] < reorder[i - 1]))
 			b->error = -EBADMSG;
 	}
 	sps->max_dec_pic_buffering = buffering[last];
 	sps->num_reorder_pics = reorder[last];
+	sps->max_latency_increase_plus1 = latency[last];
 	sps->log2_min_cb_size = hevc_ue(b, 3) + 3;
 	sps->log2_ctb_size = sps->log2_min_cb_size + hevc_ue(b, 3);
 	min_tb = hevc_ue(b, 3) + 2;
@@ -355,10 +365,19 @@ static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps)
 	    max_inter > sps->log2_ctb_size - min_tb ||
 	    max_intra > sps->log2_ctb_size - min_tb)
 		return b->error ?: -EBADMSG;
-	if (hevc_get(b, 1) && hevc_get(b, 1))
+	flag = hevc_get(b, 1);
+	if (sequence)
+		sequence->scaling_list_enabled = flag;
+	if (flag && hevc_get(b, 1))
 		hevc_scaling_list(b);
-	hevc_skip(b, 2);
-	if (hevc_get(b, 1)) {
+	hevc_skip(b, 1);
+	flag = hevc_get(b, 1);
+	if (sequence)
+		sequence->sao_enabled = flag;
+	flag = hevc_get(b, 1);
+	if (sequence)
+		sequence->pcm_enabled = flag;
+	if (flag) {
 		luma = hevc_get(b, 4) + 1;
 		chroma = hevc_get(b, 4) + 1;
 		min_pcm = hevc_ue(b, 2) + 3;
@@ -369,17 +388,27 @@ static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps)
 		hevc_skip(b, 1);
 	}
 	rps_count = hevc_ue(b, HEVC_MAX_RPS);
+	if (sequence)
+		sequence->num_short_term_rps = rps_count;
 	for (i = 0; i < rps_count; i++) {
-		next_rps = (struct hevc_rps) { 0 };
+		next_rps = (struct s7d_hevc_st_rps) { 0 };
 		hevc_short_term_rps(b, i, &previous, &next_rps);
+		if (sequence)
+			sequence->rps[i] = next_rps;
 		previous = next_rps;
 	}
-	if (hevc_get(b, 1)) {
+	flag = hevc_get(b, 1);
+	if (sequence)
+		sequence->long_term_refs_present = flag;
+	if (flag) {
 		j = hevc_ue(b, 32);
 		for (i = 0; i < j; i++)
 			hevc_skip(b, sps->log2_max_poc_lsb + 1);
 	}
-	hevc_skip(b, 2);
+	flag = hevc_get(b, 1);
+	if (sequence)
+		sequence->temporal_mvp_enabled = flag;
+	hevc_skip(b, 1);
 	if (hevc_get(b, 1))
 		hevc_vui(b, sps);
 	if (hevc_get(b, 1) && hevc_get(b, 8))
@@ -394,7 +423,9 @@ static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps)
 	return b->error;
 }
 
-int s7d_hevc_parse_sps(const u8 *nal, size_t bytes, struct s7d_hevc_sps *sps)
+static int hevc_parse_sps(const u8 *nal, size_t bytes,
+			  struct s7d_hevc_sps *sps,
+			  struct s7d_hevc_sequence *sequence)
 {
 	struct s7d_hevc_sps next = { 0 };
 	struct hevc_bits bits = { 0 };
@@ -427,11 +458,29 @@ int s7d_hevc_parse_sps(const u8 *nal, size_t bytes, struct s7d_hevc_sps *sps)
 	}
 	bits.data = rbsp;
 	bits.bytes = count;
-	ret = hevc_sps_rbsp(&bits, &next);
+	ret = hevc_sps_rbsp(&bits, &next, sequence);
 	if (!ret)
 		*sps = next;
 out:
 	kfree(rbsp);
+	return ret;
+}
+
+int s7d_hevc_parse_sequence(const u8 *nal, size_t bytes,
+			    struct s7d_hevc_sequence *sequence)
+{
+	struct s7d_hevc_sequence *next;
+	int ret;
+
+	if (!sequence)
+		return -EINVAL;
+	next = kzalloc(sizeof(*next), GFP_KERNEL);
+	if (!next)
+		return -ENOMEM;
+	ret = hevc_parse_sps(nal, bytes, &next->sps, next);
+	if (!ret)
+		*sequence = *next;
+	kfree(next);
 	return ret;
 }
 

@@ -12,20 +12,19 @@
 #define S7D_HEVC_PICTURE_DATA_DONE 0x0aU
 
 struct s7d_hevc_sps;
+struct s7d_hevc_slice_info;
 
-struct s7d_hevc_rpm {
-	u16 word[S7D_HEVC_RPM_VALID_WORDS];
-};
-
-struct s7d_hevc_idr_plan {
+struct s7d_hevc_geometry {
 	u32 coded_width;
 	u32 coded_height;
 	u32 ctb_size;
 	u32 ctb_columns;
 	u32 ctb_rows;
 	u32 ctb_count;
-	u32 nal_unit_type;
-	u32 misc_flags;
+};
+
+struct s7d_hevc_rpm {
+	u16 word[S7D_HEVC_RPM_VALID_WORDS];
 };
 
 enum s7d_hevc_event {
@@ -53,12 +52,14 @@ struct s7d_hevc_picture_done {
 /* Immutable DMA snapshot; caller proves firmware pause and DMA visibility. */
 int s7d_hevc_rpm_parse(const void *snapshot, size_t bytes,
 		       bool efficiency_mode, struct s7d_hevc_rpm *rpm);
-int s7d_hevc_rpm_plan_idr(const struct s7d_hevc_rpm *rpm,
-			  const struct s7d_hevc_sps *host,
-			  struct s7d_hevc_idr_plan *plan);
+int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
+			       const struct s7d_hevc_sps *host,
+			       struct s7d_hevc_geometry *geometry);
+/* Paused immutable RPM, checked against the original CPU-parsed picture. */
+int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
+			     const struct s7d_hevc_sps *host,
+			     const struct s7d_hevc_slice_info *cpu,
+			     struct s7d_hevc_slice_info *slice);
 int s7d_hevc_classify_status(u32 status, enum s7d_hevc_event *event);
-/* Successful immutable plan, same armed picture; no DMA retirement proof. */
-int s7d_hevc_check_picture_done(const struct s7d_hevc_idr_plan *plan,
-			       const struct s7d_hevc_picture_done *done);
 
 #endif

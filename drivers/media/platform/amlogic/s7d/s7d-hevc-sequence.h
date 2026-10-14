@@ -9,6 +9,14 @@
 #define S7D_HEVC_DOUBLE_WRITE_MODE 0x10U
 #define S7D_HEVC_MAX_CAPTURE_BUFFERS 24U
 #define S7D_HEVC_SPS_MAX_BYTES (64U * 1024U)
+#define S7D_HEVC_ST_RPS_MAX 64U
+#define S7D_HEVC_ST_RPS_ENTRIES 16U
+
+struct s7d_hevc_st_rps {
+	u32 count;
+	s32 delta[S7D_HEVC_ST_RPS_ENTRIES];
+	bool used[S7D_HEVC_ST_RPS_ENTRIES];
+};
 
 struct s7d_hevc_sps {
 	u32 vps_id;
@@ -30,14 +38,27 @@ struct s7d_hevc_sps {
 	u32 log2_max_poc_lsb;
 	u32 max_dec_pic_buffering;
 	u32 num_reorder_pics;
+	u32 max_latency_increase_plus1;
 	struct s7d_codec_colour colour;
 	bool separate_colour_plane;
 	bool interlaced_source;
 	bool field_seq;
 };
 
-/* One escaped SPS NAL including its two-byte header, without a start code. */
-int s7d_hevc_parse_sps(const u8 *nal, size_t bytes, struct s7d_hevc_sps *sps);
+struct s7d_hevc_sequence {
+	struct s7d_hevc_sps sps;
+	u32 num_short_term_rps;
+	struct s7d_hevc_st_rps rps[S7D_HEVC_ST_RPS_MAX];
+	bool sao_enabled;
+	bool temporal_mvp_enabled;
+	bool long_term_refs_present;
+	bool scaling_list_enabled;
+	bool pcm_enabled;
+};
+
+/* Heap-backed caller output; retains bounded RPS and slice-header flags. */
+int s7d_hevc_parse_sequence(const u8 *nal, size_t bytes,
+			    struct s7d_hevc_sequence *sequence);
 /* Linear, full-size DW0x10 storage; conformance offsets remain SPS units. */
 int s7d_hevc_build_layout(const struct s7d_hevc_sps *sps,
 			  enum s7d_codec_capture_format format,

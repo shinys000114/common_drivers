@@ -18,12 +18,12 @@
 
 #define DOS_REG(word) ((word) << 2)
 #define INPUT_PADDING SZ_16K
-#define PREFIX_BYTES 16U
 #define AUX_PART_BYTES (12U * SZ_1K)
 
 struct s7d_hevc_context {
 	struct s7d_codec_session *session;
 	struct s7d_codec_dma *memory;
+	struct regmap *borrowed_map;
 	struct s7d_hevc_workspace workspace;
 	struct s7d_hevc_sps host;
 	struct s7d_hevc_input_plan input;
@@ -32,147 +32,17 @@ struct s7d_hevc_context {
 	u32 input_offset;
 	u32 input_capacity;
 	u32 ring_bytes;
+	u32 slot_count;
+	u32 mv_stride;
+	u32 mv_used_bytes;
+	u64 lease_epoch;
+	u64 last_token;
+	bool idle;
+	bool begun;
 	bool staged;
 	bool attempted;
 	bool programmed;
 };
-
-static size_t hevc_start_code(const u8 *data, size_t bytes, size_t pos)
-{
-	if (pos + 3 <= bytes && !data[pos] && !data[pos + 1]) {
-		if (data[pos + 2] == 1)
-			return 3;
-		if (pos + 4 <= bytes && !data[pos + 2] && data[pos + 3] == 1)
-			return 4;
-	}
-	return 0;
-}
-
-/* Validate escaped bytes, keeping enough initial RBSP bits for IDs only. */
-static int hevc_prefix(const u8 *data, size_t bytes, u8 *prefix, u32 *count)
-{
-	u32 zeros = 0, kept = 0;
-	size_t i;
-
-	for (i = 0; i < bytes; i++) {
-		if (zeros >= 2 && data[i] <= 3) {
-			if (data[i] != 3 || i + 1 == bytes || data[i + 1] > 3)
-				return -EBADMSG;
-			zeros = 0;
-			continue;
-		}
-		if (kept < PREFIX_BYTES)
-			prefix[kept++] = data[i];
-		zeros = data[i] ? 0 : zeros + 1;
-	}
-	*count = kept;
-	return kept ? 0 : -EBADMSG;
-}
-
-static int hevc_ue(const u8 *data, u32 bytes, u32 *bit, u32 *value)
-{
-	u32 zeros = 0, result = 1;
-	bool one = false;
-
-	while (*bit < bytes * 8) {
-		one = data[*bit / 8] & (0x80 >> (*bit & 7));
-		(*bit)++;
-		if (one)
-			break;
-		if (++zeros > 31)
-			return -EBADMSG;
-	}
-	if (!one || zeros > bytes * 8 - *bit)
-		return -EBADMSG;
-	while (zeros--) {
-		result = (result << 1) | !!(data[*bit / 8] &
-						  (0x80 >> (*bit & 7)));
-		(*bit)++;
-	}
-	*value = result - 1;
-	return 0;
-}
-
-int s7d_hevc_input_validate_annexb(const u8 *data, size_t bytes,
-				   struct s7d_hevc_sps *sps)
-{
-	struct s7d_hevc_sps next;
-	u32 nals = 0, vps_id = 0, pps_id = 0;
-	size_t pos = 0;
-	int ret;
-
-	if (!data || !sps || !bytes)
-		return -EINVAL;
-	if (bytes > S7D_HEVC_INPUT_MAX_BYTES)
-		return -E2BIG;
-	/* Annex B permits leading_zero_8bits before the first start code. */
-	while (pos < bytes && !hevc_start_code(data, bytes, pos) && !data[pos])
-		pos++;
-	while (pos < bytes) {
-		u8 prefix[PREFIX_BYTES];
-		u32 prefix_bytes, type, id, bit = 0;
-		size_t code = hevc_start_code(data, bytes, pos);
-		size_t start = pos + code, end;
-
-		if (!code || nals >= 4)
-			return -EBADMSG;
-		for (pos = start; pos < bytes; pos++)
-			if (hevc_start_code(data, bytes, pos))
-				break;
-		end = pos;
-		/* Annex B trailing zeros are outside the NAL's escaped RBSP. */
-		while (end > start && !data[end - 1])
-			end--;
-		if (end - start < 3)
-			return -EBADMSG;
-		if ((data[start] & 0x81) || data[start + 1] != 1)
-			return -EOPNOTSUPP;
-		type = (data[start] >> 1) & 0x3f;
-		if ((nals < 3 && type != 32 + nals) ||
-		    (nals == 3 && type != 19 && type != 20))
-			return -EOPNOTSUPP;
-		ret = hevc_prefix(data + start + 2, end - start - 2,
-				  prefix, &prefix_bytes);
-		if (ret)
-			return ret;
-		if (!nals) {
-			vps_id = prefix[0] >> 4;
-		} else if (nals == 1) {
-			ret = s7d_hevc_parse_sps(data + start, end - start, &next);
-			if (ret)
-				return ret;
-			if (next.vps_id != vps_id)
-				return -EBADMSG;
-			/* Selected workspace reserves eight 256-byte SPS slots. */
-			if (next.sps_id >= 8)
-				return -EOPNOTSUPP;
-		} else if (nals == 2) {
-			ret = hevc_ue(prefix, prefix_bytes, &bit, &pps_id);
-			if (ret)
-				return ret;
-			ret = hevc_ue(prefix, prefix_bytes, &bit, &id);
-			if (ret)
-				return ret;
-			if (pps_id > 63 || id != next.sps_id)
-				return -EBADMSG;
-		} else {
-			if (!(prefix[0] & 0x80))
-				return -EOPNOTSUPP;
-			/* first_slice_segment flag and no_output_of_prior_pics flag */
-			bit = 2;
-			ret = hevc_ue(prefix, prefix_bytes, &bit, &id);
-			if (ret)
-				return ret;
-			if (id != pps_id)
-				return -EBADMSG;
-		}
-		nals++;
-	}
-	if (nals != 4)
-		return -EBADMSG;
-	*sps = next;
-	return 0;
-}
 
 static void hevc_region(u32 *offset, u32 bytes, u32 alignment,
 			struct s7d_hevc_dma_region *region)
@@ -184,7 +54,7 @@ static void hevc_region(u32 *offset, u32 bytes, u32 alignment,
 }
 
 /* Fixed spec[5] capacities/order; MMU regions remain reserved and unused. */
-static u32 hevc_workspace_layout(struct s7d_hevc_workspace *w)
+static u32 hevc_workspace_layout(struct s7d_hevc_workspace *w, u32 mv_bytes)
 {
 	struct s7d_hevc_dma_region reserved;
 	u32 offset = 0;
@@ -214,7 +84,7 @@ static u32 hevc_workspace_layout(struct s7d_hevc_workspace *w)
 	hevc_region(&offset, 2 * AUX_PART_BYTES, SZ_4K, &w->aux);
 	w->aux_prefix_bytes = AUX_PART_BYTES;
 	w->aux_suffix_bytes = AUX_PART_BYTES;
-	hevc_region(&offset, 0x40000, SZ_64K, &w->mv);
+	hevc_region(&offset, mv_bytes, SZ_64K, &w->mv);
 	return ALIGN(offset, SZ_4K);
 }
 
@@ -241,15 +111,72 @@ static void hevc_workspace_relocate(struct s7d_hevc_workspace *w, u32 base)
 	w->mv.address += base;
 }
 
+static int hevc_mv_layout(const struct s7d_hevc_sps *sps,
+			  u32 *used, u32 *stride)
+{
+	u32 unit, columns, rows, ctbs, padded;
+
+	unit = sps->log2_ctb_size == 6 ? 512 :
+	       sps->log2_ctb_size == 5 ? 128 : 32;
+	columns = DIV_ROUND_UP(sps->coded_width, 1U << sps->log2_ctb_size);
+	rows = DIV_ROUND_UP(sps->coded_height, 1U << sps->log2_ctb_size);
+	if (check_mul_overflow(columns, rows, &ctbs) ||
+	    check_mul_overflow(ctbs, unit, used) ||
+	    check_add_overflow(*used, SZ_64K - 1U, &padded))
+		return -EOVERFLOW;
+	*stride = round_down(padded, SZ_64K);
+	return *used && *stride ? 0 : -EINVAL;
+}
+
+static int hevc_context_ranges(const struct s7d_hevc_context *ctx, u32 total)
+{
+	const struct s7d_hevc_workspace *w = &ctx->workspace;
+	const struct s7d_hevc_dma_region *region[] = {
+		&w->ipp, &w->sao_abv, &w->sao_vb, &w->short_term_rps,
+		&w->vps, &w->sps, &w->pps, &w->sao_up, &w->swap1,
+		&w->swap2, &w->scalelut, &w->dblk_para, &w->dblk_data,
+		&w->dblk_data2, &w->mpred_above, &w->rpm, &w->lmem,
+		&w->aux, &w->mv,
+	};
+	u64 input = (u64)ctx->base + ctx->input_offset;
+	u64 end = (u64)ctx->base + total;
+	u32 i, j;
+
+	if (!ctx->base || end > U32_MAX ||
+	    input + ctx->ring_bytes != end || !IS_ALIGNED(input, SZ_4K))
+		return -ERANGE;
+	for (i = 0; i < ARRAY_SIZE(region); i++) {
+		u64 first = region[i]->address;
+		u64 last = first + region[i]->bytes;
+
+		if (first < ctx->base || last > input ||
+		    !IS_ALIGNED(first, SZ_4K))
+			return -ERANGE;
+		if (!region[i]->bytes)
+			continue;
+		for (j = 0; j < i; j++)
+			if (region[j]->bytes && first <
+			    (u64)region[j]->address + region[j]->bytes &&
+			    region[j]->address < last)
+				return -EINVAL;
+	}
+	if (!IS_ALIGNED(w->mv.address, SZ_64K) ||
+	    (u64)ctx->slot_count * ctx->mv_stride != w->mv.bytes ||
+	    ctx->mv_used_bytes > ctx->mv_stride)
+		return -ERANGE;
+	return 0;
+}
+
 struct s7d_hevc_context *
-s7d_hevc_context_create(struct s7d_codec_session *session,
-			const struct s7d_hevc_sps *sps, size_t input_capacity)
+s7d_hevc_context_create_stream(struct s7d_codec_session *session,
+		    const struct s7d_hevc_sps *sps, size_t input_capacity,
+		    u32 slot_count, u64 lease_epoch)
 {
 	struct s7d_codec_layout layout;
 	struct s7d_hevc_context *ctx;
 	dma_addr_t dma;
 	u64 base, last;
-	u32 total;
+	u32 total, mv_bytes, allocation;
 	int ret;
 
 	if (IS_ERR_OR_NULL(session) || !sps || !input_capacity)
@@ -259,22 +186,38 @@ s7d_hevc_context_create(struct s7d_codec_session *session,
 	ret = s7d_hevc_build_layout(sps, S7D_CODEC_CAPTURE_NV12M, 0, &layout);
 	if (ret)
 		return ERR_PTR(ret);
-	if (sps->coded_width < 64 || sps->coded_height < 64 ||
-	    sps->max_sub_layers != 1 || sps->log2_ctb_size < 4 ||
+	if (sps->max_sub_layers != 1 || sps->log2_ctb_size < 4 ||
 	    sps->log2_ctb_size > 6)
 		return ERR_PTR(-EOPNOTSUPP);
+	if (!lease_epoch || slot_count < layout.min_capture_buffers ||
+	    slot_count > S7D_HEVC_MAX_CAPTURE_BUFFERS)
+		return ERR_PTR(-EINVAL);
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return ERR_PTR(-ENOMEM);
 	ctx->host = *sps;
 	ctx->input_capacity = input_capacity;
-	ctx->input_offset = hevc_workspace_layout(&ctx->workspace);
-	/* WR cannot wrap; at least one 8-byte element remains after read-ahead. */
+	ctx->slot_count = slot_count;
+	ctx->lease_epoch = lease_epoch;
+	ret = hevc_mv_layout(sps, &ctx->mv_used_bytes, &ctx->mv_stride);
+	if (ret)
+		goto free;
+	if (ctx->mv_used_bytes > ctx->mv_stride ||
+	    check_mul_overflow(slot_count, ctx->mv_stride, &mv_bytes)) {
+		ret = -EOVERFLOW;
+		goto free;
+	}
+	ctx->input_offset = hevc_workspace_layout(&ctx->workspace, mv_bytes);
+	/* One read-ahead element remains before the exclusive ring end. */
 	ctx->ring_bytes = ALIGN(input_capacity + INPUT_PADDING + 8, SZ_4K);
-	total = ctx->input_offset + ctx->ring_bytes;
+	if (check_add_overflow(ctx->input_offset, ctx->ring_bytes, &total) ||
+	    check_add_overflow(total, SZ_64K - 1U, &allocation)) {
+		ret = -EOVERFLOW;
+		goto free;
+	}
 	s7d_codec_session_get(session);
 	ctx->session = session;
-	ctx->memory = s7d_codec_dma_alloc(session, total + SZ_64K - 1);
+	ctx->memory = s7d_codec_dma_alloc(session, allocation);
 	if (IS_ERR(ctx->memory)) {
 		ret = PTR_ERR(ctx->memory);
 		goto release;
@@ -282,7 +225,7 @@ s7d_hevc_context_create(struct s7d_codec_session *session,
 	dma = s7d_codec_dma_addr(ctx->memory);
 	base = ALIGN((u64)dma, (u64)SZ_64K);
 	last = base + total;
-	if (last > U32_MAX || base < dma ||
+	if (base > U32_MAX || last > U32_MAX || base < dma ||
 	    base - dma + total > s7d_codec_dma_size(ctx->memory)) {
 		ret = -ERANGE;
 		goto release;
@@ -290,23 +233,94 @@ s7d_hevc_context_create(struct s7d_codec_session *session,
 	ctx->base = base;
 	ctx->cpu = (u8 *)s7d_codec_dma_cpu(ctx->memory) + (base - dma);
 	hevc_workspace_relocate(&ctx->workspace, ctx->base);
+	ret = hevc_context_ranges(ctx, total);
+	if (ret)
+		goto release;
 	memset(ctx->cpu, 0, total);
 	dma_wmb();
 	return ctx;
 
 release:
-	/* The core retains accepted DMA even here until verified session stop. */
+	/* Accepted DMA stays with the core until verified session stop. */
 	s7d_codec_session_put(session);
+free:
 	kfree(ctx);
 	return ERR_PTR(ret);
 }
 
-void s7d_hevc_context_release(struct s7d_hevc_context *context)
+int s7d_hevc_context_destroy_stream(struct s7d_hevc_context *context,
+				  u64 lease_epoch)
 {
 	if (IS_ERR_OR_NULL(context))
-		return;
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch)
+		return -ESTALE;
+	if (!context->idle || context->begun)
+		return -EBUSY;
 	s7d_codec_session_put(context->session);
 	kfree(context);
+	return 0;
+}
+
+int s7d_hevc_context_mv_slot(const struct s7d_hevc_context *context,
+			   u64 lease_epoch, u32 slot,
+			   struct s7d_hevc_dma_region *region)
+{
+	struct s7d_hevc_dma_region next;
+	u64 start, end;
+
+	if (IS_ERR_OR_NULL(context) || !region)
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch)
+		return -ESTALE;
+	if (slot >= context->slot_count)
+		return -ERANGE;
+	start = (u64)context->workspace.mv.address +
+		(u64)slot * context->mv_stride;
+	end = start + context->mv_used_bytes;
+	if (!IS_ALIGNED(start, SZ_64K) || end > U32_MAX ||
+	    end > (u64)context->workspace.mv.address + context->workspace.mv.bytes)
+		return -ERANGE;
+	next.address = start;
+	next.bytes = context->mv_used_bytes;
+	*region = next;
+	return 0;
+}
+
+int s7d_hevc_context_mark_idle(struct s7d_hevc_context *context,
+			     u64 lease_epoch, u64 input_token,
+			     int halt_status, bool irq_joined)
+{
+	if (IS_ERR_OR_NULL(context))
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch ||
+	    context->input.token != input_token)
+		return -ESTALE;
+	if (context->idle)
+		return -EALREADY;
+	if (halt_status || !irq_joined)
+		return halt_status < 0 ? halt_status : halt_status ? -EIO : -EBUSY;
+	context->idle = true;
+	context->begun = false;
+	context->staged = false;
+	context->attempted = false;
+	context->programmed = false;
+	return 0;
+}
+
+int s7d_hevc_context_begin(struct s7d_hevc_context *context,
+			  u64 lease_epoch, u64 input_token)
+{
+	if (IS_ERR_OR_NULL(context))
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch ||
+	    context->input.token != input_token)
+		return -ESTALE;
+	if (!context->idle || !context->staged || context->begun)
+		return -EBUSY;
+	context->idle = false;
+	context->begun = true;
+	return 0;
 }
 
 const struct s7d_hevc_workspace *
@@ -337,6 +351,7 @@ static bool hevc_same_sps(const struct s7d_hevc_sps *a,
 	       a->log2_max_poc_lsb == b->log2_max_poc_lsb &&
 	       a->max_dec_pic_buffering == b->max_dec_pic_buffering &&
 	       a->num_reorder_pics == b->num_reorder_pics &&
+	       a->max_latency_increase_plus1 == b->max_latency_increase_plus1 &&
 	       a->separate_colour_plane == b->separate_colour_plane &&
 	       a->interlaced_source == b->interlaced_source &&
 	       a->field_seq == b->field_seq &&
@@ -346,38 +361,39 @@ static bool hevc_same_sps(const struct s7d_hevc_sps *a,
 	       a->colour.flags == b->colour.flags;
 }
 
-int s7d_hevc_context_stage(struct s7d_hevc_context *context,
-			   const u8 *data, size_t bytes, u64 token,
-			   struct s7d_hevc_input_plan *plan)
+int s7d_hevc_context_stage_au(struct s7d_hevc_context *context,
+			    const struct s7d_hevc_context_au *au,
+			    struct s7d_hevc_input_plan *plan)
 {
-	struct s7d_hevc_sps staged_sps;
 	struct s7d_hevc_input_plan next;
 	u8 *input;
-	int ret;
 
-	if (!context || !data || !plan || !bytes || !token)
+	if (IS_ERR_OR_NULL(context) || !au ||
+	    !au->data || !au->sps || !au->bytes || !au->input_token || !plan)
 		return -EINVAL;
-	if (context->staged || context->attempted)
-		return -EBUSY;
-	if (bytes > context->input_capacity)
-		return -E2BIG;
-	input = context->cpu + context->input_offset;
-	memcpy(input, data, bytes);
-	memset(input + bytes, 0, context->ring_bytes - bytes);
-	ret = s7d_hevc_input_validate_annexb(input, bytes, &staged_sps);
-	if (ret)
-		return ret;
-	if (!hevc_same_sps(&staged_sps, &context->host))
+	if (context->lease_epoch != au->lease_epoch ||
+	    au->input_token <= context->last_token)
 		return -ESTALE;
+	if (!context->idle || context->staged || context->begun ||
+	    context->attempted)
+		return -EBUSY;
+	if (au->bytes > context->input_capacity)
+		return -E2BIG;
+	if (!hevc_same_sps(au->sps, &context->host))
+		return -ESTALE;
+	input = context->cpu + context->input_offset;
+	memcpy(input, au->data, au->bytes);
+	memset(input + au->bytes, 0, context->ring_bytes - au->bytes);
 	next.start = context->base + context->input_offset;
 	next.end = next.start + context->ring_bytes;
 	next.read_pointer = next.start;
-	next.write_pointer = next.start + round_down(bytes + INPUT_PADDING, 8);
-	next.decode_size = bytes;
-	next.max_shift_bytes = bytes + 8;
-	next.token = token;
+	next.write_pointer = next.start + round_down(au->bytes + INPUT_PADDING, 8);
+	next.decode_size = au->bytes;
+	next.max_shift_bytes = au->bytes + 8;
+	next.token = au->input_token;
 	dma_wmb();
 	context->input = next;
+	context->last_token = au->input_token;
 	context->staged = true;
 	*plan = next;
 	return 0;
@@ -416,8 +432,12 @@ int s7d_hevc_context_program_input(struct s7d_hevc_context *context,
 
 	if (!context || IS_ERR_OR_NULL(map) || !context->staged)
 		return -EINVAL;
-	if (context->attempted)
+	if (context->attempted || !context->begun)
 		return -EBUSY;
+	if (context->borrowed_map &&
+	    context->borrowed_map != map)
+		return -ESTALE;
+	context->borrowed_map = map;
 	/* A partial failure requires the parent's full halt, never a blind retry. */
 	context->attempted = true;
 	dma_wmb();
