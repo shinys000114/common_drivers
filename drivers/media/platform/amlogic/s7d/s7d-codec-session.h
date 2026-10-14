@@ -5,6 +5,7 @@
 #define S7D_CODEC_SESSION_H
 
 #include <linux/types.h>
+#include <linux/videodev2.h>
 #include "s7d-codec-types.h"
 
 #define S7D_CODEC_MAX_PLANES 3
@@ -33,11 +34,18 @@ struct s7d_codec_surface_request {
 	size_t min_size[S7D_CODEC_MAX_PLANES];
 };
 
+/* Retained by value with each picture when its OUTPUT buffer is recycled. */
+struct s7d_codec_timestamp_metadata {
+	u32 flags;
+	struct v4l2_timecode timecode;
+};
+
 struct s7d_codec_frame {
 	u64 surface_id;
 	u64 generation;
 	u64 write_token;
 	u64 timestamp_ns;
+	struct s7d_codec_timestamp_metadata timestamp_meta;
 	u32 sequence;
 	u32 flags;
 	size_t bytesused[S7D_CODEC_MAX_PLANES];

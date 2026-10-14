@@ -33,6 +33,7 @@ struct s7d_v4l2_input {
 	size_t padded_bytes;
 	u64 token;
 	u64 timestamp_ns;
+	struct s7d_codec_timestamp_metadata timestamp_meta;
 };
 
 struct s7d_v4l2_capture_buffer {

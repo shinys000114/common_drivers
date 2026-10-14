@@ -21,6 +21,7 @@ struct s7d_h264_picture {
 	u64 write_token;
 	u64 input_token;
 	u64 timestamp_ns;
+	struct s7d_codec_timestamp_metadata timestamp_meta;
 	u32 flags;
 	bool occupied;
 	bool complete;
@@ -526,7 +527,9 @@ int s7d_h264_dpb_create(struct s7d_codec_session *session,
 
 int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 			 const struct s7d_h264_slice *slice, u64 input_token,
-			 u64 timestamp_ns, struct s7d_h264_picture_plan *plan)
+			 u64 timestamp_ns,
+			 const struct s7d_codec_timestamp_metadata *timestamp_meta,
+			 struct s7d_h264_picture_plan *plan)
 {
 	struct s7d_h264_picture_plan *prepared;
 	struct s7d_h264_marking marking;
@@ -537,7 +540,7 @@ int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 	u64 token;
 	int ret;
 
-	if (!dpb || !slice || !input_token || !plan)
+	if (!dpb || !slice || !input_token || !timestamp_meta || !plan)
 		return -EINVAL;
 	if (dpb->failed)
 		return dpb->failed;
@@ -595,6 +598,7 @@ int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 		picture.write_token = token;
 		picture.input_token = input_token;
 		picture.timestamp_ns = timestamp_ns;
+		picture.timestamp_meta = *timestamp_meta;
 		picture.flags = slice_flags(slice->type);
 		dpb->pictures[slot] = picture;
 		if (picture.mv_slot >= 0)
@@ -627,6 +631,7 @@ int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 	prepared->write_token = picture.write_token;
 	prepared->input_token = picture.input_token;
 	prepared->timestamp_ns = picture.timestamp_ns;
+	prepared->timestamp_meta = picture.timestamp_meta;
 	prepared->poc = picture.poc;
 	prepared->top_poc = picture.top_poc;
 	prepared->bottom_poc = picture.bottom_poc;
@@ -728,6 +733,7 @@ static int output_pictures(struct s7d_h264_dpb *dpb, bool flush)
 				.generation = dpb->bindings[selected].generation,
 				.write_token = picture->write_token,
 				.timestamp_ns = picture->timestamp_ns,
+				.timestamp_meta = picture->timestamp_meta,
 				.sequence = dpb->sequence,
 				.flags = picture->flags,
 				.bytesused = { dpb->layout.size[0], dpb->layout.size[1] },

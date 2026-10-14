@@ -88,6 +88,7 @@ struct s7d_h264_picture_plan {
 	u64 write_token;
 	u64 input_token;
 	u64 timestamp_ns;
+	struct s7d_codec_timestamp_metadata timestamp_meta;
 	s32 poc;
 	s32 top_poc;
 	s32 bottom_poc;
@@ -123,7 +124,9 @@ int s7d_h264_dpb_create(struct s7d_codec_session *session,
 /* Serialized process context; firmware remains paused until the plan is applied. */
 int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 			 const struct s7d_h264_slice *slice, u64 input_token,
-			 u64 timestamp_ns, struct s7d_h264_picture_plan *plan);
+			 u64 timestamp_ns,
+			 const struct s7d_codec_timestamp_metadata *timestamp_meta,
+			 struct s7d_h264_picture_plan *plan);
 /* Only the matching real PIC_DATA_DONE may complete this write. */
 int s7d_h264_dpb_picture_done(struct s7d_h264_dpb *dpb, u32 slot,
 			      u64 write_token, u32 flags);

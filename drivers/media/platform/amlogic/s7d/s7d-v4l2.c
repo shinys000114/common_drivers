@@ -708,6 +708,12 @@ static void s7d_frame_ready(void *priv, const struct s7d_codec_frame *frame)
 	}
 	vbuf = &buffer->m2m.vb;
 	vbuf->vb2_buf.timestamp = frame->timestamp_ns;
+	vbuf->vb2_buf.copied_timestamp = 1;
+	vbuf->flags &= ~(V4L2_BUF_FLAG_TSTAMP_SRC_MASK | V4L2_BUF_FLAG_TIMECODE);
+	vbuf->flags |= frame->timestamp_meta.flags &
+		       (V4L2_BUF_FLAG_TSTAMP_SRC_MASK | V4L2_BUF_FLAG_TIMECODE);
+	if (vbuf->flags & V4L2_BUF_FLAG_TIMECODE)
+		vbuf->timecode = frame->timestamp_meta.timecode;
 	vbuf->sequence = ctx->capture_sequence++;
 	vbuf->field = V4L2_FIELD_NONE;
 	vbuf->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
@@ -1244,6 +1250,12 @@ static void s7d_run_work(struct work_struct *work)
 		ALIGN(input.bytes, 64) + L1_CACHE_BYTES;
 	input.token = buffer->token;
 	input.timestamp_ns = vbuf->vb2_buf.timestamp;
+	input.timestamp_meta = (struct s7d_codec_timestamp_metadata) {
+		.flags = vbuf->flags & (V4L2_BUF_FLAG_TSTAMP_SRC_MASK |
+				       V4L2_BUF_FLAG_TIMECODE),
+	};
+	if (input.timestamp_meta.flags & V4L2_BUF_FLAG_TIMECODE)
+		input.timestamp_meta.timecode = vbuf->timecode;
 	if (!source || input.padded_bytes > s7d_codec_dma_size(ctx->staging) ||
 	    s7d_codec_dma_size(ctx->staging) - input.padded_bytes < SZ_16K) {
 		ret = -EINVAL;

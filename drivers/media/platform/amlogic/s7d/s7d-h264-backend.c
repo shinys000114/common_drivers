@@ -413,7 +413,8 @@ static int backend_slice(struct s7d_h264_backend *backend, bool retry)
 	if (ret)
 		return ret;
 	ret = s7d_h264_dpb_prepare(backend->dpb, &backend->slice, backend->input.token,
-				  backend->input.timestamp_ns, &backend->picture);
+				  backend->input.timestamp_ns, &backend->input.timestamp_meta,
+				  &backend->picture);
 	if (ret == -EAGAIN) {
 		backend->slice_waiting = true;
 		backend_timeout_disarm(backend);
