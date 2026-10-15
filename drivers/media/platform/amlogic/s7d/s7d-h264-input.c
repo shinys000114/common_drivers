@@ -1990,6 +1990,7 @@ int s7d_h264_input_preflight(struct s7d_h264_input *input,
 	struct s7d_h264_input_plan plan;
 	struct s7d_v4l2_input prepared;
 	struct s7d_h264_au_info au;
+	u8 *data;
 	bool trimmed = false;
 	int ret;
 
@@ -2006,9 +2007,12 @@ int s7d_h264_input_preflight(struct s7d_h264_input *input,
 		return -ESTALE;
 	if (input->draining && buffer->token > input->drain.last_input_token)
 		return -EPIPE;
-	ret = s7d_h264_au_validate(input->au_parser,
-				 s7d_codec_dma_cpu(buffer->memory), buffer->bytes,
-				 &au, &next);
+	data = kvmemdup(s7d_codec_dma_cpu(buffer->memory), buffer->bytes,
+			GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	ret = s7d_h264_au_validate(input->au_parser, data, buffer->bytes, &au, &next);
+	kvfree(data);
 	if (input->au_parser->hunting &&
 	    (ret == -ENOENT || ret == -EBADMSG || ret == -EOPNOTSUPP))
 		ret = s7d_h264_au_skip(input->au_parser, ret == -ENOENT ? 0 : ret,
