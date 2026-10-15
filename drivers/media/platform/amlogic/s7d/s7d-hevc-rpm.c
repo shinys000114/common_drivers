@@ -133,7 +133,6 @@ int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 	next.first_slice = word[RPM_FIRST_SLICE];
 	next.dependent_slice = word[RPM_DEPENDENT_SLICE];
 	next.slice_address = word[RPM_SLICE_ADDRESS];
-	next.temporal_mvp = word[RPM_TEMPORAL_MVP];
 	if (next.slice_type > 2 ||
 	    (next.nal_type != 0 && next.nal_type != 1 &&
 	     !(next.nal_type >= 6 && next.nal_type <= 9) &&
@@ -142,6 +141,7 @@ int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 	if (next.nal_type >= 16 && next.slice_type != 2)
 		return -EPROTO;
 	if (next.nal_type != 19 && next.nal_type != 20) {
+		next.temporal_mvp = word[RPM_TEMPORAL_MVP];
 		next.poc_lsb = word[RPM_POC_LSB];
 		if (next.poc_lsb >= (1U << host->log2_max_poc_lsb))
 			return -EPROTO;
