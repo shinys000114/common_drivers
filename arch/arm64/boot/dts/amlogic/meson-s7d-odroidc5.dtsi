@@ -408,6 +408,13 @@
 };
 
 / {
+	firmware {
+		c5_video_firmware: video-firmware {
+			compatible = "amlogic,s7d-video-firmware";
+			amlogic,tee = <&{/optee}>;
+		};
+	};
+
 	c5_media_dmc: syscon@fe036000 {
 		compatible = "amlogic,s7d-dmc", "syscon";
 		reg = <0 0xfe036000 0 0x2000>;
@@ -434,6 +441,7 @@
 		power-domain-names = "vdec", "hevc", "hcodec";
 		amlogic,dmc-syscon = <&c5_media_dmc>;
 		amlogic,tee = <&{/optee}>;
+		amlogic,video-firmware = <&c5_video_firmware>;
 		memory-region = <&codec_mm_cma>;
 		memory-region-names = "codec";
 		status = "okay";
