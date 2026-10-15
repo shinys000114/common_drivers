@@ -535,7 +535,7 @@ static int dos_hevc_halt_locked(struct s7d_codec_dos *dos)
 		return dos_report_io(dos, "poll", HEVC_WRRSP_LMEM,
 				     GENMASK(11, 0), 0, val,
 				     ret == -ETIMEDOUT, ret);
-	ret = dos_hevc_write(dos, HEVC_STREAM_CONTROL, 0);
+	ret = dos_hevc_update(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
 	if (ret)
 		return ret;
 	ret = dos_hevc_update(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, HEVC_AXI_STOP);
@@ -600,7 +600,7 @@ static int dos_hevc_halt_locked(struct s7d_codec_dos *dos)
 	ret = dos_hevc_check(dos, HEVC_CPSR, U32_MAX, 0);
 	if (ret)
 		return ret;
-	ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL, U32_MAX, 0);
+	ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
 	if (ret)
 		return ret;
 	ret = dos_hevc_check(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, HEVC_AXI_STOP);
