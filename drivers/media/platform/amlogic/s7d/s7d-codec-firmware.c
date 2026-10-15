@@ -1,24 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 
+#include <linux/amlogic/s7d-video-firmware.h>
+#include <linux/amlogic/tee.h>
 #include <linux/atomic.h>
-#include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/errno.h>
-#include <linux/firmware.h>
 #include <linux/kref.h>
-#include <linux/limits.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
 #include <linux/slab.h>
-#include <linux/workqueue.h>
-#include <linux/amlogic/tee.h>
 
-#include "s7d-codec-bundle.h"
 #include "s7d-codec-firmware.h"
 #include "s7d-codec-session.h"
-#include "s7d-codec-tee.h"
 
 #define S7D_TEE_FW_H264_MH264	15
 #define S7D_TEE_CORE_VDEC		0
@@ -27,79 +21,29 @@
 #define S7D_TEE_FW_JPEG_ENC	21
 #define S7D_TEE_CORE_HCODEC	3
 
-enum s7d_codec_firmware_state {
-	S7D_FIRMWARE_EMPTY,
-	S7D_FIRMWARE_PRE_FAILED,
-	S7D_FIRMWARE_READY,
-	S7D_FIRMWARE_FAILED,
-	S7D_FIRMWARE_INVALID,
-};
-
 struct s7d_codec_firmware_owner {
 	struct device *dev;
 	struct module *module;
-	struct workqueue_struct *queue;
-	const struct firmware *firmware;
+	struct s7d_video_fw_handle *handle;
 	atomic_t jobs;
-	/* Protects only lease_sequence, not cache or consumer lifetime. */
-	struct mutex epoch_lock;
-	u64 lease_sequence;
-	enum s7d_codec_firmware_state state;
-	u64 failed_epoch;
-	u32 cancel_sequence;
-	int error;
+	bool invalid;
 };
 
 struct s7d_codec_firmware_job {
 	struct kref ref;
-	struct work_struct work;
-	struct completion done;
 	struct s7d_codec_firmware_owner *owner;
 	struct s7d_codec_session *session;
 	struct device *dev;
 	struct module *module;
-	const struct firmware *firmware;
-	struct s7d_codec_tee_result result;
-	atomic_t cancel;
+	struct s7d_video_fw_ticket *ticket;
 	u64 lease_epoch;
-	u32 cancel_id;
-	int status;
-	bool retired;
-	bool cancelled;
 };
-
-static void firmware_job_work(struct work_struct *work)
-{
-	struct s7d_codec_firmware_job *job =
-		container_of(work, struct s7d_codec_firmware_job, work);
-	struct s7d_codec_bundle_view view;
-	int ret;
-
-	if (atomic_read(&job->cancel)) {
-		job->cancelled = true;
-		ret = -ECANCELED;
-	} else {
-		ret = request_firmware_direct(&job->firmware, "video/video_ucode.bin", job->dev);
-	}
-	if (!ret) {
-		if (atomic_read(&job->cancel)) {
-			job->cancelled = true;
-			ret = -ECANCELED;
-		} else {
-			ret = s7d_codec_bundle_parse(job->firmware->data, job->firmware->size, &view);
-		}
-	}
-	if (!ret)
-		ret = s7d_codec_tee_upload(job->dev, &view, job->cancel_id,
-					 &job->cancel, &job->result);
-	job->status = ret;
-	complete_all(&job->done);
-}
 
 struct s7d_codec_firmware_owner *
 s7d_codec_firmware_create(struct device *dev, struct module *module)
 {
 	struct s7d_codec_firmware_owner *owner;
+	struct s7d_video_fw_handle *handle;
 
 	if (!dev)
 		return ERR_PTR(-EINVAL);
@@ -107,18 +51,18 @@ s7d_codec_firmware_create(struct device *dev, struct module *module)
 	if (module != THIS_MODULE)
 		return ERR_PTR(-EINVAL);
 #endif
+	handle = s7d_video_fw_get(dev);
+	if (IS_ERR(handle))
+		return ERR_CAST(handle);
 	owner = kzalloc(sizeof(*owner), GFP_KERNEL);
-	if (!owner)
-		return ERR_PTR(-ENOMEM);
-	owner->queue = alloc_ordered_workqueue("s7d-codec-preload", WQ_MEM_RECLAIM);
-	if (!owner->queue) {
-		kfree(owner);
+	if (!owner) {
+		s7d_video_fw_put(handle);
 		return ERR_PTR(-ENOMEM);
 	}
 	owner->dev = get_device(dev);
 	owner->module = module;
+	owner->handle = handle;
 	atomic_set(&owner->jobs, 0);
-	mutex_init(&owner->epoch_lock);
 	return owner;
 }
 
@@ -126,8 +70,7 @@ int s7d_codec_firmware_destroy(struct s7d_codec_firmware_owner *owner)
 {
 	if (atomic_read(&owner->jobs))
 		return -EBUSY;
-	destroy_workqueue(owner->queue);
-	release_firmware(owner->firmware);
+	s7d_video_fw_put(owner->handle);
 	put_device(owner->dev);
 	kfree(owner);
 	return 0;
@@ -135,20 +78,12 @@ int s7d_codec_firmware_destroy(struct s7d_codec_firmware_owner *owner)
 
 int s7d_codec_firmware_next_epoch(struct s7d_codec_firmware_owner *owner, u64 *out)
 {
-	int ret = 0;
-
 	if (!out)
 		return -EINVAL;
 	*out = 0;
 	if (!owner)
 		return -EINVAL;
-	mutex_lock(&owner->epoch_lock);
-	if (owner->lease_sequence == U64_MAX)
-		ret = -EOVERFLOW;
-	else
-		*out = ++owner->lease_sequence;
-	mutex_unlock(&owner->epoch_lock);
-	return ret;
+	return s7d_video_fw_next_epoch(owner->handle, out);
 }
 
 int s7d_codec_firmware_prepare(struct s7d_codec_firmware_owner *owner,
@@ -156,36 +91,35 @@ int s7d_codec_firmware_prepare(struct s7d_codec_firmware_owner *owner,
 			       struct s7d_codec_firmware_job **out)
 {
 	struct s7d_codec_firmware_job *job;
+	struct s7d_video_fw_ticket *ticket;
+	int ret;
 
 	if (!session || !lease_epoch || !out)
 		return -EINVAL;
 	*out = NULL;
-	if (owner->state == S7D_FIRMWARE_READY)
-		return 0;
-	if (owner->state == S7D_FIRMWARE_FAILED || owner->state == S7D_FIRMWARE_INVALID ||
-	    (owner->state == S7D_FIRMWARE_PRE_FAILED && owner->failed_epoch == lease_epoch))
-		return owner->error;
-	if (owner->cancel_sequence == U32_MAX)
-		return -EOVERFLOW;
+	if (owner->invalid)
+		return -ESTALE;
+	ret = s7d_video_fw_prepare(owner->handle, lease_epoch, &ticket);
+	if (ret || !ticket)
+		return ret;
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
-	if (!job)
+	if (!job) {
+		s7d_video_fw_ticket_put(ticket);
 		return -ENOMEM;
+	}
 	if (!try_module_get(owner->module)) {
+		s7d_video_fw_ticket_put(ticket);
 		kfree(job);
 		return -ESHUTDOWN;
 	}
 	kref_init(&job->ref);
-	INIT_WORK(&job->work, firmware_job_work);
-	init_completion(&job->done);
-	atomic_set(&job->cancel, 0);
 	job->owner = owner;
 	job->session = session;
 	s7d_codec_session_get(session);
 	job->dev = get_device(owner->dev);
 	job->module = owner->module;
+	job->ticket = ticket;
 	job->lease_epoch = lease_epoch;
-	job->cancel_id = ++owner->cancel_sequence;
-	job->status = -EINPROGRESS;
 	atomic_inc(&owner->jobs);
 	*out = job;
 	return 0;
@@ -193,7 +127,7 @@ int s7d_codec_firmware_prepare(struct s7d_codec_firmware_owner *owner,
 
 bool s7d_codec_firmware_job_queue(struct s7d_codec_firmware_job *job)
 {
-	return queue_work(job->owner->queue, &job->work);
+	return s7d_video_fw_ticket_queue(job->ticket);
 }
 
 void s7d_codec_firmware_job_get(struct s7d_codec_firmware_job *job)
@@ -203,7 +137,11 @@ void s7d_codec_firmware_job_get(struct s7d_codec_firmware_job *job)
 
 static void firmware_job_free(struct kref *ref)
 {
-	kfree(container_of(ref, struct s7d_codec_firmware_job, ref));
+	struct s7d_codec_firmware_job *job =
+		container_of(ref, struct s7d_codec_firmware_job, ref);
+
+	s7d_video_fw_ticket_put(job->ticket);
+	kfree(job);
 }
 
 void s7d_codec_firmware_job_put(struct s7d_codec_firmware_job *job)
@@ -213,20 +151,19 @@ void s7d_codec_firmware_job_put(struct s7d_codec_firmware_job *job)
 
 void s7d_codec_firmware_job_stop(struct s7d_codec_firmware_job *job)
 {
-	atomic_set(&job->cancel, 1);
+	s7d_video_fw_ticket_cancel(job->ticket);
 }
 
 int s7d_codec_firmware_job_join(struct s7d_codec_firmware_job *job)
 {
-	wait_for_completion(&job->done);
-	flush_work(&job->work);
-	return job->status;
+	return s7d_video_fw_ticket_wait(job->ticket, NULL);
 }
 
 int s7d_codec_firmware_job_join_result(struct s7d_codec_firmware_job *job,
 				       struct s7d_codec_session *session,
 				       u64 lease_epoch, bool *cancelled)
 {
+	bool clean_cancel;
 	int ret;
 
 	if (!cancelled)
@@ -234,44 +171,16 @@ int s7d_codec_firmware_job_join_result(struct s7d_codec_firmware_job *job,
 	*cancelled = false;
 	if (!job || !session || !lease_epoch)
 		return -EINVAL;
-	ret = s7d_codec_firmware_job_join(job);
+	ret = s7d_video_fw_ticket_wait(job->ticket, &clean_cancel);
 	if (job->session != session || job->lease_epoch != lease_epoch)
 		return -ESTALE;
-	if (ret != -ECANCELED)
-		return ret;
-	if (job->result.linux_status)
-		return job->result.linux_status < 0 ? job->result.linux_status : -EIO;
-	if (job->result.close_status)
-		return job->result.close_status < 0 ? job->result.close_status : -EIO;
-	*cancelled = job->cancelled || job->result.cancelled;
+	*cancelled = clean_cancel;
 	return ret;
-}
-
-void s7d_codec_firmware_retire(struct s7d_codec_firmware_owner *owner,
-			       struct s7d_codec_firmware_job *job)
-{
-	if (job->retired)
-		return;
-	job->retired = true;
-	if (!job->status && job->result.complete) {
-		owner->firmware = job->firmware;
-		job->firmware = NULL;
-		owner->state = S7D_FIRMWARE_READY;
-		owner->error = 0;
-		return;
-	}
-	owner->error = job->status ? job->status : -EIO;
-	owner->failed_epoch = job->lease_epoch;
-	owner->state = job->result.phase == S7D_CODEC_TEE_NONE ?
-		S7D_FIRMWARE_PRE_FAILED : S7D_FIRMWARE_FAILED;
 }
 
 void s7d_codec_firmware_invalidate(struct s7d_codec_firmware_owner *owner)
 {
-	if (owner->state == S7D_FIRMWARE_READY) {
-		owner->state = S7D_FIRMWARE_INVALID;
-		owner->error = -ESTALE;
-	}
+	owner->invalid = true;
 }
 
 void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job)
@@ -279,8 +188,6 @@ void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job)
 	struct s7d_codec_firmware_owner *owner = job->owner;
 	struct module *module = job->module;
 
-	release_firmware(job->firmware);
-	job->firmware = NULL;
 	s7d_codec_session_put(job->session);
 	job->session = NULL;
 	put_device(job->dev);

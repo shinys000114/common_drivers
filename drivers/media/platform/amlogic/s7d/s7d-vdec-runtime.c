@@ -264,7 +264,6 @@ static void runtime_retire_preload(struct s7d_vdec_runtime *runtime,
 		runtime->preload_job = NULL;
 	spin_unlock_irqrestore(&runtime->lock, flags);
 	if (retire) {
-		s7d_codec_firmware_retire(runtime->firmware, job);
 		s7d_codec_firmware_job_put(job);
 	}
 }

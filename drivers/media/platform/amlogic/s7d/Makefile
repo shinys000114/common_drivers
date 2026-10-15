@@ -11,8 +11,6 @@ s7d-vdec-y := \
 	s7d-codec-memory.o \
 	s7d-codec-dos.o \
 	s7d-codec-firmware.o \
-	s7d-codec-bundle.o \
-	s7d-codec-tee.o \
 	s7d-vdec-runtime.o \
 	s7d-codec-layout.o \
 	s7d-h264-layout.o \

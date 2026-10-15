@@ -26,13 +26,12 @@ int s7d_codec_firmware_destroy(struct s7d_codec_firmware_owner *owner);
 /*
  * Allocate once after acquiring a new DOS lease; retain the cookie throughout
  * that lease, including preload failure, cancellation, retry and resume.
- * Every consumer of this owner uses this allocator; local counters cannot mix.
+ * All engines use the provider allocator, including after decoder reload.
  * Caller keeps owner alive and may sleep. A valid out is zero on error; wrap
- * returns -EOVERFLOW. This lock does not serialize cache or consumer lifetime.
+ * returns -EOVERFLOW.
  */
 int s7d_codec_firmware_next_epoch(struct s7d_codec_firmware_owner *owner, u64 *out);
 
-/* The exclusive DOS lease and consumer control serialize cache mutations. */
 int s7d_codec_firmware_prepare(struct s7d_codec_firmware_owner *owner,
 			       struct s7d_codec_session *session, u64 lease_epoch,
 			       struct s7d_codec_firmware_job **job);
@@ -46,8 +45,6 @@ int s7d_codec_firmware_prepare_for_engine(struct s7d_codec_firmware_owner *owner
 					enum s7d_codec_engine engine,
 					enum s7d_codec_firmware firmware,
 					struct s7d_codec_firmware_job **job);
-void s7d_codec_firmware_retire(struct s7d_codec_firmware_owner *owner,
-			       struct s7d_codec_firmware_job *job);
 void s7d_codec_firmware_invalidate(struct s7d_codec_firmware_owner *owner);
 
 bool s7d_codec_firmware_job_queue(struct s7d_codec_firmware_job *job);

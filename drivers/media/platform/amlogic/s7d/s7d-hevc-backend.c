@@ -692,7 +692,6 @@ static int hevc_preload(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *j
 		ret = s7d_codec_firmware_job_join_result(preload, job->session,
 				job->firmware_epoch, &job->result.cancelled);
 		mutex_lock(&decoder->control);
-		s7d_codec_firmware_retire(decoder->firmware, preload);
 	} else {
 		decoder->quarantined = true;
 		return -EIO;

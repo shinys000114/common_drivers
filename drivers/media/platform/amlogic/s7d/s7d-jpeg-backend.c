@@ -298,7 +298,6 @@ static int jpeg_preload(struct s7d_jpeg_encoder *encoder,
 		mutex_unlock(&encoder->control);
 		ret = s7d_codec_firmware_job_join(preload);
 		mutex_lock(&encoder->control);
-		s7d_codec_firmware_retire(encoder->firmware, preload);
 	} else {
 		ret = -EIO;
 	}
