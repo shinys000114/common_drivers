@@ -123,6 +123,7 @@ struct s7d_codec_dos {
 	bool halted;
 	bool started;
 	bool faulted;
+	bool error_reported;
 	bool release_failed;
 	bool closing;
 	bool release_pin;
@@ -200,6 +201,73 @@ static int dos_update(struct regmap *map, unsigned int reg, u32 mask, u32 val)
 	int ret = regmap_update_bits(map, reg, mask, val);
 
 	return ret ? ret : dos_check(map, reg, mask, val);
+}
+
+static int dos_report_error(struct s7d_codec_dos *dos, const char *stage,
+			    int result, int error)
+{
+	if (error && dos->engine == S7D_CODEC_ENGINE_HEVC && !dos->error_reported) {
+		dos->error_reported = true;
+		dev_err(dos->dev, "HEVC DOS %s result=%d error=%d\n", stage, result, error);
+	}
+	return error;
+}
+
+static int dos_report_io(struct s7d_codec_dos *dos, const char *stage,
+			 unsigned int reg, u32 mask, u32 want,
+			 u32 observed, bool observed_valid, int error)
+{
+	if (error && dos->engine == S7D_CODEC_ENGINE_HEVC && !dos->error_reported) {
+		dos->error_reported = true;
+		dev_err(dos->dev,
+			"HEVC DOS %s reg=%#x mask=%#x want=%#x observed=%#x valid=%u error=%d\n",
+			stage, reg, mask, want,
+			observed, observed_valid, error);
+	}
+	return error;
+}
+
+static int dos_hevc_check(struct s7d_codec_dos *dos, unsigned int reg,
+			  u32 mask, u32 want)
+{
+	u32 val = 0;
+	int ret;
+
+	ret = regmap_read(dos->map, reg, &val);
+	if (ret)
+		return dos_report_io(dos, "read", reg, mask, want, val, false, ret);
+	ret = (val & mask) == want ? 0 : -EIO;
+	return dos_report_io(dos, "check", reg, mask, want, val, true, ret);
+}
+
+static int dos_hevc_write_raw(struct s7d_codec_dos *dos, unsigned int reg, u32 val)
+{
+	int ret = regmap_write(dos->map, reg, val);
+
+	return dos_report_io(dos, "write", reg, U32_MAX, val, 0, false, ret);
+}
+
+static int dos_hevc_write(struct s7d_codec_dos *dos, unsigned int reg, u32 val)
+{
+	int ret = dos_hevc_write_raw(dos, reg, val);
+
+	return ret ? ret : dos_hevc_check(dos, reg, U32_MAX, val);
+}
+
+static int dos_hevc_update(struct s7d_codec_dos *dos, unsigned int reg,
+			   u32 mask, u32 val)
+{
+	int ret = regmap_update_bits(dos->map, reg, mask, val);
+
+	return ret ? dos_report_io(dos, "update", reg, mask, val, 0, false, ret) :
+		dos_hevc_check(dos, reg, mask, val);
+}
+
+static int dos_hevc_read(struct s7d_codec_dos *dos, unsigned int reg, u32 *val)
+{
+	int ret = regmap_read(dos->map, reg, val);
+
+	return dos_report_io(dos, "read", reg, 0, 0, 0, false, ret);
 }
 
 static int dos_reset(struct s7d_codec_dos *dos, u32 mask)
@@ -283,24 +351,24 @@ static int dos_hevc_prepare_access_locked(struct s7d_codec_dos *dos)
 	int ret;
 
 	usleep_range(20, 30);
-	ret = regmap_write(dos->map, DOS_GCLK_EN3, U32_MAX);
+	ret = dos_hevc_write_raw(dos, DOS_GCLK_EN3, U32_MAX);
 	if (ret)
 		return ret;
-	ret = dos_write(dos->map, DOS_MEM_PD_HEVC, 0);
+	ret = dos_hevc_write(dos, DOS_MEM_PD_HEVC, 0);
 	if (ret)
 		return ret;
-	ret = regmap_write(dos->map, DOS_SW_RESET3, U32_MAX);
+	ret = dos_hevc_write_raw(dos, DOS_SW_RESET3, U32_MAX);
 	if (ret)
 		return ret;
 	usleep_range(20, 30);
-	ret = regmap_write(dos->map, DOS_SW_RESET3, 0);
+	ret = dos_hevc_write_raw(dos, DOS_SW_RESET3, 0);
 	if (ret)
 		return ret;
 	usleep_range(10, 20);
-	ret = dos_check(dos->map, DOS_SW_RESET3, U32_MAX, 0);
+	ret = dos_hevc_check(dos, DOS_SW_RESET3, U32_MAX, 0);
 	if (ret)
 		return ret;
-	return dos_write(dos->map, DOS_MEM_PD_HEVC, 0);
+	return dos_hevc_write(dos, DOS_MEM_PD_HEVC, 0);
 }
 
 static int dos_prepare_access_locked(struct s7d_codec_dos *dos)
@@ -435,56 +503,66 @@ static int dos_hcodec_halt_locked(struct s7d_codec_dos *dos)
 
 static int dos_hevc_halt_locked(struct s7d_codec_dos *dos)
 {
-	u32 val;
+	u32 val = 0;
 	int ret;
 
 	dos->halted = false;
-	ret = dos_write(dos->map, HEVC_MBOX0_MASK, 0);
+	ret = dos_hevc_write(dos, HEVC_MBOX0_MASK, 0);
 	if (ret)
 		return ret;
-	ret = dos_write(dos->map, HEVC_MPSR, 0);
+	ret = dos_hevc_write(dos, HEVC_MPSR, 0);
 	if (ret)
 		return ret;
-	ret = dos_write(dos->map, HEVC_CPSR, 0);
+	ret = dos_hevc_write(dos, HEVC_CPSR, 0);
 	if (ret)
 		return ret;
 	ret = regmap_read_poll_timeout(dos->map, HEVC_IMEM_DMA_CTRL, val,
 				      !(val & BIT(15)), 10, DMA_TIMEOUT_US);
 	if (ret)
-		return ret;
+		return dos_report_io(dos, "poll", HEVC_IMEM_DMA_CTRL,
+				     BIT(15), 0, val,
+				     ret == -ETIMEDOUT, ret);
 	ret = regmap_read_poll_timeout(dos->map, HEVC_LMEM_DMA_CTRL, val,
 				      !(val & BIT(15)), 10, DMA_TIMEOUT_US);
 	if (ret)
-		return ret;
+		return dos_report_io(dos, "poll", HEVC_LMEM_DMA_CTRL,
+				     BIT(15), 0, val,
+				     ret == -ETIMEDOUT, ret);
 	ret = regmap_read_poll_timeout(dos->map, HEVC_WRRSP_LMEM, val,
 				      !(val & GENMASK(11, 0)), 10,
 				      HEVC_RESPONSE_TIMEOUT_US);
 	if (ret)
-		return ret;
-	ret = dos_write(dos->map, HEVC_STREAM_CONTROL, 0);
+		return dos_report_io(dos, "poll", HEVC_WRRSP_LMEM,
+				     GENMASK(11, 0), 0, val,
+				     ret == -ETIMEDOUT, ret);
+	ret = dos_hevc_write(dos, HEVC_STREAM_CONTROL, 0);
 	if (ret)
 		return ret;
-	ret = dos_update(dos->map, HEVC_AXI_CTRL, HEVC_AXI_STOP, HEVC_AXI_STOP);
+	ret = dos_hevc_update(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, HEVC_AXI_STOP);
 	if (ret)
 		return ret;
 	ret = regmap_read_poll_timeout(dos->map, HEVC_AXI_STATUS, val,
 				      (val & HEVC_AXI_IDLE) == HEVC_AXI_IDLE,
 				      10, HEVC_IDLE_TIMEOUT_US);
 	if (ret)
-		return ret;
+		return dos_report_io(dos, "poll", HEVC_AXI_STATUS,
+				     HEVC_AXI_IDLE, HEVC_AXI_IDLE, val,
+				     ret == -ETIMEDOUT, ret);
 	ret = regmap_read_poll_timeout(dos->map, HEVC_AFIFO_CTRL, val,
 				      !(val & HEVC_AFIFO_BUSY), 10,
 				      HEVC_IDLE_TIMEOUT_US);
 	if (ret)
-		return ret;
-	ret = dos_update(dos->map, HEVC_SAO_MMU_RESET, BIT(0), BIT(0));
+		return dos_report_io(dos, "poll", HEVC_AFIFO_CTRL,
+				     HEVC_AFIFO_BUSY, 0, val,
+				     ret == -ETIMEDOUT, ret);
+	ret = dos_hevc_update(dos, HEVC_SAO_MMU_RESET, BIT(0), BIT(0));
 	if (ret)
 		return ret;
-	ret = dos_update(dos->map, DOS_SW_RESET3, HEVC_CORE_RESET, HEVC_CORE_RESET);
+	ret = dos_hevc_update(dos, DOS_SW_RESET3, HEVC_CORE_RESET, HEVC_CORE_RESET);
 	if (ret)
 		return ret;
 	usleep_range(20, 30);
-	ret = dos_update(dos->map, DOS_SW_RESET3, HEVC_CORE_RESET, 0);
+	ret = dos_hevc_update(dos, DOS_SW_RESET3, HEVC_CORE_RESET, 0);
 	if (ret)
 		return ret;
 	usleep_range(10, 20);
@@ -492,42 +570,46 @@ static int dos_hevc_halt_locked(struct s7d_codec_dos *dos)
 				      !(val & GENMASK(11, 0)), 10,
 				      HEVC_RESPONSE_TIMEOUT_US);
 	if (ret)
-		return ret;
-	ret = dos_update(dos->map, HEVC_SAO_MMU_RESET, BIT(0), 0);
+		return dos_report_io(dos, "poll", HEVC_WRRSP_LMEM,
+				     GENMASK(11, 0), 0, val,
+				     ret == -ETIMEDOUT, ret);
+	ret = dos_hevc_update(dos, HEVC_SAO_MMU_RESET, BIT(0), 0);
 	if (ret)
 		return ret;
 	ret = reset_control_assert(dos->hevc_reset);
 	if (ret)
-		return ret;
+		return dos_report_error(dos, "reset-assert", ret, ret);
 	ret = reset_control_status(dos->hevc_reset);
 	if (ret != 1)
-		return ret < 0 ? ret : -EIO;
+		return dos_report_error(dos, "reset-assert-status", ret,
+					ret < 0 ? ret : -EIO);
 	usleep_range(20, 30);
 	ret = reset_control_deassert(dos->hevc_reset);
 	if (ret)
-		return ret;
+		return dos_report_error(dos, "reset-deassert", ret, ret);
 	ret = reset_control_status(dos->hevc_reset);
 	if (ret)
-		return ret < 0 ? ret : -EIO;
-	ret = dos_check(dos->map, HEVC_MBOX0_MASK, U32_MAX, 0);
+		return dos_report_error(dos, "reset-deassert-status", ret,
+					ret < 0 ? ret : -EIO);
+	ret = dos_hevc_check(dos, HEVC_MBOX0_MASK, U32_MAX, 0);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_MPSR, U32_MAX, 0);
+	ret = dos_hevc_check(dos, HEVC_MPSR, U32_MAX, 0);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_CPSR, U32_MAX, 0);
+	ret = dos_hevc_check(dos, HEVC_CPSR, U32_MAX, 0);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_STREAM_CONTROL, U32_MAX, 0);
+	ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL, U32_MAX, 0);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_AXI_CTRL, HEVC_AXI_STOP, HEVC_AXI_STOP);
+	ret = dos_hevc_check(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, HEVC_AXI_STOP);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_AXI_STATUS, HEVC_AXI_IDLE, HEVC_AXI_IDLE);
+	ret = dos_hevc_check(dos, HEVC_AXI_STATUS, HEVC_AXI_IDLE, HEVC_AXI_IDLE);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_AFIFO_CTRL, HEVC_AFIFO_BUSY, 0);
+	ret = dos_hevc_check(dos, HEVC_AFIFO_CTRL, HEVC_AFIFO_BUSY, 0);
 	if (ret)
 		return ret;
 	dos->halted = true;
@@ -555,55 +637,55 @@ static int dos_hevc_stopped_cpu_locked(struct s7d_codec_dos *dos)
 {
 	int ret;
 
-	ret = dos_check(dos->map, HEVC_MPSR, U32_MAX, 0);
+	ret = dos_hevc_check(dos, HEVC_MPSR, U32_MAX, 0);
 	if (ret)
 		return ret;
-	return dos_check(dos->map, HEVC_CPSR, U32_MAX, 0);
+	return dos_hevc_check(dos, HEVC_CPSR, U32_MAX, 0);
 }
 
 static int dos_hevc_dma_idle_locked(struct s7d_codec_dos *dos)
 {
 	int ret;
 
-	ret = dos_check(dos->map, HEVC_IMEM_DMA_CTRL, BIT(15), 0);
+	ret = dos_hevc_check(dos, HEVC_IMEM_DMA_CTRL, BIT(15), 0);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_LMEM_DMA_CTRL, BIT(15), 0);
+	ret = dos_hevc_check(dos, HEVC_LMEM_DMA_CTRL, BIT(15), 0);
 	if (ret)
 		return ret;
-	return dos_check(dos->map, HEVC_WRRSP_LMEM, GENMASK(11, 0), 0);
+	return dos_hevc_check(dos, HEVC_WRRSP_LMEM, GENMASK(11, 0), 0);
 }
 
 static int dos_hevc_port_enable_locked(struct s7d_codec_dos *dos)
 {
 	int ret;
 
-	ret = dos_check(dos->map, HEVC_MBOX0_MASK, U32_MAX, 0);
+	ret = dos_hevc_check(dos, HEVC_MBOX0_MASK, U32_MAX, 0);
 	if (ret)
 		return ret;
 	ret = dos_hevc_stopped_cpu_locked(dos);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
+	ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, DOS_SW_RESET3, HEVC_CORE_RESET, 0);
+	ret = dos_hevc_check(dos, DOS_SW_RESET3, HEVC_CORE_RESET, 0);
 	if (ret)
 		return ret;
 	ret = dos_hevc_dma_idle_locked(dos);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_AXI_CTRL, HEVC_AXI_STOP, HEVC_AXI_STOP);
+	ret = dos_hevc_check(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, HEVC_AXI_STOP);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_AXI_STATUS, HEVC_AXI_IDLE, HEVC_AXI_IDLE);
+	ret = dos_hevc_check(dos, HEVC_AXI_STATUS, HEVC_AXI_IDLE, HEVC_AXI_IDLE);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_AFIFO_CTRL, HEVC_AFIFO_BUSY, 0);
+	ret = dos_hevc_check(dos, HEVC_AFIFO_CTRL, HEVC_AFIFO_BUSY, 0);
 	if (ret)
 		return ret;
 	dos->halted = false;
-	return dos_update(dos->map, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
+	return dos_hevc_update(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
 }
 
 static int dos_hevc_cpu_reset_locked(struct s7d_codec_dos *dos)
@@ -612,22 +694,24 @@ static int dos_hevc_cpu_reset_locked(struct s7d_codec_dos *dos)
 	int i, ret;
 
 	for (i = 0; i < 3; i++) {
-		ret = regmap_read(dos->map, DOS_SW_RESET3, &val);
+		ret = dos_hevc_read(dos, DOS_SW_RESET3, &val);
 		if (ret)
 			return ret;
 	}
-	ret = regmap_write(dos->map, DOS_SW_RESET3, HEVC_CPU_RESET);
+	ret = dos_hevc_write_raw(dos, DOS_SW_RESET3, HEVC_CPU_RESET);
 	if (ret)
 		return ret;
-	ret = regmap_write(dos->map, DOS_SW_RESET3, 0);
+	ret = dos_hevc_write_raw(dos, DOS_SW_RESET3, 0);
 	if (ret)
 		return ret;
 	for (i = 0; i < 3; i++) {
-		ret = regmap_read(dos->map, DOS_SW_RESET3, &val);
+		ret = dos_hevc_read(dos, DOS_SW_RESET3, &val);
 		if (ret)
 			return ret;
 	}
-	return val & (HEVC_CPU_RESET | HEVC_IQIT_RESET) ? -EIO : 0;
+	return dos_report_io(dos, "cpu-reset", DOS_SW_RESET3,
+			     HEVC_CPU_RESET | HEVC_IQIT_RESET, 0, val, true,
+			     val & (HEVC_CPU_RESET | HEVC_IQIT_RESET) ? -EIO : 0);
 }
 
 static int dos_hevc_start_locked(struct s7d_codec_dos *dos)
@@ -636,7 +720,7 @@ static int dos_hevc_start_locked(struct s7d_codec_dos *dos)
 
 	if (!dos->hevc_init_written)
 		return -EBUSY;
-	ret = dos_check(dos->map, HEVC_MBOX0_MASK, U32_MAX, 1);
+	ret = dos_hevc_check(dos, HEVC_MBOX0_MASK, U32_MAX, 1);
 	if (ret)
 		return ret;
 	ret = dos_hevc_stopped_cpu_locked(dos);
@@ -645,27 +729,27 @@ static int dos_hevc_start_locked(struct s7d_codec_dos *dos)
 	ret = dos_hevc_dma_idle_locked(dos);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_STREAM_CONTROL,
+	ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL,
 			HEVC_STREAM_FETCH | HEVC_STREAM_ENDIAN,
 			HEVC_STREAM_FETCH | HEVC_STREAM_ENDIAN);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_STREAM_FIFO_CTL, HEVC_FIFO_ENABLE,
+	ret = dos_hevc_check(dos, HEVC_STREAM_FIFO_CTL, HEVC_FIFO_ENABLE,
 			HEVC_FIFO_ENABLE);
 	if (ret)
 		return ret;
-	ret = dos_check(dos->map, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
+	ret = dos_hevc_check(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
 	if (ret)
 		return ret;
 	dos->started = true;
 	ret = dos_hevc_cpu_reset_locked(dos);
 	if (ret)
 		return ret;
-	ret = dos_update(dos->map, HEVC_WRRSP_LMEM, HEVC_LMEM_PRIORITY,
+	ret = dos_hevc_update(dos, HEVC_WRRSP_LMEM, HEVC_LMEM_PRIORITY,
 			 HEVC_LMEM_PRIORITY);
 	if (ret)
 		return ret;
-	return dos_write(dos->map, HEVC_MPSR, 1);
+	return dos_hevc_write(dos, HEVC_MPSR, 1);
 }
 
 static int dos_halt_locked(struct s7d_codec_dos *dos)
@@ -936,6 +1020,7 @@ static int dos_hold_rate(struct s7d_codec_dos *dos,
 		goto disable_vdec;
 	dos->leased = true;
 	dos->engine = engine;
+	dos->error_reported = false;
 	dos->local_access_ready = false;
 	dos->halted = false;
 	ret = 0;
@@ -1225,7 +1310,7 @@ int s7d_codec_dos_hevc_init(struct s7d_codec_dos *dos)
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = dos_check(dos->map, HEVC_MBOX0_MASK, U32_MAX, 0);
+	ret = dos_hevc_check(dos, HEVC_MBOX0_MASK, U32_MAX, 0);
 	if (ret)
 		goto fault;
 	ret = dos_hevc_stopped_cpu_locked(dos);
@@ -1234,13 +1319,13 @@ int s7d_codec_dos_hevc_init(struct s7d_codec_dos *dos)
 	ret = dos_hevc_dma_idle_locked(dos);
 	if (ret)
 		goto fault;
-	ret = dos_check(dos->map, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
+	ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
 	if (ret)
 		goto fault;
-	ret = dos_check(dos->map, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
+	ret = dos_hevc_check(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
 	if (ret)
 		goto fault;
-	ret = regmap_write(dos->map, DOS_SW_RESET3, HEVC_IQIT_RESET);
+	ret = dos_hevc_write_raw(dos, DOS_SW_RESET3, HEVC_IQIT_RESET);
 	if (ret)
 		goto fault;
 	dos->hevc_init_written = true;
@@ -1276,11 +1361,11 @@ int s7d_codec_dos_hevc_irq_mask(struct s7d_codec_dos *dos, bool enable)
 		ret = dos_hevc_stopped_cpu_locked(dos);
 		if (ret)
 			goto fault;
-		ret = dos_check(dos->map, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
+		ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
 		if (ret)
 			goto fault;
 	}
-	ret = dos_write(dos->map, HEVC_MBOX0_MASK, enable ? 1 : 0);
+	ret = dos_hevc_write(dos, HEVC_MBOX0_MASK, enable ? 1 : 0);
 	if (ret)
 		goto fault;
 	goto out;
@@ -1304,24 +1389,24 @@ int s7d_codec_dos_hevc_input_enable(struct s7d_codec_dos *dos)
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = dos_check(dos->map, HEVC_MBOX0_MASK, U32_MAX, 1);
+	ret = dos_hevc_check(dos, HEVC_MBOX0_MASK, U32_MAX, 1);
 	if (ret)
 		goto fault;
 	ret = dos_hevc_stopped_cpu_locked(dos);
 	if (ret)
 		goto fault;
-	ret = dos_check(dos->map, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
+	ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH, 0);
 	if (ret)
 		goto fault;
-	ret = dos_update(dos->map, HEVC_STREAM_CONTROL, HEVC_STREAM_ENDIAN,
+	ret = dos_hevc_update(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_ENDIAN,
 			 HEVC_STREAM_ENDIAN);
 	if (ret)
 		goto fault;
-	ret = dos_update(dos->map, HEVC_STREAM_FIFO_CTL, HEVC_FIFO_ENABLE,
+	ret = dos_hevc_update(dos, HEVC_STREAM_FIFO_CTL, HEVC_FIFO_ENABLE,
 			 HEVC_FIFO_ENABLE);
 	if (ret)
 		goto fault;
-	ret = dos_update(dos->map, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH,
+	ret = dos_hevc_update(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH,
 			 HEVC_STREAM_FETCH);
 	if (ret)
 		goto fault;

@@ -129,6 +129,7 @@ struct s7d_hevc_decoder {
 	u8 rps_set_id;
 	int irq;
 	int release_error;
+	int quiesce_error;
 	int failure;
 	bool irq_accept;
 	bool irq_enabled;
@@ -553,6 +554,7 @@ static int hevc_hold(void *priv, enum s7d_codec_engine engine)
 		decoder->quiesced = false;
 		decoder->lease_active = true;
 		decoder->failure = 0;
+		decoder->quiesce_error = 0;
 		decoder->decode_count = 0;
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		decoder->stop_requested = false;
@@ -598,6 +600,8 @@ static int hevc_quiesce_locked(struct s7d_hevc_decoder *decoder,
 	}
 	if (!ret && decoder->job)
 		decoder->job->opaque_swap = 0;
+	if (ret && !decoder->quiesce_error)
+		decoder->quiesce_error = ret;
 	decoder->quiesced = !ret;
 	decoder->quarantined = !!ret;
 	mutex_unlock(&decoder->protocol);
@@ -1067,6 +1071,48 @@ static int hevc_wait_picture(struct s7d_hevc_decoder *decoder, struct s7d_hevc_j
 	}
 }
 
+static void hevc_report_failure(struct s7d_hevc_decoder *decoder,
+				struct s7d_hevc_job *job, const char *stage,
+				int first_error, int error, int halt_error)
+{
+	struct s7d_hevc_irq_snapshot snapshot;
+	unsigned long flags;
+	bool valid, armed, complete;
+	u32 i, slot, headers;
+
+	mutex_lock(&decoder->protocol);
+	spin_lock_irqsave(&decoder->irq_lock, flags);
+	snapshot = job->snapshot;
+	valid = job->snapshot_valid;
+	spin_unlock_irqrestore(&decoder->irq_lock, flags);
+	slot = job->current_slot;
+	headers = job->headers;
+	armed = job->header_armed;
+	complete = job->picture_complete;
+	mutex_unlock(&decoder->protocol);
+	dev_err(decoder->dev,
+		"HEVC input %llu epoch %llu phase=%s first=%d error=%d halt=%d first-quiesce=%d slot=%u headers=%u armed=%u complete=%u\n",
+		job->metadata.input_token, job->lease_epoch, stage, first_error,
+		error, halt_error, decoder->quiesce_error, slot, headers, armed, complete);
+	dev_err(decoder->dev,
+		"HEVC IRQ valid=%u error=%d status=%#x lcu=%#x shift-status=%#x shift-bytes=%#x\n",
+		valid, snapshot.error, snapshot.status, snapshot.lcu,
+		snapshot.shift_status, snapshot.shift_bytes);
+	dev_err(decoder->dev,
+		"HEVC input token=%llu start=%#x end=%#x read=%#x write=%#x decode=%u max-shift=%u\n",
+		job->input.token, job->input.start, job->input.end,
+		job->input.read_pointer, job->input.write_pointer,
+		job->input.decode_size, job->input.max_shift_bytes);
+	s7d_hevc_context_report_dma(job->context, decoder->dev);
+	for (i = 0; i < decoder->captures; i++)
+		dev_err(decoder->dev,
+			"HEVC capture %u id=%llu generation=%llu Y=%#x+%#x UV=%#x+%#x MV=%#x+%#x\n",
+			i, decoder->capture[i].surface_id, decoder->capture[i].generation,
+			decoder->surface[i].address[0], decoder->surface[i].bytes[0],
+			decoder->surface[i].address[1], decoder->surface[i].bytes[1],
+			decoder->mv[i].address, decoder->mv[i].bytes);
+}
+
 int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 			   struct s7d_codec_session *session,
 			   const struct s7d_hevc_input_result *input,
@@ -1078,7 +1124,8 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	struct s7d_hevc_context_au au;
 	struct s7d_hevc_job *job;
 	unsigned long flags;
-	int ret, stopped, cleanup, fault;
+	const char *stage = "quiesce";
+	int ret, stopped, cleanup, fault, first_error;
 
 	if (!decoder || !session || !input || !input->data || !input->bytes ||
 	    !input_token || !timestamp_meta || !result ||
@@ -1135,6 +1182,7 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	ret = hevc_quiesce_locked(decoder, S7D_CODEC_ENGINE_HEVC);
 	if (!ret && !decoder->context_initialized) {
+		stage = "context-idle";
 		ret = s7d_hevc_context_mark_idle(job->context, decoder->epoch, 0, 0, true);
 		if (!ret)
 			decoder->context_initialized = true;
@@ -1143,45 +1191,68 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 		.data = input->data, .bytes = input->bytes, .sps = &decoder->sps,
 		.lease_epoch = decoder->epoch, .input_token = input_token,
 	};
-	if (!ret)
+	if (!ret) {
+		stage = "stage-input";
 		ret = s7d_hevc_context_stage_au(job->context, &au, &job->input);
-	if (!ret)
+	}
+	if (!ret) {
+		stage = "context-begin";
 		ret = s7d_hevc_context_begin(job->context, decoder->epoch, input_token);
+	}
 	if (ret)
 		goto stop;
 	job->context_begun = true;
 	decoder->quiesced = false;
+	stage = "prepare";
 	ret = s7d_codec_dos_prepare(decoder->dos, S7D_CODEC_ENGINE_HEVC);
-	if (!ret)
+	if (!ret) {
+		stage = "program-input";
 		ret = s7d_hevc_context_program_input(job->context, decoder->map);
-	if (!ret)
+	}
+	if (!ret) {
+		stage = "port-enable";
 		ret = s7d_codec_dos_port_enable(decoder->dos, S7D_CODEC_ENGINE_HEVC);
-	if (!ret)
+	}
+	if (!ret) {
+		stage = "firmware-preload";
 		ret = hevc_preload(decoder, job);
-	if (!ret)
+	}
+	if (!ret) {
+		stage = "firmware-load";
 		ret = s7d_codec_firmware_load(decoder->dev, S7D_CODEC_ENGINE_HEVC,
 					      S7D_CODEC_FIRMWARE_HEVC);
+	}
 	if (ret) {
 		s7d_codec_firmware_invalidate(decoder->firmware);
 		goto stop;
 	}
+	stage = "swap-token";
 	ret = regmap_read(decoder->map, HEVC_SWAP_TOKEN, &job->opaque_swap);
 
 	mutex_lock(&decoder->protocol);
-	if (!ret)
+	if (!ret) {
+		stage = "protocol";
 		ret = hevc_protocol(decoder, job);
-	if (!ret)
+	}
+	if (!ret) {
+		stage = "start";
 		ret = hevc_start(decoder, job);
+	}
 	mutex_unlock(&decoder->protocol);
-	if (!ret)
+	if (!ret) {
+		stage = "picture";
 		ret = hevc_wait_picture(decoder, job);
+	}
 stop:
+	first_error = ret;
 	stopped = hevc_job_halt(decoder, job);
 	fault = stopped ? READ_ONCE(job->irq_error) : hevc_joined_error(decoder, job);
 	if (fault) {
 		ret = fault;
 		job->result.cancelled = false;
 	}
+	if (stopped || (ret && !job->result.cancelled))
+		hevc_report_failure(decoder, job, stage, first_error, ret, stopped);
 	if (stopped) {
 		dev_err(decoder->dev, "HEVC input %llu error %d, halt unproved %d; DMA retained\n",
 			input_token, ret, stopped);

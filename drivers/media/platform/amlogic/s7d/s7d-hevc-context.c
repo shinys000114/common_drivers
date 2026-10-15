@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 
+#include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/errno.h>
@@ -327,6 +328,23 @@ const struct s7d_hevc_workspace *
 s7d_hevc_context_workspace(const struct s7d_hevc_context *context)
 {
 	return context ? &context->workspace : NULL;
+}
+
+void s7d_hevc_context_report_dma(const struct s7d_hevc_context *context,
+				struct device *dev)
+{
+	const struct s7d_hevc_workspace *w = &context->workspace;
+	dma_addr_t allocation = s7d_codec_dma_addr(context->memory);
+	u32 input = context->base + context->input_offset;
+
+	dev_err(dev,
+		"HEVC context allocation=%pad+%zx workspace=[%#x,%#x) ring=[%#x,%#llx)\n",
+		&allocation, s7d_codec_dma_size(context->memory), context->base,
+		input, input, (u64)input + context->ring_bytes);
+	dev_err(dev,
+		"HEVC context RPM=%#x+%#x LMEM=%#x+%#x AUX=%#x+%#x MV=%#x+%#x\n",
+		w->rpm.address, w->rpm.bytes, w->lmem.address, w->lmem.bytes,
+		w->aux.address, w->aux.bytes, w->mv.address, w->mv.bytes);
 }
 
 static bool hevc_same_sps(const struct s7d_hevc_sps *a,

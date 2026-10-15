@@ -8,6 +8,7 @@
 
 #define S7D_HEVC_INPUT_MAX_BYTES (2U * 1024U * 1024U)
 
+struct device;
 struct regmap;
 struct s7d_codec_session;
 struct s7d_hevc_sps;
@@ -87,6 +88,9 @@ int s7d_hevc_context_begin(struct s7d_hevc_context *context,
 			  u64 lease_epoch, u64 input_token);
 const struct s7d_hevc_workspace *
 s7d_hevc_context_workspace(const struct s7d_hevc_context *context);
+/* Caller holds the executor and a live context; reads cached metadata only. */
+void s7d_hevc_context_report_dma(const struct s7d_hevc_context *context,
+				struct device *dev);
 /* Serialized calls: parent proves CPU/fetch stopped; four addresses only. */
 int s7d_hevc_context_program_input(struct s7d_hevc_context *context,
 				   struct regmap *map);
