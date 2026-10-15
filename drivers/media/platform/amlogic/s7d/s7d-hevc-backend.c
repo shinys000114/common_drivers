@@ -56,6 +56,17 @@ struct s7d_hevc_irq_snapshot {
 	int error;
 };
 
+struct s7d_hevc_first_failure {
+	struct s7d_hevc_irq_snapshot snapshot;
+	struct s7d_hevc_rpm rpm;
+	const char *stage;
+	int error;
+	u32 status;
+	bool snapshot_valid;
+	bool status_valid;
+	bool rpm_valid;
+};
+
 struct s7d_hevc_job {
 	struct s7d_codec_session *session;
 	struct s7d_hevc_context *context;
@@ -67,6 +78,7 @@ struct s7d_hevc_job {
 	struct s7d_hevc_picture_plan picture;
 	struct s7d_hevc_picture_metadata metadata;
 	struct s7d_hevc_irq_snapshot snapshot;
+	struct s7d_hevc_first_failure failure;
 	struct s7d_hevc_decode_result result;
 	struct completion wake;
 	u64 lease_epoch;
@@ -185,13 +197,44 @@ static void hevc_finish(struct s7d_hevc_job *job, int error, bool cancelled)
 	complete_all(&job->wake);
 }
 
+static void hevc_latch_failure_locked(struct s7d_hevc_job *job, const char *stage,
+		int error, const struct s7d_hevc_irq_snapshot *snapshot,
+		u32 status, bool status_valid, bool rpm_valid)
+{
+	if (!error || job->failure.error)
+		return;
+	job->failure = (struct s7d_hevc_first_failure) {
+		.snapshot = *snapshot, .stage = stage, .error = error,
+		.status = status, .status_valid = status_valid,
+		.snapshot_valid = job->snapshot_valid, .rpm_valid = rpm_valid,
+	};
+	if (rpm_valid)
+		job->failure.rpm = job->rpm;
+}
+
+static int hevc_header_failure(struct s7d_hevc_decoder *decoder,
+		struct s7d_hevc_job *job, const char *stage, int error,
+		u32 status, bool status_valid, bool rpm_valid)
+{
+	unsigned long flags;
+
+	if (!error || error == -EAGAIN || error == -ECANCELED || error == -ESHUTDOWN)
+		return error;
+	spin_lock_irqsave(&decoder->irq_lock, flags);
+	hevc_latch_failure_locked(job, stage, error, &job->snapshot,
+		status, status_valid, rpm_valid);
+	spin_unlock_irqrestore(&decoder->irq_lock, flags);
+	return error;
+}
+
 static irqreturn_t hevc_irq(void *data, const struct s7d_hevc_irq_cookie *cookie)
 {
 	struct s7d_hevc_decoder *decoder = data;
 	struct s7d_hevc_irq_snapshot snapshot = { };
 	struct s7d_hevc_job *job;
 	unsigned long flags;
-	u32 status;
+	u32 status = 0;
+	bool status_valid = false;
 	enum s7d_hevc_event event;
 	int ret;
 
@@ -218,6 +261,8 @@ static irqreturn_t hevc_irq(void *data, const struct s7d_hevc_irq_cookie *cookie
 		ret = regmap_read(decoder->map, HEVC_DECODE_INFO, &snapshot.decode_info);
 	if (!ret)
 		ret = regmap_read(decoder->map, HEVC_STATUS, &status);
+	if (!ret)
+		status_valid = true;
 	if (!ret && status != snapshot.status)
 		ret = -ESTALE;
 	snapshot.error = ret;
@@ -229,8 +274,11 @@ static irqreturn_t hevc_irq(void *data, const struct s7d_hevc_irq_cookie *cookie
 	if (!ret && event != S7D_HEVC_EVENT_SLICE_HEADER &&
 	    event != S7D_HEVC_EVENT_PICTURE_DATA)
 		ret = -ENODATA;
-	if (ret && !job->irq_error)
+	if (ret && !job->irq_error) {
 		job->irq_error = ret;
+		hevc_latch_failure_locked(job, "irq-snapshot", ret, &snapshot,
+			status, status_valid, false);
+	}
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	return IRQ_WAKE_THREAD;
 }
@@ -353,34 +401,49 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 	u8 raw[S7D_HEVC_RPM_BYTES];
 	unsigned long flags;
 	u64 serial;
-	u32 status, lmem, mask, slot;
+	u32 status = 0, lmem, mask, slot;
+	const char *stage = "header-status";
+	bool status_valid = false, rpm_valid = job->rpm_valid;
 	int ret;
 
 	*cancelled = false;
 	if (job->headers || job->header_armed)
-		return -EOPNOTSUPP;
+		return hevc_header_failure(decoder, job, "header-repeated",
+			-EOPNOTSUPP, status, status_valid, rpm_valid);
 	ret = regmap_read(decoder->map, HEVC_STATUS, &status);
+	status_valid = !ret;
 	if (!ret && status != S7D_HEVC_SLICE_HEADER_DONE)
 		ret = -ESTALE;
-	if (!ret)
+	if (!ret) {
+		stage = "header-lmem";
 		ret = regmap_read(decoder->map, HEVC_LMEM_DMA_CONTROL, &lmem);
+	}
 	if (!ret && (lmem & BIT(15)))
 		ret = -EBUSY;
 	if (!ret && !job->rpm_valid) {
 		dma_rmb();
+		stage = "rpm-snapshot";
 		ret = s7d_hevc_context_snapshot_rpm(job->context, raw, sizeof(raw));
-		if (!ret)
+		if (!ret) {
+			stage = "rpm-parse";
 			ret = s7d_hevc_rpm_parse(raw, sizeof(raw), true, &job->rpm);
-		if (!ret)
+		}
+		if (!ret) {
+			rpm_valid = true;
+			stage = "rpm-sequence";
 			ret = s7d_hevc_rpm_check_sequence(&job->rpm, &decoder->sps, &job->geometry);
-		if (!ret)
+		}
+		if (!ret) {
+			stage = "rpm-slice";
 			ret = s7d_hevc_rpm_decode_slice(&job->rpm, &decoder->sps,
 						&job->host_slice, &job->slice);
+		}
 		if (!ret)
 			job->rpm_valid = true;
 	}
 	if (ret)
-		return ret;
+		return hevc_header_failure(decoder, job, stage, ret,
+			status, status_valid, rpm_valid);
 	for (;;) {
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		mask = decoder->queued_mask;
@@ -388,7 +451,8 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 		ret = s7d_hevc_dpb_plan(decoder->dpb, &job->slice, &job->metadata,
 					mask, &job->picture);
 		if (ret)
-			return ret;
+			return hevc_header_failure(decoder, job, "dpb-plan", ret,
+				status, status_valid, rpm_valid);
 		if (job->picture.kind == S7D_HEVC_PLAN_SKIP_RASL) {
 			job->result.skipped = true;
 			hevc_finish(job, 0, false);
@@ -399,17 +463,20 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 
 			ret = hevc_emit(decoder, true, true, &job->result.published_frames);
 			if (ret || before == job->result.published_frames)
-				return ret ? ret : -EPROTO;
+				return hevc_header_failure(decoder, job, "dpb-bump",
+					ret ? ret : -EPROTO, status, status_valid, rpm_valid);
 			continue;
 		}
 		slot = job->picture.current_slot;
 		if (slot >= decoder->captures || job->picture.generation != decoder->generation)
-			return -ESTALE;
+			return hevc_header_failure(decoder, job, "picture-generation",
+				-ESTALE, status, status_valid, rpm_valid);
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		serial = decoder->queue_serial[slot];
 		spin_unlock_irqrestore(&decoder->irq_lock, flags);
 		if (hevc_core_blocked(decoder))
-			return hevc_core_result(decoder, -ESHUTDOWN);
+			return hevc_header_failure(decoder, job, "core-before-acquire",
+				hevc_core_result(decoder, -ESHUTDOWN), status, status_valid, rpm_valid);
 		ret = hevc_core_result(decoder, s7d_codec_surface_acquire(decoder->capture[slot].surface,
 						&job->write_token));
 		if (ret == -EAGAIN) {
@@ -420,7 +487,8 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 			continue;
 		}
 		if (ret)
-			return ret;
+			return hevc_header_failure(decoder, job, "surface-acquire", ret,
+				status, status_valid, rpm_valid);
 		job->current_slot = slot;
 		job->acquired = true;
 		decoder->write_token[slot] = job->write_token;
@@ -538,6 +606,7 @@ failed:
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		if (!job->irq_error)
 			job->irq_error = ret;
+		hevc_latch_failure_locked(job, "irq-thread", ret, &snapshot, 0, false, false);
 		spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	}
 	hevc_finish(job, ret, cancelled);
@@ -1117,12 +1186,15 @@ static void hevc_report_failure(struct s7d_hevc_decoder *decoder,
 				int first_error, int error, int halt_error)
 {
 	struct s7d_hevc_irq_snapshot snapshot;
+	struct s7d_hevc_first_failure failure;
 	unsigned long flags;
 	bool valid, armed, complete;
 	u32 i, slot, headers;
 
 	mutex_lock(&decoder->protocol);
 	spin_lock_irqsave(&decoder->irq_lock, flags);
+	hevc_latch_failure_locked(job, "worker", first_error, &job->snapshot, 0, false, job->rpm_valid);
+	failure = job->failure;
 	snapshot = job->snapshot;
 	valid = job->snapshot_valid;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
@@ -1139,6 +1211,16 @@ static void hevc_report_failure(struct s7d_hevc_decoder *decoder,
 		"HEVC IRQ valid=%u error=%d status=%#x lcu=%#x shift-status=%#x shift-bytes=%#x\n",
 		valid, snapshot.error, snapshot.status, snapshot.lcu,
 		snapshot.shift_status, snapshot.shift_bytes);
+	if (failure.error) {
+		dev_err(decoder->dev,
+			"HEVC first failure stage=%s error=%d IRQ-valid=%u IRQ-error=%d status=%#x fresh-valid=%u fresh-status=%#x RPM-valid=%u\n",
+			failure.stage, failure.error, failure.snapshot_valid,
+			failure.snapshot.error, failure.snapshot.status,
+			failure.status_valid, failure.status, failure.rpm_valid);
+		if (failure.rpm_valid)
+			s7d_hevc_rpm_report(decoder->dev, &failure.rpm,
+				&decoder->sps, &job->host_slice);
+	}
 	dev_err(decoder->dev,
 		"HEVC input token=%llu start=%#x end=%#x read=%#x write=%#x decode=%u max-shift=%u\n",
 		job->input.token, job->input.start, job->input.end,

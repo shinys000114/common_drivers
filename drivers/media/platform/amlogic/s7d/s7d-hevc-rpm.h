@@ -13,6 +13,7 @@
 
 struct s7d_hevc_sps;
 struct s7d_hevc_slice_info;
+struct device;
 
 struct s7d_hevc_geometry {
 	u32 coded_width;
@@ -26,6 +27,9 @@ struct s7d_hevc_geometry {
 struct s7d_hevc_rpm {
 	u16 word[S7D_HEVC_RPM_VALID_WORDS];
 };
+
+void s7d_hevc_rpm_report(struct device *dev, const struct s7d_hevc_rpm *rpm,
+		const struct s7d_hevc_sps *host, const struct s7d_hevc_slice_info *slice);
 
 enum s7d_hevc_event {
 	S7D_HEVC_EVENT_SLICE_HEADER,

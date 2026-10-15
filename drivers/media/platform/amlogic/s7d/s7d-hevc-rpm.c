@@ -2,6 +2,7 @@
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 
 #include <linux/bitops.h>
+#include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
@@ -46,6 +47,36 @@ enum s7d_hevc_rpm_word {
 	RPM_CHROMA = 0x71,
 	RPM_DPB_MINUS1 = 0x76,
 };
+
+void s7d_hevc_rpm_report(struct device *dev, const struct s7d_hevc_rpm *rpm,
+		const struct s7d_hevc_sps *host, const struct s7d_hevc_slice_info *slice)
+{
+	const u16 *w = rpm->word;
+
+	dev_err(dev, "HEVC RPM geometry %ux%u host %ux%u min-CB %u/%u CTB %u/%u POC-log2 %u/%u\n",
+		w[RPM_WIDTH], w[RPM_HEIGHT], host->coded_width, host->coded_height,
+		w[RPM_MIN_CB_MINUS3] + 3, host->log2_min_cb_size,
+		w[RPM_MIN_CB_MINUS3] + 3 + w[RPM_CTB_DIFF], host->log2_ctb_size,
+		w[RPM_POC_LOG2_MINUS4] + 4, host->log2_max_poc_lsb);
+	dev_err(dev, "HEVC RPM DPB %u/%u reorder %u/%u chroma %u/%u depth %#x profile %#x frame-field %#x\n",
+		w[RPM_DPB_MINUS1] + 1U, host->max_dec_pic_buffering,
+		w[RPM_REORDER], host->num_reorder_pics, w[RPM_CHROMA], host->chroma_format_idc,
+		w[RPM_BIT_DEPTH], w[RPM_PROFILE_ETC], w[RPM_SEI_FRAME_FIELD]);
+	dev_err(dev, "HEVC RPM crop flag %u [%u,%u,%u,%u] host [%u,%u,%u,%u]\n",
+		w[RPM_CROP_FLAG], w[RPM_CROP_LEFT], w[RPM_CROP_RIGHT],
+		w[RPM_CROP_TOP], w[RPM_CROP_BOTTOM], host->crop_left, host->crop_right,
+		host->crop_top, host->crop_bottom);
+	dev_err(dev, "HEVC RPM slice NAL %u/%u temporal %u/%u type %u/%u first %u/%u dependent %u/%u address %u/%u POC %u/%u epoch %llu\n",
+		w[RPM_NAL_TYPE], slice->nal_type, w[RPM_TEMPORAL_ID_PLUS1], slice->temporal_id_plus1,
+		w[RPM_SLICE_TYPE], slice->slice_type, w[RPM_FIRST_SLICE], slice->first_slice,
+		w[RPM_DEPENDENT_SLICE], slice->dependent_slice, w[RPM_SLICE_ADDRESS],
+		slice->slice_address, w[RPM_POC_LSB], slice->poc_lsb, slice->parameter_epoch);
+	dev_err(dev, "HEVC RPM references L0 %u/%u L1 %u/%u MVP %u/%u collocated %u/%u index %u/%u modification %#x\n",
+		w[RPM_ACTIVE_L0], slice->active[0], w[RPM_ACTIVE_L1], slice->active[1],
+		w[RPM_TEMPORAL_MVP], slice->temporal_mvp,
+		w[RPM_COL_FROM_L0], slice->collocated_from_l0,
+		w[RPM_COL_INDEX], slice->collocated_ref_idx, w[RPM_MODIFICATION]);
+}
 
 static bool hevc_slice_same(const struct s7d_hevc_slice_info *a,
 			    const struct s7d_hevc_slice_info *b)
