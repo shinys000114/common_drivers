@@ -26,6 +26,7 @@ s7d-vdec-y := \
 	s7d-v4l2-device.o
 
 s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) += \
+	s7d-hevc-engine.o \
 	s7d-hevc-input.o \
 	s7d-hevc-dpb.o \
 	s7d-hevc-sequence.o \

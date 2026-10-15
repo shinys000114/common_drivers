@@ -19,6 +19,7 @@
 #include "s7d-codec-firmware.h"
 #include "s7d-h264-backend.h"
 #include "s7d-hevc-v4l2.h"
+#include "s7d-hevc-engine.h"
 #include "s7d-jpeg-backend.h"
 #include "s7d-jpeg-v4l2.h"
 #include "s7d-v4l2-device.h"
@@ -31,6 +32,7 @@ struct s7d_vdec {
 	struct s7d_h264_decoder *decoder;
 	struct s7d_v4l2_device *video;
 	struct s7d_hevc_v4l2 *hevc;
+	struct s7d_hevc_engine *hevc_engine;
 	struct s7d_v4l2_device *hevc_video;
 	struct s7d_jpeg_encoder *jpeg;
 	struct s7d_jpeg_v4l2 *jpeg_video;
@@ -177,6 +179,12 @@ static int s7d_vdec_release(struct s7d_vdec *vdec)
 			return ret;
 		vdec->hevc = NULL;
 	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) && vdec->hevc_engine) {
+		ret = s7d_hevc_engine_destroy(vdec->hevc_engine);
+		if (ret)
+			return ret;
+		vdec->hevc_engine = NULL;
+	}
 	if (vdec->decoder) {
 		ret = s7d_h264_decoder_destroy(vdec->decoder);
 		if (ret)
@@ -299,8 +307,14 @@ static int s7d_vdec_probe(struct platform_device *pdev)
 		goto fail;
 	}
 	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL)) {
+		vdec->hevc_engine = s7d_hevc_engine_create(vdec->dev, vdec->dos, THIS_MODULE);
+		if (IS_ERR(vdec->hevc_engine)) {
+			ret = PTR_ERR(vdec->hevc_engine);
+			vdec->hevc_engine = NULL;
+			goto fail;
+		}
 		vdec->hevc = s7d_hevc_v4l2_create(vdec->dev, vdec->dos, vdec->firmware,
-						THIS_MODULE);
+						vdec->hevc_engine, THIS_MODULE);
 		if (IS_ERR(vdec->hevc)) {
 			ret = PTR_ERR(vdec->hevc);
 			vdec->hevc = NULL;
@@ -402,6 +416,11 @@ static int s7d_vdec_prepare(struct device *dev)
 		return ret;
 	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) && vdec->hevc) {
 		ret = s7d_hevc_v4l2_suspend_check(vdec->hevc);
+		if (ret)
+			return ret;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) && vdec->hevc_engine) {
+		ret = s7d_hevc_engine_suspend_check(vdec->hevc_engine);
 		if (ret)
 			return ret;
 	}

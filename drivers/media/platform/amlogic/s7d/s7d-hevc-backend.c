@@ -16,6 +16,7 @@
 #include "s7d-codec-dos.h"
 #include "s7d-codec-firmware.h"
 #include "s7d-hevc-backend.h"
+#include "s7d-hevc-engine.h"
 #include "s7d-hevc-context.h"
 #include "s7d-hevc-dpb.h"
 #include "s7d-hevc-input.h"
@@ -127,12 +128,12 @@ struct s7d_hevc_decoder {
 	u32 decode_count;
 	u8 start_decoding_flag;
 	u8 rps_set_id;
-	int irq;
+	struct s7d_hevc_engine *irq_engine;
+	u64 irq_binding;
 	int release_error;
 	int quiesce_error;
 	int failure;
 	bool irq_accept;
-	bool irq_enabled;
 	bool stop_requested;
 	bool closing;
 	bool quiesced;
@@ -184,7 +185,7 @@ static void hevc_finish(struct s7d_hevc_job *job, int error, bool cancelled)
 	complete_all(&job->wake);
 }
 
-static irqreturn_t hevc_irq(int irq, void *data)
+static irqreturn_t hevc_irq(void *data, const struct s7d_hevc_irq_cookie *cookie)
 {
 	struct s7d_hevc_decoder *decoder = data;
 	struct s7d_hevc_irq_snapshot snapshot = { };
@@ -196,6 +197,11 @@ static irqreturn_t hevc_irq(int irq, void *data)
 
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	job = decoder->irq_accept ? decoder->job : NULL;
+	if (job && (cookie->session != job->session ||
+	    cookie->lease_epoch != job->lease_epoch ||
+	    cookie->binding != decoder->irq_binding ||
+	    cookie->input_token != job->metadata.input_token))
+		job = NULL;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	if (!job)
 		return IRQ_HANDLED;
@@ -464,7 +470,7 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 	return ret;
 }
 
-static irqreturn_t hevc_irq_thread(int irq, void *data)
+static irqreturn_t hevc_irq_thread(void *data, const struct s7d_hevc_irq_cookie *cookie)
 {
 	struct s7d_hevc_decoder *decoder = data;
 	struct s7d_hevc_irq_snapshot snapshot;
@@ -478,6 +484,11 @@ static irqreturn_t hevc_irq_thread(int irq, void *data)
 	mutex_lock(&decoder->protocol);
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	job = decoder->irq_accept ? decoder->job : NULL;
+	if (job && (cookie->session != job->session ||
+	    cookie->lease_epoch != job->lease_epoch ||
+	    cookie->binding != decoder->irq_binding ||
+	    cookie->input_token != job->metadata.input_token))
+		job = NULL;
 	if (job)
 		snapshot = job->snapshot;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
@@ -535,6 +546,11 @@ out:
 	return IRQ_HANDLED;
 }
 
+static const struct s7d_hevc_irq_ops hevc_irq_ops = {
+	.irq = hevc_irq,
+	.thread = hevc_irq_thread,
+};
+
 static int hevc_hold(void *priv, enum s7d_codec_engine engine)
 {
 	struct s7d_hevc_decoder *decoder = priv;
@@ -571,8 +587,7 @@ static int hevc_quiesce_locked(struct s7d_hevc_decoder *decoder,
 			       enum s7d_codec_engine engine)
 {
 	unsigned long flags;
-	bool disable;
-	int ret, halted;
+	int ret, halted, joined;
 
 	lockdep_assert_held(&decoder->control);
 	if (engine != S7D_CODEC_ENGINE_HEVC)
@@ -583,15 +598,15 @@ static int hevc_quiesce_locked(struct s7d_hevc_decoder *decoder,
 		return 0;
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->irq_accept = false;
-	disable = decoder->irq_enabled;
-	decoder->irq_enabled = false;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	ret = s7d_codec_dos_prepare_access(decoder->dos, engine);
 	if (!ret)
 		ret = s7d_codec_dos_hevc_irq_mask(decoder->dos, false);
-	if (disable)
-		disable_irq_nosync(decoder->irq);
-	synchronize_irq(decoder->irq);
+	if (decoder->irq_binding) {
+		joined = s7d_hevc_engine_disarm(decoder->irq_engine, decoder->irq_binding);
+		if (!ret)
+			ret = joined;
+	}
 	mutex_lock(&decoder->protocol);
 	if (!ret) {
 		halted = s7d_codec_dos_halt(decoder->dos, engine);
@@ -605,6 +620,24 @@ static int hevc_quiesce_locked(struct s7d_hevc_decoder *decoder,
 	decoder->quiesced = !ret;
 	decoder->quarantined = !!ret;
 	mutex_unlock(&decoder->protocol);
+	if (ret && decoder->irq_binding)
+		s7d_hevc_engine_quarantine(decoder->irq_engine, decoder->irq_binding);
+	return ret;
+}
+
+static int hevc_irq_release_locked(struct s7d_hevc_decoder *decoder)
+{
+	int ret;
+
+	if (!decoder->irq_binding)
+		return 0;
+	ret = s7d_hevc_engine_unbind(decoder->irq_engine, decoder->irq_binding);
+	if (!ret) {
+		decoder->irq_binding = 0;
+	} else {
+		decoder->quarantined = true;
+		s7d_hevc_engine_quarantine(decoder->irq_engine, decoder->irq_binding);
+	}
 	return ret;
 }
 
@@ -632,6 +665,8 @@ static int hevc_quiesce(void *priv, enum s7d_codec_engine engine)
 		mutex_lock(&decoder->control);
 	}
 	ret = hevc_quiesce_locked(decoder, engine);
+	if (!ret)
+		ret = hevc_irq_release_locked(decoder);
 	mutex_unlock(&decoder->control);
 	return ret;
 }
@@ -754,10 +789,11 @@ static int hevc_start(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *job
 		return ret;
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->irq_accept = true;
-	decoder->irq_enabled = true;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
-	enable_irq(decoder->irq);
-	ret = s7d_codec_dos_hevc_irq_mask(decoder->dos, true);
+	ret = s7d_hevc_engine_arm(decoder->irq_engine, decoder->irq_binding,
+				  job->metadata.input_token);
+	if (!ret)
+		ret = s7d_codec_dos_hevc_irq_mask(decoder->dos, true);
 	if (!ret)
 		ret = hevc_job_check_stop(decoder, job);
 	if (!ret)
@@ -877,6 +913,12 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 			decoder->failure = ret;
 			goto out;
 		}
+	}
+	ret = s7d_hevc_engine_bind(decoder->irq_engine, session, decoder->epoch,
+				   &hevc_irq_ops, decoder, &decoder->irq_binding);
+	if (ret) {
+		decoder->failure = ret;
+		goto out;
 	}
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->queued_mask = GENMASK(count - 1, 0);
@@ -1386,6 +1428,8 @@ int s7d_hevc_decoder_stream_close(struct s7d_hevc_decoder *decoder,
 			decoder->context_initialized = true;
 	}
 	if (!ret)
+		ret = hevc_irq_release_locked(decoder);
+	if (!ret)
 		ret = s7d_hevc_context_destroy_stream(decoder->context, decoder->epoch);
 	if (ret)
 		goto out;
@@ -1418,12 +1462,13 @@ out:
 struct s7d_hevc_decoder *
 s7d_hevc_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 			struct s7d_codec_firmware_owner *borrowed_firmware,
-			struct module *owner)
+			struct s7d_hevc_engine *borrowed_engine, struct module *owner)
 {
 	struct s7d_hevc_decoder *decoder;
 	int ret;
 
-	if (!dev || IS_ERR_OR_NULL(borrowed_dos) || IS_ERR_OR_NULL(borrowed_firmware))
+	if (!dev || IS_ERR_OR_NULL(borrowed_dos) || IS_ERR_OR_NULL(borrowed_firmware) ||
+	    IS_ERR_OR_NULL(borrowed_engine))
 		return ERR_PTR(-EINVAL);
 #ifdef MODULE
 	if (owner != THIS_MODULE)
@@ -1436,6 +1481,7 @@ s7d_hevc_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 	decoder->owner = owner;
 	decoder->dos = borrowed_dos;
 	decoder->firmware = borrowed_firmware;
+	decoder->irq_engine = borrowed_engine;
 	mutex_init(&decoder->control);
 	mutex_init(&decoder->protocol);
 	init_completion(&decoder->idle);
@@ -1447,23 +1493,12 @@ s7d_hevc_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 		ret = decoder->map ? PTR_ERR(decoder->map) : -ENODEV;
 		goto free;
 	}
-	decoder->irq = s7d_codec_dos_irq(borrowed_dos, S7D_CODEC_ENGINE_HEVC);
-	if (decoder->irq < 0) {
-		ret = decoder->irq;
-		goto free;
-	}
-	ret = request_threaded_irq(decoder->irq, hevc_irq, hevc_irq_thread,
-				   IRQF_NO_AUTOEN | IRQF_ONESHOT, dev_name(dev), decoder);
-	if (ret)
-		goto free;
 	decoder->core = s7d_codec_core_create(dev, owner, &hevc_resource_ops, decoder, 32);
 	if (IS_ERR(decoder->core)) {
 		ret = PTR_ERR(decoder->core);
-		goto free_irq;
+		goto free;
 	}
 	return decoder;
-free_irq:
-	free_irq(decoder->irq, decoder);
 free:
 	put_device(decoder->dev);
 	kfree(decoder);
@@ -1489,14 +1524,13 @@ int s7d_hevc_decoder_destroy(struct s7d_hevc_decoder *decoder)
 	mutex_lock(&decoder->control);
 	if (decoder->job || decoder->session || decoder->context || decoder->dpb ||
 	    decoder->quarantined || decoder->release_error ||
-	    decoder->release_pin) {
+	    decoder->release_pin || decoder->irq_binding) {
 		ret = -EBUSY;
 		goto out;
 	}
 	ret = s7d_codec_core_destroy(decoder->core);
 	if (ret)
 		goto out;
-	free_irq(decoder->irq, decoder);
 	mutex_unlock(&decoder->control);
 	put_device(decoder->dev);
 	kfree(decoder);

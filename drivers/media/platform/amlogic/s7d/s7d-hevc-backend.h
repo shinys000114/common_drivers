@@ -9,6 +9,7 @@
 struct device;
 struct module;
 struct s7d_codec_dos;
+struct s7d_hevc_engine;
 struct s7d_codec_firmware_owner;
 struct s7d_hevc_decoder;
 struct s7d_hevc_input_result;
@@ -22,11 +23,11 @@ struct s7d_hevc_decode_result {
 	bool cancelled;
 };
 
-/* The caller keeps DOS and firmware owner alive until destroy succeeds. */
+/* The caller keeps DOS, firmware and engine owners alive until destroy succeeds. */
 struct s7d_hevc_decoder *
 s7d_hevc_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 			struct s7d_codec_firmware_owner *borrowed_firmware,
-			struct module *owner);
+			struct s7d_hevc_engine *borrowed_engine, struct module *owner);
 struct s7d_codec_core *s7d_hevc_decoder_core(struct s7d_hevc_decoder *decoder);
 /* Gate and join frontend requests before stopping the borrowed session. */
 /* Capture bindings remain live through successful stream_close. */

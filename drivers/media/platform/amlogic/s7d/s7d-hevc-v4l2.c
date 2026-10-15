@@ -780,7 +780,7 @@ static void hevc_factory_destroy(void *priv, void *instance)
 struct s7d_hevc_v4l2 *
 s7d_hevc_v4l2_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 		      struct s7d_codec_firmware_owner *borrowed_firmware,
-		      struct module *owner)
+		      struct s7d_hevc_engine *borrowed_engine, struct module *owner)
 {
 	struct s7d_hevc_v4l2 *adapter;
 	int ret;
@@ -795,7 +795,8 @@ s7d_hevc_v4l2_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 	adapter->dos = borrowed_dos;
 	mutex_init(&adapter->clients);
 	INIT_LIST_HEAD(&adapter->instances);
-	adapter->decoder = s7d_hevc_decoder_create(dev, borrowed_dos, borrowed_firmware, owner);
+	adapter->decoder = s7d_hevc_decoder_create(dev, borrowed_dos, borrowed_firmware,
+						 borrowed_engine, owner);
 	if (IS_ERR(adapter->decoder)) {
 		ret = PTR_ERR(adapter->decoder);
 		put_device(adapter->dev);
