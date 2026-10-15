@@ -69,7 +69,7 @@
 #define HEVC_AFIFO_BUSY		BIT(28)
 #define HEVC_STREAM_FETCH	BIT(0)
 #define HEVC_STREAM_ENDIAN	GENMASK(6, 4)
-#define HEVC_FIFO_ENABLE		BIT(29)
+#define HEVC_STREAM_FIFO_HOLE	BIT(29)
 #define HEVC_IQIT_RESET		BIT(14)
 #define HEVC_CPU_RESET		(BIT(11) | BIT(12))
 #define HEVC_LMEM_PRIORITY	GENMASK(27, 25)
@@ -732,10 +732,6 @@ static int dos_hevc_start_locked(struct s7d_codec_dos *dos)
 	ret = dos_hevc_check(dos, HEVC_STREAM_CONTROL,
 			HEVC_STREAM_FETCH | HEVC_STREAM_ENDIAN,
 			HEVC_STREAM_FETCH | HEVC_STREAM_ENDIAN);
-	if (ret)
-		return ret;
-	ret = dos_hevc_check(dos, HEVC_STREAM_FIFO_CTL, HEVC_FIFO_ENABLE,
-			HEVC_FIFO_ENABLE);
 	if (ret)
 		return ret;
 	ret = dos_hevc_check(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
@@ -1402,10 +1398,13 @@ int s7d_codec_dos_hevc_input_enable(struct s7d_codec_dos *dos)
 			 HEVC_STREAM_ENDIAN);
 	if (ret)
 		goto fault;
-	ret = dos_hevc_update(dos, HEVC_STREAM_FIFO_CTL, HEVC_FIFO_ENABLE,
-			 HEVC_FIFO_ENABLE);
-	if (ret)
+	ret = regmap_update_bits(dos->map, HEVC_STREAM_FIFO_CTL,
+				 HEVC_STREAM_FIFO_HOLE, HEVC_STREAM_FIFO_HOLE);
+	if (ret) {
+		dos_report_io(dos, "update", HEVC_STREAM_FIFO_CTL,
+			      HEVC_STREAM_FIFO_HOLE, HEVC_STREAM_FIFO_HOLE, 0, false, ret);
 		goto fault;
+	}
 	ret = dos_hevc_update(dos, HEVC_STREAM_CONTROL, HEVC_STREAM_FETCH,
 			 HEVC_STREAM_FETCH);
 	if (ret)
