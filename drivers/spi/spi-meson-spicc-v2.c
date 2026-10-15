@@ -20,6 +20,9 @@
 #include <linux/spi/spi.h>
 #include <linux/types.h>
 #include <linux/interrupt.h>
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+#include <linux/property.h>
+#endif
 #include <linux/reset.h>
 #include <linux/gpio.h>
 #include <linux/delay.h>
@@ -620,6 +623,47 @@ static int nbits_to_lane[] = {
 	SPICC_QUAD_SPI
 };
 
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+static int spicc_config_dt_timing(struct spicc_device *spicc,
+				  struct spicc_descriptor *desc)
+{
+	static const char * const properties[] = {
+		"rx-sample-delay-ns", "amlogic,tx-delay-ns",
+	};
+	struct spi_device *spi = spicc->controller->cur_msg->spi;
+	u64 clocks;
+	s64 ns;
+	u32 value;
+	unsigned int i;
+	int ret, tuning;
+
+	for (i = 0; i < ARRAY_SIZE(properties); i++) {
+		if (!device_property_present(&spi->dev, properties[i]))
+			continue;
+		ret = device_property_read_u32(&spi->dev, properties[i], &value);
+		if (ret)
+			return dev_err_probe(&spi->dev, ret,
+					     "invalid %s\n", properties[i]);
+
+		/* RX is unsigned; signed TX offsets also allow advancing MOSI. */
+		ns = i ? (s32)value : (s64)value;
+		clocks = DIV_ROUND_CLOSEST_ULL((ns < 0 ? -ns : ns) *
+					     (u64)spicc->pclk_rate, NSEC_PER_SEC);
+		if (clocks > (ns < 0 ? 8 : 7))
+			return dev_err_probe(&spi->dev, -ERANGE,
+					     "%s exceeds signed 4-bit tuning range\n",
+					     properties[i]);
+		tuning = ns < 0 ? -(int)clocks : (int)clocks;
+		if (i)
+			desc->cfg_bus.b.tx_tuning = tuning;
+		else
+			desc->cfg_bus.b.rx_tuning = tuning;
+	}
+
+	return 0;
+}
+
+#endif
 static int spicc_config_desc_one_transfer(struct spicc_device *spicc,
 			struct spi_transfer *xfer,
 			bool is_last_xfer,
@@ -647,6 +691,14 @@ static int spicc_config_desc_one_transfer(struct spicc_device *spicc,
 #endif
 	desc->cfg_start.d32 = spicc->cfg_start.d32;
 	desc->cfg_bus.d32 = spicc->cfg_bus.d32;
+#ifdef CONFIG_ARCH_MESON_ODROID_COMMON
+	/* Extra descriptors identify the queued path; retain vendor timing priority. */
+	if (exdesc && !(cdata && cdata->timing_en)) {
+		ret = spicc_config_dt_timing(spicc, desc);
+		if (ret)
+			return ret;
+	}
+#endif
 
 	block_size = xfer->bits_per_word >> 3;
 	blocks = xfer->len / block_size;
