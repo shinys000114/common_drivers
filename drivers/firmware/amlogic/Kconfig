@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config AMLOGIC_S7D_VIDEO_FIRMWARE
+	tristate "Amlogic S7D resident video firmware archive"
+	depends on ARM64 && OF
+	depends on AMLOGIC_AMLTEE && AMLOGIC_OPTEE && !AMLOGIC_MEDIA_ENABLE
+	select FW_LOADER
+	help
+	  Own the immutable video firmware archive uploaded through OP-TEE.
+	  Decoder and encoder consumers may reload without uploading it again.
+	  A module build remains resident until reboot because the secure archive
+	  has no verified unload or state-query API. Forced unload and dynamic
+	  removal of this firmware service are not supported.
