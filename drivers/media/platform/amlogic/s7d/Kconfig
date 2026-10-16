@@ -30,6 +30,18 @@ config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
 	  Hardware validation is incomplete. Leave this disabled for normal
 	  H.264-only operation.
 
+config VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL
+	bool "Amlogic S7D experimental VP9 decoder"
+	depends on VIDEO_AMLOGIC_S7D
+	default n
+	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
+	help
+	  Register an additional standard V4L2 node for progressive
+	  Profile 0 VP9 up to 1920x1080 with NV12M output. The initial path
+	  accepts fixed-resolution frames and superframes, including hidden
+	  reference and intra-only frames, and can show existing references.
+	  Reference scaling is not supported. Hardware validation is incomplete.
+
 config VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	bool
 
