@@ -45,6 +45,20 @@ config VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL
 config VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	bool
 
+config VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL
+	bool "Amlogic S7D experimental AV1 decoder"
+	depends on VIDEO_AMLOGIC_S7D
+	default n
+	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
+	help
+	  Register a standard stateful AV1 OBU/TU decoder with NV12M output.
+	  The initial path supports Main profile 8-bit 4:2:0 up to 1920x1080,
+	  up to 16 complete frames per temporal unit and fixed even frame
+	  geometry.
+	  Film grain, super-resolution and dynamic format changes are unsupported.
+	  Internal compressed references and double-write shadows are copied to
+	  capture buffers after full engine stop. Hardware validation is incomplete.
+
 config VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL
 	bool "Amlogic S7D experimental JPEG encoder"
 	depends on VIDEO_AMLOGIC_S7D
