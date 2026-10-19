@@ -430,6 +430,18 @@ int s7d_rdma_loop_check_stage(struct s7d_rdma *r)
 	return ret;
 }
 
+bool s7d_rdma_loop_can_replace(struct s7d_rdma *r)
+{
+	unsigned long flags;
+	bool ready;
+
+	spin_lock_irqsave(&r->lock, flags);
+	ready = r->ready && !r->fault && r->loop && r->loop_cookie &&
+		!r->pending && r->staged_count;
+	spin_unlock_irqrestore(&r->lock, flags);
+	return ready;
+}
+
 int s7d_rdma_loop_replace(struct s7d_rdma *r,
 			  int (*freshness)(void *data), void *data)
 {

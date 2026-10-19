@@ -84,6 +84,7 @@ int s7d_rdma_loop_stage(struct s7d_rdma *rdma,
 int s7d_rdma_loop_cancel(struct s7d_rdma *rdma);
 /* CPU-only staging; the current loop's first DONE may still be pending. */
 int s7d_rdma_loop_check_stage(struct s7d_rdma *rdma);
+bool s7d_rdma_loop_can_replace(struct s7d_rdma *rdma);
 /*
  * Serialized with modeset/shutdown. freshness runs with the lock held, IRQs off,
  * after verified reset and zero sources, before publication. It cannot sleep

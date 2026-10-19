@@ -363,6 +363,52 @@ static int s7d_vpu_afbc_replay_barrier(void *data)
 	return s7d_afbc_engine_replay_barrier(&v->afbc);
 }
 
+static int s7d_vpu_afbc_replay_publish(struct s7d_vpu *v, u64 sequence,
+				     u32 before)
+{
+	u32 after;
+	int ret;
+
+	if (sequence == ~0ULL)
+		return s7d_afbc_engine_fail(&v->afbc, -EOVERFLOW, ENCP_INFO_READ);
+	ret = s7d_rdma_loop_replace(&v->rdma, s7d_vpu_afbc_replay_barrier, v);
+	if (ret)
+		return s7d_afbc_engine_fail(&v->afbc, ret, AFBC_COMMAND);
+	v->afbc_replay_armed_ns = ktime_get_mono_fast_ns();
+	after = vpu_read(v, ENCP_INFO_READ);
+	if ((before >> 29) != (after >> 29) ||
+	    ((after >> 16) & 0x1fff) < ((before >> 16) & 0x1fff))
+		return s7d_afbc_engine_fail(&v->afbc, -ETIMEDOUT, ENCP_INFO_READ);
+	v->afbc_replay_afbc_changed = v->afbc.pending_valid;
+	if (v->afbc_replay_afbc_changed) {
+		ret = s7d_afbc_engine_replay_published(&v->afbc);
+		if (ret)
+			return s7d_afbc_engine_fail(&v->afbc, ret, AFBC_COMMAND);
+	}
+	v->afbc_replay_cookie = v->afbc_replay_pending_cookie;
+	v->afbc_replay_pending_cookie = 0;
+	v->afbc_replay_expected_sequence = sequence + 1;
+	v->afbc_replay_apply_pending = true;
+	trace_s7d_afbc_publish(v->afbc_replay_cookie, sequence + 1, before, after);
+	return 0;
+}
+
+static int s7d_vpu_afbc_replay_prepare_next(struct s7d_vpu *v)
+{
+	u32 before, line;
+
+	lockdep_assert_held(&v->frame_lock);
+	if (!v->afbc_replay_pending_cookie || !s7d_rdma_loop_can_replace(&v->rdma))
+		return 0;
+	before = vpu_read(v, ENCP_INFO_READ);
+	line = (before >> 16) & 0x1fff;
+	if (line < v->flip_end || line >= v->replay_prepare_end ||
+	    !v->scanout.vblank_seq ||
+	    v->scanout.vblank_field != before >> 29)
+		return 0;
+	return s7d_vpu_afbc_replay_publish(v, v->scanout.vblank_seq, before);
+}
+
 static int s7d_vpu_afbc_replay_stage(struct s7d_vpu_submission *submission,
 				    const struct s7d_scanout_buffers *active,
 				    const struct s7d_scanout_buffers *candidate)
@@ -475,6 +521,8 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 	if (!ret && transaction == S7D_SCANOUT_TRANSACTION_REPLAY) {
 		ret = s7d_crtc_expect_latch(v->crtc,
 					 s7d_scanout_pending_generation(&v->scanout));
+		if (!ret)
+			ret = s7d_vpu_afbc_replay_prepare_next(v);
 		if (ret)
 			s7d_scanout_fail(&v->scanout);
 	}
@@ -1259,6 +1307,10 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	v->afbc_replay_frame_ns = DIV_ROUND_UP_ULL(
 		(u64)state->base.adjusted_mode.htotal *
 		state->base.adjusted_mode.vtotal * NSEC_PER_SEC, state->pixel_rate);
+	v->replay_prepare_end = v->afbc_replay_frame_ns > NSEC_PER_MSEC ?
+		state->base.adjusted_mode.vtotal -
+		DIV_ROUND_UP_ULL((u64)state->base.adjusted_mode.vtotal * NSEC_PER_MSEC,
+				v->afbc_replay_frame_ns) : 0;
 	/* RDMA done was acknowledged by prepare; clear stale GIC edge state. */
 	ret = irq_set_irqchip_state(v->rdma_irq, IRQCHIP_STATE_PENDING, false);
 	if (ret)
@@ -1512,8 +1564,7 @@ static int s7d_vpu_afbc_replay_replace(struct s7d_vpu *v,
 				      enum s7d_rdma_result result, u64 cookie)
 {
 	u64 sequence;
-	u32 before, after;
-	int ret;
+	u32 before;
 
 	if (!v->afbc_replay || !v->afbc_replay_pending_cookie ||
 	    s7d_crtc_last_error(v->crtc) || !frame->window ||
@@ -1527,27 +1578,7 @@ static int s7d_vpu_afbc_replay_replace(struct s7d_vpu *v,
 	sequence = READ_ONCE(v->scanout.vblank_seq);
 	if (READ_ONCE(v->scanout.vblank_field) != frame->field)
 		sequence++;
-	if (sequence == ~0ULL)
-		return s7d_afbc_engine_fail(&v->afbc, -EOVERFLOW, ENCP_INFO_READ);
-	ret = s7d_rdma_loop_replace(&v->rdma, s7d_vpu_afbc_replay_barrier, v);
-	if (ret)
-		return s7d_afbc_engine_fail(&v->afbc, ret, AFBC_COMMAND);
-	v->afbc_replay_armed_ns = ktime_get_mono_fast_ns();
-	after = vpu_read(v, ENCP_INFO_READ);
-	if ((before >> 29) != (after >> 29) ||
-	    ((after >> 16) & 0x1fff) < ((before >> 16) & 0x1fff))
-		return s7d_afbc_engine_fail(&v->afbc, -ETIMEDOUT, ENCP_INFO_READ);
-	v->afbc_replay_afbc_changed = v->afbc.pending_valid;
-	if (v->afbc_replay_afbc_changed) {
-		ret = s7d_afbc_engine_replay_published(&v->afbc);
-		if (ret)
-			return s7d_afbc_engine_fail(&v->afbc, ret, AFBC_COMMAND);
-	}
-	v->afbc_replay_cookie = v->afbc_replay_pending_cookie;
-	v->afbc_replay_pending_cookie = 0;
-	v->afbc_replay_expected_sequence = sequence + 1;
-	v->afbc_replay_apply_pending = true;
-	return 0;
+	return s7d_vpu_afbc_replay_publish(v, sequence, before);
 }
 
 static void s7d_vpu_afbc_report_first(struct s7d_vpu *v, bool restart,

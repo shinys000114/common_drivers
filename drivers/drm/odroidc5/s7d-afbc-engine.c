@@ -520,6 +520,7 @@ int s7d_afbc_engine_replay_begin(struct s7d_afbc_engine *e)
 int s7d_afbc_engine_replay_barrier(struct s7d_afbc_engine *e)
 {
 	struct s7d_afbc_observation o;
+	u32 raw;
 	int ret;
 
 	if (!e->replay || e->phase != S7D_AFBC_RUNNING || e->replay_published)
@@ -534,7 +535,15 @@ int s7d_afbc_engine_replay_barrier(struct s7d_afbc_engine *e)
 		return -EINVAL;
 	if (o.status & AFBC_SWAPPING)
 		return s7d_afbc_engine_fail(e, -EBUSY, AFBC_STATUS);
-	return clear_previous(e);
+	/* READOUT may still arrive; discard it after the new configuration swap. */
+	ret = engine_write(e, AFBC_CLEAR, AFBC_SWAPPED);
+	if (!ret)
+		ret = engine_read(e, AFBC_RAW, &raw);
+	if (ret)
+		return ret;
+	e->observed.raw = raw;
+	return raw & (AFBC_SWAPPED | AFBC_RAW_ERROR) ?
+		s7d_afbc_engine_fail(e, -EIO, AFBC_RAW) : 0;
 }
 
 int s7d_afbc_engine_replay_published(struct s7d_afbc_engine *e)

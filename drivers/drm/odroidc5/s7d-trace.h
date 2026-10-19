@@ -59,6 +59,25 @@ TRACE_EVENT(s7d_frame_idle,
 		  __entry->fifo2, __entry->vd1, __entry->vd2, __entry->arbiter, __entry->vblank)
 );
 
+TRACE_EVENT(s7d_afbc_publish,
+	TP_PROTO(u64 cookie, u64 sequence, u32 before, u32 after),
+	TP_ARGS(cookie, sequence, before, after),
+	TP_STRUCT__entry(
+		__field(u64, cookie)
+		__field(u64, sequence)
+		__field(u32, before)
+		__field(u32, after)
+	),
+	TP_fast_assign(
+		__entry->cookie = cookie;
+		__entry->sequence = sequence;
+		__entry->before = before;
+		__entry->after = after;
+	),
+	TP_printk("cookie=%llu sequence=%llu before=%#x after=%#x",
+		  __entry->cookie, __entry->sequence, __entry->before, __entry->after)
+);
+
 TRACE_EVENT(s7d_afbc_replay,
 	TP_PROTO(u64 cookie, u64 generation, u64 handover, u64 epoch,
 		 u32 raw, u32 status, u8 field, bool vblank, int result),

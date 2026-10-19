@@ -75,6 +75,7 @@ struct s7d_vpu {
 	bool osd_scaler_route_owned;
 	u16 flip_start;
 	u16 flip_end;
+	u16 replay_prepare_end;
 	u32 failed_reg;
 };
 
