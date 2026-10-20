@@ -14,6 +14,7 @@
 #include <linux/sizes.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_debugfs_crc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_vblank.h>
 
@@ -717,6 +718,40 @@ static int stop_encoders(struct s7d_vpu *v)
 	return 0;
 }
 
+static int s7d_vpu_set_crc(void *data, bool enable)
+{
+	struct s7d_vpu *v = data;
+	unsigned long flags;
+	bool put = false;
+	int ret = 0;
+
+	if (enable) {
+		ret = drm_crtc_vblank_get(v->crtc);
+		if (ret)
+			return ret;
+	}
+	spin_lock_irqsave(&v->frame_lock, flags);
+	if (enable) {
+		if (v->crc_requested) {
+			put = true;
+		} else if (!v->acquired || !v->touched) {
+			ret = -EIO;
+			put = true;
+		} else {
+			v->crc_requested = true;
+			v->crc_armed = false;
+		}
+	} else {
+		put = v->crc_requested;
+		v->crc_requested = false;
+		v->crc_armed = false;
+	}
+	spin_unlock_irqrestore(&v->frame_lock, flags);
+	if (put)
+		drm_crtc_vblank_put(v->crtc);
+	return ret;
+}
+
 static int s7d_vpu_stop_hw(void *data)
 {
 	struct s7d_vpu *v = data;
@@ -730,6 +765,9 @@ static int s7d_vpu_stop_hw(void *data)
 	int ret;
 
 	mask_irqs(v);
+	spin_lock_irq(&v->frame_lock);
+	v->crc_armed = false;
+	spin_unlock_irq(&v->frame_lock);
 	cancel_delayed_work_sync(&v->afbc_timeout);
 	if (!v->touched)
 		return 0;
@@ -1454,6 +1492,7 @@ const struct s7d_crtc_ops s7d_vpu_crtc_ops = {
 	.enable_vblank = s7d_vpu_enable_vblank,
 	.disable_vblank = s7d_vpu_disable_vblank,
 	.report_error = s7d_vpu_report_error,
+	.set_crc = s7d_vpu_set_crc,
 };
 
 /* No extra MMIO in normal operation; opt-in tracefs event only. */
@@ -1741,6 +1780,25 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	}
 	trace_s7d_frame_idle(before, after, fifo, fifo2, vd1, vd2, arbiter, vblank);
 	s7d_crtc_irq_latched(v->crtc, vblank, result, &frame, latch_ptr);
+	if (vblank && v->crc_requested) {
+		u32 value;
+
+		if (v->crc_armed && ((frame.field - v->crc_field) & 7) == 1) {
+			value = vpu_read(v, 0x1db2);
+			drm_crtc_add_crc_entry(v->crtc, true,
+				drm_crtc_accurate_vblank_count(v->crtc), &value);
+		}
+		v->crc_armed = false;
+		value = vpu_read(v, ENCP_INFO_READ);
+		if ((value >> 29) == frame.field &&
+		    ((value >> 16) & 0x1fff) < v->flip_end) {
+			writel(1, v->regs + 0x1db3 * 4);
+			value = vpu_read(v, ENCP_INFO_READ);
+			v->crc_field = frame.field;
+			v->crc_armed = (value >> 29) == frame.field &&
+				((value >> 16) & 0x1fff) < v->flip_end;
+		}
+	}
 	ret = s7d_vpu_afbc_restart(v, &afbc_frame);
 	if (!ret)
 		ret = s7d_vpu_afbc_replay_begin(v, &afbc_frame);

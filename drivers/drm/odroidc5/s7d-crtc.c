@@ -1069,7 +1069,41 @@ static void s7d_crtc_cleanup(struct drm_device *drm, void *data)
 	mutex_destroy(&c->mutex);
 }
 
+static int s7d_crtc_verify_crc_source(struct drm_crtc *crtc, const char *source,
+				     size_t *values_cnt)
+{
+	if (source && strcmp(source, "auto") && strcmp(source, "vpp"))
+		return -EINVAL;
+	*values_cnt = 1;
+	return 0;
+}
+
+static const char *const *s7d_crtc_get_crc_sources(struct drm_crtc *crtc, size_t *count)
+{
+	static const char *const sources[] = { "auto", "vpp" };
+
+	*count = ARRAY_SIZE(sources);
+	return sources;
+}
+
+static int s7d_crtc_set_crc_source(struct drm_crtc *crtc, const char *source)
+{
+	struct s7d_crtc *c = to_s7d_crtc(crtc);
+	size_t count;
+	int ret = s7d_crtc_verify_crc_source(crtc, source, &count);
+
+	if (ret)
+		return ret;
+	mutex_lock(&c->mutex);
+	ret = c->ops->set_crc ? c->ops->set_crc(c->data, source != NULL) : -EOPNOTSUPP;
+	mutex_unlock(&c->mutex);
+	return ret;
+}
+
 static const struct drm_crtc_funcs s7d_crtc_funcs = {
+	.get_crc_sources = s7d_crtc_get_crc_sources,
+	.verify_crc_source = s7d_crtc_verify_crc_source,
+	.set_crc_source = s7d_crtc_set_crc_source,
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
 	.reset = s7d_crtc_reset,

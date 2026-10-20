@@ -89,6 +89,7 @@ struct s7d_crtc_ops {
 	int (*enable_vblank)(void *data);
 	void (*disable_vblank)(void *data);
 	void (*report_error)(void *data, int error);
+	int (*set_crc)(void *data, bool enable);
 };
 
 struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *primary,

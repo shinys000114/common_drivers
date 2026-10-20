@@ -40,6 +40,9 @@ struct s7d_vpu {
 	int vsync_irq;
 	int rdma_irq;
 	atomic_t vsync_enabled;
+	bool crc_requested;
+	bool crc_armed;
+	u8 crc_field;
 	bool rdma_enabled;
 	bool acquired;
 	bool pixel_enabled;
