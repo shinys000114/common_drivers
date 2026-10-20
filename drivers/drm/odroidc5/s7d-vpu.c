@@ -557,6 +557,7 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 {
 	struct s7d_vpu *v = data;
 	struct s7d_hdmi_pll_rate plan;
+	unsigned long core_rate;
 	int ret;
 
 	ret = s7d_display_check_resources(&state->resources);
@@ -582,20 +583,22 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 			return v->afbc_admission_error[mask == BIT(0) ? 0 : 1] ?: -EOPNOTSUPP;
 	}
 	/* One unscaled RGB pixel per VPU cycle; protect this rate at prepare. */
-	if (s7d_display_mode_valid(&state->base.adjusted_mode) != MODE_OK ||
-	    clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
+	if (s7d_display_mode_valid(&state->base.adjusted_mode) != MODE_OK)
+		return -ERANGE;
+	core_rate = clk_get_rate(v->clocks[0].clk);
+	if (core_rate < state->pixel_rate)
 		return -ERANGE;
 	if (state->buffers.afbc.fb && state->buffers.video.fb &&
-	    clk_get_rate(v->clocks[0].clk) < 2 * state->pixel_rate)
+	    core_rate < 2 * state->pixel_rate)
 		return -ERANGE;
 	ret = s7d_osd_scaler_check_mode(state->osd.scalers,
 		state->base.adjusted_mode.htotal, state->pixel_rate,
-		clk_get_rate(v->clocks[0].clk));
+		core_rate);
 	if (ret)
 		return ret;
 	ret = s7d_video_scaler_check_mode(&state->video.scaler,
 		state->base.adjusted_mode.hdisplay, state->base.adjusted_mode.vdisplay,
-		state->pixel_rate, clk_get_rate(v->clocks[0].clk));
+		state->pixel_rate, core_rate);
 	if (ret)
 		return ret;
 	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler,
@@ -603,7 +606,7 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 					      state->osd.scalers,
 					      state->base.adjusted_mode.htotal,
 					      state->pixel_rate,
-					      clk_get_rate(v->clocks[0].clk));
+					      core_rate);
 	if (ret)
 		return ret;
 	/*
