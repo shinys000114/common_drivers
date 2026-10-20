@@ -1780,9 +1780,10 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	frame.early = frame.idle && !((vd1 | vd2) & BIT(0)) &&
 		s7d_vpu_afbc_window(before, after, vd1, vd2, v->flip_start, v->flip_end);
 	if (v->gfcd_enabled) {
-		/* Scaled GFCD keeps the later idle-field retirement boundary. */
-		frame.early = frame.early && !v->gfcd_scaled &&
-			(v->gfcd_unchanged || s7d_vpu_gfcd_latched(v, frame.field));
+		/* A changed scaled GFCD input needs a later idle field. */
+		frame.early = frame.early &&
+			(v->gfcd_unchanged ||
+			 (!v->gfcd_scaled && s7d_vpu_gfcd_latched(v, frame.field)));
 		if (vpu_read(v, S7D_GFCD_ERROR) & GENMASK(31, 28)) {
 			v->gfcd_fault = true;
 			v->failed_reg = S7D_GFCD_ERROR;
