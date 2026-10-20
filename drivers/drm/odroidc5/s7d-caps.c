@@ -33,8 +33,7 @@ int s7d_display_check_resources(const struct s7d_display_resources *r)
 	if (hweight8(r->afbc) > 1)
 		return -ENOSPC;
 	if (r->gfcd && (r->gfcd != BIT(S7D_INPUT_OSD1) || r->afbc ||
-			(r->inputs & S7D_VIDEO_INPUTS) ||
-			(r->scalers & BIT(S7D_INPUT_OSD1))))
+			(r->inputs & S7D_VIDEO_INPUTS)))
 		return -EINVAL;
 	if (r->afbc && (r->inputs & BIT(S7D_INPUT_VD2)))
 		return -EINVAL;

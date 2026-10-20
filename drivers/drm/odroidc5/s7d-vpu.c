@@ -567,7 +567,8 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 		    READ_ONCE(v->gfcd_fault) ||
 		    state->pixel_rate > 148500000)
 			return -EOPNOTSUPP;
-		ret = s7d_gfcd_check_state(&state->buffers.gfcd.plan);
+		ret = s7d_gfcd_check_scaler(&state->buffers.gfcd.plan,
+					    &state->osd.scalers[0]);
 		if (ret)
 			return ret;
 	}
@@ -881,6 +882,9 @@ static int s7d_vpu_stop_hw(void *data)
 		if (ret)
 			return ret;
 		v->gfcd_enabled = false;
+		spin_lock_irq(&v->frame_lock);
+		v->gfcd_scaled = false;
+		spin_unlock_irq(&v->frame_lock);
 	}
 	if (v->afbc_enabled) {
 		if (abort_prepare) {
@@ -1322,6 +1326,12 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	v->failed_reg = 0;
 	if (!v->acquired)
 		return -EIO;
+	if (state->buffers.gfcd.fb) {
+		ret = s7d_gfcd_check_scaler(&state->buffers.gfcd.plan,
+					    &state->osd.scalers[0]);
+		if (ret)
+			return ret;
+	}
 	/* From here even a partial failure needs a verified stop before release. */
 	v->touched = true;
 	ret = s7d_vpu_stop(v);
@@ -1377,6 +1387,9 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 		v->gfcd_hdr_saved = vpu_read(v, 0x1d7f) & 0x1f;
 		v->gfcd_enabled = true;
 		v->gfcd_unchanged = false;
+		spin_lock_irq(&v->frame_lock);
+		v->gfcd_scaled = state->osd.scalers[0].enabled;
+		spin_unlock_irq(&v->frame_lock);
 		ret = s7d_gfcd_prepare(v->regmap, gfcd);
 		if (!ret)
 			ret = vpu_update(v, 0x1d7f, 0x1f, hdr);
@@ -1767,7 +1780,8 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	frame.early = frame.idle && !((vd1 | vd2) & BIT(0)) &&
 		s7d_vpu_afbc_window(before, after, vd1, vd2, v->flip_start, v->flip_end);
 	if (v->gfcd_enabled) {
-		frame.early = frame.early &&
+		/* Scaled GFCD keeps the later idle-field retirement boundary. */
+		frame.early = frame.early && !v->gfcd_scaled &&
 			(v->gfcd_unchanged || s7d_vpu_gfcd_latched(v, frame.field));
 		if (vpu_read(v, S7D_GFCD_ERROR) & GENMASK(31, 28)) {
 			v->gfcd_fault = true;

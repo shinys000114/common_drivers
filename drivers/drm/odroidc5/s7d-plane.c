@@ -58,7 +58,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	struct s7d_plane_state *state = to_s7d_plane_state(base);
 	int min_scale = DRM_PLANE_NO_SCALING;
 	int max_scale = DRM_PLANE_NO_SCALING;
-	bool can_scale, scaled;
+	bool can_scale, scaled, gfcd_primary;
 	int ret;
 
 	state->osd_valid = false;
@@ -86,12 +86,15 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		(base->fb->modifier == DRM_FORMAT_MOD_LINEAR ||
 		 base->fb->modifier == S7D_AFBC_MODIFIER) &&
 		(plane->slot == S7D_PLANE_PRIMARY || plane->slot == S7D_PLANE_RGB);
-	if (IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) && plane->slot == S7D_PLANE_PRIMARY &&
-	    base->fb && base->fb->modifier != DRM_FORMAT_MOD_LINEAR)
-		can_scale = false;
+	gfcd_primary = IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) &&
+		plane->slot == S7D_PLANE_PRIMARY && base->fb &&
+		base->fb->modifier != DRM_FORMAT_MOD_LINEAR;
+	if (gfcd_primary)
+		can_scale = can_scale && base->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE;
 	if (can_scale) {
 		min_scale /= S7D_OSD_SCALER_MAX_UPSCALE;
-		max_scale *= S7D_OSD_SCALER_MAX_DOWNSCALE;
+		if (!gfcd_primary)
+			max_scale *= S7D_OSD_SCALER_MAX_DOWNSCALE;
 	} else if (plane->slot == S7D_PLANE_VIDEO) {
 		min_scale /= S7D_VIDEO_SCALER_MAX_UPSCALE;
 		max_scale *= S7D_VIDEO_SCALER_MAX_DOWNSCALE;

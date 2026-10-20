@@ -53,6 +53,7 @@ struct s7d_vpu {
 	bool gfcd_available;
 	bool gfcd_enabled;
 	bool gfcd_unchanged;
+	bool gfcd_scaled;
 	bool gfcd_fault;
 	u32 gfcd_hdr_saved;
 	u32 afbc_ready_mask;

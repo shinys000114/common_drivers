@@ -49,9 +49,11 @@ config AMLOGIC_C5_GFCD
 	depends on AMLOGIC_C5_NATIVE_DISPLAY
 	help
 	  Use GFCD for the native AFBC primary instead of Mali AFBCD. Supports
-	  unscaled ABGR8888 with opaque or premultiplied alpha in the 32x8 tiled
-	  AFBC layout, full source up to 1920x1080 at 148.5 MHz, width aligned
-	  to 32 and height aligned to 8. Linear OSD2 remains
-	  available; video and simultaneous compressed surfaces are excluded.
+	  ABGR8888 in the 32x8 tiled AFBC layout, full source up to 1920x1080
+	  at 148.5 MHz, width aligned to 32 and height aligned to 8. The local
+	  OSD1 scaler supports up to 4x enlargement into a 1920x1080 output
+	  with opaque pixels. Unscaled input also supports premultiplied alpha.
+	  Linear OSD2 remains available; video and simultaneous compressed
+	  surfaces are excluded.
 	  Requires the retained GFCD automatic clock and reset configuration.
 	  Keep disabled to use the existing Mali AFBCD primary backend.

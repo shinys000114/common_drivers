@@ -530,6 +530,12 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 				     base->adjusted_mode.vdisplay, layers, &state->osd);
 	if (ret)
 		return ret;
+	if (state->buffers.gfcd.fb) {
+		ret = s7d_gfcd_check_scaler(&state->buffers.gfcd.plan,
+					    &state->osd.scalers[0]);
+		if (ret)
+			return ret;
+	}
 	ret = s7d_crtc_check_afbc_video(state);
 	if (ret)
 		return ret;

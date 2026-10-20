@@ -11,6 +11,7 @@
 #include <drm/drm_rect.h>
 
 #include "s7d-gfcd.h"
+#include "s7d-osd-scaler.h"
 
 int s7d_gfcd_check_state(const struct s7d_gfcd_state *s)
 {
@@ -36,6 +37,33 @@ int s7d_gfcd_check_state(const struct s7d_gfcd_state *s)
 	if (((u64)s->head << 4) > GENMASK_ULL(35, 0) - (bytes - 1))
 		return -ERANGE;
 	return 0;
+}
+
+int s7d_gfcd_check_scaler(const struct s7d_gfcd_state *s,
+			  const struct s7d_osd_scaler_state *scaler)
+{
+	struct s7d_osd_scaler_state checked = { };
+	u32 width, height, output_w, output_h;
+	int ret = s7d_gfcd_check_state(s);
+
+	if (ret)
+		return ret;
+	if (!scaler)
+		return -EINVAL;
+	if (!scaler->enabled)
+		return s7d_osd_scaler_same(scaler, &checked) ? 0 : -EINVAL;
+	width = s->frame_size >> 16;
+	height = s->frame_size & 0xffff;
+	output_w = scaler->output_h + 1;
+	output_h = scaler->output_v + 1;
+	/* Opaque enlargement does not skip source pixels. */
+	if (s->osd.alpha_config != 0x7fc2 || output_w < width ||
+	    output_h < height || output_w > 1920 || output_h > 1080)
+		return -EINVAL;
+	ret = s7d_osd_scaler_build(0, width, height, output_w, output_h, &checked);
+	if (ret)
+		return ret;
+	return s7d_osd_scaler_same(scaler, &checked) ? 0 : -EINVAL;
 }
 
 bool s7d_gfcd_same_config(const struct s7d_gfcd_state *a,
