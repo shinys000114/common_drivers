@@ -333,6 +333,9 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	ret = drm_plane_create_zpos_property(&plane->base, zpos, 0, S7D_DISPLAY_MAX_ZPOS);
 	if (ret)
 		return ERR_PTR(ret);
+	ret = drm_plane_create_alpha_property(&plane->base);
+	if (ret)
+		return ERR_PTR(ret);
 	if (slot == S7D_PLANE_VIDEO || slot == S7D_PLANE_VIDEO2) {
 		ret = drm_plane_create_color_properties(&plane->base,
 			BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709),
@@ -343,9 +346,6 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		drm_plane_helper_add(&plane->base, &s7d_plane_helper_funcs);
 		return &plane->base;
 	}
-	ret = drm_plane_create_alpha_property(&plane->base);
-	if (ret)
-		return ERR_PTR(ret);
 	ret = drm_plane_create_blend_mode_property(&plane->base,
 		BIT(DRM_MODE_BLEND_PIXEL_NONE) | BIT(DRM_MODE_BLEND_PREMULTI) |
 		BIT(DRM_MODE_BLEND_COVERAGE));

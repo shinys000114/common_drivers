@@ -1170,13 +1170,7 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		if (ret)
 			return ret;
 	}
-	ret = vpu_update(v, 0x1d26, BIT(27) | GENMASK(26, 18), 256 << 18);
-	if (ret)
-		return ret;
 	ret = vpu_update(v, 0x58b0, GENMASK(28, 0), BIT(0));
-	if (ret)
-		return ret;
-	ret = vpu_update(v, 0x1d76, GENMASK(8, 0), 256);
 	if (ret)
 		return ret;
 	ret = vpu_update(v, 0x3968, GENMASK(23, 0), 0);

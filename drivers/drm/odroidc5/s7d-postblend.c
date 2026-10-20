@@ -2,17 +2,21 @@
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/bits.h>
 #include <linux/errno.h>
+#include <linux/kernel.h>
 #include <linux/string.h>
 
 #include <asm/byteorder.h>
 
 #include <drm/drm_rect.h>
+#include <drm/drm_blend.h>
 
 #include "s7d-postblend.h"
 
 #define VPP_PREBLEND_VD1_H	0x1d1a
 #define VPP_PREBLEND_VD1_V	0x1d1b
 #define VPP_PREBLEND_SIZE		0x1d20
+#define VPP_MISC			0x1d26
+#define VPP_MISC1			0x1d76
 #define VPP_POSTBLEND_VD1_H	0x1d1c
 #define VPP_POSTBLEND_VD1_V	0x1d1d
 #define VPP_OSD1_SCOPE_H		0x1df5
@@ -68,6 +72,7 @@ int s7d_postblend_build_state(u32 width, u32 height,
 			     const struct s7d_display_resources *resources,
 			     const u32 zpos[S7D_INPUT_COUNT],
 			     u8 opaque,
+			     const u16 video_alpha[2],
 			     const struct drm_rect *video_dst,
 			     u32 video_width, u32 video_height,
 			     const struct drm_rect *video2_dst,
@@ -79,7 +84,7 @@ int s7d_postblend_build_state(u32 width, u32 height,
 	u32 sources[S7D_INPUT_COUNT] = {0}, pre_src = 0;
 	int ret;
 
-	if (!state || !resources || !zpos || !width || !height ||
+	if (!state || !resources || !zpos || !video_alpha || !width || !height ||
 	    (opaque & ~resources->inputs) ||
 	    width > S7D_DISPLAY_MAX_WIDTH || height > S7D_DISPLAY_MAX_HEIGHT ||
 	    !(resources->inputs & BIT(S7D_INPUT_OSD1)) ||
@@ -89,6 +94,10 @@ int s7d_postblend_build_state(u32 width, u32 height,
 	ret = s7d_display_check_resources(resources);
 	if (ret)
 		return ret;
+	if (video_alpha[0] != DRM_BLEND_ALPHA_OPAQUE)
+		opaque &= ~BIT(S7D_INPUT_VD1);
+	if (video_alpha[1] != DRM_BLEND_ALPHA_OPAQUE)
+		opaque &= ~BIT(S7D_INPUT_VD2);
 	ret = s7d_postblend_sources(resources, zpos, opaque, sources);
 	if (ret)
 		return ret;
@@ -133,6 +142,13 @@ int s7d_postblend_build_state(u32 width, u32 height,
 			/* Bit 20 keeps logical OSD1 on the postblend path. */
 			REG(OSD1_BLEND_SRC_CTRL, BIT(20) | (sources[2] << 8)),
 			REG(OSD2_BLEND_SRC_CTRL, BIT(20) | (sources[3] << 8)),
+			REG(VPP_MISC1, DIV_ROUND_CLOSEST((u32)video_alpha[0] * 256,
+						 DRM_BLEND_ALPHA_OPAQUE)),
+			/* Native owns the whole word; legacy force/enhancement stays off. */
+			REG(VPP_MISC, (DIV_ROUND_CLOSEST((u32)video_alpha[1] * 256,
+						  DRM_BLEND_ALPHA_OPAQUE) << 18) |
+				BIT(7) | BIT(6) |
+				(resources->scalers & BIT(S7D_INPUT_VD1) ? BIT(1) : 0)),
 		},
 	};
 	return 0;

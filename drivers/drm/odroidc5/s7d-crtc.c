@@ -342,6 +342,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	struct s7d_osd_layer layers[2] = {0};
 	u32 zpos[S7D_INPUT_COUNT] = {0};
 	u8 opaque = 0;
+	u16 video_alpha[2] = { DRM_BLEND_ALPHA_OPAQUE, DRM_BLEND_ALPHA_OPAQUE };
 	const struct s7d_plane_state *video = NULL, *video2 = NULL;
 	struct drm_rect video_dst, video2_dst;
 	enum drm_color_encoding encoding = DRM_COLOR_YCBCR_BT709;
@@ -422,6 +423,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 			if (!checked->video_valid)
 				return -EINVAL;
 			video2 = checked;
+			video_alpha[1] = ps->alpha;
 			video2_dst = ps->dst;
 			encoding2 = ps->color_encoding;
 			range2 = ps->color_range;
@@ -429,6 +431,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 			if (!checked->video_valid)
 				return -EINVAL;
 			video = checked;
+			video_alpha[0] = ps->alpha;
 			video_dst = ps->dst;
 			encoding = ps->color_encoding;
 			range = ps->color_range;
@@ -534,6 +537,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	ret = s7d_postblend_build_state(base->adjusted_mode.hdisplay,
 					base->adjusted_mode.vdisplay,
 					&state->resources, zpos, opaque,
+					video_alpha,
 					video ? &video_dst : NULL,
 					state->video.scaler.src_width,
 					state->video.scaler.src_height,

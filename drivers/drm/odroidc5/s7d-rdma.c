@@ -205,6 +205,12 @@ static bool display_write_valid(u32 reg, u32 value)
 	case 0x1d20:
 		return (value >> 16) && (value >> 16) <= 4096 &&
 		       (value & 0xffff) && (value & 0xffff) <= 4096;
+	case 0x1d76:
+		return value <= 256;
+	case 0x1d26:
+		return !(value & ~(GENMASK(26, 18) | BIT(7) | BIT(6) | BIT(1))) &&
+		       (value & (BIT(7) | BIT(6))) == (BIT(7) | BIT(6)) &&
+		       (value >> 18) <= 256;
 	case 0x1dfb:
 		return (value & BIT(16)) &&
 		       !(value & ~(BIT(16) | GENMASK(10, 8) | BIT(4) | BIT(0))) &&
