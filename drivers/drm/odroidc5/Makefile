@@ -30,6 +30,7 @@ s7d-display-y := \
 	s7d-afbc.o \
 	s7d-afbc-engine.o \
 	s7d-fb.o \
+	s7d-filter.o \
 	s7d-osd-scaler.o \
 	s7d-video-scaler.o \
 	s7d-gfcd.o

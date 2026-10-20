@@ -7,6 +7,7 @@
 #include <linux/math64.h>
 
 #include "s7d-osd-scaler.h"
+#include "s7d-filter.h"
 
 int s7d_osd_scaler_build(unsigned int index, u32 input_w, u32 input_h,
 			 u32 output_w, u32 output_h,
@@ -97,35 +98,6 @@ static int scaler_write(void __iomem *vcbus, u32 reg, u32 mask, u32 value,
 	return -EIO;
 }
 
-static u32 bilinear_coef(unsigned int phase)
-{
-	return ((128 - 2 * phase) << 16) | ((2 * phase) << 8);
-}
-
-static const u32 bicubic_coefficients[] = {
-	0x00800000, 0x007f0100, 0xff7f0200, 0xfe7f0300,
-	0xfd7e0500, 0xfc7e0600, 0xfb7d0800, 0xfb7c0900,
-	0xfa7b0b00, 0xfa7a0dff, 0xf9790fff, 0xf97711ff,
-	0xf87613ff, 0xf87416fe, 0xf87218fe, 0xf8701afe,
-	0xf76f1dfd, 0xf76d1ffd, 0xf76b21fd, 0xf76824fd,
-	0xf76627fc, 0xf76429fc, 0xf7612cfc, 0xf75f2ffb,
-	0xf75d31fb, 0xf75a34fb, 0xf75837fa, 0xf7553afa,
-	0xf8523cfa, 0xf8503ff9, 0xf84d42f9, 0xf84a45f9,
-	0xf84848f8,
-};
-
-static const u32 triangle_coefficients[] = {
-	0x20402000, 0x20402000, 0x1f3f2101, 0x1f3f2101,
-	0x1e3e2202, 0x1e3e2202, 0x1d3d2303, 0x1d3d2303,
-	0x1c3c2404, 0x1c3c2404, 0x1b3b2505, 0x1b3b2505,
-	0x1a3a2606, 0x1a3a2606, 0x19392707, 0x19392707,
-	0x18382808, 0x18382808, 0x17372909, 0x17372909,
-	0x16362a0a, 0x16362a0a, 0x15352b0b, 0x15352b0b,
-	0x14342c0c, 0x14342c0c, 0x13332d0d, 0x13332d0d,
-	0x12322e0e, 0x12322e0e, 0x11312f0f, 0x11312f0f,
-	0x10303010,
-};
-
 static void scaler_coefficients(void __iomem *vcbus, u32 index_reg, u32 data_reg,
 				const struct s7d_osd_scaler_state *s)
 {
@@ -137,15 +109,15 @@ static void scaler_coefficients(void __iomem *vcbus, u32 index_reg, u32 data_reg
 	if (s->output_h < 720 &&
 	    (input_w > s->output_h + 1 || input_h > s->output_v + 1)) {
 		coefficients[0] = input_h > s->output_v + 1 ?
-			triangle_coefficients : bicubic_coefficients;
+			s7d_filter_triangle : s7d_filter_bicubic;
 		coefficients[1] = input_w > s->output_h + 1 ?
-			triangle_coefficients : bicubic_coefficients;
+			s7d_filter_triangle : s7d_filter_bicubic;
 	}
 	for (direction = 0; direction < 2; direction++) {
 		writel(direction << 8, vcbus + index_reg * 4);
-		for (phase = 0; phase < 33; phase++)
+		for (phase = 0; phase < S7D_FILTER_PHASES; phase++)
 			writel(coefficients[direction] ? coefficients[direction][phase] :
-			       bilinear_coef(phase), vcbus + data_reg * 4);
+			       s7d_filter_bilinear[phase], vcbus + data_reg * 4);
 	}
 	writel(0, vcbus + index_reg * 4);
 }
