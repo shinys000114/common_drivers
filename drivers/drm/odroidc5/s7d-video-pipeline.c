@@ -52,7 +52,7 @@ static int check_layout(const struct s7d_video_state *layout,
 {
 	u32 x_start, x_end, y_start, y_end;
 	u32 chroma_x, chroma_y;
-	bool packed = layout->format == DRM_FORMAT_UYVY;
+	bool packed = layout->format == DRM_FORMAT_UYVY || layout->format == DRM_FORMAT_VYUY;
 
 	if (!dst || (layout->reflection & ~(S7D_VIDEO_REFLECT_X | S7D_VIDEO_REFLECT_Y)) ||
 	    (layout->format != DRM_FORMAT_NV12 &&
@@ -147,7 +147,7 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 					  drm_rect_height(dst), &next.scaler)) {
 		return -EINVAL;
 	}
-	if (layout->format == DRM_FORMAT_UYVY) {
+	if (layout->format == DRM_FORMAT_UYVY || layout->format == DRM_FORMAT_VYUY) {
 		next.setup[0].value = (next.setup[0].value & ~BIT(1)) | BIT(14);
 		next.control.value = next.setup[0].value;
 		next.setup[2].value = 0x30310c20;

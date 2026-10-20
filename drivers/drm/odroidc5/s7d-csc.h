@@ -28,10 +28,12 @@ struct s7d_csc_state {
  * Errors leave state unchanged; no registers are read or written.
  */
 int s7d_csc_build_state(enum drm_color_encoding encoding,
-			enum drm_color_range range, struct s7d_csc_state *state);
+			enum drm_color_range range, bool swap_uv,
+			struct s7d_csc_state *state);
 
 int s7d_csc_build_video2_state(enum drm_color_encoding encoding,
-			enum drm_color_range range, struct s7d_csc_state *state);
+			enum drm_color_range range, bool swap_uv,
+			struct s7d_csc_state *state);
 
 /* Matrix masks only; controls and unknown registers return zero. */
 u32 s7d_csc_reg_mask(u32 reg);

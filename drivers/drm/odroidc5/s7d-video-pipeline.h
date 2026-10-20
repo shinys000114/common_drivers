@@ -34,7 +34,7 @@ struct s7d_video_pipeline_state {
 
 
 /*
- * Pure progressive 8-bit NV12/NV21/UYVY state; NULL layout disables VD1.
+ * Pure progressive 8-bit YUV state; NULL layout disables VD1.
  * GEM bounds/fences belong to the plane and scanout owners. dst is clipped,
  * even, with identity or checked SAFA enlargement. Errors leave out unchanged.
  * hold_lines delays fetch after go_field. Apply setup with VENC/VD1 stopped.

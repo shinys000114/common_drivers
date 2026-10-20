@@ -57,7 +57,8 @@ u32 s7d_csc_reg_mask(u32 reg)
 }
 
 int s7d_csc_build_state(enum drm_color_encoding encoding,
-			enum drm_color_range range, struct s7d_csc_state *state)
+			enum drm_color_range range, bool swap_uv,
+			struct s7d_csc_state *state)
 {
 	/* Q10 coefficients; rows are R, G, B and columns are Y, Cb, Cr. */
 	static const s16 coeffs[2][2][3][3] = {
@@ -71,6 +72,7 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 	};
 	struct s7d_csc_state next;
 	const s16 (*coeff)[3];
+	unsigned int cb = swap_uv ? 2 : 1, cr = swap_uv ? 1 : 2;
 	unsigned int enc, rng;
 	unsigned int i;
 	int pre_y;
@@ -103,15 +105,15 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 	next = (struct s7d_csc_state) {
 		.matrix = {
 			{0x3290, 0,
-			 csc_pair(coeff[0][0], coeff[0][1], 0x1fff)},
+			 csc_pair(coeff[0][0], coeff[0][cb], 0x1fff)},
 			{0x3291, 0,
-			 csc_pair(coeff[0][2], coeff[1][0], 0x1fff)},
+			 csc_pair(coeff[0][cr], coeff[1][0], 0x1fff)},
 			{0x3292, 0,
-			 csc_pair(coeff[1][1], coeff[1][2], 0x1fff)},
+			 csc_pair(coeff[1][cb], coeff[1][cr], 0x1fff)},
 			{0x3293, 0,
-			 csc_pair(coeff[2][0], coeff[2][1], 0x1fff)},
+			 csc_pair(coeff[2][0], coeff[2][cb], 0x1fff)},
 			{0x3294, 0,
-			 (u32)coeff[2][2] & 0x1fff},
+			 (u32)coeff[2][cr] & 0x1fff},
 			{0x3295, 0, 0},
 			{0x3296, 0, 0},
 			{0x3297, 0, 0},
@@ -136,7 +138,8 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 }
 
 int s7d_csc_build_video2_state(enum drm_color_encoding encoding,
-			enum drm_color_range range, struct s7d_csc_state *state)
+			enum drm_color_range range, bool swap_uv,
+			struct s7d_csc_state *state)
 {
 	static const u32 matrix_regs[S7D_CSC_MATRIX_REG_COUNT] = {
 		0x3852, 0x3853, 0x3854, 0x3855, 0x3856, 0x3857, 0x3858,
@@ -155,7 +158,7 @@ int s7d_csc_build_video2_state(enum drm_color_encoding encoding,
 
 	if (!state)
 		return -EINVAL;
-	ret = s7d_csc_build_state(encoding, range, &next);
+	ret = s7d_csc_build_state(encoding, range, swap_uv, &next);
 	if (ret)
 		return ret;
 	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {

@@ -28,6 +28,7 @@ int s7d_video_build_state(struct drm_framebuffer *fb, const struct drm_rect *src
 	case DRM_FORMAT_NV21:
 		break;
 	case DRM_FORMAT_UYVY:
+	case DRM_FORMAT_VYUY:
 		planes = 1;
 		cpp = 2;
 		break;
