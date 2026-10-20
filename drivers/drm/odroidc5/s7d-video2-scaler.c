@@ -88,11 +88,6 @@ int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 	next.setup[12].value = (h_end << 16) | h_end;
 	next.setup[13].value = h_end;
 	next.setup[24].value = (height << 16) | width;
-	if (width != output_w || height != output_h) {
-		/* S7D vdx_scaler_setting: normal 8-bit coefficient rounding. */
-		next.setup[22].mask |= GENMASK(20, 12);
-		next.setup[22].value |= 0x77 << 12;
-	}
 	if (pre_h) {
 		next.setup[22].value &= ~GENMASK(10, 7);
 		next.setup[22].value |= (4 << 7) | BIT(2);
