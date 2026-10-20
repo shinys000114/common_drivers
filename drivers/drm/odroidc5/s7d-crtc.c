@@ -340,6 +340,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct drm_plane *plane;
 	struct s7d_osd_layer layers[2] = {0};
+	struct s7d_bandwidth_input bandwidth[S7D_INPUT_COUNT] = {0};
 	u32 zpos[S7D_INPUT_COUNT] = {0};
 	u8 opaque = 0;
 	u16 video_alpha[2] = { DRM_BLEND_ALPHA_OPAQUE, DRM_BLEND_ALPHA_OPAQUE };
@@ -363,6 +364,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	state->buffers = (struct s7d_scanout_buffers) {0};
 	state->resources = (struct s7d_display_resources) {0};
+	state->bandwidth = (struct s7d_bandwidth_state) {0};
 	if (!base->active)
 		return 0;
 	if (!base->enable || base->vrr_enabled || base->self_refresh_active ||
@@ -403,6 +405,10 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		if (ret)
 			return ret;
 		zpos[inputs[slot]] = ps->normalized_zpos;
+		bandwidth[inputs[slot]] = (struct s7d_bandwidth_input) {
+			.fb = ps->fb, .src = ps->src, .dst = ps->dst,
+			.compressed_size = checked->compressed_size,
+		};
 		if (checked->video_valid ? ps->alpha == DRM_BLEND_ALPHA_OPAQUE :
 		    checked->layer.alpha == 256 &&
 		    !(checked->layer.layout.alpha_config & BIT(2)))
@@ -566,6 +572,11 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		s7d_gfcd_same_config(&to_s7d_crtc_state(old)->buffers.gfcd.plan,
 				    &state->buffers.gfcd.plan);
 	s7d_crtc_build_update(state);
+	ret = s7d_bandwidth_build(&base->adjusted_mode, bandwidth,
+		state->update_count + (state->buffers.afbc.fb ? S7D_RDMA_AFBC_LOOP_ENTRIES : 0),
+		&state->bandwidth);
+	if (ret)
+		return ret;
 	state->pixel_rate = (unsigned long)base->adjusted_mode.clock * 1000;
 	state->afbc_decode_only = s7d_crtc_decode_only(state,
 		old ? to_s7d_crtc_state(old) : NULL);
@@ -1130,6 +1141,23 @@ static int s7d_crtc_set_crc_source(struct drm_crtc *crtc, const char *source)
 	return ret;
 }
 
+static void s7d_crtc_print_state(struct drm_printer *p, const struct drm_crtc_state *base)
+{
+	const struct s7d_crtc_state *state = container_of(base, const struct s7d_crtc_state, base);
+	const struct s7d_bandwidth_state *b = &state->bandwidth;
+	unsigned int i;
+
+	drm_printf(p, "\tfetch_payload=%llu bytes/frame\n", b->payload_bytes);
+	drm_printf(p, "\tfetch_bound=%llu bytes/frame avg=%llu B/s window=%llu B/s\n",
+		   b->read_bytes, b->average_bps, b->window_bps);
+	drm_printf(p, "\trdma_bound=%llu bytes/frame\n", b->rdma_bytes);
+	for (i = 0; i < S7D_INPUT_COUNT; i++)
+		if (b->input[i].read_bytes)
+			drm_printf(p, "\tfetch_input[%u]=%llu bytes/frame avg=%llu B/s window=%llu B/s\n",
+				   i, b->input[i].read_bytes,
+				   b->input[i].average_bps, b->input[i].window_bps);
+}
+
 static const struct drm_crtc_funcs s7d_crtc_funcs = {
 	.get_crc_sources = s7d_crtc_get_crc_sources,
 	.verify_crc_source = s7d_crtc_verify_crc_source,
@@ -1139,6 +1167,7 @@ static const struct drm_crtc_funcs s7d_crtc_funcs = {
 	.reset = s7d_crtc_reset,
 	.atomic_duplicate_state = s7d_crtc_duplicate_state,
 	.atomic_destroy_state = s7d_crtc_destroy_state,
+	.atomic_print_state = s7d_crtc_print_state,
 	.enable_vblank = s7d_crtc_enable_vblank,
 	.disable_vblank = s7d_crtc_disable_vblank,
 };

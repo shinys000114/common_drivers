@@ -29,7 +29,6 @@
 #define RDMA_CONFIG		(3 << 4 | 3 << 2)
 #define RDMA_TABLE_BYTES	SZ_4K
 #define RDMA_MAX_ENTRIES	(RDMA_TABLE_BYTES / sizeof(struct s7d_rdma_entry))
-#define LOOP_AFBC_ENTRIES	4
 #define AFBC_CLEAR		0x3a02
 #define AFBC_COMMAND		0x3a05
 
@@ -366,7 +365,7 @@ int s7d_rdma_loop_stage(struct s7d_rdma *r,
 
 	if (IS_ENABLED(CONFIG_PREEMPT_RT))
 		return -EOPNOTSUPP;
-	if ((!entries && count) || count > RDMA_MAX_ENTRIES - LOOP_AFBC_ENTRIES ||
+	if ((!entries && count) || count > RDMA_MAX_ENTRIES - S7D_RDMA_AFBC_LOOP_ENTRIES ||
 	    surface > 1 || !cookie ||
 	    (command != S7D_RDMA_AFBC_DIRECT && command != S7D_RDMA_AFBC_PENDING) ||
 	    !IS_ALIGNED(header, 64) ||
@@ -411,7 +410,7 @@ int s7d_rdma_loop_stage(struct s7d_rdma *r,
 	};
 	r->staged_cookie = cookie;
 	r->cookie_floor = cookie;
-	r->staged_count = count + LOOP_AFBC_ENTRIES;
+	r->staged_count = count + S7D_RDMA_AFBC_LOOP_ENTRIES;
 out:
 	spin_unlock_irqrestore(&r->lock, flags);
 	return ret;
@@ -530,7 +529,7 @@ int s7d_rdma_loop_replace(struct s7d_rdma *r,
 
 	count = r->staged_count;
 	memcpy(r->table, r->staged, count * sizeof(*r->table));
-	for (i = 0; i < count - LOOP_AFBC_ENTRIES; i++) {
+	for (i = 0; i < count - S7D_RDMA_AFBC_LOOP_ENTRIES; i++) {
 		u32 reg = le32_to_cpu(r->staged[i].reg);
 		u32 value = le32_to_cpu(r->staged[i].value);
 		u32 mask = s7d_csc_reg_mask(reg);

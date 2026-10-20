@@ -9,6 +9,8 @@
 struct device;
 struct reset_control;
 
+#define S7D_RDMA_AFBC_LOOP_ENTRIES 4
+
 struct s7d_rdma_entry {
 	__le32 reg;
 	__le32 value;

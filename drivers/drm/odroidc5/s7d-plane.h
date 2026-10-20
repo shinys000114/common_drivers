@@ -25,6 +25,7 @@ struct s7d_plane_state {
 	struct s7d_video_state video;
 	struct s7d_afbc_state afbc;
 	struct s7d_gfcd_state gfcd;
+	u32 compressed_size;
 	bool osd_valid;
 	bool video_valid;
 	bool afbc_valid;

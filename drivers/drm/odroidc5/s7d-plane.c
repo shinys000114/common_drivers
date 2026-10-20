@@ -65,6 +65,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	state->video_valid = false;
 	state->afbc_valid = false;
 	state->gfcd_valid = false;
+	state->compressed_size = 0;
 	state->layer.afbc = false;
 	state->layer.enabled = false;
 	if (!base->crtc) {
@@ -133,6 +134,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		    (base->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE &&
 		     base->pixel_blend_mode != DRM_MODE_BLEND_PREMULTI))
 			return -EINVAL;
+		state->compressed_size = fb->afbc_size;
 		if (IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) && plane->slot == S7D_PLANE_PRIMARY) {
 			ret = s7d_gfcd_build_state(fb, &base->src, plane->dma_mask,
 						 base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI,
