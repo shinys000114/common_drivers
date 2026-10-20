@@ -10,5 +10,6 @@
 extern const u32 s7d_filter_bilinear[S7D_FILTER_PHASES];
 extern const u32 s7d_filter_bicubic[S7D_FILTER_PHASES];
 extern const u32 s7d_filter_triangle[S7D_FILTER_PHASES];
+extern const u32 s7d_filter_bspline[S7D_FILTER_PHASES];
 
 #endif

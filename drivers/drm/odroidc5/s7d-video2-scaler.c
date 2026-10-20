@@ -10,6 +10,18 @@
 
 #define SET(r, m, v) { .reg = (r), .mask = (m), .value = (v) }
 
+static const u32 *s7d_video2_filter(u64 step, u32 *bank)
+{
+	*bank = 4;
+	if (step >= (3 << 24))
+		return s7d_filter_triangle;
+	if (step >= (2 << 24)) {
+		*bank = 3;
+		return s7d_filter_bspline;
+	}
+	return s7d_filter_bicubic;
+}
+
 int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 			  struct s7d_video2_pps_state *out)
 {
@@ -48,7 +60,7 @@ int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 			       GENMASK(10, 8) | GENMASK(5, 4) | GENMASK(2, 0),
 			       BIT(24) | BIT(16) | BIT(15) | 4),
 	};
-	u32 h_end, v_end, ratio, offset, skip, phase;
+	u32 h_end, v_end, ratio, offset, skip, phase, bank;
 	u64 h_step, v_step;
 	static const u8 skip_code[] = { 0x24, 0x04, 0x68, 0x48, 0x28, 0x08 };
 
@@ -78,8 +90,8 @@ int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 		next.setup[14].value = h_step;
 		next.setup[19].value = (1 << 20) | (4 << 16);
 		next.setup[20].value = next.setup[19].value;
-		next.control.value |= BIT(17) | (4 << 8);
-		next.coefficients[1] = width > output_w ? s7d_filter_triangle : s7d_filter_bicubic;
+		next.coefficients[1] = s7d_video2_filter(h_step, &bank);
+		next.control.value |= BIT(17) | (bank << 8);
 	}
 	if (height != output_h) {
 		ratio = div_u64((u64)height << 18, output_h);
@@ -90,7 +102,8 @@ int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 		next.setup[9].value = (skip_code[skip] << 8) | skip_code[skip];
 		next.setup[10].value = (phase << 24) | (phase << 8);
 		next.control.value |= BIT(18);
-		next.coefficients[0] = height > output_h ? s7d_filter_triangle : s7d_filter_bicubic;
+		next.coefficients[0] = s7d_video2_filter(v_step, &bank);
+		next.control.value = (next.control.value & ~GENMASK(2, 0)) | bank;
 	}
 	*out = next;
 	return 0;
