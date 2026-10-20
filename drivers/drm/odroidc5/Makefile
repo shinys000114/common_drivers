@@ -14,6 +14,7 @@ s7d-display-y := \
 	s7d-vpu.o \
 	s7d-vpp.o \
 	s7d-crtc.o \
+	s7d-caps.o \
 	s7d-plane.o \
 	s7d-gem.o \
 	s7d-osd.o \

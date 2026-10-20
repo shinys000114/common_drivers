@@ -209,8 +209,8 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	drm->mode_config.helper_private = &s7d_mode_config_helper_funcs;
 	drm->mode_config.min_width = 1;
 	drm->mode_config.min_height = 1;
-	drm->mode_config.max_width = 4096;
-	drm->mode_config.max_height = 2160;
+	drm->mode_config.max_width = S7D_DISPLAY_MAX_WIDTH;
+	drm->mode_config.max_height = S7D_DISPLAY_MAX_HEIGHT;
 	drm->mode_config.cursor_width = 256;
 	drm->mode_config.cursor_height = 256;
 	ret = s7d_vpu_init(pdev, &display->vpu, &link);

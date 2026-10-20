@@ -194,8 +194,6 @@ static int s7d_crtc_check_afbc_video(const struct s7d_crtc_state *state)
 {
 	const struct drm_display_mode *mode = &state->base.adjusted_mode;
 
-	if (state->buffers.afbc.fb && state->buffers.fb[S7D_PLANE_VIDEO2])
-		return -EINVAL;
 	if (!state->buffers.afbc.fb || !state->buffers.fb[S7D_PLANE_VIDEO])
 		return 0;
 	if (state->buffers.afbc.plan.surface_mask != BIT(0) ||
@@ -328,6 +326,13 @@ static bool s7d_crtc_replay_compatible(const struct s7d_crtc_state *state,
 
 static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
 {
+	static const enum s7d_display_input inputs[] = {
+		[S7D_PLANE_PRIMARY] = S7D_INPUT_OSD1,
+		[S7D_PLANE_RGB] = S7D_INPUT_OSD2,
+		[S7D_PLANE_VIDEO] = S7D_INPUT_VD1,
+		[S7D_PLANE_CURSOR] = S7D_INPUT_OSD2,
+		[S7D_PLANE_VIDEO2] = S7D_INPUT_VD2,
+	};
 	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
 	struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(atomic, crtc);
 	struct s7d_crtc_state *state = to_s7d_crtc_state(base);
@@ -353,6 +358,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->afbc_replay_compatible = false;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	state->buffers = (struct s7d_scanout_buffers) {0};
+	state->resources = (struct s7d_display_resources) {0};
 	if (!base->active)
 		return 0;
 	if (!base->enable || base->vrr_enabled || base->self_refresh_active ||
@@ -387,6 +393,11 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		if (ps->crtc != crtc || !ps->fb)
 			return -EINVAL;
 		slot = s7d_plane_slot(plane);
+		ret = s7d_display_claim(&state->resources, inputs[slot],
+			checked->gfcd_valid ? S7D_FETCH_GFCD :
+			checked->afbc_valid ? S7D_FETCH_AFBC : S7D_FETCH_LINEAR);
+		if (ret)
+			return ret;
 		if (slot == S7D_PLANE_PRIMARY)
 			primary_changed = !old_ps || old_ps->fb != ps->fb ||
 				old_ps->src_x != ps->src_x || old_ps->src_y != ps->src_y ||
@@ -416,12 +427,8 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		} else {
 			if (!checked->osd_valid)
 				return -EINVAL;
-			if (slot != S7D_PLANE_PRIMARY && layers[1].enabled)
-				return -ENOSPC;
 			layers[slot == S7D_PLANE_PRIMARY ? 0 : 1] = checked->layer;
 			if (checked->afbc_valid) {
-				if (state->buffers.afbc.fb)
-					return -ENOSPC;
 				state->buffers.afbc = (struct s7d_scanout_afbc) {
 					.fb = ps->fb,
 					.plan = checked->afbc,
@@ -436,9 +443,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	}
 	if (!state->buffers.fb[S7D_PLANE_PRIMARY])
 		return -EINVAL;
-	if (state->buffers.gfcd.fb &&
-	    (state->buffers.afbc.fb || video || video2 ||
-	     s7d_gfcd_check_state(&state->buffers.gfcd.plan)))
+	if (state->buffers.gfcd.fb && s7d_gfcd_check_state(&state->buffers.gfcd.plan))
 		return -EINVAL;
 	if (old && old->active) {
 		const struct s7d_crtc_state *before = to_s7d_crtc_state(old);
@@ -496,9 +501,13 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	ret = s7d_crtc_check_afbc_video(state);
 	if (ret)
 		return ret;
-	if (state->buffers.afbc.fb && state->video.scaler.enabled &&
-	    (state->osd.scalers[0].enabled || state->osd.scalers[1].enabled))
-		return -EINVAL;
+	state->resources.scalers =
+		(state->osd.scalers[0].enabled ? BIT(S7D_INPUT_OSD1) : 0) |
+		(state->osd.scalers[1].enabled ? BIT(S7D_INPUT_OSD2) : 0) |
+		(state->video.scaler.enabled ? BIT(S7D_INPUT_VD1) : 0);
+	ret = s7d_display_check_resources(&state->resources);
+	if (ret)
+		return ret;
 	if (old && old->active &&
 	    (!s7d_osd_scaler_same(&state->osd.scalers[0],
 				 &to_s7d_crtc_state(old)->osd.scalers[0]) ||

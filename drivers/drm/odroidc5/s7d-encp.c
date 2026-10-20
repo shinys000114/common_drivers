@@ -8,6 +8,7 @@
 #include <linux/kernel.h>
 
 #include "s7d-encp.h"
+#include "s7d-caps.h"
 
 /*
  * Use the S7D Linux/U-Boot VCBUS indices. Datasheet 01's ENCP HAVON and
@@ -42,6 +43,7 @@ static enum drm_mode_status s7d_encp_check_mode(const struct drm_display_mode *m
 {
 	u32 sync_flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC |
 			 DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC;
+	enum drm_mode_status status;
 
 	if (m->flags & DRM_MODE_FLAG_INTERLACE)
 		return MODE_NO_INTERLACE;
@@ -58,19 +60,15 @@ static enum drm_mode_status s7d_encp_check_mode(const struct drm_display_mode *m
 	    (m->flags & (DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC)) ==
 	    (DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC))
 		return MODE_BAD;
-	if (m->clock < 25175)
-		return MODE_CLOCK_LOW;
-	if (m->clock > 594000)
-		return MODE_CLOCK_HIGH;
+	status = s7d_display_mode_valid(m);
+	if (status != MODE_OK)
+		return status;
 
-	/* The initial primary plane has 12-bit display coordinates. */
-	if (!m->hdisplay || m->hdisplay > 4096 ||
-	    m->hdisplay >= m->hsync_start || m->hsync_start >= m->hsync_end ||
-	    m->hsync_end >= m->htotal || m->htotal > 8192)
+	if (m->hdisplay >= m->hsync_start || m->hsync_start >= m->hsync_end ||
+	    m->hsync_end >= m->htotal)
 		return MODE_BAD_HVALUE;
-	if (!m->vdisplay || m->vdisplay > 4096 ||
-	    m->vdisplay >= m->vsync_start || m->vsync_start >= m->vsync_end ||
-	    m->vsync_end >= m->vtotal || m->vtotal > 8192)
+	if (m->vdisplay >= m->vsync_start || m->vsync_start >= m->vsync_end ||
+	    m->vsync_end >= m->vtotal)
 		return MODE_BAD_VVALUE;
 
 	/*

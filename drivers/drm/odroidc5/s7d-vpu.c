@@ -553,18 +553,18 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	struct s7d_hdmi_pll_rate plan;
 	int ret;
 
+	ret = s7d_display_check_resources(&state->resources);
+	if (ret)
+		return ret;
 	if (state->buffers.gfcd.fb) {
 		if (!IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) || !v->gfcd_available ||
-		    READ_ONCE(v->gfcd_fault) || state->buffers.afbc.fb || state->buffers.video.fb ||
-		    state->buffers.video2.fb || state->osd.scalers[0].enabled ||
+		    READ_ONCE(v->gfcd_fault) ||
 		    state->pixel_rate > 148500000)
 			return -EOPNOTSUPP;
 		ret = s7d_gfcd_check_state(&state->buffers.gfcd.plan);
 		if (ret)
 			return ret;
 	}
-	if (state->buffers.video2.fb && state->buffers.afbc.fb)
-		return -EINVAL;
 	if (state->buffers.afbc.fb) {
 		u32 mask = state->buffers.afbc.plan.surface_mask;
 
@@ -575,9 +575,7 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 			return v->afbc_admission_error[mask == BIT(0) ? 0 : 1] ?: -EOPNOTSUPP;
 	}
 	/* One unscaled RGB pixel per VPU cycle; protect this rate at prepare. */
-	if (state->pixel_rate < 25175000 || state->pixel_rate > 594000000 ||
-	    state->base.adjusted_mode.hdisplay > 4096 ||
-	    state->base.adjusted_mode.vdisplay > 2160 ||
+	if (s7d_display_mode_valid(&state->base.adjusted_mode) != MODE_OK ||
 	    clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
 		return -ERANGE;
 	if (state->buffers.afbc.fb && state->buffers.video.fb &&

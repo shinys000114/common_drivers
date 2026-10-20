@@ -6,6 +6,7 @@
 #include <drm/drm_crtc.h>
 
 #include "s7d-encp.h"
+#include "s7d-caps.h"
 #include "s7d-flip-timestamp.h"
 #include "s7d-csc.h"
 #include "s7d-osd-pipeline.h"
@@ -26,6 +27,7 @@ struct s7d_crtc_state {
 	struct s7d_csc_state csc;
 	struct s7d_csc_state csc2;
 	struct s7d_postblend_state postblend;
+	struct s7d_display_resources resources;
 	struct s7d_rdma_entry update[S7D_CRTC_UPDATE_REG_COUNT];
 	unsigned int update_count;
 	/* Borrowed from the checked atomic plane states until scanout takes refs. */
