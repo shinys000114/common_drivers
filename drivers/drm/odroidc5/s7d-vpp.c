@@ -55,6 +55,9 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x3d08, GENMASK(13, 12) | GENMASK(11, 2), 0 },
 		{ 0x3d02, BIT(24) | BIT(23), 0 },
 		{ 0x3d05, BIT(22), 0 },
+		/* Set the S7D alpha baseline even when scaling is bypassed. */
+		{ 0x1dbf, BIT(7) | GENMASK(5, 4) | GENMASK(2, 0), 0xb1 },
+		{ 0x3d38, BIT(7) | GENMASK(5, 4) | GENMASK(2, 0), 0xb1 },
 		{ 0x1df1, 0x1fff1fff, (height << 16) | width },
 		/* Disable HDR and its independent matrix-only bypass path. */
 		{ 0x3800, GENMASK(20, 13) | GENMASK(7, 2), 0 },
