@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpu/amlogic,s7d-mali.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D Mali Valhall GPU with a fixed supply
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  The S7D Mali-G310 GPU has separate core and stack clocks and two reset
+  inputs. The ODROID-C5 integration uses a fixed supply and clock gating for
+  runtime power management. It has no controllable regulator or GPU power
+  domain. Its buffers are allocated through the GPU and DMA-BUF interfaces,
+  rather than a GPU memory-region reservation.
+
+  This binding describes the resource-based vendor kbase CSF integration.
+  GPU, MMU and JOB interrupt names retain the ordering used by that platform.
+
+properties:
+  $nodename:
+    pattern: '^gpu@[a-f0-9]+$'
+
+  compatible:
+    items:
+      - const: amlogic,s7d-mali
+      - const: arm,mali-valhall-csf
+
+  reg:
+    maxItems: 1
+    description: GPU register aperture, 8 MiB.
+
+  interrupts:
+    items:
+      - description: GPU interrupt
+      - description: MMU interrupt
+      - description: Job interrupt
+
+  interrupt-names:
+    items:
+      - const: GPU
+      - const: MMU
+      - const: JOB
+
+  clocks:
+    items:
+      - description: GPU core clock
+      - description: GPU stack clock
+
+  clock-names:
+    items:
+      - const: core
+      - const: stacks
+
+  resets:
+    items:
+      - description: GPU bus reset
+      - description: GPU core reset
+
+  reset-names:
+    items:
+      - const: bus
+      - const: core
+
+  operating-points-v2: true
+
+  '#cooling-cells':
+    const: 2
+
+  firmware-name:
+    maxItems: 1
+    description: CSF firmware filename; defaults to mali_csffw.bin.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - interrupt-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - operating-points-v2
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    gpu@fd000000 {
+        compatible = "amlogic,s7d-mali", "arm,mali-valhall-csf";
+        reg = <0xfd000000 0x800000>;
+        interrupts = <GIC_SPI 144 IRQ_TYPE_LEVEL_HIGH>,
+                     <GIC_SPI 145 IRQ_TYPE_LEVEL_HIGH>,
+                     <GIC_SPI 146 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "GPU", "MMU", "JOB";
+        clocks = <&gpu_core_clk>, <&gpu_stack_clk>;
+        clock-names = "core", "stacks";
+        resets = <&gpu_bus_reset>, <&gpu_core_reset>;
+        reset-names = "bus", "core";
+        operating-points-v2 = <&gpu_opp_table>;
+        #cooling-cells = <2>;
+    };

@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/amlogic,s7d-audio-playback.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D HDMI, analog and SPDIF playback interfaces
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  These children of amlogic,s7d-audio each contain a dedicated FRDDR reader,
+  output engine and routing. HDMI uses FRDDR A and TDMOUT B; analog output
+  uses FRDDR B and TDMOUT C; SPDIF A uses FRDDR C. Each interface provides
+  one playback DAI and handles its own DMA buffer and period interrupt.
+  Register access uses the parent's regmap, so neither reg nor DMAengine
+  channel properties are used. Serial bit and frame clocks are generated
+  internally. HDMI packets and ELD belong to the HDMI bridge DAI.
+
+allOf:
+  - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          const: amlogic,s7d-hdmi-audio
+    then:
+      properties:
+        clocks:
+          minItems: 7
+          maxItems: 7
+        clock-names:
+          items:
+            - const: arb
+            - const: fifo
+            - const: tdm
+            - const: mclk
+            - const: bclk
+            - const: lrclk
+            - const: hdmi-mclk
+        resets:
+          minItems: 2
+          maxItems: 2
+        reset-names:
+          items:
+            - const: fifo
+            - const: tdm
+  - if:
+      properties:
+        compatible:
+          const: amlogic,s7d-analog-audio
+    then:
+      properties:
+        clocks:
+          minItems: 6
+          maxItems: 6
+        clock-names:
+          items:
+            - const: arb
+            - const: fifo
+            - const: tdm
+            - const: mclk
+            - const: bclk
+            - const: lrclk
+        resets:
+          minItems: 3
+          maxItems: 3
+        reset-names:
+          items:
+            - const: fifo
+            - const: tdm
+            - const: route
+  - if:
+      properties:
+        compatible:
+          const: amlogic,s7d-spdif-audio
+    then:
+      properties:
+        clocks:
+          minItems: 7
+          maxItems: 7
+        clock-names:
+          items:
+            - const: arb
+            - const: fifo
+            - const: tdm
+            - const: mclk
+            - const: mclk-sel
+            - const: pll-44k
+            - const: pll-48k
+        resets:
+          minItems: 2
+          maxItems: 2
+        reset-names:
+          items:
+            - const: fifo
+            - const: spdif
+
+properties:
+  compatible:
+    enum:
+      - amlogic,s7d-hdmi-audio
+      - amlogic,s7d-analog-audio
+      - amlogic,s7d-spdif-audio
+
+  '#sound-dai-cells':
+    const: 0
+
+  interrupts:
+    maxItems: 1
+    description: Period interrupt of the dedicated FRDDR channel.
+
+  clocks:
+    minItems: 6
+    maxItems: 7
+    description: |
+      Arbiter and FRDDR gates, output-engine gate and master clock, followed
+      by serial bit/frame and HDMI master clocks, or SPDIF mux and source
+      PLLs. The tdm clock name denotes the SPDIF A output gate for SPDIF.
+
+  clock-names:
+    minItems: 6
+    maxItems: 7
+
+  resets:
+    minItems: 2
+    maxItems: 3
+    description: |
+      FRDDR and output-engine resets, plus the TOACODEC routing reset for
+      analog output. Resets are supplied by the parent audio reset child.
+
+  reset-names:
+    minItems: 2
+    maxItems: 3
+
+required:
+  - compatible
+  - '#sound-dai-cells'
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    hdmi-audio {
+        compatible = "amlogic,s7d-hdmi-audio";
+        #sound-dai-cells = <0>;
+        interrupts = <GIC_SPI 36 IRQ_TYPE_EDGE_RISING>;
+        clocks = <&audio_clkc 0>, <&audio_clkc 1>, <&audio_clkc 2>,
+                 <&audio_clkc 3>, <&audio_clkc 4>, <&audio_clkc 5>,
+                 <&audio_clkc 6>;
+        clock-names = "arb", "fifo", "tdm", "mclk", "bclk", "lrclk",
+                      "hdmi-mclk";
+        resets = <&audio_reset 9>, <&audio_reset 13>;
+        reset-names = "fifo", "tdm";
+    };

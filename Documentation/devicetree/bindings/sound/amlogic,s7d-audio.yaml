@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/amlogic,s7d-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D audio resource controller
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  The controller owns the 4 KiB audio register bank, its peripheral clock,
+  bus reset and power domain. Clock, reset and PCM children share its regmap
+  instead of mapping overlapping registers. The separately addressed T9015
+  DAC may also be a child; its address is outside the shared audio bank.
+
+properties:
+  compatible:
+    const: amlogic,s7d-audio
+
+  reg:
+    maxItems: 1
+    description: Audio register bank, 0x1000 bytes.
+
+  clocks:
+    maxItems: 1
+    description: Audio peripheral bus clock.
+
+  clock-names:
+    const: pclk
+
+  resets:
+    maxItems: 1
+    description: Top-level audio bus reset.
+
+  reset-names:
+    const: audio
+
+  power-domains:
+    maxItems: 1
+
+  '#address-cells':
+    const: 2
+
+  '#size-cells':
+    const: 2
+
+  ranges: true
+
+  clock-controller:
+    $ref: /schemas/clock/amlogic,s7d-audio-clkc.yaml#
+
+  reset-controller:
+    $ref: /schemas/reset/amlogic,s7d-audio-reset.yaml#
+
+  hdmi-audio:
+    $ref: amlogic,s7d-audio-playback.yaml#
+    properties:
+      compatible:
+        const: amlogic,s7d-hdmi-audio
+
+  analog-audio:
+    $ref: amlogic,s7d-audio-playback.yaml#
+    properties:
+      compatible:
+        const: amlogic,s7d-analog-audio
+
+  spdif-audio:
+    $ref: amlogic,s7d-audio-playback.yaml#
+    properties:
+      compatible:
+        const: amlogic,s7d-spdif-audio
+
+patternProperties:
+  '^codec@[0-9a-f]+$':
+    $ref: amlogic,s7d-t9015.yaml#
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - power-domains
+  - '#address-cells'
+  - '#size-cells'
+  - ranges
+  - clock-controller
+  - reset-controller
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        audio-controller@fe330000 {
+            compatible = "amlogic,s7d-audio";
+            reg = <0 0xfe330000 0 0x1000>;
+            clocks = <&clkc 0>;
+            clock-names = "pclk";
+            resets = <&reset 0>;
+            reset-names = "audio";
+            power-domains = <&pwrdm 0>;
+            #address-cells = <2>;
+            #size-cells = <2>;
+            ranges;
+
+            audio_clkc: clock-controller {
+                compatible = "amlogic,s7d-audio-clkc";
+                #clock-cells = <1>;
+                clocks = <&clkc 0>, <&clkc 1>, <&clkc 2>,
+                         <&clkc 3>, <&clkc 4>, <&xtal>;
+                clock-names = "pclk", "hifi1", "hifi0", "fclk-div3",
+                              "fclk-div4", "xtal";
+            };
+
+            audio_reset: reset-controller {
+                compatible = "amlogic,s7d-audio-reset";
+                #reset-cells = <1>;
+            };
+        };
+    };

@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/amlogic,s7d-vdec.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D video codec subsystem
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  The DOS aperture contains the VDEC, HEVC and HCODEC engines. Their mailbox
+  interrupts, clocks and power domains belong to one codec device. The DMC
+  request and drain registers are accessed through a separate system
+  controller. The resident video firmware service and the codec device must
+  reference the same enabled OP-TEE device, using the SMC conduit.
+
+  The codec memory region must be a reusable shared-dma-pool without no-map.
+  Its entire address range must fit below 4 GiB for the codec DMA engines.
+  Firmware storage is managed by the firmware service, not a codec child node.
+
+properties:
+  compatible:
+    const: amlogic,s7d-vdec
+
+  reg:
+    maxItems: 1
+    description: DOS register aperture, 64 KiB.
+
+  reg-names:
+    const: dos
+
+  interrupts:
+    items:
+      - description: VDEC mailbox interrupt
+      - description: HEVC mailbox interrupt
+      - description: HCODEC mailbox interrupt
+
+  interrupt-names:
+    items:
+      - const: mailbox_1
+      - const: mailbox_0
+      - const: mailbox_2
+
+  clocks:
+    items:
+      - description: DOS register bus clock
+      - description: VDEC engine clock
+      - description: HEVC engine clock
+      - description: HCODEC engine clock
+
+  clock-names:
+    items:
+      - const: dos
+      - const: vdec
+      - const: hevc
+      - const: hcodec
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: hevc-pipeline
+
+  power-domains:
+    items:
+      - description: VDEC power domain
+      - description: HEVC power domain
+      - description: HCODEC power domain
+
+  power-domain-names:
+    items:
+      - const: vdec
+      - const: hevc
+      - const: hcodec
+
+  amlogic,dmc-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the S7D DMC system controller.
+
+  amlogic,tee:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to an enabled linaro,optee-tz device using SMC.
+
+  amlogic,video-firmware:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the amlogic,s7d-video-firmware service.
+
+  memory-region:
+    maxItems: 1
+    description: Reusable codec DMA pool entirely below 4 GiB.
+
+  memory-region-names:
+    const: codec
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - power-domains
+  - power-domain-names
+  - amlogic,dmc-syscon
+  - amlogic,tee
+  - amlogic,video-firmware
+  - memory-region
+  - memory-region-names
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    video-codec@fe320000 {
+        compatible = "amlogic,s7d-vdec";
+        reg = <0xfe320000 0x10000>;
+        reg-names = "dos";
+        interrupts = <GIC_SPI 92 IRQ_TYPE_EDGE_RISING>,
+                     <GIC_SPI 91 IRQ_TYPE_EDGE_RISING>,
+                     <GIC_SPI 93 IRQ_TYPE_EDGE_RISING>;
+        interrupt-names = "mailbox_1", "mailbox_0", "mailbox_2";
+        clocks = <&dos_clk>, <&vdec_clk>, <&hevc_clk>, <&hcodec_clk>;
+        clock-names = "dos", "vdec", "hevc", "hcodec";
+        resets = <&hevc_pipeline_reset>;
+        reset-names = "hevc-pipeline";
+        power-domains = <&vdec_pd>, <&hevc_pd>, <&hcodec_pd>;
+        power-domain-names = "vdec", "hevc", "hcodec";
+        amlogic,dmc-syscon = <&dmc>;
+        amlogic,tee = <&optee>;
+        amlogic,video-firmware = <&video_firmware>;
+        memory-region = <&codec_pool>;
+        memory-region-names = "codec";
+    };
