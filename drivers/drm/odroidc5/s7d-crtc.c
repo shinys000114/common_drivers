@@ -13,7 +13,6 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_device.h>
 #include <drm/drm_file.h>
-#include <drm/drm_framebuffer.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_print.h>
@@ -402,10 +401,6 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 			continue;
 		if (ps->crtc != crtc || !ps->fb)
 			return -EINVAL;
-		if (checked->video_valid && old_ps && old_ps->visible && old_ps->fb &&
-		    ((ps->fb->format->format == DRM_FORMAT_VYUY) !=
-		     (old_ps->fb->format->format == DRM_FORMAT_VYUY)))
-			base->mode_changed = true;
 		slot = s7d_plane_slot(plane);
 		ret = s7d_display_claim(&state->resources, inputs[slot],
 			checked->gfcd_valid ? S7D_FETCH_GFCD :
