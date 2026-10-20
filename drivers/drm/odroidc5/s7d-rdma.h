@@ -71,7 +71,7 @@ int s7d_rdma_finish(struct s7d_rdma *rdma);
 /*
  * Loop mode requires the exclusive S7D MMIO reset provider and non-RT kernel.
  * Stage only prepares CPU memory; entries remain the ordinary display list.
- * The backend adds the selected surface's header pair and exact command 1/2.
+ * The backend adds the header pair, swap acknowledgement and exact command 1/2.
  * The owner validates the AFBC layout, holds its buffers and supplies a
  * strictly increasing nonzero submission cookie, separate from buffer generation.
  * Cancellation/quiesce do not permit cookie reuse. A running immutable list

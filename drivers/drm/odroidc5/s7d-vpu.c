@@ -402,9 +402,15 @@ static int s7d_vpu_afbc_replay_prepare_next(struct s7d_vpu *v)
 		return 0;
 	before = vpu_read(v, ENCP_INFO_READ);
 	line = (before >> 16) & 0x1fff;
-	if (line < v->flip_end || line >= v->replay_prepare_end ||
+	if (line >= v->replay_prepare_end ||
 	    !v->scanout.vblank_seq ||
 	    v->scanout.vblank_field != before >> 29)
+		return 0;
+	/* An early replacement must follow this field's first completed list. */
+	if (line < v->flip_end &&
+	    (v->afbc_replay_apply_pending ||
+	     v->afbc_replay_expected_sequence != v->scanout.vblank_seq ||
+	     v->afbc_replay_applied_field != before >> 29))
 		return 0;
 	return s7d_vpu_afbc_replay_publish(v, v->scanout.vblank_seq, before);
 }
@@ -424,7 +430,7 @@ static int s7d_vpu_afbc_replay_stage(struct s7d_vpu_submission *submission,
 			return ret;
 	}
 	ret = s7d_rdma_loop_stage(&v->rdma, state->update, state->update_count, 0,
-		candidate->afbc.plan.header_addr, S7D_RDMA_AFBC_DIRECT,
+		candidate->afbc.plan.header_addr, S7D_RDMA_AFBC_PENDING,
 		candidate->generation);
 	if (!ret)
 		v->afbc_replay_pending_cookie = candidate->generation;
@@ -1462,7 +1468,6 @@ static int s7d_vpu_afbc_sample(struct s7d_vpu *v,
 			frame->field, afbc_frame->vblank, ret);
 		frame->afbc_handover_generation = v->afbc.replay_handover_generation;
 		frame->afbc_handover_epoch = v->afbc.replay_handover_epoch;
-		frame->early = false;
 		return ret < 0 ? ret : 0;
 	}
 	ret = s7d_afbc_engine_read(&v->afbc, &o);
@@ -1548,7 +1553,7 @@ static int s7d_vpu_afbc_replay_begin(struct s7d_vpu *v,
 	v->afbc_replay = true;
 	v->afbc_replay_cookie = cookie;
 	ret = s7d_rdma_loop_stage(&v->rdma, NULL, 0, 0, e->bound.header_addr,
-				  S7D_RDMA_AFBC_DIRECT, v->afbc_replay_cookie);
+				  S7D_RDMA_AFBC_PENDING, v->afbc_replay_cookie);
 	if (!ret)
 		ret = s7d_rdma_loop_replace(&v->rdma, s7d_vpu_afbc_replay_barrier, v);
 	if (ret)

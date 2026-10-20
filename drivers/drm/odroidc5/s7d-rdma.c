@@ -28,7 +28,8 @@
 #define RDMA_CONFIG		(3 << 4 | 3 << 2)
 #define RDMA_TABLE_BYTES	SZ_4K
 #define RDMA_MAX_ENTRIES	(RDMA_TABLE_BYTES / sizeof(struct s7d_rdma_entry))
-#define LOOP_AFBC_ENTRIES	3
+#define LOOP_AFBC_ENTRIES	4
+#define AFBC_CLEAR		0x3a02
 #define AFBC_COMMAND		0x3a05
 
 static u32 rdma_read(struct s7d_rdma *r, u32 reg)
@@ -386,6 +387,10 @@ int s7d_rdma_loop_stage(struct s7d_rdma *r,
 		.value = cpu_to_le32(upper_32_bits(header)),
 	};
 	r->staged[count + 2] = (struct s7d_rdma_entry) {
+		.reg = cpu_to_le32(AFBC_CLEAR),
+		.value = cpu_to_le32(BIT(1)),
+	};
+	r->staged[count + 3] = (struct s7d_rdma_entry) {
 		.reg = cpu_to_le32(AFBC_COMMAND),
 		.value = cpu_to_le32(command),
 	};

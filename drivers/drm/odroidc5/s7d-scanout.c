@@ -316,6 +316,7 @@ int s7d_scanout_replay_applied(struct s7d_scanout *s, u64 cookie,
 		s->phase = S7D_SCANOUT_VBLANK;
 		s->applied_field = field;
 		s->wait_field = true;
+		s->early_complete = true;
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ret;
@@ -467,6 +468,7 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 {
 	enum s7d_scanout_result result = S7D_SCANOUT_NO_CHANGE;
 	unsigned long flags;
+	bool early = false;
 
 	spin_lock_irqsave(&s->lock, flags);
 	if (vblank) {
@@ -491,9 +493,8 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 	if (s->phase != S7D_SCANOUT_VBLANK)
 		goto out;
 	if (s->wait_field) {
-		bool early = s->early_complete && frame->early && frame->idle && s->vblank_valid &&
-			     frame->field == s->applied_field &&
-			     frame->field == s->vblank_field;
+		early = s->early_complete && frame->early && frame->idle && s->vblank_valid &&
+			frame->field == s->applied_field && frame->field == s->vblank_field;
 
 		if (!early && (!vblank || !frame->idle || frame->field == s->applied_field))
 			goto out;
@@ -501,7 +502,8 @@ s7d_scanout_irq(struct s7d_scanout *s, bool vblank, enum s7d_rdma_result rdma_re
 		goto out;
 	}
 	if (s->pending.afbc.fb && s->pending_transaction == S7D_SCANOUT_TRANSACTION_REPLAY &&
-	    (!frame->afbc_gate || !vblank || !frame->idle || !s->pending_afbc_epoch ||
+	    (!frame->afbc_gate || (!vblank && !early) || !frame->idle ||
+	     !s->pending_afbc_epoch ||
 	     (!s->pending_afbc_unchanged &&
 	      (frame->afbc_handover_generation != s->pending.afbc.generation ||
 	       frame->afbc_handover_epoch != s->pending_afbc_epoch))))

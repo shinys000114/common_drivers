@@ -113,6 +113,7 @@ int s7d_afbc_engine_sample(struct s7d_afbc_engine *e,
 int s7d_afbc_engine_restart(struct s7d_afbc_engine *e,
 			     const struct s7d_afbc_frame *frame);
 int s7d_afbc_engine_replay_begin(struct s7d_afbc_engine *e);
+/* Replay lists acknowledge SWAPPED immediately before each PENDING_SWAP. */
 int s7d_afbc_engine_replay_barrier(struct s7d_afbc_engine *e);
 int s7d_afbc_engine_replay_published(struct s7d_afbc_engine *e);
 int s7d_afbc_engine_replay_applied(struct s7d_afbc_engine *e, u64 generation,

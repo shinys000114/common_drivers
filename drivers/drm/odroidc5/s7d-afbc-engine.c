@@ -614,6 +614,13 @@ int s7d_afbc_engine_replay_sample(struct s7d_afbc_engine *e,
 		e->swapped = true;
 	if (!e->swapped)
 		return 0;
+	/* PENDING_SWAP completes the old decode before replacing its configuration. */
+	if (frame->window) {
+		e->replay_handover_generation = e->generation;
+		e->replay_handover_epoch = e->epoch;
+		e->replay_wait_swap = false;
+		return 1;
+	}
 	if (!e->replay_readout_armed) {
 		/* Discard readout that predates the new configuration swap. */
 		ret = engine_write(e, AFBC_CLEAR, AFBC_READOUT);
