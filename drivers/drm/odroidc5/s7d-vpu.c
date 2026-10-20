@@ -78,9 +78,14 @@ static u32 vpu_read(struct s7d_vpu *v, u32 reg)
 
 static int vpu_update(struct s7d_vpu *v, u32 reg, u32 mask, u32 value)
 {
+	u32 observed;
+
 	writel((vpu_read(v, reg) & ~mask) | value, v->regs + reg * 4);
-	if ((vpu_read(v, reg) & mask) != value) {
+	observed = vpu_read(v, reg);
+	if ((observed & mask) != value) {
 		v->failed_reg = reg;
+		dev_err(v->dev, "VCBUS %#x readback %#x expected %#x mask %#x\n",
+			reg, observed, value, mask);
 		return -EIO;
 	}
 	return 0;
