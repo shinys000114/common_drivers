@@ -197,8 +197,6 @@ int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
 
 	if (!out)
 		return -EINVAL;
-	if (layout && layout->format == DRM_FORMAT_UYVY)
-		return -EINVAL;
 	ret = s7d_video_build_pipeline_common(layout, dst, 8, true, &next);
 	if (ret)
 		return ret;

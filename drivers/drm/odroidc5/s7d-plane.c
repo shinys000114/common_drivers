@@ -293,7 +293,6 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	static const u32 video_formats[] = {
 		DRM_FORMAT_NV12, DRM_FORMAT_NV21, DRM_FORMAT_UYVY,
 	};
-	static const u32 video2_formats[] = { DRM_FORMAT_NV12, DRM_FORMAT_NV21 };
 	const u32 *plane_formats = formats;
 	unsigned int format_count = ARRAY_SIZE(formats);
 	struct s7d_plane *plane;
@@ -331,9 +330,8 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		type = DRM_PLANE_TYPE_OVERLAY;
 		name = slot == S7D_PLANE_VIDEO ? "S7D VD1" : "S7D VD2";
 		zpos = slot == S7D_PLANE_VIDEO ? 1 : 2;
-		plane_formats = slot == S7D_PLANE_VIDEO ? video_formats : video2_formats;
-		format_count = slot == S7D_PLANE_VIDEO ? ARRAY_SIZE(video_formats) :
-			ARRAY_SIZE(video2_formats);
+		plane_formats = video_formats;
+		format_count = ARRAY_SIZE(video_formats);
 		break;
 	default:
 		return ERR_PTR(-EINVAL);

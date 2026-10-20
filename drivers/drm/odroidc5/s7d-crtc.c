@@ -503,6 +503,10 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		video2 ? &video2_dst : NULL, &state->video2);
 	if (ret)
 		return ret;
+	if (old && old->active &&
+	    memcmp(to_s7d_crtc_state(old)->video2.setup, state->video2.setup,
+		   sizeof(state->video2.setup)))
+		base->mode_changed = true;
 	if (video2) {
 		ret = s7d_video2_scaler_build(state->video2.scaler.src_width,
 			state->video2.scaler.src_height, state->video2.scaler.dst_width,
