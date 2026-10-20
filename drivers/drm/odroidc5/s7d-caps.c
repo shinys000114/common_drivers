@@ -29,8 +29,8 @@ int s7d_display_check_resources(const struct s7d_display_resources *r)
 	    ((r->afbc | r->gfcd | r->scalers) & ~r->inputs) ||
 	    (r->afbc & ~S7D_OSD_INPUTS) || (r->scalers & BIT(S7D_INPUT_VD2)))
 		return -EINVAL;
-	/* The native path carries one compressed plan and three postblend inputs. */
-	if (hweight8(r->afbc) > 1 || hweight8(r->inputs) > 3)
+	/* Scanout retains one compressed plan. */
+	if (hweight8(r->afbc) > 1)
 		return -ENOSPC;
 	if (r->gfcd && (r->gfcd != BIT(S7D_INPUT_OSD1) || r->afbc ||
 			(r->inputs & S7D_VIDEO_INPUTS) ||

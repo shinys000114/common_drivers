@@ -2,6 +2,7 @@
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/bits.h>
 #include <linux/errno.h>
+#include <linux/string.h>
 
 #include <asm/byteorder.h>
 
@@ -26,7 +27,8 @@
 #define REG(r, v) { .reg = cpu_to_le32(r), .value = cpu_to_le32(v) }
 
 static int s7d_postblend_sources(const struct s7d_display_resources *r,
-				const u32 zpos[S7D_INPUT_COUNT], u32 sources[3])
+				const u32 zpos[S7D_INPUT_COUNT], u8 opaque,
+				u32 sources[S7D_INPUT_COUNT])
 {
 	static const u8 source_id[] = {
 		[S7D_INPUT_OSD1] = 3,
@@ -35,6 +37,7 @@ static int s7d_postblend_sources(const struct s7d_display_resources *r,
 		[S7D_INPUT_VD2] = 2,
 	};
 	unsigned int i, j, rank, port;
+	bool four = r->inputs == GENMASK(S7D_INPUT_COUNT - 1, 0);
 
 	for (i = 0; i < S7D_INPUT_COUNT; i++) {
 		if (!(r->inputs & BIT(i)))
@@ -50,8 +53,12 @@ static int s7d_postblend_sources(const struct s7d_display_resources *r,
 			if (zpos[j] < zpos[i])
 				rank++;
 		}
-		/* Preserve the established OSD-only port gap. */
-		port = rank == 1 && !(r->inputs & S7D_VIDEO_INPUTS) ? 2 : rank;
+		/* DIN0 keeps the vendor premult label, valid for opaque sources. */
+		if (four && !rank && !(opaque & BIT(i)))
+			return -EINVAL;
+		port = four ? rank : rank + 1;
+		if (!four && rank == 1 && !(r->inputs & S7D_VIDEO_INPUTS))
+			port++;
 		sources[port] = source_id[i];
 	}
 	return 0;
@@ -60,6 +67,7 @@ static int s7d_postblend_sources(const struct s7d_display_resources *r,
 int s7d_postblend_build_state(u32 width, u32 height,
 			     const struct s7d_display_resources *resources,
 			     const u32 zpos[S7D_INPUT_COUNT],
+			     u8 opaque,
 			     const struct drm_rect *video_dst,
 			     u32 video_width, u32 video_height,
 			     const struct drm_rect *video2_dst,
@@ -68,10 +76,11 @@ int s7d_postblend_build_state(u32 width, u32 height,
 	u32 video_h = 0x1fff0000, video_v = 0x1fff0000;
 	u32 video2_h = 0x1fff0000, video2_v = 0x1fff0000;
 	u32 input_width = width, input_height = height;
-	u32 sources[3] = {0}, pre_src = 0;
+	u32 sources[S7D_INPUT_COUNT] = {0}, pre_src = 0;
 	int ret;
 
 	if (!state || !resources || !zpos || !width || !height ||
+	    (opaque & ~resources->inputs) ||
 	    width > S7D_DISPLAY_MAX_WIDTH || height > S7D_DISPLAY_MAX_HEIGHT ||
 	    !(resources->inputs & BIT(S7D_INPUT_OSD1)) ||
 	    !!video_dst != !!(resources->inputs & BIT(S7D_INPUT_VD1)) ||
@@ -80,7 +89,7 @@ int s7d_postblend_build_state(u32 width, u32 height,
 	ret = s7d_display_check_resources(resources);
 	if (ret)
 		return ret;
-	ret = s7d_postblend_sources(resources, zpos, sources);
+	ret = s7d_postblend_sources(resources, zpos, opaque, sources);
 	if (ret)
 		return ret;
 	if (video_dst) {
@@ -119,13 +128,21 @@ int s7d_postblend_build_state(u32 width, u32 height,
 			REG(VPP_POSTBLEND_VD1_V, video_v),
 			REG(0x1d1e, video2_h),
 			REG(0x1d1f, video2_v),
-			/* Port 0 requires bit 16; keep straight OSD output off it. */
-			REG(VD1_BLEND_SRC_CTRL, BIT(16) | pre_src),
-			REG(VD2_BLEND_SRC_CTRL, (sources[0] << 8) | (video2_dst ? BIT(20) : 0)),
+			REG(VD1_BLEND_SRC_CTRL, BIT(16) | (sources[0] << 8) | pre_src),
+			REG(VD2_BLEND_SRC_CTRL, (sources[1] << 8) | (video2_dst ? BIT(20) : 0)),
 			/* Bit 20 keeps logical OSD1 on the postblend path. */
-			REG(OSD1_BLEND_SRC_CTRL, BIT(20) | (sources[1] << 8)),
-			REG(OSD2_BLEND_SRC_CTRL, BIT(20) | (sources[2] << 8)),
+			REG(OSD1_BLEND_SRC_CTRL, BIT(20) | (sources[2] << 8)),
+			REG(OSD2_BLEND_SRC_CTRL, BIT(20) | (sources[3] << 8)),
 		},
 	};
 	return 0;
+}
+
+bool s7d_postblend_needs_modeset(const struct s7d_postblend_state *before,
+				 const struct s7d_postblend_state *after)
+{
+	return ((le32_to_cpu(before->regs[11].value) |
+		 le32_to_cpu(after->regs[11].value)) & GENMASK(11, 8)) &&
+		memcmp(&before->regs[11], &after->regs[11],
+		       4 * sizeof(before->regs[0]));
 }

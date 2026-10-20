@@ -14,7 +14,7 @@ struct s7d_postblend_state {
 	struct s7d_rdma_entry regs[S7D_POSTBLEND_REG_COUNT];
 };
 
-/* Order up to three physical inputs using DRM's normalized zpos values.
+/* Order physical inputs using DRM's normalized zpos values.
  * OSD2 cursor and overlay share an input. NULL destinations disable videos.
  * Preblend covers the cropped input at origin zero; postblend sets its position.
  * Shared alpha/dummy setup is masked while stopped. No register access;
@@ -23,9 +23,13 @@ struct s7d_postblend_state {
 int s7d_postblend_build_state(u32 width, u32 height,
 			     const struct s7d_display_resources *resources,
 			     const u32 zpos[S7D_INPUT_COUNT],
+			     u8 opaque,
 			     const struct drm_rect *video_dst,
 			     u32 video_width, u32 video_height,
 			     const struct drm_rect *video2_dst,
 			     struct s7d_postblend_state *state);
+
+bool s7d_postblend_needs_modeset(const struct s7d_postblend_state *before,
+				 const struct s7d_postblend_state *after);
 
 #endif

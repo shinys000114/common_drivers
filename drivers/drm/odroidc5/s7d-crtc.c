@@ -9,6 +9,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_device.h>
 #include <drm/drm_file.h>
@@ -340,6 +341,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	struct drm_plane *plane;
 	struct s7d_osd_layer layers[2] = {0};
 	u32 zpos[S7D_INPUT_COUNT] = {0};
+	u8 opaque = 0;
 	const struct s7d_plane_state *video = NULL, *video2 = NULL;
 	struct drm_rect video_dst, video2_dst;
 	enum drm_color_encoding encoding = DRM_COLOR_YCBCR_BT709;
@@ -400,6 +402,10 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		if (ret)
 			return ret;
 		zpos[inputs[slot]] = ps->normalized_zpos;
+		if (checked->video_valid ? ps->alpha == DRM_BLEND_ALPHA_OPAQUE :
+		    checked->layer.alpha == 256 &&
+		    !(checked->layer.layout.alpha_config & BIT(2)))
+			opaque |= BIT(inputs[slot]);
 		if (slot == S7D_PLANE_PRIMARY)
 			primary_changed = !old_ps || old_ps->fb != ps->fb ||
 				old_ps->src_x != ps->src_x || old_ps->src_y != ps->src_y ||
@@ -526,12 +532,19 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (ret)
 		return ret;
 	ret = s7d_postblend_build_state(base->adjusted_mode.hdisplay,
-		base->adjusted_mode.vdisplay, &state->resources, zpos,
-		video ? &video_dst : NULL,
-		state->video.scaler.src_width, state->video.scaler.src_height,
-		video2 ? &video2_dst : NULL, &state->postblend);
+					base->adjusted_mode.vdisplay,
+					&state->resources, zpos, opaque,
+					video ? &video_dst : NULL,
+					state->video.scaler.src_width,
+					state->video.scaler.src_height,
+					video2 ? &video2_dst : NULL,
+					&state->postblend);
 	if (ret)
 		return ret;
+	if (old && old->active &&
+	    s7d_postblend_needs_modeset(&to_s7d_crtc_state(old)->postblend,
+				       &state->postblend))
+		base->mode_changed = true;
 	s7d_crtc_check_video_update(state, old ? to_s7d_crtc_state(old) : NULL);
 	state->afbc_unchanged = state->input_captured &&
 		!state->primary_submitted && !state->connector_submitted &&

@@ -206,7 +206,10 @@ static bool display_write_valid(u32 reg, u32 value)
 		return (value >> 16) && (value >> 16) <= 4096 &&
 		       (value & 0xffff) && (value & 0xffff) <= 4096;
 	case 0x1dfb:
-		return value == BIT(16) || value == (BIT(16) | BIT(4) | BIT(0));
+		return (value & BIT(16)) &&
+		       !(value & ~(BIT(16) | GENMASK(10, 8) | BIT(4) | BIT(0))) &&
+		       ((value >> 8) & 7) <= 4 &&
+		       (!(value & 0xff) || (value & 0xff) == 0x11);
 	case 0x1dfc:
 		return !(value & ~(BIT(20) | GENMASK(10, 8))) &&
 		       ((value >> 8) & 7) <= 4;
