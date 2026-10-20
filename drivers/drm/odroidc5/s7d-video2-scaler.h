@@ -13,7 +13,7 @@ struct s7d_video2_pps_state {
 	struct s7d_video_scaler_reg setup[S7D_VIDEO2_PPS_SETUP_REG_COUNT];
 	struct s7d_video_scaler_reg control;
 	/* Immutable tables, loaded only while fetch and VENC are stopped. */
-	const u32 *coefficients[2];
+	const u32 *coefficients[3];
 };
 
 int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,

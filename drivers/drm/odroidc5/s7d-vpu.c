@@ -1107,10 +1107,11 @@ static int program_video2_pps(struct s7d_vpu *v,
 		if (ret)
 			return ret;
 	}
-	for (direction = 0; direction < 2; direction++) {
+	for (direction = 0; direction < 3; direction++) {
 		if (!pps->coefficients[direction])
 			continue;
-		writel(direction << 8, v->regs + 0x3943 * 4);
+		writel(direction == 2 ? BIT(8) | BIT(7) : direction << 8,
+		       v->regs + 0x3943 * 4);
 		for (phase = 0; phase < S7D_FILTER_PHASES; phase++)
 			writel(pps->coefficients[direction][phase], v->regs + 0x3944 * 4);
 	}

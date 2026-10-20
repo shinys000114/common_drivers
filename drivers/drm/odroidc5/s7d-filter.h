@@ -11,5 +11,7 @@ extern const u32 s7d_filter_bilinear[S7D_FILTER_PHASES];
 extern const u32 s7d_filter_bicubic[S7D_FILTER_PHASES];
 extern const u32 s7d_filter_triangle[S7D_FILTER_PHASES];
 extern const u32 s7d_filter_bspline[S7D_FILTER_PHASES];
+extern const u32 s7d_filter_lanczos2_8tap[2 * S7D_FILTER_PHASES];
+extern const u32 s7d_filter_lanczos4_8tap[2 * S7D_FILTER_PHASES];
 
 #endif

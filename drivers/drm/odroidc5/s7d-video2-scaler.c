@@ -57,7 +57,7 @@ int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 			SET(0x1df0, 0x1fff1fff, 0),
 		},
 		.control = SET(0x3958, BIT(24) | GENMASK(22, 15) | BIT(12) |
-			       GENMASK(10, 8) | GENMASK(5, 4) | GENMASK(2, 0),
+			       GENMASK(11, 8) | GENMASK(5, 4) | GENMASK(2, 0),
 			       BIT(24) | BIT(16) | BIT(15) | 4),
 	};
 	u32 h_end, v_end, ratio, offset, skip, phase, bank;
@@ -88,9 +88,17 @@ int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 	}
 	if (width != output_w) {
 		next.setup[14].value = h_step;
-		next.setup[19].value = (1 << 20) | (4 << 16);
+		if (width >= 8) {
+			next.coefficients[1] = h_step <= BIT(24) ?
+				s7d_filter_lanczos4_8tap : s7d_filter_lanczos2_8tap;
+			next.coefficients[2] = next.coefficients[1] + S7D_FILTER_PHASES;
+			next.setup[19].value = (3 << 20) | (8 << 16);
+			bank = 8;
+		} else {
+			next.coefficients[1] = s7d_video2_filter(h_step, &bank);
+			next.setup[19].value = (1 << 20) | (4 << 16);
+		}
 		next.setup[20].value = next.setup[19].value;
-		next.coefficients[1] = s7d_video2_filter(h_step, &bank);
 		next.control.value |= BIT(17) | (bank << 8);
 	}
 	if (height != output_h) {
