@@ -524,6 +524,8 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 			&state->previous_afbc : NULL,
 		s7d_vpu_afbc_stage,
 		s7d_vpu_afbc_cancel, &submission);
+	if (!ret && v->gfcd_enabled)
+		v->gfcd_unchanged = state->gfcd_unchanged;
 	if (!ret && transaction == S7D_SCANOUT_TRANSACTION_REPLAY) {
 		ret = s7d_crtc_expect_latch(v->crtc,
 					 s7d_scanout_pending_generation(&v->scanout));
@@ -550,6 +552,16 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	struct s7d_hdmi_pll_rate plan;
 	int ret;
 
+	if (state->buffers.gfcd.fb) {
+		if (!IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) || !v->gfcd_available ||
+		    READ_ONCE(v->gfcd_fault) || state->buffers.afbc.fb || state->buffers.video.fb ||
+		    state->buffers.video2.fb || state->osd.scalers[0].enabled ||
+		    state->pixel_rate > 148500000)
+			return -EOPNOTSUPP;
+		ret = s7d_gfcd_check_state(&state->buffers.gfcd.plan);
+		if (ret)
+			return ret;
+	}
 	if (state->buffers.video2.fb && state->buffers.afbc.fb)
 		return -EINVAL;
 	if (state->buffers.afbc.fb) {
@@ -638,6 +650,8 @@ static int s7d_vpu_acquire(void *data)
 		v->pixel_enabled = true;
 	}
 	s7d_vpu_afbc_admission(v);
+	if (IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD))
+		v->gfcd_available = !s7d_gfcd_admit(v->regmap);
 	return 0;
 disable_bus:
 	v->acquired = false;
@@ -796,12 +810,32 @@ static int s7d_vpu_stop_hw(void *data)
 			return ret;
 		}
 	}
+	if (v->gfcd_enabled) {
+		ret = s7d_gfcd_close(v->regmap);
+		if (ret) {
+			v->failed_reg = S7D_GFCD_TOP;
+			return ret;
+		}
+	}
 	/* No fixed sleep authorizes buffer release. Fail and retain on timeout. */
 	ret = readl_poll_timeout(v->regs + ASYNC_STAT * 4, value,
 				(value & ASYNC_IDLE) == ASYNC_IDLE, 10, 50000);
 	if (ret) {
 		v->failed_reg = ASYNC_STAT;
 		return ret;
+	}
+	if (v->gfcd_enabled) {
+		if (v->gfcd_fault || (vpu_read(v, S7D_GFCD_ERROR) & GENMASK(31, 28))) {
+			v->gfcd_fault = true;
+			v->failed_reg = S7D_GFCD_ERROR;
+			return -EIO;
+		}
+		ret = vpu_update(v, OSD_PATH, S7D_GFCD_ROUTE, 0);
+		if (!ret)
+			ret = vpu_update(v, 0x1d7f, 0x1f, v->gfcd_hdr_saved);
+		if (ret)
+			return ret;
+		v->gfcd_enabled = false;
 	}
 	if (v->afbc_enabled) {
 		if (abort_prepare) {
@@ -1290,6 +1324,21 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = program_output(v, state);
 	if (ret)
 		return ret;
+	if (state->buffers.gfcd.fb) {
+		const struct s7d_gfcd_state *gfcd = &state->buffers.gfcd.plan;
+		u32 hdr = gfcd->osd.alpha_config == 0x7fc2 ? 0x18 : 0x19;
+
+		v->gfcd_hdr_saved = vpu_read(v, 0x1d7f) & 0x1f;
+		v->gfcd_enabled = true;
+		v->gfcd_unchanged = false;
+		ret = s7d_gfcd_prepare(v->regmap, gfcd);
+		if (!ret)
+			ret = vpu_update(v, 0x1d7f, 0x1f, hdr);
+		if (!ret)
+			ret = vpu_update(v, OSD_PATH, S7D_GFCD_ROUTE, S7D_GFCD_ROUTE);
+		if (ret)
+			return ret;
+	}
 	if (state->buffers.afbc.fb) {
 		const struct s7d_afbc_state *p = &state->buffers.afbc.plan;
 		u64 generation = s7d_scanout_pending_afbc_generation(&v->scanout);
@@ -1652,6 +1701,14 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	/* Any active video MIF requires a later field before framebuffer retirement. */
 	frame.early = frame.idle && !((vd1 | vd2) & BIT(0)) &&
 		s7d_vpu_afbc_window(before, after, vd1, vd2, v->flip_start, v->flip_end);
+	if (v->gfcd_enabled) {
+		frame.early &= v->gfcd_unchanged;
+		if (vpu_read(v, S7D_GFCD_ERROR) & GENMASK(31, 28)) {
+			v->gfcd_fault = true;
+			v->failed_reg = S7D_GFCD_ERROR;
+			result = S7D_RDMA_FAULT;
+		}
+	}
 	afbc_frame = (struct s7d_afbc_frame) {
 		.sequence = READ_ONCE(v->scanout.vblank_seq) + (vblank ? 1 : 0),
 		.field = frame.field, .vblank = vblank,

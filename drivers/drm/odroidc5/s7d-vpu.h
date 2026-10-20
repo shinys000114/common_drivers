@@ -47,6 +47,11 @@ struct s7d_vpu {
 	bool touched;
 	bool osd2_enable;
 	bool afbc_available;
+	bool gfcd_available;
+	bool gfcd_enabled;
+	bool gfcd_unchanged;
+	bool gfcd_fault;
+	u32 gfcd_hdr_saved;
 	u32 afbc_ready_mask;
 	u32 afbc_surface_mask;
 	u32 afbc_unpack_mask;

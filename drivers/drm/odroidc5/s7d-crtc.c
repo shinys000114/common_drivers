@@ -83,6 +83,7 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->connector_submitted = false;
 	state->primary_dependency = false;
 	state->afbc_unchanged = false;
+	state->gfcd_unchanged = false;
 	state->afbc_decode_only = false;
 	state->afbc_replay_compatible = false;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
@@ -129,6 +130,7 @@ void s7d_crtc_primary_dependency(struct drm_crtc *crtc, struct drm_atomic_state 
 	state = to_s7d_crtc_state(base);
 	state->primary_dependency = true;
 	state->afbc_unchanged = false;
+	state->gfcd_unchanged = false;
 }
 
 static enum drm_mode_status
@@ -210,12 +212,18 @@ static void s7d_crtc_build_update(struct s7d_crtc_state *state)
 {
 	unsigned int count = 0, i;
 
+	if (state->buffers.gfcd.fb && !state->gfcd_unchanged)
+		state->update[count++] = (struct s7d_rdma_entry) {
+			.reg = cpu_to_le32(S7D_GFCD_HEAD),
+			.value = cpu_to_le32(state->buffers.gfcd.plan.head),
+		};
 	for (i = 0; i < S7D_OSD_UPDATE_REG_COUNT; i++) {
 		u32 reg = le32_to_cpu(state->osd.update[i].reg);
 
 		/* Leave the selected AFBC MIF fixed; the other OSD stays linear. */
-		if (state->buffers.afbc.fb) {
-			u32 mask = state->buffers.afbc.plan.surface_mask;
+		if (state->buffers.afbc.fb || state->buffers.gfcd.fb) {
+			u32 mask = state->buffers.gfcd.fb ? BIT(0) :
+				state->buffers.afbc.plan.surface_mask;
 
 			if ((mask == BIT(0) &&
 			     (reg == 0x1a1b || reg == 0x1a14 || reg == 0x1a15 ||
@@ -340,6 +348,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->video_unchanged = false;
 	state->video_address_only = false;
 	state->afbc_unchanged = false;
+	state->gfcd_unchanged = false;
 	state->afbc_decode_only = false;
 	state->afbc_replay_compatible = false;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
@@ -418,11 +427,29 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 					.plan = checked->afbc,
 				};
 			}
+			if (checked->gfcd_valid) {
+				state->buffers.gfcd.fb = ps->fb;
+				state->buffers.gfcd.plan = checked->gfcd;
+			}
 		}
 		state->buffers.fb[slot] = ps->fb;
 	}
 	if (!state->buffers.fb[S7D_PLANE_PRIMARY])
 		return -EINVAL;
+	if (state->buffers.gfcd.fb &&
+	    (state->buffers.afbc.fb || video || video2 ||
+	     s7d_gfcd_check_state(&state->buffers.gfcd.plan)))
+		return -EINVAL;
+	if (old && old->active) {
+		const struct s7d_crtc_state *before = to_s7d_crtc_state(old);
+
+		if (!!before->buffers.gfcd.fb != !!state->buffers.gfcd.fb)
+			base->mode_changed = true;
+		else if (state->buffers.gfcd.fb &&
+			 !s7d_gfcd_same_config(&before->buffers.gfcd.plan,
+					      &state->buffers.gfcd.plan))
+			base->mode_changed = true;
+	}
 	if (state->buffers.afbc.fb &&
 	    (s7d_afbc_check_state(&state->buffers.afbc.plan) ||
 	     (state->buffers.fb[S7D_PLANE_CURSOR] &&
@@ -500,6 +527,14 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		to_s7d_crtc_state(old)->valid &&
 		!drm_atomic_crtc_needs_modeset(base) &&
 		s7d_scanout_afbc_equal(&to_s7d_crtc_state(old)->buffers, &state->buffers);
+	state->gfcd_unchanged = state->buffers.gfcd.fb && state->input_captured &&
+		!state->primary_submitted && !state->connector_submitted &&
+		!state->primary_dependency && old && old->active &&
+		!drm_atomic_crtc_needs_modeset(base) &&
+		to_s7d_crtc_state(old)->buffers.gfcd.fb == state->buffers.gfcd.fb &&
+		to_s7d_crtc_state(old)->buffers.gfcd.plan.head == state->buffers.gfcd.plan.head &&
+		s7d_gfcd_same_config(&to_s7d_crtc_state(old)->buffers.gfcd.plan,
+				    &state->buffers.gfcd.plan);
 	s7d_crtc_build_update(state);
 	state->pixel_rate = (unsigned long)base->adjusted_mode.clock * 1000;
 	state->afbc_decode_only = s7d_crtc_decode_only(state,

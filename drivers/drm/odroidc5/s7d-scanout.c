@@ -41,6 +41,13 @@ static bool afbc_owned(const struct s7d_scanout_buffers *buffers)
 	return buffers->fb[slot] == buffers->afbc.fb;
 }
 
+static bool gfcd_owned(const struct s7d_scanout_buffers *buffers)
+{
+	return buffers->gfcd.fb && !buffers->afbc.fb &&
+		buffers->fb[S7D_PLANE_PRIMARY] == buffers->gfcd.fb &&
+		!s7d_gfcd_check_state(&buffers->gfcd.plan);
+}
+
 bool s7d_scanout_afbc_equal(const struct s7d_scanout_buffers *a,
 			    const struct s7d_scanout_buffers *b)
 {
@@ -178,7 +185,8 @@ int s7d_scanout_begin_initial(struct s7d_scanout *s,
 		return -EINVAL;
 	if ((buffers->video.fb && !video_owned(buffers, &buffers->video, S7D_PLANE_VIDEO)) ||
 	    (buffers->video2.fb && !video_owned(buffers, &buffers->video2, S7D_PLANE_VIDEO2)) ||
-	    (buffers->afbc.fb && !afbc_owned(buffers)))
+	    (buffers->afbc.fb && !afbc_owned(buffers)) ||
+	    (buffers->gfcd.fb && !gfcd_owned(buffers)))
 		return -EINVAL;
 	flush_work(&s->retire_work);
 	spin_lock_irqsave(&s->lock, flags);
@@ -346,7 +354,8 @@ int s7d_scanout_submit_staged(struct s7d_scanout *s,
 	     transaction != S7D_SCANOUT_TRANSACTION_REPLAY) ||
 	    (buffers->video.fb && !video_owned(buffers, &buffers->video, S7D_PLANE_VIDEO)) ||
 	    (buffers->video2.fb && !video_owned(buffers, &buffers->video2, S7D_PLANE_VIDEO2)) ||
-	    (buffers->afbc.fb && (!afbc_owned(buffers) || !stage)))
+	    (buffers->afbc.fb && (!afbc_owned(buffers) || !stage)) ||
+	    (buffers->gfcd.fb && !gfcd_owned(buffers)))
 		return -EINVAL;
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->fault) {
@@ -360,6 +369,9 @@ int s7d_scanout_submit_staged(struct s7d_scanout *s,
 	}
 	/* AFBC entry and exit require a stopped, fully prepared pipeline. */
 	if (!!s->active.afbc.fb != !!buffers->afbc.fb ||
+	    !!s->active.gfcd.fb != !!buffers->gfcd.fb ||
+	    (buffers->gfcd.fb &&
+	     !s7d_gfcd_same_config(&s->active.gfcd.plan, &buffers->gfcd.plan)) ||
 	    (video_unchanged && !s7d_scanout_video_equal(&s->active, buffers)) ||
 	    (video_address_only && !s7d_scanout_video_same_config(&s->active, buffers)) ||
 	    (afbc_unchanged && (!s->active.afbc.generation ||

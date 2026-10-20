@@ -64,6 +64,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	state->osd_valid = false;
 	state->video_valid = false;
 	state->afbc_valid = false;
+	state->gfcd_valid = false;
 	state->layer.afbc = false;
 	state->layer.enabled = false;
 	if (!base->crtc) {
@@ -80,6 +81,9 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		(base->fb->modifier == DRM_FORMAT_MOD_LINEAR ||
 		 base->fb->modifier == S7D_AFBC_MODIFIER) &&
 		(plane->slot == S7D_PLANE_PRIMARY || plane->slot == S7D_PLANE_RGB);
+	if (IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) && plane->slot == S7D_PLANE_PRIMARY &&
+	    base->fb && base->fb->modifier != DRM_FORMAT_MOD_LINEAR)
+		can_scale = false;
 	if (can_scale) {
 		min_scale /= S7D_OSD_SCALER_MAX_UPSCALE;
 		max_scale *= S7D_OSD_SCALER_MAX_DOWNSCALE;
@@ -121,16 +125,26 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		    (base->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE &&
 		     base->pixel_blend_mode != DRM_MODE_BLEND_PREMULTI))
 			return -EINVAL;
-		ret = s7d_afbc_build_state(fb, &base->src, plane->dma_mask,
+		if (IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) && plane->slot == S7D_PLANE_PRIMARY) {
+			ret = s7d_gfcd_build_state(fb, &base->src, plane->dma_mask,
+						 base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI,
+						 &state->gfcd);
+			if (ret)
+				return ret;
+			state->layer.layout = state->gfcd.osd;
+			state->gfcd_valid = true;
+		} else {
+			ret = s7d_afbc_build_state(fb, &base->src, plane->dma_mask,
 					 plane->slot == S7D_PLANE_PRIMARY ? 0 : 1,
 					 &state->afbc);
-		if (!ret && base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
-			ret = s7d_afbc_set_premult(&state->afbc);
-		if (ret)
-			return ret;
-		state->layer.layout = state->afbc.osd;
+			if (!ret && base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
+				ret = s7d_afbc_set_premult(&state->afbc);
+			if (ret)
+				return ret;
+			state->layer.layout = state->afbc.osd;
+			state->afbc_valid = true;
+		}
 		state->layer.afbc = true;
-		state->afbc_valid = true;
 	} else {
 		ret = s7d_osd_build_state(base->fb, &base->src, plane->dma_mask,
 					&state->layer.layout);

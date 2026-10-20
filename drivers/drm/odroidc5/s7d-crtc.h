@@ -15,7 +15,7 @@
 
 #define S7D_CRTC_UPDATE_REG_COUNT (S7D_OSD_UPDATE_REG_COUNT + \
 	2 * (S7D_VIDEO_UPDATE_REG_COUNT + S7D_CSC_MATRIX_REG_COUNT + 1) + \
-	S7D_POSTBLEND_REG_COUNT)
+	S7D_POSTBLEND_REG_COUNT + 1)
 
 struct s7d_crtc_state {
 	struct drm_crtc_state base;
@@ -42,6 +42,7 @@ struct s7d_crtc_state {
 	bool connector_submitted;
 	bool primary_dependency;
 	bool afbc_unchanged;
+	bool gfcd_unchanged;
 	bool afbc_decode_only;
 	bool afbc_replay_compatible;
 };

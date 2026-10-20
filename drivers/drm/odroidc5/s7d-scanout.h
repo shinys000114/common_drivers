@@ -7,6 +7,7 @@
 
 #include "s7d-rdma.h"
 #include "s7d-afbc.h"
+#include "s7d-gfcd.h"
 #include "s7d-csc.h"
 #include "s7d-postblend.h"
 #include "s7d-video-pipeline.h"
@@ -46,6 +47,10 @@ struct s7d_scanout_buffers {
 	struct s7d_scanout_video video2;
 	/* afbc.fb aliases an owned fb[] reference. */
 	struct s7d_scanout_afbc afbc;
+	struct {
+		struct drm_framebuffer *fb;
+		struct s7d_gfcd_state plan;
+	} gfcd;
 	u64 generation;
 };
 

@@ -7,6 +7,7 @@
 
 #include "s7d-osd.h"
 #include "s7d-afbc.h"
+#include "s7d-gfcd.h"
 #include "s7d-osd-pipeline.h"
 #include "s7d-video.h"
 
@@ -23,9 +24,11 @@ struct s7d_plane_state {
 	struct s7d_osd_layer layer;
 	struct s7d_video_state video;
 	struct s7d_afbc_state afbc;
+	struct s7d_gfcd_state gfcd;
 	bool osd_valid;
 	bool video_valid;
 	bool afbc_valid;
+	bool gfcd_valid;
 };
 
 static inline struct s7d_plane_state *

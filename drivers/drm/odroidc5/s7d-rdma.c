@@ -12,6 +12,7 @@
 #include <linux/string.h>
 
 #include "s7d-rdma.h"
+#include "s7d-gfcd.h"
 #include "s7d-csc.h"
 #include "s7d-osd-pipeline.h"
 
@@ -145,6 +146,8 @@ static bool display_write_valid(u32 reg, u32 value)
 	if (mask)
 		return !(value & ~mask);
 	switch (reg) {
+	case S7D_GFCD_HEAD:
+		return IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) && value && !(value & 3);
 	case 0x1a1b:
 	case 0x1a3b:
 		return (value & ~0xcU) == 0x8500 || value == 0x8408 ||
