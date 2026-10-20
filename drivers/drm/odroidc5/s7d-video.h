@@ -4,12 +4,15 @@
 #define __S7D_VIDEO_H
 
 #include <linux/types.h>
+#include <linux/bits.h>
 
 struct drm_framebuffer;
 struct drm_rect;
 
 #define S7D_VIDEO_MAX_WIDTH 4096
 #define S7D_VIDEO_MAX_HEIGHT 2160
+#define S7D_VIDEO_REFLECT_X BIT(0)
+#define S7D_VIDEO_REFLECT_Y BIT(1)
 
 struct s7d_video_state {
 	u32 frame_addr[2];
@@ -17,6 +20,7 @@ struct s7d_video_state {
 	u32 scope_x[2];
 	u32 scope_y[2];
 	u32 format;
+	u8 reflection;
 };
 
 /* GEM DMA layout and even 16.16 crop; errors leave state unchanged. */

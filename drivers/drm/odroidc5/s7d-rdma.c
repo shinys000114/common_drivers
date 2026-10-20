@@ -150,6 +150,7 @@ static bool display_write_valid(u32 reg, u32 value)
 		return IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) && value && !(value & 3);
 	case 0x1a1b:
 	case 0x1a3b:
+		value &= ~GENMASK(29, 28);
 		return (value & ~0xcU) == 0x8500 || value == 0x8408 ||
 		       value == 0x8700 || value == 0x8714;
 	case 0x1a14:
@@ -230,9 +231,11 @@ static bool display_write_valid(u32 reg, u32 value)
 		return value == 0x38400052 || value == 0x38400053 ||
 		       value == 0x38404050 || value == 0x38404051;
 	case 0x4899:
-		return value == 1 || value == 2;
 	case 0x4819:
-		return value <= 2;
+		return !(value & ~GENMASK(5, 0)) && (value & 3) <= 2 &&
+		       (reg != 0x4899 || (value & 3)) &&
+		       !!(value & BIT(2)) == !!(value & BIT(4)) &&
+		       !!(value & BIT(3)) == !!(value & BIT(5));
 	case 0x48a0:
 	case 0x48a1:
 	case 0x4820:

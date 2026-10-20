@@ -71,7 +71,11 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		base->visible = false;
 		return base->fb ? -EINVAL : 0;
 	}
-	if (base->rotation != DRM_MODE_ROTATE_0)
+	if (!(base->rotation & DRM_MODE_ROTATE_0) ||
+	    (base->rotation & ~(DRM_MODE_ROTATE_0 | DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y)))
+		return -EINVAL;
+	if (base->fb && base->fb->modifier != DRM_FORMAT_MOD_LINEAR &&
+	    base->rotation != DRM_MODE_ROTATE_0)
 		return -EINVAL;
 	if (plane->slot == S7D_PLANE_CURSOR && base->fb &&
 	    (base->fb->width > 256 || base->fb->height > 256))
@@ -113,8 +117,12 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 			return -EINVAL;
 		ret = s7d_video_build_state(base->fb, &base->src, plane->dma_mask,
 					    &state->video);
-		if (!ret)
+		if (!ret) {
+			state->video.reflection =
+				(base->rotation & DRM_MODE_REFLECT_X ? S7D_VIDEO_REFLECT_X : 0) |
+				(base->rotation & DRM_MODE_REFLECT_Y ? S7D_VIDEO_REFLECT_Y : 0);
 			state->video_valid = true;
+		}
 		return ret;
 	}
 	if (base->fb->modifier != DRM_FORMAT_MOD_LINEAR) {
@@ -150,6 +158,10 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 					&state->layer.layout);
 		if (ret)
 			return ret;
+		if (base->rotation & DRM_MODE_REFLECT_X)
+			state->layer.layout.block_config |= BIT(28);
+		if (base->rotation & DRM_MODE_REFLECT_Y)
+			state->layer.layout.block_config |= BIT(29);
 		if (base->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE)
 			state->layer.layout.alpha_config =
 				(state->layer.layout.alpha_config & BIT(0)) | 0x7fc0;
@@ -334,6 +346,10 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	if (ret)
 		return ERR_PTR(ret);
 	ret = drm_plane_create_alpha_property(&plane->base);
+	if (ret)
+		return ERR_PTR(ret);
+	ret = drm_plane_create_rotation_property(&plane->base, DRM_MODE_ROTATE_0,
+		DRM_MODE_ROTATE_0 | DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y);
 	if (ret)
 		return ERR_PTR(ret);
 	if (slot == S7D_PLANE_VIDEO || slot == S7D_PLANE_VIDEO2) {

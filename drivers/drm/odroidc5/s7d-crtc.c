@@ -414,6 +414,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 				old_ps->crtc_x != ps->crtc_x || old_ps->crtc_y != ps->crtc_y ||
 				old_ps->crtc_w != ps->crtc_w || old_ps->crtc_h != ps->crtc_h ||
 				old_ps->alpha != ps->alpha ||
+				old_ps->rotation != ps->rotation ||
 				old_ps->pixel_blend_mode != ps->pixel_blend_mode;
 		if (checked->afbc_valid)
 			afbc_position_changed = !old_ps ||

@@ -76,6 +76,7 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 	const struct s7d_osd_state *layout = &layer->layout;
 	const struct drm_rect *dst = &layer->dst;
 	u32 x_start, x_end, y_start, y_end, cpp = 4;
+	u32 block = layout->block_config & ~GENMASK(29, 28);
 	int ret;
 
 	if (!layer->enabled)
@@ -89,15 +90,15 @@ static int check_layer(const struct s7d_osd_layer *layer, u32 width, u32 height,
 		    ((layout->scope_x | layout->scope_y) & 0xffff) ||
 		    layout->stride != ALIGN((layout->scope_x >> 16) + 1, 256) / 4)
 			return -EINVAL;
-	} else if (layout->block_config == 0x8408) {
+	} else if (block == 0x8408) {
 		cpp = 2;
 		if (layout->alpha_config != 0x7fc1)
 			return -EINVAL;
-	} else if (layout->block_config == 0x8700 || layout->block_config == 0x8714) {
+	} else if (block == 0x8700 || block == 0x8714) {
 		cpp = 3;
 		if (layout->alpha_config != 0x7fc0)
 			return -EINVAL;
-	} else if ((layout->block_config & ~0xcU) != 0x8500 ||
+	} else if ((block & ~0xcU) != 0x8500 ||
 		   (layout->alpha_config != 0x7fc0 && layout->alpha_config != BIT(2))) {
 		return -EINVAL;
 	}

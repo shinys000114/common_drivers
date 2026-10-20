@@ -54,7 +54,8 @@ static int check_layout(const struct s7d_video_state *layout,
 	u32 chroma_x, chroma_y;
 	bool packed = layout->format == DRM_FORMAT_UYVY;
 
-	if (!dst || (layout->format != DRM_FORMAT_NV12 &&
+	if (!dst || (layout->reflection & ~(S7D_VIDEO_REFLECT_X | S7D_VIDEO_REFLECT_Y)) ||
+	    (layout->format != DRM_FORMAT_NV12 &&
 		     layout->format != DRM_FORMAT_NV21 && !packed) ||
 	    !layout->stride[0] || layout->stride[0] > 0x1fff ||
 	    (packed ? layout->stride[1] || layout->frame_addr[1] :
@@ -157,7 +158,10 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 	next.update[5] = (struct s7d_rdma_entry)REG(VD1_LUMA_Y0, layout->scope_y[0]);
 	next.update[6] = (struct s7d_rdma_entry)REG(VD1_CHROMA_X0, layout->scope_x[1]);
 	next.update[7] = (struct s7d_rdma_entry)REG(VD1_CHROMA_Y0, layout->scope_y[1]);
-	/* Clear inherited mirror/reverse fields together with selecting NV order. */
+	if (layout->reflection & S7D_VIDEO_REFLECT_X)
+		color |= BIT(2) | BIT(4);
+	if (layout->reflection & S7D_VIDEO_REFLECT_Y)
+		color |= BIT(3) | BIT(5);
 	next.update[8] = (struct s7d_rdma_entry)REG(VD1_GEN_REG2, color);
 	/* Vendor width4096 uses FMT_W bit28; qualify that PDF conflict on board. */
 	next.update[9] = (struct s7d_rdma_entry)REG(VD1_FMT_W, (width << 16) | (width >> 1));
