@@ -266,14 +266,14 @@ int s7d_hdmi_ddc_register(struct device *dev, struct s7d_hdmi_ddc *ddc,
 
 	ddc->core = core;
 	mutex_init(&ddc->lock);
-	/* Vendor default 75 kHz profile with the parent's 200 MHz basic clocks. */
+	/* Match the vendor EDID path's 50 kHz profile at a 200 MHz parent. */
 	ret = s7d_hdmi_update_checked(core, DDC_CYP, 0x3, 2);
 	if (ret)
 		return ret;
 	ret = s7d_hdmi_update_checked(core, DDC_DUTY, 0x3, 0);
 	if (ret)
 		return ret;
-	ret = s7d_hdmi_update_checked(core, DDC_DELAY, 0xff, 0x26);
+	ret = s7d_hdmi_update_checked(core, DDC_DELAY, 0xff, 0x3d);
 	if (ret)
 		return ret;
 	ret = ddc_recover(ddc);

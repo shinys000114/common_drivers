@@ -129,7 +129,7 @@ static struct s7d_hdmi_state *to_s7d_hdmi_state(struct drm_bridge_state *state)
 /* Fixed-PLL/SCMI integer recalc can report 199999997 for nominal 200 MHz. */
 static int s7d_hdmi_ddc_clock_check(unsigned long rate)
 {
-	/* 100 ppm still keeps the 75 kHz DDC profile below the 100 kHz limit. */
+	/* 100 ppm still keeps the 50 kHz DDC profile below the 100 kHz limit. */
 	if (!rate)
 		return -EPROBE_DEFER;
 	return rate >= 199980000 && rate <= 200020000 ? 0 : -ERANGE;
@@ -641,13 +641,27 @@ static const struct drm_edid *s7d_hdmi_get_edid(struct drm_bridge *bridge,
 				    struct drm_connector *connector)
 {
 	struct s7d_hdmi *h = to_s7d_hdmi(bridge);
+	const struct drm_edid *edid;
+	unsigned int attempt;
 
-	mutex_lock(&h->lock);
-	h->edid_generation = h->sink_generation;
-	mutex_unlock(&h->lock);
-	if (s7d_hdmi_detect(bridge) != connector_status_connected)
-		return NULL;
-	return drm_edid_read_ddc(connector, &h->ddc.adapter);
+	for (attempt = 0; attempt < 2; attempt++) {
+		/* Some sinks assert HPD before their EDID responder is ready. */
+		if (attempt)
+			msleep(500);
+		mutex_lock(&h->lock);
+		if (h->stopping) {
+			mutex_unlock(&h->lock);
+			return NULL;
+		}
+		h->edid_generation = h->sink_generation;
+		mutex_unlock(&h->lock);
+		if (s7d_hdmi_detect(bridge) != connector_status_connected)
+			return NULL;
+		edid = drm_edid_read_ddc(connector, &h->ddc.adapter);
+		if (edid)
+			return edid;
+	}
+	return NULL;
 }
 
 static enum drm_mode_status s7d_hdmi_mode_valid(struct drm_bridge *bridge,
