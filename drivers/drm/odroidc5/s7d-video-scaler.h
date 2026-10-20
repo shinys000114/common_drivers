@@ -44,6 +44,7 @@ int s7d_video_scaler_check_mode(const struct s7d_video_scaler_state *state,
 			      u32 width, u32 height, unsigned long pixel_rate,
 			      unsigned long core_rate);
 int s7d_video_osd_scaler_check_mode(const struct s7d_video_scaler_state *video,
+				    const struct s7d_video_scaler_state *video2,
 				    const struct s7d_osd_scaler_state *osd,
 				    u32 htotal, unsigned long pixel_rate,
 				    unsigned long core_rate);

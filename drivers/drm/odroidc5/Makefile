@@ -33,4 +33,5 @@ s7d-display-y := \
 	s7d-filter.o \
 	s7d-osd-scaler.o \
 	s7d-video-scaler.o \
+	s7d-video2-scaler.o \
 	s7d-gfcd.o

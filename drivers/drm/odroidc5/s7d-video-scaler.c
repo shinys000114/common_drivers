@@ -9,6 +9,7 @@
 
 #include "s7d-video-scaler.h"
 #include "s7d-osd-scaler.h"
+#include "s7d-video2-scaler.h"
 
 #define SET(r, m, v) { .reg = (r), .mask = (m), .value = (v) }
 
@@ -270,29 +271,44 @@ static u64 scaler_clock_load(u32 input_w, u32 input_h, u32 output_w, u32 output_
 }
 
 int s7d_video_osd_scaler_check_mode(const struct s7d_video_scaler_state *video,
+				    const struct s7d_video_scaler_state *video2,
 				    const struct s7d_osd_scaler_state *osd,
 				    u32 htotal, unsigned long pixel_rate,
 				    unsigned long core_rate)
 {
 	struct s7d_video_scaler_state checked;
-	u64 required;
+	struct s7d_video2_pps_state pps;
+	u64 required = 0;
 	unsigned int index;
+	bool mixed_safa;
 	int ret;
 
-	if (!video || !osd || !htotal || !pixel_rate || !core_rate)
+	if (!video || !video2 || !osd || !htotal || !pixel_rate || !core_rate)
 		return -EINVAL;
-	if (!video->enabled || (!osd[0].enabled && !osd[1].enabled))
+	mixed_safa = video->enabled && (osd[0].enabled || osd[1].enabled);
+	if (!mixed_safa && !video2->enabled)
 		return 0;
-	if (htotal > 8192 || pixel_rate > 148500000)
+	if (htotal > 8192 || pixel_rate > 594000000 ||
+	    (mixed_safa && pixel_rate > 148500000))
 		return -ERANGE;
-	ret = s7d_video_scaler_build(video->src_width, video->src_height,
-		video->dst_width, video->dst_height, &checked);
-	if (ret || !s7d_video_scaler_same_config(video, &checked))
-		return -EINVAL;
-	/* Conservative composition budget; the scaler engines remain independent. */
-	required = max_t(u64, (u64)pixel_rate * 2,
-		scaler_clock_load(video->src_width, video->src_height,
-			video->dst_width, video->dst_height, htotal, pixel_rate));
+	if (video->enabled) {
+		ret = s7d_video_scaler_build(video->src_width, video->src_height,
+			video->dst_width, video->dst_height, &checked);
+		if (ret || !s7d_video_scaler_same_config(video, &checked))
+			return -EINVAL;
+		required = scaler_clock_load(video->src_width, video->src_height,
+			video->dst_width, video->dst_height, htotal, pixel_rate);
+		if (mixed_safa)
+			required = max_t(u64, (u64)pixel_rate * 2, required);
+	}
+	if (video2->enabled) {
+		ret = s7d_video2_scaler_build(video2->src_width, video2->src_height,
+			video2->dst_width, video2->dst_height, &pps);
+		if (ret)
+			return ret;
+		required += scaler_clock_load(video2->src_width, video2->src_height,
+			video2->dst_width, video2->dst_height, htotal, pixel_rate);
+	}
 	for (index = 0; index < 2; index++) {
 		const struct s7d_osd_scaler_state *s = &osd[index];
 		struct s7d_osd_scaler_state checked_osd;
@@ -308,7 +324,7 @@ int s7d_video_osd_scaler_check_mode(const struct s7d_video_scaler_state *video,
 		required += scaler_clock_load(input_w, input_h,
 			s->output_h + 1, s->output_v + 1, htotal, pixel_rate);
 	}
-	return required > core_rate ? -ERANGE : 0;
+	return max_t(u64, pixel_rate, required) > core_rate ? -ERANGE : 0;
 }
 
 bool s7d_video_scaler_same_config(const struct s7d_video_scaler_state *a,

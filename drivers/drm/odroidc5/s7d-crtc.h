@@ -25,6 +25,7 @@ struct s7d_crtc_state {
 	struct s7d_osd_pipeline_state osd;
 	struct s7d_video_pipeline_state video;
 	struct s7d_video_pipeline_state video2;
+	struct s7d_video2_pps_state video2_pps;
 	struct s7d_csc_state csc;
 	struct s7d_csc_state csc2;
 	struct s7d_postblend_state postblend;

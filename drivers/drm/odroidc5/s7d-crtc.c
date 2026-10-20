@@ -172,10 +172,12 @@ static void s7d_crtc_check_video_update(struct s7d_crtc_state *state,
 		&state->video, &state->csc, &state->postblend);
 	s7d_crtc_snapshot_video(&state->buffers.video2, state->buffers.fb[S7D_PLANE_VIDEO2],
 		&state->video2, &state->csc2, &state->postblend);
-	/* VD2 PPS presence and input dimensions are prepared while stopped. */
+	/* VD2 coefficients and geometry are prepared while stopped. */
 	if (old && old->valid && old->base.active &&
 	    (state->video2.scaler.src_width != old->video2.scaler.src_width ||
-	     state->video2.scaler.src_height != old->video2.scaler.src_height))
+	     state->video2.scaler.src_height != old->video2.scaler.src_height ||
+	     state->video2.scaler.dst_width != old->video2.scaler.dst_width ||
+	     state->video2.scaler.dst_height != old->video2.scaler.dst_height))
 		state->base.mode_changed = true;
 	if (old && old->valid && old->base.active &&
 	    ((state->buffers.afbc.fb && state->buffers.video.fb) ||
@@ -365,6 +367,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->buffers = (struct s7d_scanout_buffers) {0};
 	state->resources = (struct s7d_display_resources) {0};
 	state->bandwidth = (struct s7d_bandwidth_state) {0};
+	state->video2_pps = (struct s7d_video2_pps_state) {0};
 	if (!base->active)
 		return 0;
 	if (!base->enable || base->vrr_enabled || base->self_refresh_active ||
@@ -500,6 +503,13 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		video2 ? &video2_dst : NULL, &state->video2);
 	if (ret)
 		return ret;
+	if (video2) {
+		ret = s7d_video2_scaler_build(state->video2.scaler.src_width,
+			state->video2.scaler.src_height, state->video2.scaler.dst_width,
+			state->video2.scaler.dst_height, &state->video2_pps);
+		if (ret)
+			return ret;
+	}
 	/* Entry, owner, layout and alpha-route changes require stopped preparation. */
 	if (old && old->active) {
 		const struct s7d_scanout_afbc *before = &to_s7d_crtc_state(old)->buffers.afbc;
@@ -522,7 +532,8 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->resources.scalers =
 		(state->osd.scalers[0].enabled ? BIT(S7D_INPUT_OSD1) : 0) |
 		(state->osd.scalers[1].enabled ? BIT(S7D_INPUT_OSD2) : 0) |
-		(state->video.scaler.enabled ? BIT(S7D_INPUT_VD1) : 0);
+		(state->video.scaler.enabled ? BIT(S7D_INPUT_VD1) : 0) |
+		(state->video2.scaler.enabled ? BIT(S7D_INPUT_VD2) : 0);
 	ret = s7d_display_check_resources(&state->resources);
 	if (ret)
 		return ret;

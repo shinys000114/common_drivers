@@ -95,6 +95,9 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	} else if (plane->slot == S7D_PLANE_VIDEO) {
 		min_scale /= S7D_VIDEO_SCALER_MAX_UPSCALE;
 		max_scale *= S7D_VIDEO_SCALER_MAX_DOWNSCALE;
+	} else if (plane->slot == S7D_PLANE_VIDEO2) {
+		min_scale /= S7D_VIDEO2_SCALER_MAX_UPSCALE;
+		max_scale = max_scale * S7D_VIDEO2_SCALER_MAX_DOWNSCALE - 1;
 	}
 	scaled = base->src_w != ((u64)base->crtc_w << 16) ||
 		base->src_h != ((u64)base->crtc_h << 16);
@@ -104,7 +107,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 						 plane->slot != S7D_PLANE_PRIMARY, false);
 	if (ret || !base->visible)
 		return ret;
-	if (scaled && plane->slot != S7D_PLANE_VIDEO &&
+	if (scaled && plane->slot != S7D_PLANE_VIDEO && plane->slot != S7D_PLANE_VIDEO2 &&
 	    (base->src.x1 != base->src_x || base->src.y1 != base->src_y ||
 	     drm_rect_width(&base->src) != base->src_w ||
 	     drm_rect_height(&base->src) != base->src_h ||

@@ -21,6 +21,7 @@
 #include <dt-bindings/reset/amlogic,s7d-vpu-reset.h>
 
 #include "s7d-vpu.h"
+#include "s7d-filter.h"
 #include "s7d-vpp.h"
 #include "s7d-plane.h"
 
@@ -591,9 +592,12 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 		state->pixel_rate, clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
-	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler, state->osd.scalers,
-		state->base.adjusted_mode.htotal, state->pixel_rate,
-		clk_get_rate(v->clocks[0].clk));
+	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler,
+					      &state->video2.scaler,
+					      state->osd.scalers,
+					      state->base.adjusted_mode.htotal,
+					      state->pixel_rate,
+					      clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
 	/*
@@ -1084,30 +1088,33 @@ static int program_video_scaler(struct s7d_vpu *v,
 }
 
 static int program_video2_pps(struct s7d_vpu *v,
-			      const struct s7d_video_pipeline_state *video)
+			      const struct s7d_video_pipeline_state *video,
+			      const struct s7d_video2_pps_state *pps)
 {
-	struct s7d_video2_pps_state pps;
-	unsigned int i;
+	unsigned int i, direction, phase;
 	int ret;
 
 	if (!video->update_count)
 		return 0;
-	ret = s7d_video_build_vd2_pps(video->scaler.src_width,
-				    video->scaler.src_height, &pps);
-	if (ret)
-		return ret;
 	/* Fetch and VENC are stopped; close the PPS before changing geometry. */
-	ret = vpu_update(v, pps.control.reg, pps.control.mask, 0);
+	ret = vpu_update(v, pps->control.reg, pps->control.mask, 0);
 	if (ret)
 		return ret;
 	for (i = 0; i < S7D_VIDEO2_PPS_SETUP_REG_COUNT; i++) {
-		const struct s7d_video_reg_setting *s = &pps.setup[i];
+		const struct s7d_video_scaler_reg *s = &pps->setup[i];
 
 		ret = vpu_update(v, s->reg, s->mask, s->value);
 		if (ret)
 			return ret;
 	}
-	return vpu_update(v, pps.control.reg, pps.control.mask, pps.control.value);
+	for (direction = 0; direction < 2; direction++) {
+		if (!pps->coefficients[direction])
+			continue;
+		writel(direction << 8, v->regs + 0x3943 * 4);
+		for (phase = 0; phase < S7D_FILTER_PHASES; phase++)
+			writel(pps->coefficients[direction][phase], v->regs + 0x3944 * 4);
+	}
+	return vpu_update(v, pps->control.reg, pps->control.mask, pps->control.value);
 }
 
 static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
@@ -1139,7 +1146,7 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 	ret = program_video_scaler(v, &state->video.scaler);
 	if (ret)
 		return ret;
-	ret = program_video2_pps(v, &state->video2);
+	ret = program_video2_pps(v, &state->video2, &state->video2_pps);
 	if (ret)
 		return ret;
 	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {
@@ -1333,9 +1340,12 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 		state->pixel_rate, clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
-	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler, state->osd.scalers,
-		state->base.adjusted_mode.htotal, state->pixel_rate,
-		clk_get_rate(v->clocks[0].clk));
+	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler,
+					      &state->video2.scaler,
+					      state->osd.scalers,
+					      state->base.adjusted_mode.htotal,
+					      state->pixel_rate,
+					      clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
 	ret = s7d_vpu_prepare_pixel(v, state->pixel_rate);

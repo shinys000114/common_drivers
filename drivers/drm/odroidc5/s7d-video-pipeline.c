@@ -86,10 +86,10 @@ static int check_layout(const struct s7d_video_state *layout,
 	return 0;
 }
 
-int s7d_video_build_pipeline(const struct s7d_video_state *layout,
-			     const struct drm_rect *dst,
-			     unsigned int hold_lines,
-			     struct s7d_video_pipeline_state *out)
+static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
+					   const struct drm_rect *dst,
+					   unsigned int hold_lines, bool vd2,
+					   struct s7d_video_pipeline_state *out)
 {
 	/*
 	 * Sources: video_hw.c S7D selection, vd1_set_dcu(), vd_set_blk_mode(),
@@ -137,9 +137,16 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 	}
 	if (check_layout(layout, dst, &width, &height))
 		return -EINVAL;
-	if (s7d_video_scaler_build(width, height, drm_rect_width(dst),
-				   drm_rect_height(dst), &next.scaler))
+	if (vd2) {
+		next.scaler.src_width = width;
+		next.scaler.src_height = height;
+		next.scaler.dst_width = drm_rect_width(dst);
+		next.scaler.dst_height = drm_rect_height(dst);
+		next.scaler.enabled = width != next.scaler.dst_width || height != next.scaler.dst_height;
+	} else if (s7d_video_scaler_build(width, height, drm_rect_width(dst),
+					  drm_rect_height(dst), &next.scaler)) {
 		return -EINVAL;
+	}
 	if (layout->format == DRM_FORMAT_UYVY) {
 		next.setup[0].value = (next.setup[0].value & ~BIT(1)) | BIT(14);
 		next.control.value = next.setup[0].value;
@@ -173,6 +180,13 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 	return 0;
 }
 
+int s7d_video_build_pipeline(const struct s7d_video_state *layout,
+			     const struct drm_rect *dst, unsigned int hold_lines,
+			     struct s7d_video_pipeline_state *out)
+{
+	return s7d_video_build_pipeline_common(layout, dst, hold_lines, false, out);
+}
+
 int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
 			       const struct drm_rect *dst,
 			       struct s7d_video_pipeline_state *out)
@@ -185,10 +199,10 @@ int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
 		return -EINVAL;
 	if (layout && layout->format == DRM_FORMAT_UYVY)
 		return -EINVAL;
-	ret = s7d_video_build_pipeline(layout, dst, 8, &next);
+	ret = s7d_video_build_pipeline_common(layout, dst, 8, true, &next);
 	if (ret)
 		return ret;
-	if (layout && (next.scaler.enabled || next.scaler.src_width > 2048 ||
+	if (layout && (next.scaler.src_width > 2048 ||
 		       next.scaler.src_height > 1080))
 		return -EINVAL;
 	/* S7D selects the same MIF layout at 0x4880 and a separate VD2 PPS. */
@@ -208,60 +222,6 @@ int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
 			(next.scaler.src_height << 16) | next.scaler.src_width);
 		next.update_count = S7D_VIDEO2_UPDATE_REG_COUNT;
 	}
-	*out = next;
-	return 0;
-}
-
-int s7d_video_build_vd2_pps(u32 width, u32 height,
-			  struct s7d_video2_pps_state *out)
-{
-	/* Unfiltered 1:1 PPS; prepare all geometry before enabling its output. */
-	struct s7d_video2_pps_state next = {
-		.setup = {
-			SET(0x395c, GENMASK(15, 0), 0),
-			SET(0x3945, 0x1fff1fff, 0),
-			SET(0x3946, 0x1fff1fff, 0),
-			SET(0x3947, GENMASK(12, 0), 0),
-			SET(0x3948, GENMASK(27, 0), BIT(24)),
-			SET(0x3949, GENMASK(24, 0), 0),
-			SET(0x394a, GENMASK(24, 0), 0),
-			SET(0x394b, GENMASK(24, 0), 0),
-			SET(0x394c, GENMASK(24, 0), 0),
-			/* Preserve the read-only progressive/interlace status bit. */
-			SET(0x394d, GENMASK(18, 17) | GENMASK(15, 13) |
-			    GENMASK(11, 8) | GENMASK(7, 5) | GENMASK(3, 0), 0x2424),
-			SET(0x394e, U32_MAX, 0),
-			SET(0x394f, 0x1fff1fff, 0),
-			SET(0x3950, 0x1fff1fff, 0),
-			SET(0x3951, GENMASK(12, 0), 0),
-			SET(0x3952, GENMASK(27, 0), BIT(24)),
-			SET(0x3953, GENMASK(24, 0), 0),
-			SET(0x3954, GENMASK(24, 0), 0),
-			SET(0x3955, GENMASK(24, 0), 0),
-			SET(0x3956, GENMASK(24, 0), 0),
-			SET(0x3957, GENMASK(23, 0), (3 << 20) | (8 << 16)),
-			SET(0x395a, GENMASK(27, 0), (3 << 20) | (8 << 16)),
-			SET(0x395b, 0xff77ff77, 0),
-			SET(0x395e, GENMASK(10, 0), (2 << 7) | (2 << 4)),
-			SET(0x3959, GENMASK(27, 16) | GENMASK(11, 1), 0x0fff0200),
-			SET(0x1df0, 0x1fff1fff, 0),
-		},
-		.control = SET(0x3958, BIT(24) | GENMASK(22, 15) | BIT(12) |
-			       GENMASK(10, 8) | GENMASK(5, 4) | GENMASK(2, 0),
-			       BIT(24) | BIT(16) | BIT(15) | 4),
-	};
-	u32 h_end, v_end;
-
-	if (!out || !width || !height || width > 2048 || height > 1080 ||
-	    ((width | height) & 1))
-		return -EINVAL;
-	h_end = width - 1;
-	v_end = height - 1;
-	next.setup[2].value = (v_end << 16) | v_end;
-	next.setup[3].value = v_end;
-	next.setup[12].value = (h_end << 16) | h_end;
-	next.setup[13].value = h_end;
-	next.setup[24].value = (height << 16) | width;
 	*out = next;
 	return 0;
 }

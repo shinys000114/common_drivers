@@ -27,7 +27,7 @@ int s7d_display_check_resources(const struct s7d_display_resources *r)
 {
 	if ((r->inputs & ~GENMASK(S7D_INPUT_COUNT - 1, 0)) ||
 	    ((r->afbc | r->gfcd | r->scalers) & ~r->inputs) ||
-	    (r->afbc & ~S7D_OSD_INPUTS) || (r->scalers & BIT(S7D_INPUT_VD2)))
+	    (r->afbc & ~S7D_OSD_INPUTS))
 		return -EINVAL;
 	/* Scanout retains one compressed plan. */
 	if (hweight8(r->afbc) > 1)
