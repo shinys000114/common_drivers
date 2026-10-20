@@ -10,6 +10,7 @@
 #define S7D_DISPLAY_MAX_WIDTH 4096
 #define S7D_DISPLAY_MAX_HEIGHT 2160
 #define S7D_DISPLAY_MAX_TOTAL 8192
+#define S7D_DISPLAY_MAX_ZPOS 4
 /* Pixel clocks use drm_display_mode's kHz units. */
 #define S7D_DISPLAY_MIN_CLOCK 25175
 #define S7D_DISPLAY_MAX_CLOCK 594000

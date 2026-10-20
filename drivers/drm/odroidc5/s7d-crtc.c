@@ -339,6 +339,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	struct s7d_crtc *c = to_s7d_crtc(crtc);
 	struct drm_plane *plane;
 	struct s7d_osd_layer layers[2] = {0};
+	u32 zpos[S7D_INPUT_COUNT] = {0};
 	const struct s7d_plane_state *video = NULL, *video2 = NULL;
 	struct drm_rect video_dst, video2_dst;
 	enum drm_color_encoding encoding = DRM_COLOR_YCBCR_BT709;
@@ -398,6 +399,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 			checked->afbc_valid ? S7D_FETCH_AFBC : S7D_FETCH_LINEAR);
 		if (ret)
 			return ret;
+		zpos[inputs[slot]] = ps->normalized_zpos;
 		if (slot == S7D_PLANE_PRIMARY)
 			primary_changed = !old_ps || old_ps->fb != ps->fb ||
 				old_ps->src_x != ps->src_x || old_ps->src_y != ps->src_y ||
@@ -524,9 +526,10 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (ret)
 		return ret;
 	ret = s7d_postblend_build_state(base->adjusted_mode.hdisplay,
-		base->adjusted_mode.vdisplay, video ? &video_dst : NULL,
+		base->adjusted_mode.vdisplay, &state->resources, zpos,
+		video ? &video_dst : NULL,
 		state->video.scaler.src_width, state->video.scaler.src_height,
-		video2 ? &video2_dst : NULL, layers[1].enabled, &state->postblend);
+		video2 ? &video2_dst : NULL, &state->postblend);
 	if (ret)
 		return ret;
 	s7d_crtc_check_video_update(state, old ? to_s7d_crtc_state(old) : NULL);

@@ -213,6 +213,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	drm->mode_config.max_height = S7D_DISPLAY_MAX_HEIGHT;
 	drm->mode_config.cursor_width = 256;
 	drm->mode_config.cursor_height = 256;
+	drm->mode_config.normalize_zpos = true;
 	ret = s7d_vpu_init(pdev, &display->vpu, &link);
 	if (ret)
 		return dev_err_probe(dev, ret, "VPU resources\n");

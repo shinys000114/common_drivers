@@ -330,7 +330,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		return ERR_CAST(plane);
 	plane->dma_mask = dma_mask;
 	plane->slot = slot;
-	ret = drm_plane_create_zpos_immutable_property(&plane->base, zpos);
+	ret = drm_plane_create_zpos_property(&plane->base, zpos, 0, S7D_DISPLAY_MAX_ZPOS);
 	if (ret)
 		return ERR_PTR(ret);
 	if (slot == S7D_PLANE_VIDEO || slot == S7D_PLANE_VIDEO2) {
