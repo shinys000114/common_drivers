@@ -1707,6 +1707,24 @@ static void s7d_vpu_afbc_report_first(struct s7d_vpu *v, bool restart,
 		v->afbc.pending.header_addr, before, after, fifo, fifo2, vd1, arbiter);
 }
 
+static bool s7d_vpu_gfcd_latched(struct s7d_vpu *v, u8 field)
+{
+	struct s7d_scanout *s = &v->scanout;
+	unsigned long flags;
+	u32 head = 0, info;
+
+	lockdep_assert_held(&v->frame_lock);
+	spin_lock_irqsave(&s->lock, flags);
+	if (!s->fault && s->active.gfcd.fb && s->pending.gfcd.fb &&
+	    (s->phase == S7D_SCANOUT_RDMA || s->phase == S7D_SCANOUT_VBLANK))
+		head = s->pending.gfcd.plan.head;
+	spin_unlock_irqrestore(&s->lock, flags);
+	if (!head || vpu_read(v, S7D_GFCD_HEAD) != head)
+		return false;
+	info = vpu_read(v, ENCP_INFO_READ);
+	return (info >> 29) == field && ((info >> 16) & 0x1fff) < v->flip_end;
+}
+
 static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 			      enum s7d_rdma_result result, u64 cookie)
 {
@@ -1741,7 +1759,8 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	frame.early = frame.idle && !((vd1 | vd2) & BIT(0)) &&
 		s7d_vpu_afbc_window(before, after, vd1, vd2, v->flip_start, v->flip_end);
 	if (v->gfcd_enabled) {
-		frame.early &= v->gfcd_unchanged;
+		frame.early = frame.early &&
+			(v->gfcd_unchanged || s7d_vpu_gfcd_latched(v, frame.field));
 		if (vpu_read(v, S7D_GFCD_ERROR) & GENMASK(31, 28)) {
 			v->gfcd_fault = true;
 			v->failed_reg = S7D_GFCD_ERROR;
