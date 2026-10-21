@@ -40,17 +40,7 @@ const struct s7d_afbc_surface *s7d_afbc_surface_get(u32 mask)
 	return NULL;
 }
 
-struct s7d_afbc_layout {
-	u32 aligned_width;
-	u32 aligned_height;
-	u32 buffer_height;
-	u32 pitch;
-	u32 header_size;
-	u32 body_size;
-	u32 size;
-};
-
-static int afbc_layout(u32 width, u32 height, struct s7d_afbc_layout *layout)
+static int afbc_layout(u32 width, u32 height, struct s7d_afbc_buffer *layout)
 {
 	u64 n_blocks, header_size, body_size, size;
 	u32 aligned_width, aligned_height, pitch;
@@ -68,7 +58,7 @@ static int afbc_layout(u32 width, u32 height, struct s7d_afbc_layout *layout)
 	body_size = n_blocks * 1024;
 	if (check_add_overflow(header_size, body_size, &size) || size > U32_MAX)
 		return -ERANGE;
-	*layout = (struct s7d_afbc_layout) {
+	*layout = (struct s7d_afbc_buffer) {
 		.aligned_width = aligned_width,
 		.aligned_height = aligned_height,
 		.buffer_height = ALIGN(height, 8),
@@ -84,7 +74,7 @@ int s7d_afbc_check_state(const struct s7d_afbc_state *p)
 {
 	const struct s7d_afbc_surface *s = p ?
 		s7d_afbc_surface_get(p->surface_mask) : NULL;
-	struct s7d_afbc_layout layout;
+	struct s7d_afbc_buffer layout;
 	u32 settings[11], width, height, unpack_mask, unpack_value;
 	unsigned int i;
 
@@ -134,22 +124,22 @@ int s7d_afbc_check_state(const struct s7d_afbc_state *p)
 	return 0;
 }
 
-int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
-			 const struct drm_rect *src, u64 dma_mask,
-			 unsigned int surface, struct s7d_afbc_state *out)
+int s7d_afbc_build_buffer(const struct drm_afbc_framebuffer *afbc_fb,
+			  const struct drm_rect *src, u64 dma_mask,
+			  struct s7d_afbc_buffer *out)
 {
 	const struct drm_gem_dma_object *obj;
 	const struct drm_framebuffer *fb;
-	const struct s7d_afbc_surface *s;
-	struct s7d_afbc_layout layout;
+	struct s7d_afbc_buffer layout;
 	u64 header_addr, dma_end;
 	int ret;
 
-	if (!afbc_fb || !src || !out || surface > 1)
+	if (!afbc_fb || !src || !out)
 		return -EINVAL;
-	s = s7d_afbc_surface_get(BIT(surface));
 	fb = &afbc_fb->base;
-	if (!fb->format || fb->format->format != DRM_FORMAT_ABGR8888 ||
+	if (!fb->format ||
+	    (fb->format->format != DRM_FORMAT_ABGR8888 &&
+	     fb->format->format != DRM_FORMAT_XBGR8888) ||
 	    fb->format->num_planes != 1 || !fb->obj[0] ||
 	    fb->modifier != S7D_AFBC_MODIFIER ||
 	    fb->flags != DRM_MODE_FB_MODIFIERS ||
@@ -175,6 +165,31 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 	if (!IS_ALIGNED(header_addr, 64) || dma_end > dma_mask ||
 	    dma_end > GENMASK_ULL(35, 0))
 		return -ERANGE;
+	layout.header_addr = header_addr;
+	layout.last_byte_addr = dma_end;
+	*out = layout;
+	return 0;
+}
+
+int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
+			 const struct drm_rect *src, u64 dma_mask,
+			 unsigned int surface, struct s7d_afbc_state *out)
+{
+	const struct drm_framebuffer *fb;
+	const struct s7d_afbc_surface *s;
+	struct s7d_afbc_buffer layout;
+	u64 header_addr;
+	int ret;
+
+	if (!afbc_fb || !out || surface > 1 || !afbc_fb->base.format ||
+	    afbc_fb->base.format->format != DRM_FORMAT_ABGR8888)
+		return -EINVAL;
+	ret = s7d_afbc_build_buffer(afbc_fb, src, dma_mask, &layout);
+	if (ret)
+		return ret;
+	s = s7d_afbc_surface_get(BIT(surface));
+	fb = &afbc_fb->base;
+	header_addr = layout.header_addr;
 
 	*out = (struct s7d_afbc_state) {
 		.osd = {
@@ -212,7 +227,7 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 		},
 		.header_addr = header_addr,
 		.body_addr = header_addr + layout.header_size,
-		.last_byte_addr = dma_end,
+		.last_byte_addr = layout.last_byte_addr,
 		.header_size = layout.header_size,
 		.body_size = layout.body_size,
 		.afbc_size = layout.size,

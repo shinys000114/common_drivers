@@ -211,7 +211,10 @@ static bool s7d_rgb_format_mod_supported(struct drm_plane *plane,
 					 u32 format, u64 modifier)
 {
 	return modifier == DRM_FORMAT_MOD_LINEAR ||
-		(format == DRM_FORMAT_ABGR8888 && modifier == S7D_AFBC_MODIFIER);
+		(modifier == S7D_AFBC_MODIFIER &&
+		 (format == DRM_FORMAT_ABGR8888 ||
+		  (IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) &&
+		   plane->type == DRM_PLANE_TYPE_PRIMARY && format == DRM_FORMAT_XBGR8888)));
 }
 
 static const struct drm_plane_funcs s7d_plane_funcs = {

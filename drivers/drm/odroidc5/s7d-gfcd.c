@@ -78,25 +78,33 @@ int s7d_gfcd_build_state(const struct drm_afbc_framebuffer *fb,
 			 const struct drm_rect *source, u64 dma_mask,
 			 bool premult, struct s7d_gfcd_state *state)
 {
-	struct s7d_afbc_state afbc;
+	struct s7d_afbc_buffer buffer;
 	struct s7d_gfcd_state candidate;
 	u32 width, height;
 	int ret;
 
 	if (!state)
 		return -EINVAL;
-	ret = s7d_afbc_build_state(fb, source, dma_mask, 0, &afbc);
+	ret = s7d_afbc_build_buffer(fb, source, dma_mask, &buffer);
 	if (ret)
 		return ret;
 	width = fb->base.width;
 	height = fb->base.height;
 	candidate = (struct s7d_gfcd_state) {
-		.osd = afbc.osd,
-		.head = afbc.header_addr >> 4,
+		.osd = {
+			.block_config = BIT(30) | (5 << 8),
+			.frame_addr = 0x00100000,
+			.stride = buffer.pitch >> 4,
+			.scope_x = (width - 1) << 16,
+			.scope_y = (height - 1) << 16,
+			.alpha_config = 0x7fc2,
+		},
+		.head = buffer.header_addr >> 4,
 		.frame_end = (height - 1) << 16 | (width - 1),
 		.frame_size = width << 16 | height,
 	};
-	if (premult)
+	/* X is an encoded fourth component, never pixel alpha. */
+	if (premult && fb->base.format->format == DRM_FORMAT_ABGR8888)
 		candidate.osd.alpha_config = BIT(2) | BIT(1);
 	ret = s7d_gfcd_check_state(&candidate);
 	if (!ret)

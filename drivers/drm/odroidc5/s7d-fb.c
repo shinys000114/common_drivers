@@ -29,14 +29,16 @@ s7d_fb_create(struct drm_device *dev, struct drm_file *file,
 	      const struct drm_mode_fb_cmd2 *cmd)
 {
 	struct drm_afbc_framebuffer *fb;
-	struct s7d_afbc_state layout;
+	struct s7d_afbc_buffer layout;
 	struct drm_rect source;
 	int ret;
 
 	if (cmd->modifier[0] == DRM_FORMAT_MOD_LINEAR)
 		return drm_gem_fb_create(dev, file, cmd);
 	if (cmd->modifier[0] != S7D_AFBC_MODIFIER ||
-	    cmd->pixel_format != DRM_FORMAT_ABGR8888 ||
+	    (cmd->pixel_format != DRM_FORMAT_ABGR8888 &&
+	     (!IS_ENABLED(CONFIG_AMLOGIC_C5_GFCD) ||
+	      cmd->pixel_format != DRM_FORMAT_XBGR8888)) ||
 	    cmd->flags != DRM_MODE_FB_MODIFIERS ||
 	    !cmd->width || !cmd->height || cmd->width > S7D_AFBC_MAX_WIDTH ||
 	    cmd->height > S7D_AFBC_MAX_HEIGHT || cmd->offsets[0])
@@ -54,8 +56,7 @@ s7d_fb_create(struct drm_device *dev, struct drm_file *file,
 	if (ret)
 		goto err_put;
 	source = DRM_RECT_INIT(0, 0, cmd->width << 16, cmd->height << 16);
-	ret = s7d_afbc_build_state(fb, &source, dma_get_mask(dev->dev),
-				   S7D_AFBC_SURFACE, &layout);
+	ret = s7d_afbc_build_buffer(fb, &source, dma_get_mask(dev->dev), &layout);
 	if (ret)
 		goto err_put;
 	return &fb->base;

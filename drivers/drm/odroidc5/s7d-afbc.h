@@ -42,6 +42,18 @@ struct s7d_afbc_surface {
 	u32 route_mask;
 };
 
+struct s7d_afbc_buffer {
+	u64 header_addr;
+	u64 last_byte_addr;
+	u32 aligned_width;
+	u32 aligned_height;
+	u32 buffer_height;
+	u32 pitch;
+	u32 header_size;
+	u32 body_size;
+	u32 size;
+};
+
 struct s7d_afbc_state {
 	struct s7d_osd_state osd;
 	/* Decoder-owned settings; never replay through display RDMA. */
@@ -60,6 +72,10 @@ struct s7d_afbc_state {
 	u32 surface_mask;
 };
 
+/* Full-source ABGR/XBGR8888 metadata; errors leave the output unchanged. */
+int s7d_afbc_build_buffer(const struct drm_afbc_framebuffer *afbc_fb,
+			  const struct drm_rect *source, u64 dma_mask,
+			  struct s7d_afbc_buffer *out);
 /* Full 16.16 source; metadata comes from drm_gem_fb_afbc_init(). */
 int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 			 const struct drm_rect *source, u64 dma_mask,
