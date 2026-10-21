@@ -141,7 +141,7 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 	}
 	if (check_layout(layout, dst, &width, &height))
 		return -EINVAL;
-	if (layout->format == DRM_FORMAT_VUY888 &&
+	if (!vd2 && layout->format == DRM_FORMAT_VUY888 &&
 	    (width != (u32)drm_rect_width(dst) || height != (u32)drm_rect_height(dst)))
 		return -EOPNOTSUPP;
 	if (vd2) {
