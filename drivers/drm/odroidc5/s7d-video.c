@@ -19,6 +19,7 @@ int s7d_video_build_state(struct drm_framebuffer *fb, const struct drm_rect *src
 	struct s7d_video_state next = {0};
 	u32 x1, y1, x2, y2;
 	unsigned int i, planes = 2, cpp = 1;
+	bool full_chroma = false;
 
 	if (!fb || !src || !state || !fb->format ||
 	    fb->modifier != DRM_FORMAT_MOD_LINEAR)
@@ -31,6 +32,11 @@ int s7d_video_build_state(struct drm_framebuffer *fb, const struct drm_rect *src
 	case DRM_FORMAT_VYUY:
 		planes = 1;
 		cpp = 2;
+		break;
+	case DRM_FORMAT_VUY888:
+		planes = 1;
+		cpp = 3;
+		full_chroma = true;
 		break;
 	default:
 		return -EINVAL;
@@ -72,7 +78,8 @@ int s7d_video_build_state(struct drm_framebuffer *fb, const struct drm_rect *src
 	}
 	next.scope_x[0] = ((x2 - 1) << 16) | x1;
 	next.scope_y[0] = ((y2 - 1) << 16) | y1;
-	next.scope_x[1] = (((x2 >> 1) - 1) << 16) | (x1 >> 1);
+	next.scope_x[1] = full_chroma ? next.scope_x[0] :
+		(((x2 >> 1) - 1) << 16) | (x1 >> 1);
 	next.scope_y[1] = planes == 1 ? next.scope_y[0] :
 		(((y2 >> 1) - 1) << 16) | (y1 >> 1);
 	*state = next;

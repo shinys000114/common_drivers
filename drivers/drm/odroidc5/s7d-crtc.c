@@ -327,6 +327,17 @@ static bool s7d_crtc_replay_compatible(const struct s7d_crtc_state *state,
 		s7d_osd_scaler_same(&state->osd.scalers[1], &old->osd.scalers[1]);
 }
 
+static enum s7d_csc_input_order s7d_crtc_csc_order(const struct s7d_plane_state *video)
+{
+	if (video) {
+		if (video->video.format == DRM_FORMAT_VYUY)
+			return S7D_CSC_INPUT_YCRCB;
+		if (video->video.format == DRM_FORMAT_VUY888)
+			return S7D_CSC_INPUT_CRCBY;
+	}
+	return S7D_CSC_INPUT_YCBCR;
+}
+
 static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
 {
 	static const enum s7d_display_input inputs[] = {
@@ -557,11 +568,11 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
 		return -EIO;
 	ret = s7d_csc_build_state(encoding, range,
-		video && video->video.format == DRM_FORMAT_VYUY, &state->csc);
+		s7d_crtc_csc_order(video), &state->csc);
 	if (ret)
 		return ret;
 	ret = s7d_csc_build_video2_state(encoding2, range2,
-		video2 && video2->video.format == DRM_FORMAT_VYUY, &state->csc2);
+		s7d_crtc_csc_order(video2), &state->csc2);
 	if (ret)
 		return ret;
 	ret = s7d_postblend_build_state(base->adjusted_mode.hdisplay,

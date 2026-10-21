@@ -52,7 +52,10 @@ static int check_layout(const struct s7d_video_state *layout,
 {
 	u32 x_start, x_end, y_start, y_end;
 	u32 chroma_x, chroma_y;
-	bool packed = layout->format == DRM_FORMAT_UYVY || layout->format == DRM_FORMAT_VYUY;
+	bool full_chroma = layout->format == DRM_FORMAT_VUY888;
+	bool packed = full_chroma || layout->format == DRM_FORMAT_UYVY ||
+		layout->format == DRM_FORMAT_VYUY;
+	u32 cpp = full_chroma ? 3 : packed ? 2 : 1;
 
 	if (!dst || (layout->reflection & ~(S7D_VIDEO_REFLECT_X | S7D_VIDEO_REFLECT_Y)) ||
 	    (layout->format != DRM_FORMAT_NV12 &&
@@ -73,10 +76,11 @@ static int check_layout(const struct s7d_video_state *layout,
 	if (x_end < x_start || y_end < y_start ||
 	    ((x_start | y_start | (x_end + 1) | (y_end + 1)) & 1) ||
 	    x_end >= S7D_VIDEO_MAX_WIDTH || y_end >= S7D_VIDEO_MAX_HEIGHT ||
-	    (x_end + 1) * (packed ? 2 : 1) > layout->stride[0] * 16 ||
+	    (x_end + 1) * cpp > layout->stride[0] * 16 ||
 	    (!packed && x_end + 1 > layout->stride[1] * 16))
 		return -EINVAL;
-	chroma_x = ((x_end >> 1) << 16) | (x_start >> 1);
+	chroma_x = full_chroma ? layout->scope_x[0] :
+		((x_end >> 1) << 16) | (x_start >> 1);
 	chroma_y = packed ? layout->scope_y[0] :
 		((y_end >> 1) << 16) | (y_start >> 1);
 	*width = x_end - x_start + 1;
@@ -137,6 +141,9 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 	}
 	if (check_layout(layout, dst, &width, &height))
 		return -EINVAL;
+	if (layout->format == DRM_FORMAT_VUY888 &&
+	    (width != (u32)drm_rect_width(dst) || height != (u32)drm_rect_height(dst)))
+		return -EOPNOTSUPP;
 	if (vd2) {
 		next.scaler.src_width = width;
 		next.scaler.src_height = height;
@@ -147,7 +154,12 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 					  drm_rect_height(dst), &next.scaler)) {
 		return -EINVAL;
 	}
-	if (layout->format == DRM_FORMAT_UYVY || layout->format == DRM_FORMAT_VYUY) {
+	if (layout->format == DRM_FORMAT_VUY888) {
+		next.setup[0].value = (next.setup[0].value & ~BIT(1)) | BIT(16) | (2 << 14);
+		next.control.value = next.setup[0].value;
+		next.setup[2].value = BIT(29);
+		color = 0;
+	} else if (layout->format == DRM_FORMAT_UYVY || layout->format == DRM_FORMAT_VYUY) {
 		next.setup[0].value = (next.setup[0].value & ~BIT(1)) | BIT(14);
 		next.control.value = next.setup[0].value;
 		next.setup[2].value = 0x30310c20;

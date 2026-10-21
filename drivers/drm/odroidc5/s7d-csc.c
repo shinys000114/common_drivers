@@ -57,7 +57,8 @@ u32 s7d_csc_reg_mask(u32 reg)
 }
 
 int s7d_csc_build_state(enum drm_color_encoding encoding,
-			enum drm_color_range range, bool swap_uv,
+			enum drm_color_range range,
+			enum s7d_csc_input_order input_order,
 			struct s7d_csc_state *state)
 {
 	/* Q10 coefficients; rows are R, G, B and columns are Y, Cb, Cr. */
@@ -70,14 +71,19 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 			{{1024, 0, 1613}, {1024, -192, -479}, {1024, 1900, 0}},
 		},
 	};
+	static const u8 columns[][3] = {
+		[S7D_CSC_INPUT_YCBCR] = {0, 1, 2},
+		[S7D_CSC_INPUT_YCRCB] = {0, 2, 1},
+		[S7D_CSC_INPUT_CRCBY] = {2, 1, 0},
+	};
 	struct s7d_csc_state next;
 	const s16 (*coeff)[3];
-	unsigned int cb = swap_uv ? 2 : 1, cr = swap_uv ? 1 : 2;
+	const u8 *column;
 	unsigned int enc, rng;
 	unsigned int i;
-	int pre_y;
+	int pre[3] = {0, -512, -512};
 
-	if (!state)
+	if (!state || (unsigned int)input_order > S7D_CSC_INPUT_CRCBY)
 		return -EINVAL;
 	switch (encoding) {
 	case DRM_COLOR_YCBCR_BT601:
@@ -92,36 +98,36 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 	switch (range) {
 	case DRM_COLOR_YCBCR_LIMITED_RANGE:
 		rng = 0;
-		pre_y = -64;
+		pre[0] = -64;
 		break;
 	case DRM_COLOR_YCBCR_FULL_RANGE:
 		rng = 1;
-		pre_y = 0;
 		break;
 	default:
 		return -EINVAL;
 	}
 	coeff = coeffs[enc][rng];
+	column = columns[input_order];
 	next = (struct s7d_csc_state) {
 		.matrix = {
 			{0x3290, 0,
-			 csc_pair(coeff[0][0], coeff[0][cb], 0x1fff)},
+			 csc_pair(coeff[0][column[0]], coeff[0][column[1]], 0x1fff)},
 			{0x3291, 0,
-			 csc_pair(coeff[0][cr], coeff[1][0], 0x1fff)},
+			 csc_pair(coeff[0][column[2]], coeff[1][column[0]], 0x1fff)},
 			{0x3292, 0,
-			 csc_pair(coeff[1][cb], coeff[1][cr], 0x1fff)},
+			 csc_pair(coeff[1][column[1]], coeff[1][column[2]], 0x1fff)},
 			{0x3293, 0,
-			 csc_pair(coeff[2][0], coeff[2][cb], 0x1fff)},
+			 csc_pair(coeff[2][column[0]], coeff[2][column[1]], 0x1fff)},
 			{0x3294, 0,
-			 (u32)coeff[2][cr] & 0x1fff},
+			 (u32)coeff[2][column[2]] & 0x1fff},
 			{0x3295, 0, 0},
 			{0x3296, 0, 0},
 			{0x3297, 0, 0},
 			{0x3298, 0, 0},
 			{0x3299, 0, csc_pair(2, 2, 0xfff)},
 			{0x329a, 0, 2},
-			{0x329b, 0, csc_pair(pre_y, -512, 0xfff)},
-			{0x329c, 0, (u32)-512 & 0xfff},
+			{0x329b, 0, csc_pair(pre[column[0]], pre[column[1]], 0xfff)},
+			{0x329c, 0, (u32)pre[column[2]] & 0xfff},
 		},
 		.control = {
 			{0x1a0c, BIT(4) | BIT(0), BIT(0)},
@@ -138,7 +144,8 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 }
 
 int s7d_csc_build_video2_state(enum drm_color_encoding encoding,
-			enum drm_color_range range, bool swap_uv,
+			enum drm_color_range range,
+			enum s7d_csc_input_order input_order,
 			struct s7d_csc_state *state)
 {
 	static const u32 matrix_regs[S7D_CSC_MATRIX_REG_COUNT] = {
@@ -158,7 +165,7 @@ int s7d_csc_build_video2_state(enum drm_color_encoding encoding,
 
 	if (!state)
 		return -EINVAL;
-	ret = s7d_csc_build_state(encoding, range, swap_uv, &next);
+	ret = s7d_csc_build_state(encoding, range, input_order, &next);
 	if (ret)
 		return ret;
 	for (i = 0; i < S7D_CSC_MATRIX_REG_COUNT; i++) {

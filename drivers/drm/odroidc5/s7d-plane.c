@@ -295,6 +295,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	const struct drm_plane_funcs *funcs = &s7d_plane_funcs;
 	static const u32 video_formats[] = {
 		DRM_FORMAT_NV12, DRM_FORMAT_NV21, DRM_FORMAT_UYVY, DRM_FORMAT_VYUY,
+		DRM_FORMAT_VUY888,
 	};
 	const u32 *plane_formats = formats;
 	unsigned int format_count = ARRAY_SIZE(formats);

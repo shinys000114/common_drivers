@@ -10,6 +10,12 @@
 #define S7D_CSC_MATRIX_REG_COUNT 13
 #define S7D_CSC_CONTROL_REG_COUNT 5
 
+enum s7d_csc_input_order {
+	S7D_CSC_INPUT_YCBCR,
+	S7D_CSC_INPUT_YCRCB,
+	S7D_CSC_INPUT_CRCBY,
+};
+
 struct s7d_csc_reg {
 	u32 reg;
 	u32 mask;
@@ -28,11 +34,13 @@ struct s7d_csc_state {
  * Errors leave state unchanged; no registers are read or written.
  */
 int s7d_csc_build_state(enum drm_color_encoding encoding,
-			enum drm_color_range range, bool swap_uv,
+			enum drm_color_range range,
+			enum s7d_csc_input_order input_order,
 			struct s7d_csc_state *state);
 
 int s7d_csc_build_video2_state(enum drm_color_encoding encoding,
-			enum drm_color_range range, bool swap_uv,
+			enum drm_color_range range,
+			enum s7d_csc_input_order input_order,
 			struct s7d_csc_state *state);
 
 /* Matrix masks only; controls and unknown registers return zero. */
