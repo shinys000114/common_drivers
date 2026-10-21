@@ -531,8 +531,13 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 			&state->previous_afbc : NULL,
 		s7d_vpu_afbc_stage,
 		s7d_vpu_afbc_cancel, &submission);
-	if (!ret && v->gfcd_enabled)
-		v->gfcd_unchanged = state->gfcd_unchanged;
+	if (!ret) {
+		v->static_video_mask = state->video_unchanged ?
+			((state->buffers.video.fb ? BIT(0) : 0) |
+			 (state->buffers.video2.fb ? BIT(1) : 0)) : 0;
+		if (v->gfcd_enabled)
+			v->gfcd_unchanged = state->gfcd_unchanged;
+	}
 	if (!ret && transaction == S7D_SCANOUT_TRANSACTION_REPLAY) {
 		ret = s7d_crtc_expect_latch(v->crtc,
 					 s7d_scanout_pending_generation(&v->scanout));
@@ -777,6 +782,7 @@ static int s7d_vpu_stop_hw(void *data)
 
 	mask_irqs(v);
 	spin_lock_irq(&v->frame_lock);
+	v->static_video_mask = 0;
 	v->crc_armed = false;
 	spin_unlock_irq(&v->frame_lock);
 	cancel_delayed_work_sync(&v->afbc_timeout);
@@ -1758,6 +1764,7 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	struct s7d_flip_latch latch;
 	unsigned long flags;
 	u32 before, after, fifo, fifo2, vd1, vd2, arbiter;
+	u8 video_mask;
 	bool afbc_error;
 	int ret;
 
@@ -1779,9 +1786,12 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	frame.idle = (before >> 29) == frame.field &&
 		     !((fifo | fifo2) & OSD_FIFO_STATE) && !((vd1 | vd2) & VD1_BUSY) &&
 		     (arbiter & ASYNC_IDLE);
-	/* Any active video MIF requires a later field before framebuffer retirement. */
-	frame.early = frame.idle && !((vd1 | vd2) & BIT(0)) &&
-		s7d_vpu_afbc_window(before, after, vd1, vd2, v->flip_start, v->flip_end);
+	video_mask = (vd1 & BIT(0) ? BIT(0) : 0) |
+		(vd2 & BIT(0) ? BIT(1) : 0);
+	/* Unchanged video inputs keep their buffers across the OSD flip. */
+	frame.early = frame.idle &&
+		(!video_mask || video_mask == v->static_video_mask) &&
+		s7d_vpu_afbc_window(before, after, 0, 0, v->flip_start, v->flip_end);
 	if (v->gfcd_enabled) {
 		/* A changed scaled GFCD input needs a later idle field. */
 		frame.early = frame.early &&
