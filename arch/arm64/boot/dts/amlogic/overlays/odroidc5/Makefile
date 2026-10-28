@@ -12,6 +12,7 @@ dtb-y += \
 	i2c0.dtbo \
 	i2c1.dtbo \
 	i2c2.dtbo \
+	i2s.dtbo \
 	ir.dtbo \
 	mcp2515.dtbo \
 	mcp2515_12mhz.dtbo \

@@ -1,0 +1,48 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/amlogic,s7d-clkc.h>
+#include <dt-bindings/clock/amlogic,txhd2-audio-clk.h>
+
+&periphs_pinctrl {
+	tdma_mclk_pins: tdma_mclk_pins {
+		mux { /* GPIOD_4 */
+			groups = "mclk_1_d4";
+			function = "mclk";
+		};
+	};
+};
+
+&tdma {
+	clocks = <&clkaudio CLKID_AUDIO_MCLK_A
+		  &clkc CLKID_HIFI_PLL
+		  &clkc CLKID_HIFI1_PLL
+		  &clkaudio CLKID_AUDIO_MCLK_PAD1>;
+	clock-names = "mclk", "clk_srcpll", "clk_src_cd", "mclk_pad";
+	pinctrl-names = "tdm_pins";
+	pinctrl-0 = <&tdm_a_pins &tdm_d0_pins &tdm_d1_pins
+		     &tdma_clk_pins &tdma_mclk_pins>;
+	status = "okay";
+};
+
+&{/auge_sound} {
+	aml-audio-card,dai-link@4 {
+		format = "i2s";
+		mclk-fs = <256>;
+		continuous-clock;
+		bitclock-master = <&tdma>;
+		frame-master = <&tdma>;
+		suffix-name = "alsaPORT-tdma";
+		cpu {
+			sound-dai = <&tdma>;
+			dai-tdm-slot-tx-mask = <1 1>;
+			dai-tdm-slot-rx-mask = <1 1>;
+			dai-tdm-slot-num = <2>;
+			dai-tdm-slot-width = <32>;
+			system-clock-frequency = <12288000>;
+		};
+		codec {
+			sound-dai = <&dummy_codec>;
+		};
+	};
+};
