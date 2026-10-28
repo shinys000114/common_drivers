@@ -907,6 +907,11 @@
 	hdcp_ctl_lvl = <1>;
 };
 
+&vend_data {
+	vendor_name = "ODROID";
+	product_desc = "ODROID-C5";
+};
+
 &drm_amhdmitx {
 	status = "disabled";
 	hdcp = "disabled";
