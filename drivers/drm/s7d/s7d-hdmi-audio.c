@@ -21,7 +21,7 @@
 #define INFO_ENABLE	0x06df
 #define INFO_TRANSMIT	(BIT(7) | BIT(6))
 
-/* Two-channel L-PCM rates: N comes from the 32/44.1/48 kHz base times a multiple. */
+/* L-PCM rates: N comes from the 32/44.1/48 kHz base times a multiple. */
 static const struct s7d_audio_rate {
 	u32 rate;
 	u8 base;	/* 0: 32 kHz, 1: 44.1 kHz, 2: 48 kHz */
@@ -55,7 +55,7 @@ bool s7d_hdmi_audio_supported(const u8 *eld, const struct hdmi_codec_params *par
 	u8 rate, width;
 	int i;
 
-	if (params->channels != 2 || !r)
+	if (params->channels < 2 || params->channels > 8 || !r)
 		return false;
 	rate = r->sad_freq;
 	if (params->sample_width == 16)
@@ -64,6 +64,7 @@ bool s7d_hdmi_audio_supported(const u8 *eld, const struct hdmi_codec_params *par
 		width = BIT(2);	/* 32-bit samples carry 24 bits */
 	else
 		return false;
+	/* A SAD stores its maximum channel count minus one. */
 	for (i = 0; i < drm_eld_sad_count(eld); i++) {
 		if (drm_eld_sad_get(eld, i, &sad))
 			return false;
@@ -72,7 +73,8 @@ bool s7d_hdmi_audio_supported(const u8 *eld, const struct hdmi_codec_params *par
 		    (sad.freq & rate))
 			return true;
 		if (!compressed && sad.format == HDMI_AUDIO_CODING_TYPE_PCM &&
-		    sad.channels >= 1 && (sad.freq & rate) && (sad.byte2 & width))
+		    sad.channels + 1 >= params->channels && (sad.freq & rate) &&
+		    (sad.byte2 & width))
 			return true;
 	}
 	return false;
@@ -201,7 +203,7 @@ int s7d_hdmi_audio_configure(struct regmap *core, struct regmap *top,
 	static const struct reg_sequence config[] = {
 		{ 0x0a2d, 0 }, /* HDMI, no MHL. */
 		{ 0x0a25, 0 }, /* No sample-rate conversion. */
-		{ PACKET_CTRL, BIT(7) }, /* Layout 0, initially muted. */
+		{ PACKET_CTRL, BIT(7) }, /* Initially muted; layout set below. */
 		{ ACR_CTRL, 2 }, /* Hardware CTS from the external MCLK. */
 		{ 0x0a02, 0 }, /* MCLK = 128 Fs. */
 		{ 0x0a1c, 0xe4 }, /* Identity I2S lane mapping. */
@@ -211,11 +213,13 @@ int s7d_hdmi_audio_configure(struct regmap *core, struct regmap *top,
 	};
 	struct hdmi_audio_infoframe frame = params->cea;
 	u8 info[HDMI_INFOFRAME_HEADER_SIZE + HDMI_AUDIO_INFOFRAME_SIZE];
+	/* One I2S data lane carries each channel pair. */
+	unsigned int lanes = DIV_ROUND_UP(params->channels, 2);
 	unsigned int n, i;
 	int ret;
 
-	if (params->channels != 2 || params->cea.channels != 2 ||
-	    params->cea.channel_allocation ||
+	if (params->channels < 2 || params->channels > (spdif ? 2 : 8) ||
+	    params->cea.channels != params->channels ||
 	    (!spdif && (params->iec.status[0] & IEC958_AES0_NONAUDIO)) ||
 	    (params->sample_width != 16 && params->sample_width != 24 &&
 	     params->sample_width != 32))
@@ -241,8 +245,13 @@ int s7d_hdmi_audio_configure(struct regmap *core, struct regmap *top,
 		if (ret)
 			goto fail;
 	}
-	/* I2S lane 0 or the SPDIF input; no HBR or DSD. */
-	ret = audio_write(core, 0x0a14, spdif ? BIT(1) : BIT(4));
+	/* Multichannel L-PCM uses sample packet layout 1. */
+	ret = s7d_hdmi_update_checked(core, PACKET_CTRL, BIT(1),
+				      params->channels > 2 ? BIT(1) : 0);
+	if (ret)
+		goto fail;
+	/* I2S lanes 0..3 or the SPDIF input; no HBR or DSD. */
+	ret = audio_write(core, 0x0a14, spdif ? BIT(1) : GENMASK(3 + lanes, 4));
 	if (ret)
 		goto fail;
 	ret = s7d_hdmi_update_checked(core, 0x0245, BIT(1), BIT(1));
