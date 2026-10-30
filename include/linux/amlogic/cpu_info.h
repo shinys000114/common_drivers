@@ -8,5 +8,7 @@
 
 #define CHIPID_LEN 16
 void cpuinfo_get_chipid(unsigned char *cid, unsigned int size);
+/* Returns -EPROBE_DEFER until firmware has supplied a valid chip ID. */
+int meson_cpu_version_read(unsigned int level, unsigned char *value);
 
 #endif
