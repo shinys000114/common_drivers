@@ -24,6 +24,7 @@
 #include "s7d-afbc-engine.h"
 #include "s7d-gamma.h"
 #include "s7d-plane.h"
+#include "s7d-writeback.h"
 
 struct s7d_crtc {
 	struct drm_crtc base;
@@ -1034,7 +1035,7 @@ static void s7d_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_stat
 	ret = -EBUSY;
 	if (c->prepared)
 		goto fail;
-	c->link_required = c->ops->wait_for_link;
+	c->link_required = c->ops->wait_for_link && !state->writeback_only;
 	ret = c->ops->acquire(c->data);
 	if (ret)
 		goto fail;
@@ -1306,6 +1307,27 @@ void s7d_crtc_link_error(struct drm_crtc *crtc, int error)
 int s7d_crtc_last_error(struct drm_crtc *crtc)
 {
 	return READ_ONCE(to_s7d_crtc(crtc)->last_error);
+}
+
+int s7d_crtc_writeback_capture(struct drm_crtc *crtc, struct drm_atomic_state *atomic,
+			       struct s7d_writeback *writeback)
+{
+	struct s7d_crtc *c = to_s7d_crtc(crtc);
+	struct drm_crtc_state *base = drm_atomic_get_new_crtc_state(atomic, crtc);
+	int ret;
+
+	mutex_lock(&c->mutex);
+	ret = READ_ONCE(c->last_error);
+	if (!ret && (!base || crtc->state != base || !c->prepared ||
+		     !base->commit || !completion_done(&base->commit->flip_done)))
+		ret = -EIO;
+	if (!ret)
+		ret = s7d_writeback_capture(writeback, to_s7d_crtc_state(base));
+	else if (s7d_writeback_cancel(writeback, ret))
+		s7d_crtc_fail(c, ret, NULL);
+	mutex_unlock(&c->mutex);
+	/* Fault and timeout work may stop the CRTC while the frame is written. */
+	return ret ? ret : s7d_writeback_wait(writeback);
 }
 
 int s7d_crtc_shutdown(struct drm_crtc *crtc)

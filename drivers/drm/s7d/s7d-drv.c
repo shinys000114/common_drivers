@@ -34,6 +34,8 @@
 #include "s7d-hdmi-output.h"
 #include "s7d-plane.h"
 #include "s7d-vpu.h"
+#include "s7d-writeback.h"
+#include "s7d-vdin.h"
 
 struct s7d_drm {
 	struct drm_device drm;
@@ -84,8 +86,111 @@ static const struct drm_driver s7d_drm_driver = {
 	.minor = 0,
 };
 
+static int s7d_output_route(u32 connector_mask, u32 writeback_mask, bool active,
+			   bool *writeback_only)
+{
+	if (active && !connector_mask)
+		return -EINVAL;
+	*writeback_only = connector_mask && !(connector_mask & ~writeback_mask);
+	return 0;
+}
+
+static int s7d_check_output_routes(struct drm_device *drm, struct drm_atomic_state *state)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	struct drm_crtc_state *old, *base;
+	struct drm_crtc *crtc;
+	u32 writeback_mask = 0;
+	int i, ret;
+
+	drm_connector_list_iter_begin(drm, &iter);
+	drm_for_each_connector_iter(connector, &iter)
+		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+			writeback_mask |= drm_connector_mask(connector);
+	drm_connector_list_iter_end(&iter);
+	for_each_oldnew_crtc_in_state(state, crtc, old, base, i) {
+		struct s7d_crtc_state *next = to_s7d_crtc_state(base);
+
+		ret = s7d_output_route(base->connector_mask, writeback_mask,
+				       base->active, &next->writeback_only);
+		if (ret)
+			return ret;
+		if (old->active && to_s7d_crtc_state(old)->writeback_only != next->writeback_only)
+			base->mode_changed = true;
+	}
+	return 0;
+}
+
+static int s7d_writeback_output(const struct drm_crtc_state *base, unsigned long reference,
+			       struct s7d_hdmi_output_state *output)
+{
+	struct s7d_hdmi_output_state next;
+	struct s7d_encp_state encp;
+	int ret;
+
+	if (s7d_encp_build_state(&base->adjusted_mode, &encp) != MODE_OK)
+		return -EINVAL;
+	/* Plan internal RGB8/full independently of HDMI sink capabilities. */
+	ret = s7d_hdmi_output_build(S7D_HDMI_OUTPUT_RGB8,
+		(unsigned long)s7d_mode_clock(&base->adjusted_mode) * 1000, reference, &next);
+	if (!ret)
+		ret = s7d_hdmi_output_apply_ctm(&next, base->ctm ? base->ctm->data : NULL);
+	if (!ret)
+		*output = next;
+	return ret;
+}
+
+static bool s7d_writeback_output_reusable(const struct s7d_crtc_state *before,
+					 const struct s7d_crtc_state *next)
+{
+	const struct drm_crtc_state *old = &before->base, *base = &next->base;
+
+	return old->active && base->active && before->valid && before->writeback_only &&
+		next->writeback_only && !drm_atomic_crtc_needs_modeset(base) &&
+		!base->color_mgmt_changed && !base->self_refresh_active && !base->vrr_enabled &&
+		old->ctm == base->ctm && old->gamma_lut == base->gamma_lut &&
+		old->degamma_lut == base->degamma_lut &&
+		old->mode.clock == base->mode.clock && old->mode.flags == base->mode.flags &&
+		old->adjusted_mode.clock == base->adjusted_mode.clock &&
+		old->adjusted_mode.flags == base->adjusted_mode.flags &&
+		drm_mode_equal(&old->mode, &base->mode) &&
+		drm_mode_equal(&old->adjusted_mode, &base->adjusted_mode) &&
+		before->output.encoding == S7D_HDMI_OUTPUT_RGB8 && before->output.bpc == 8 &&
+		!before->output.rgb_limited && s7d_hdmi_output_same(&before->output, &next->output);
+}
+
+static int s7d_build_writeback_outputs(struct drm_device *drm, struct drm_atomic_state *state)
+{
+	struct s7d_drm *display = container_of(drm, struct s7d_drm, drm);
+	struct drm_crtc_state *old, *base;
+	struct drm_crtc *crtc;
+	int i, ret;
+
+	for_each_oldnew_crtc_in_state(state, crtc, old, base, i) {
+		struct s7d_crtc_state *next = to_s7d_crtc_state(base);
+		struct s7d_hdmi_output_state output, others;
+
+		if (!base->active || !next->writeback_only)
+			continue;
+		if (s7d_writeback_output_reusable(to_s7d_crtc_state(old), next))
+			continue;
+		ret = s7d_writeback_output(base, clk_get_rate(display->vpu.xtal), &output);
+		if (ret)
+			return ret;
+		/* As on HDMI, a CTM change alone is a POST2 update over RDMA. */
+		others = output;
+		others.post2 = to_s7d_crtc_state(old)->output.post2;
+		if (old->active && !s7d_hdmi_output_same(&to_s7d_crtc_state(old)->output, &others))
+			base->mode_changed = true;
+		next->output = output;
+	}
+	return 0;
+}
+
 static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *state)
 {
+	struct s7d_drm *display = container_of(drm, struct s7d_drm, drm);
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *crtc_state;
 	struct drm_plane *plane;
@@ -108,6 +213,9 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 	}
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
 		s7d_crtc_capture_input(crtc, state);
+	ret = s7d_check_output_routes(drm, state);
+	if (ret)
+		return ret;
 	/* Cursor updates also require VSYNC RDMA completion and buffer retirement. */
 	state->legacy_cursor_update = false;
 	ret = drm_atomic_helper_check_modeset(drm, state);
@@ -116,6 +224,9 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
 		if (crtc_state->mode_changed)
 			checked_modesets |= drm_crtc_mask(crtc);
+	ret = s7d_build_writeback_outputs(drm, state);
+	if (ret)
+		return ret;
 	if (drm->mode_config.normalize_zpos) {
 		ret = drm_atomic_normalize_zpos(drm, state);
 		if (ret)
@@ -133,12 +244,15 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 		ret = drm_atomic_helper_check_modeset(drm, state);
 		if (ret)
 			return ret;
+		ret = s7d_build_writeback_outputs(drm, state);
+		if (ret)
+			return ret;
 		ret = drm_atomic_helper_check_planes(drm, state);
 		if (ret)
 			return ret;
 	}
 	drm_self_refresh_helper_alter_state(state);
-	return 0;
+	return s7d_writeback_atomic_check(display->vpu.writeback, state);
 }
 
 static const struct drm_mode_config_funcs s7d_mode_config_funcs = {
@@ -150,14 +264,22 @@ static const struct drm_mode_config_funcs s7d_mode_config_funcs = {
 static void s7d_atomic_commit_tail(struct drm_atomic_state *state)
 {
 	struct drm_device *drm = state->dev;
+	struct s7d_drm *display = container_of(drm, struct s7d_drm, drm);
+	bool capture = s7d_writeback_has_job(display->vpu.writeback, state);
 
 	drm_atomic_helper_commit_modeset_disables(drm, state);
 	drm_atomic_helper_commit_planes(drm, state, 0);
 	drm_atomic_helper_commit_modeset_enables(drm, state);
 	drm_atomic_helper_fake_vblank(state);
-	drm_atomic_helper_commit_hw_done(state);
-	/* RDMA completion and buffer retirement can span several vblanks. */
-	drm_atomic_helper_wait_for_flip_done(drm, state);
+	if (capture) {
+		drm_atomic_helper_wait_for_flip_done(drm, state);
+		s7d_crtc_writeback_capture(display->vpu.crtc, state, display->vpu.writeback);
+		drm_atomic_helper_commit_hw_done(state);
+	} else {
+		drm_atomic_helper_commit_hw_done(state);
+		/* RDMA completion and buffer retirement can span several vblanks. */
+		drm_atomic_helper_wait_for_flip_done(drm, state);
+	}
 	drm_atomic_helper_cleanup_planes(drm, state);
 }
 
@@ -174,9 +296,10 @@ static int s7d_drm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct drm_connector *connector;
-	struct drm_encoder *encoder;
+	struct drm_encoder *encoder, *writeback_encoder;
 	struct drm_bridge *bridge;
 	struct s7d_vpu_link link;
+	struct s7d_vdin *vdin;
 	struct drm_plane *primary, *cursor, *overlay, *video, *video2;
 	struct drm_device *drm;
 	struct s7d_drm *display;
@@ -333,9 +456,22 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = drm_connector_attach_encoder(connector, encoder);
 	if (ret)
 		goto fini_vpu;
+	ret = s7d_vdin_init(&display->vpu, &vdin);
+	if (ret)
+		goto fini_vpu;
+	display->vpu.vdin = vdin;
+	ret = s7d_writeback_init(drm, display->vpu.crtc,
+		&s7d_vdin_writeback_caps, &s7d_vdin_writeback_ops, vdin,
+		&display->vpu.writeback);
+	if (ret)
+		goto fini_vpu;
+	writeback_encoder = s7d_writeback_encoder(display->vpu.writeback);
+	encoder->possible_clones = drm_encoder_mask(encoder) | drm_encoder_mask(writeback_encoder);
+	writeback_encoder->possible_clones = encoder->possible_clones;
 	drm_mode_config_reset(drm);
 	if (!primary->state || !display->vpu.crtc->state || !connector->state ||
-	    !bridge->base.state) {
+	    !bridge->base.state ||
+	    !s7d_writeback_connector(display->vpu.writeback)->state) {
 		ret = -ENOMEM;
 		goto fini_vpu;
 	}
@@ -368,6 +504,8 @@ static void s7d_drm_shutdown(struct platform_device *pdev)
 	drm_kms_helper_poll_fini(&display->drm);
 	drm_atomic_helper_shutdown(&display->drm);
 	ret = s7d_crtc_shutdown(display->vpu.crtc);
+	if (!ret)
+		ret = s7d_writeback_shutdown(display->vpu.writeback);
 	if (ret)
 		dev_err(&pdev->dev, "shutdown failed (%d); retaining DMA and resources\n", ret);
 	/* No devres/DMA release here: failed stop is never permission to free. */
