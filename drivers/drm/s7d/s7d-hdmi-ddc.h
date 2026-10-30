@@ -26,5 +26,9 @@ struct s7d_hdmi_ddc {
 int s7d_hdmi_ddc_register(struct device *dev, struct s7d_hdmi_ddc *ddc,
 			struct regmap *core);
 void s7d_hdmi_ddc_unregister(struct s7d_hdmi_ddc *ddc);
+/* Transfers return -ESHUTDOWN between suspend and resume. */
+void s7d_hdmi_ddc_suspend(struct s7d_hdmi_ddc *ddc);
+/* Reprograms the controller after its registers may have been reset. */
+int s7d_hdmi_ddc_resume(struct s7d_hdmi_ddc *ddc);
 
 #endif
