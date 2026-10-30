@@ -20,6 +20,8 @@
 #include "h264/s7d-h264-backend.h"
 #include "hevc/s7d-hevc-v4l2.h"
 #include "common/s7d-hevc-engine.h"
+#include "jpeg/s7d-jpeg-backend.h"
+#include "jpeg/s7d-jpeg-v4l2.h"
 #include "common/s7d-v4l2-device.h"
 
 struct s7d_vdec {
@@ -32,6 +34,8 @@ struct s7d_vdec {
 	struct s7d_v4l2_device *video;
 	struct s7d_hevc_v4l2 *hevc;
 	struct s7d_hevc_engine *hevc_engine;
+	struct s7d_jpeg_encoder *jpeg;
+	struct s7d_jpeg_v4l2 *jpeg_video;
 	struct module *tee_owner;
 	bool reserved_memory;
 };
@@ -145,11 +149,23 @@ static int s7d_vdec_release(struct s7d_vdec *vdec)
 {
 	int ret;
 
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) && vdec->jpeg_video) {
+		ret = s7d_jpeg_v4l2_destroy(vdec->jpeg_video);
+		if (ret)
+			return ret;
+		vdec->jpeg_video = NULL;
+	}
 	if (vdec->video) {
 		ret = s7d_v4l2_device_destroy(vdec->video);
 		if (ret)
 			return ret;
 		vdec->video = NULL;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) && vdec->jpeg) {
+		ret = s7d_jpeg_encoder_destroy(vdec->jpeg);
+		if (ret)
+			return ret;
+		vdec->jpeg = NULL;
 	}
 	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) && vdec->hevc) {
 		ret = s7d_hevc_v4l2_destroy(vdec->hevc);
@@ -195,6 +211,8 @@ static int s7d_vdec_stop(struct s7d_vdec *vdec)
 
 	if (vdec->video)
 		s7d_v4l2_device_unregister(vdec->video);
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) && vdec->jpeg_video)
+		s7d_jpeg_v4l2_unregister(vdec->jpeg_video);
 	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) && vdec->hevc) {
 		ret = s7d_hevc_v4l2_shutdown(vdec->hevc);
 		if (ret)
@@ -202,6 +220,16 @@ static int s7d_vdec_stop(struct s7d_vdec *vdec)
 	}
 	if (vdec->video) {
 		ret = s7d_v4l2_device_shutdown(vdec->video);
+		if (ret && !error)
+			error = ret;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) && vdec->jpeg_video) {
+		ret = s7d_jpeg_v4l2_shutdown(vdec->jpeg_video);
+		if (ret && !error)
+			error = ret;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) && vdec->jpeg) {
+		ret = s7d_jpeg_encoder_shutdown(vdec->jpeg);
 		if (ret && !error)
 			error = ret;
 	}
@@ -289,9 +317,29 @@ static int s7d_vdec_probe(struct platform_device *pdev)
 		if (ret)
 			goto fail;
 	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL)) {
+		vdec->jpeg = s7d_jpeg_encoder_create(vdec->dev, vdec->dos, vdec->firmware,
+						    THIS_MODULE);
+		if (IS_ERR(vdec->jpeg)) {
+			ret = PTR_ERR(vdec->jpeg);
+			vdec->jpeg = NULL;
+			goto fail;
+		}
+		vdec->jpeg_video = s7d_jpeg_v4l2_create(vdec->dev, vdec->jpeg);
+		if (IS_ERR(vdec->jpeg_video)) {
+			ret = PTR_ERR(vdec->jpeg_video);
+			vdec->jpeg_video = NULL;
+			goto fail;
+		}
+	}
 	ret = s7d_v4l2_device_register(vdec->video);
 	if (ret)
 		goto fail;
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) && vdec->jpeg_video) {
+		ret = s7d_jpeg_v4l2_register(vdec->jpeg_video);
+		if (ret)
+			goto fail;
+	}
 	platform_set_drvdata(pdev, vdec);
 	return 0;
 
