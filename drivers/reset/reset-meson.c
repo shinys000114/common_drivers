@@ -21,6 +21,7 @@
 struct meson_reset_param {
 	int reg_count;
 	int level_offset;
+	int mask_offset;
 };
 
 struct meson_reset {
@@ -54,10 +55,17 @@ static int meson_reset_level(struct reset_controller_dev *rcdev,
 	void __iomem *reg_addr;
 	unsigned long flags;
 	u32 reg;
+	int ret = 0;
 
 	reg_addr = data->reg_base + data->param->level_offset + (bank << 2);
 
 	spin_lock_irqsave(&data->lock, flags);
+
+	if (assert && data->param->mask_offset &&
+	    (readl(data->reg_base + data->param->mask_offset + bank * 4) & BIT(offset))) {
+		ret = -EBUSY;
+		goto out;
+	}
 
 	reg = readl(reg_addr);
 	if (assert)
@@ -65,9 +73,13 @@ static int meson_reset_level(struct reset_controller_dev *rcdev,
 	else
 		writel(reg | BIT(offset), reg_addr);
 
+	if (data->param->mask_offset &&
+	    (!!(readl(reg_addr) & BIT(offset)) == assert))
+		ret = -EIO;
+out:
 	spin_unlock_irqrestore(&data->lock, flags);
 
-	return 0;
+	return ret;
 }
 
 static int meson_reset_assert(struct reset_controller_dev *rcdev,
@@ -81,6 +93,29 @@ static int meson_reset_deassert(struct reset_controller_dev *rcdev,
 {
 	return meson_reset_level(rcdev, id, false);
 }
+
+static int meson_reset_status(struct reset_controller_dev *rcdev, unsigned long id)
+{
+	struct meson_reset *data = container_of(rcdev, struct meson_reset, rcdev);
+	unsigned int offset = (id / BITS_PER_REG) * 4;
+	unsigned long flags;
+	u32 released;
+
+	/* MASK overrides LEVEL; power-controller reset is a separate input. */
+	spin_lock_irqsave(&data->lock, flags);
+	released = readl(data->reg_base + data->param->level_offset + offset);
+	released |= readl(data->reg_base + data->param->mask_offset + offset);
+	spin_unlock_irqrestore(&data->lock, flags);
+
+	return !(released & BIT(id % BITS_PER_REG));
+}
+
+static const struct reset_control_ops meson_s7d_reset_ops = {
+	.reset = meson_reset_reset,
+	.assert = meson_reset_assert,
+	.deassert = meson_reset_deassert,
+	.status = meson_reset_status,
+};
 
 static const struct reset_control_ops meson_reset_ops = {
 	.reset		= meson_reset_reset,
@@ -101,6 +136,12 @@ static const struct meson_reset_param meson_a1_param = {
 #endif
 
 #ifdef CONFIG_AMLOGIC_MODIFY
+static const struct meson_reset_param meson_s7d_param = {
+	.reg_count = 6,
+	.level_offset = 0x40,
+	.mask_offset = 0x80,
+};
+
 static const struct meson_reset_param meson_sc2_param = {
 	.reg_count	= 6,
 	.level_offset	= 0x40,
@@ -143,6 +184,7 @@ static const struct of_device_id meson_reset_dt_ids[] = {
 #endif
 	 // zapper use sc2
 	 { .compatible = "amlogic,meson-sc2-reset",  .data = &meson_sc2_param},
+	 { .compatible = "amlogic,s7d-reset", .data = &meson_s7d_param },
 #endif
 	 { /* sentinel */ },
 };
@@ -171,7 +213,8 @@ static int meson_reset_probe(struct platform_device *pdev)
 
 	data->rcdev.owner = THIS_MODULE;
 	data->rcdev.nr_resets = data->param->reg_count * BITS_PER_REG;
-	data->rcdev.ops = &meson_reset_ops;
+	data->rcdev.ops = data->param->mask_offset ?
+		&meson_s7d_reset_ops : &meson_reset_ops;
 	data->rcdev.of_node = pdev->dev.of_node;
 
 	return devm_reset_controller_register(&pdev->dev, &data->rcdev);
