@@ -1101,6 +1101,9 @@ static int s7d_vpu_stop_hw(void *data)
 		v->osd_scaler_route_owned = false;
 		v->osd_scaler_route_saved = 0;
 	}
+	/* Unroute the postblend inputs, as firmware leaves them, for a later takeover. */
+	writel(vpu_read(v, VD1_BLEND) & ~0x0f0f, v->regs + VD1_BLEND * 4);
+	writel(vpu_read(v, VD2_BLEND) & ~0x0f0f, v->regs + VD2_BLEND * 4);
 	for (i = 0; i < ARRAY_SIZE(videos); i++) {
 		ret = vpu_update(v, videos[i], VD1_FREE_CLK, v->video_free_clk[i]);
 		if (ret)
@@ -1173,20 +1176,35 @@ static int check_handoff(struct s7d_vpu *v)
 	 * Initial takeover supports firmware's linear OSD path. Refuse video,
 	 * GFCD/AFBC routes rather than guessing their stop/idle/reset protocols.
 	 * The provider profile excludes Linux video/capture and legacy writers.
+	 * ENCP FIFO must use cts_vpu_clk, not an unowned vpu_clkc route. Both
+	 * OSD arbiter branches and RDMA must use the READ0 idle we check.
 	 */
-	if ((vpu_read(v, OSD_PATH) & (BIT(14) | GENMASK(12, 9) | GENMASK(7, 0))) ||
-	    (vpu_read(v, VD1_PATH) & 0x007dff00) ||
-	    (vpu_read(v, VD2_PATH) & 0x007dfe00) ||
-	    (vpu_read(v, 0x1d26) & BIT(27)) ||
-	    (!v->touched &&
-	     ((vpu_read(v, VD1_BLEND) | vpu_read(v, VD2_BLEND)) & 0x0f0f)))
-		return -EOPNOTSUPP;
-	/* ENCP FIFO must use cts_vpu_clk, not an unowned vpu_clkc route. */
-	if (vpu_read(v, VENC_CLK) & BIT(0))
-		return -EOPNOTSUPP;
-	/* Both OSD arbiter branches and RDMA must use the READ0 idle we check. */
-	if (vpu_read(v, RDARB_MODE_L2) & GENMASK(18, 16))
-		return -EOPNOTSUPP;
+	static const struct {
+		u16 reg;
+		u32 mask;
+		bool untouched;
+	} refused[] = {
+		{ OSD_PATH, BIT(14) | GENMASK(12, 9) | GENMASK(7, 0) },
+		{ VD1_PATH, 0x007dff00 },
+		{ VD2_PATH, 0x007dfe00 },
+		{ 0x1d26, BIT(27) },
+		{ VD1_BLEND, 0x0f0f, true },
+		{ VD2_BLEND, 0x0f0f, true },
+		{ VENC_CLK, BIT(0) },
+		{ RDARB_MODE_L2, GENMASK(18, 16) },
+	};
+	u32 value;
+
+	for (i = 0; i < ARRAY_SIZE(refused); i++) {
+		if (refused[i].untouched && v->touched)
+			continue;
+		value = vpu_read(v, refused[i].reg);
+		if (value & refused[i].mask) {
+			dev_err(v->dev, "refusing takeover: VCBUS %#x = %#x\n",
+				refused[i].reg, value);
+			return -EOPNOTSUPP;
+		}
+	}
 	return 0;
 }
 
