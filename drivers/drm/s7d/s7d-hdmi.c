@@ -1782,7 +1782,7 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 		.spdif = 1,
 		.no_i2s_capture = 1,
 		.no_spdif_capture = 1,
-		.max_i2s_channels = 2,
+		.max_i2s_channels = 8,
 	};
 	unsigned int value, i;
 	int ret;
