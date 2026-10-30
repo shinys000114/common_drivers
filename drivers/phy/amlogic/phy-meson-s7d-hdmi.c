@@ -16,6 +16,8 @@
 #include <linux/reset.h>
 
 #define PHY_CTRL0	0x200
+#define PHY_CTRL1	0x204
+#define PHY_CTRL1_READY	0x0390000e
 #define PHY_CTRL3	0x20c
 #define PHY_CTRL5	0x214
 #define PHY_LANES_ON	GENMASK(29, 28)
@@ -47,6 +49,41 @@ static int s7d_phy_stop(struct s7d_hdmi_phy *priv)
 	if (ret)
 		return ret;
 	return regmap_write(priv->map, PHY_CTRL3, 0xc1b);
+}
+
+/*
+ * PHY clock enable and soft reset, as the vendor programs them for a mode;
+ * firmware leaves them set only when it drove HDMI itself.
+ */
+static int s7d_phy_reset(struct s7d_hdmi_phy *priv)
+{
+	unsigned int i;
+	u32 ctrl1;
+	int ret;
+
+	ret = regmap_read(priv->map, PHY_CTRL1, &ctrl1);
+	if (ret || ctrl1 == PHY_CTRL1_READY)
+		return ret;
+	ret = regmap_update_bits(priv->map, PHY_CTRL1, GENMASK(31, 16), 0x0390 << 16);
+	if (!ret)
+		ret = regmap_update_bits(priv->map, PHY_CTRL1, BIT(17), BIT(17));
+	if (!ret)
+		ret = regmap_update_bits(priv->map, PHY_CTRL1, BIT(17) | GENMASK(3, 0), 0);
+	if (ret)
+		return ret;
+	msleep(20);
+	for (i = 0; i < 3; i++) {
+		ret = regmap_update_bits(priv->map, PHY_CTRL1, GENMASK(3, 0), 0xf);
+		if (ret)
+			return ret;
+		usleep_range(2000, 2100);
+		ret = regmap_update_bits(priv->map, PHY_CTRL1, GENMASK(3, 0), 0xe);
+		if (ret)
+			return ret;
+		usleep_range(2000, 2100);
+	}
+	ret = regmap_read(priv->map, PHY_CTRL1, &ctrl1);
+	return ret ? ret : ctrl1 == PHY_CTRL1_READY ? 0 : -EIO;
 }
 
 static int s7d_phy_is_enabled(struct s7d_hdmi_phy *priv)
@@ -113,6 +150,9 @@ static int s7d_phy_init(struct phy *phy)
 		usleep_range(100, 110);
 		ret = regmap_update_bits(priv->map, PHY_CTRL3,
 					GENMASK(1, 0) | BIT(3), 3 | BIT(3));
+		if (ret)
+			goto disable_clock;
+		ret = s7d_phy_reset(priv);
 		if (ret)
 			goto disable_clock;
 	}
