@@ -45,6 +45,7 @@ obj-y					+= dvb/
 obj-y					+= dvb_ci/
 obj-$(CONFIG_AMLOGIC_MEDIA_ENABLE)	+= media/
 obj-$(CONFIG_AMLOGIC_S7D_VIDEO_FIRMWARE) += firmware/amlogic/
+obj-$(CONFIG_VIDEO_AMLOGIC_S7D) += media/platform/amlogic/s7d/
 obj-$(CONFIG_CEC_MESON_S7D) += media/cec/platform/meson/
 obj-$(CONFIG_AMLOGIC_WATERMARK)		+= aml_watermark/
 obj-$(CONFIG_AMLOGIC_TRUSTED_KEYS)	+= aml_trusted_keys/
