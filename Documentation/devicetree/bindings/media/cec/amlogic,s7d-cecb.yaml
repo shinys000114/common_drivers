@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/cec/amlogic,s7d-cecb.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D CECB controller
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  The S7D always-on CECB controller handles CEC for the HDMI transmitter.
+  During deep suspend and power off the AOCPU firmware runs the controller,
+  answers on behalf of the system and wakes it when the TV selects this
+  source. The firmware reads its configuration from two SYSCTRL status
+  registers and records the wake source in a SYSCTRL sticky register.
+
+allOf:
+  - $ref: cec-common.yaml#
+
+properties:
+  compatible:
+    const: amlogic,s7d-cecb
+
+  reg:
+    minItems: 1
+    items:
+      - description: CECB controller registers.
+      - description: SYSCTRL_STATUS_REG0/1, read by the AOCPU firmware.
+      - description: SYSCTRL_STICKY_REG7, the firmware wake reason.
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: cecb
+      - const: handoff
+      - const: wake
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: Peripheral bus clock.
+      - description: 32768 Hz CEC core clock.
+
+  clock-names:
+    items:
+      - const: apb
+      - const: core
+
+  resets:
+    maxItems: 1
+
+  mboxes:
+    maxItems: 1
+    description:
+      Mailbox channel to the AOCPU, used to pass the OSD name and vendor ID
+      and to read back the message that woke the system.
+
+  mbox-names:
+    const: aocpu
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - hdmi-phandle
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    cec@fe044040 {
+        compatible = "amlogic,s7d-cecb";
+        reg = <0xfe044040 0x14>, <0xfe010280 0x8>, <0xfe0102dc 0x4>;
+        reg-names = "cecb", "handoff", "wake";
+        interrupts = <GIC_SPI 180 IRQ_TYPE_EDGE_RISING>;
+        clocks = <&clkc 1>, <&clkc 2>;
+        clock-names = "apb", "core";
+        resets = <&reset 3>;
+        mboxes = <&mbox 69>;
+        mbox-names = "aocpu";
+        hdmi-phandle = <&hdmi>;
+    };
