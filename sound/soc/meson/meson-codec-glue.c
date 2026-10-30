@@ -83,6 +83,19 @@ int meson_codec_glue_input_hw_params(struct snd_pcm_substream *substream,
 }
 EXPORT_SYMBOL_GPL(meson_codec_glue_input_hw_params);
 
+/*
+ * The glue passes the whole stream through, so it has no slot mask. The
+ * default one, derived from the slots per lane, would drop all channels
+ * past the first lane from the codec parameters.
+ */
+int meson_codec_glue_input_xlate_tdm_slot_mask(unsigned int slots,
+					       unsigned int *tx_mask,
+					       unsigned int *rx_mask)
+{
+	return 0;
+}
+EXPORT_SYMBOL_GPL(meson_codec_glue_input_xlate_tdm_slot_mask);
+
 int meson_codec_glue_input_set_fmt(struct snd_soc_dai *dai,
 				   unsigned int fmt)
 {

@@ -199,6 +199,7 @@ static const struct snd_soc_dai_ops g12a_tohdmitx_input_ops = {
 	.remove		= meson_codec_glue_input_dai_remove,
 	.hw_params	= meson_codec_glue_input_hw_params,
 	.set_fmt	= meson_codec_glue_input_set_fmt,
+	.xlate_tdm_slot_mask = meson_codec_glue_input_xlate_tdm_slot_mask,
 };
 
 static bool s7d_tohdmitx_i2s_selected(struct snd_soc_dai *dai)
@@ -272,6 +273,7 @@ static const struct snd_soc_dai_ops s7d_tohdmitx_i2s_input_ops = {
 	.remove		= meson_codec_glue_input_dai_remove,
 	.hw_params	= meson_codec_glue_input_hw_params,
 	.set_fmt	= meson_codec_glue_input_set_fmt,
+	.xlate_tdm_slot_mask = meson_codec_glue_input_xlate_tdm_slot_mask,
 	.prepare	= s7d_tohdmitx_i2s_input_prepare,
 	.shutdown	= s7d_tohdmitx_i2s_input_shutdown,
 };

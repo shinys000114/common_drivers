@@ -20,6 +20,9 @@ meson_codec_glue_input_get_data(struct snd_soc_dai *dai);
 int meson_codec_glue_input_hw_params(struct snd_pcm_substream *substream,
 				     struct snd_pcm_hw_params *params,
 				     struct snd_soc_dai *dai);
+int meson_codec_glue_input_xlate_tdm_slot_mask(unsigned int slots,
+					       unsigned int *tx_mask,
+					       unsigned int *rx_mask);
 int meson_codec_glue_input_set_fmt(struct snd_soc_dai *dai,
 				   unsigned int fmt);
 int meson_codec_glue_input_dai_probe(struct snd_soc_dai *dai);
