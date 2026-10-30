@@ -1112,6 +1112,18 @@ static void s7d_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_sta
 
 	mutex_lock(&c->mutex);
 	ret = s7d_crtc_stop(c);
+	if (ret && READ_ONCE(c->prepared)) {
+		/*
+		 * A decoder fault seen while stopping is reset once the scanout
+		 * is marked faulted; stop again now, as the error work would.
+		 */
+		spin_lock_irqsave(&crtc->dev->event_lock, flags);
+		s7d_scanout_fail(c->scanout);
+		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+		ret = s7d_crtc_stop(c);
+		if (!ret)
+			drm_warn(crtc->dev, "S7D stop recovered after a fault\n");
+	}
 	s7d_crtc_abort_pending(c, ret ? ret : -ECANCELED);
 	if (ret) {
 		s7d_crtc_fail(c, ret, state);
