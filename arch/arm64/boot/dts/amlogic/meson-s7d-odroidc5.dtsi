@@ -580,6 +580,9 @@
 		clock-names = "vpu", "vapb", "intr", "encp", "xtal", "pixel-pll",
 			      "pixel-source", "pixel-mux", "pixel-parent",
 			      "hdmi-shared", "hdmi-serial", "enci", "enci-mux";
+		/* The vendor GE2D driver runs the shared VAPB at 500 MHz on S7D. */
+		assigned-clocks = <&clkc CLKID_VAPB>;
+		assigned-clock-rates = <500000000>;
 		resets = <&reset RESET_VIU>, <&reset RESET_VENC>,
 			 <&reset RESET_VENCP>, <&reset RESET_RDMA>,
 			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBCD_REGS>,
@@ -746,5 +749,21 @@
 			groups = "mclk_1_d4";
 			function = "mclk";
 		};
+	};
+};
+
+/* The native GE2D driver replaces the vendor node. */
+/delete-node/ &{/ge2d};
+
+/ {
+	c5_ge2d: ge2d@ff040000 {
+		compatible = "amlogic,s7d-ge2d";
+		reg = <0 0xff040000 0 0x400>;
+		interrupts = <GIC_SPI 217 IRQ_TYPE_EDGE_RISING>;
+		clocks = <&clkc CLKID_GE2D>, <&clkc CLKID_SYS_GE2D>;
+		resets = <&reset RESET_GE2D>;
+		power-domains = <&pwrdm PDID_S7D_GE2D>;
+		/* Frames are shared with the display, so use its CMA area. */
+		memory-region = <&c5_display_cma>;
 	};
 };
