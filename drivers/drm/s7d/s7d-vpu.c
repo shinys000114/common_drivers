@@ -1163,14 +1163,22 @@ static int s7d_vpu_stop(void *data)
 
 static int check_handoff(struct s7d_vpu *v)
 {
+	bool cold = false;
 	unsigned int i;
 	int ret;
 
-	/* Cold/reset domains need a separate initialization sequence. */
+	/* Without firmware setup the display starts cold: release its resets. */
 	for (i = 0; i < ARRAY_SIZE(v->resets); i++) {
 		ret = reset_control_status(v->resets[i].rstc);
+		if (ret < 0)
+			return ret;
+		cold |= ret;
+	}
+	if (cold) {
+		ret = reset_control_bulk_deassert(ARRAY_SIZE(v->resets), v->resets);
 		if (ret)
-			return ret < 0 ? ret : -EHOSTDOWN;
+			return ret;
+		dev_info(v->dev, "VPU held in reset; starting it without firmware setup\n");
 	}
 	/*
 	 * Initial takeover supports firmware's linear OSD path. Refuse video,

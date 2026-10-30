@@ -1834,11 +1834,18 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	ret = devm_reset_control_bulk_get_exclusive(dev, ARRAY_SIZE(h->resets), h->resets);
 	if (ret)
 		return dev_err_probe(dev, ret, "TX resets\n");
-	/* Initial retained-state profile: never deassert a cold block speculatively. */
+	/* Without firmware setup the TX starts cold: release its resets. */
 	for (i = 0; i < ARRAY_SIZE(h->resets); i++) {
 		ret = reset_control_status(h->resets[i].rstc);
-		if (ret)
-			return dev_err_probe(dev, ret < 0 ? ret : -EHOSTDOWN, "TX held in reset\n");
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "TX reset state\n");
+		if (ret) {
+			ret = reset_control_bulk_deassert(ARRAY_SIZE(h->resets), h->resets);
+			if (ret)
+				return dev_err_probe(dev, ret, "TX reset release\n");
+			dev_info(dev, "TX held in reset; starting it without firmware setup\n");
+			break;
+		}
 	}
 	h->phy = devm_phy_get(dev, "hdmi");
 	if (IS_ERR(h->phy))
@@ -1867,10 +1874,10 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	if (ret)
 		goto put_pm;
 	ret = regmap_read(h->top, TOP_RESET, &value);
-	if (ret || value) {
-		ret = ret ? ret : -EHOSTDOWN;
+	if (!ret && value)
+		ret = s7d_hdmi_tx_reset(h);
+	if (ret)
 		goto disable_basic;
-	}
 	/* Refuse firmware protection; this driver never owns HDCP authentication. */
 	ret = regmap_read(h->core, CORE_HDCP1, &value);
 	if (ret || (value & (BIT(7) | BIT(0)))) {

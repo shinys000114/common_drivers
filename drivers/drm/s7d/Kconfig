@@ -43,7 +43,8 @@ config DRM_S7D
 	  combine with VD1 up to 1080p at 148.5 MHz, but local OSD and VD1 scaling
 	  cannot run together with AFBC;
 	  joint primary/video changes require a stopped modeset.
-	  Requires retained firmware output on S7D revision B, with SDR RGB8 TMDS up to 594 MHz.
+	  Supports S7D revision B, with TMDS up to 594 MHz. Takes over a firmware
+	  output when there is one; otherwise starts the display from reset.
 	  Do not enable with legacy media/display writers. System sleep, including
 	  deep sleep where firmware powers the display domain off, restores the
 	  output after the driver has taken over.
