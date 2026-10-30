@@ -877,7 +877,7 @@ static int s7d_vpu_stop_hw(void *data)
 	if (!v->acquired)
 		return -EIO;
 	/* Also used by CRTC error work, which bypasses DRM bridge disable. */
-	ret = v->link.quiesce ? v->link.quiesce(v->link.data) : 0;
+	ret = v->link.quiesce(v->link.data);
 	if (ret)
 		return ret;
 	/*
@@ -1664,7 +1664,7 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_vpu_check_link_rates(v, &state->output.rate, 3);
 	if (ret)
 		return ret;
-	ret = v->link.prepare ? v->link.prepare(v->link.data, &state->output) : 0;
+	ret = v->link.prepare(v->link.data, &state->output);
 	if (ret)
 		return ret;
 	ret = s7d_vpu_check_link_rates(v, &state->output.rate, 3);
@@ -2268,10 +2268,9 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	struct resource *res;
 	int ret;
 
-	if (link && (!link->quiesce || !link->prepare))
+	if (!link || !link->quiesce || !link->prepare)
 		return -EINVAL;
-	if (link)
-		v->link = *link;
+	v->link = *link;
 	v->dev = dev;
 	spin_lock_init(&v->frame_lock);
 	INIT_DELAYED_WORK(&v->afbc_timeout, s7d_vpu_afbc_timeout);
