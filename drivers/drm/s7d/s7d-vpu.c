@@ -20,7 +20,9 @@
 
 #include <dt-bindings/reset/amlogic,s7d-vpu-reset.h>
 
+#include "s7d-vdin.h"
 #include "s7d-vpu.h"
+#include "s7d-writeback.h"
 #include "s7d-filter.h"
 #include "s7d-gamma.h"
 #include "s7d-vpp.h"
@@ -866,6 +868,9 @@ static int s7d_vpu_stop_hw(void *data)
 	bool recover = false;
 	int ret;
 
+	ret = s7d_writeback_cancel(v->writeback, -ECANCELED);
+	if (ret)
+		return ret;
 	mask_irqs(v);
 	spin_lock_irq(&v->frame_lock);
 	v->static_video_mask = 0;
@@ -1664,9 +1669,11 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_vpu_check_link_rates(v, &state->output.rate, 3);
 	if (ret)
 		return ret;
-	ret = v->link.prepare(v->link.data, &state->output);
-	if (ret)
-		return ret;
+	if (!state->writeback_only) {
+		ret = v->link.prepare(v->link.data, &state->output);
+		if (ret)
+			return ret;
+	}
 	ret = s7d_vpu_check_link_rates(v, &state->output.rate, 3);
 	if (ret)
 		return ret;
@@ -2191,6 +2198,8 @@ static irqreturn_t s7d_vpu_vsync_irq(int irq, void *data)
 	s7d_vpu_trace_frame(v, 0, 0);
 	/* VIU1 VSYNC is a GIC edge, not the legacy VENC_INTFLAG interrupt. */
 	s7d_vpu_frame_irq(v, true, S7D_RDMA_NO_IRQ, 0);
+	if (v->vdin)
+		s7d_vdin_vsync(v->vdin);
 	return IRQ_HANDLED;
 }
 

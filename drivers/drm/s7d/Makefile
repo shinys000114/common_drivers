@@ -15,6 +15,8 @@ s7d-drm-y := \
 	s7d-vpu.o \
 	s7d-vpp.o \
 	s7d-gamma.o \
+	s7d-writeback.o \
+	s7d-vdin.o \
 	s7d-crtc.o \
 	s7d-caps.o \
 	s7d-bandwidth.o \

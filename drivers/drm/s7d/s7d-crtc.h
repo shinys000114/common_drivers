@@ -22,6 +22,8 @@
 	2 * (S7D_VIDEO_UPDATE_REG_COUNT + S7D_CSC_MATRIX_REG_COUNT + 1) + \
 	S7D_POSTBLEND_REG_COUNT + 2 + S7D_VPP_POST2_UPDATE_COUNT + S7D_GAMMA_UPDATE_COUNT)
 
+struct s7d_writeback;
+
 struct s7d_crtc_state {
 	struct drm_crtc_state base;
 	struct s7d_encp_state encp;
@@ -42,6 +44,8 @@ struct s7d_crtc_state {
 	struct s7d_scanout_afbc previous_afbc;
 	unsigned long pixel_rate;
 	bool valid;
+	/* Derived from attached connectors, independently of HPD and WB jobs. */
+	bool writeback_only;
 	bool video_unchanged;
 	bool video_address_only;
 	bool input_captured;
@@ -122,6 +126,8 @@ void s7d_crtc_capture_input(struct drm_crtc *crtc, struct drm_atomic_state *atom
 void s7d_crtc_primary_dependency(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
 void s7d_crtc_osd2_dependency(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
 int s7d_crtc_last_error(struct drm_crtc *crtc);
+int s7d_crtc_writeback_capture(struct drm_crtc *crtc, struct drm_atomic_state *atomic,
+			       struct s7d_writeback *writeback);
 /* Bridge completion/error, after atomic_enable; never used from atomic_check. */
 void s7d_crtc_link_ready(struct drm_crtc *crtc);
 void s7d_crtc_link_error(struct drm_crtc *crtc, int error);

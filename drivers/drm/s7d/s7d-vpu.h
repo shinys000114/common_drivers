@@ -11,6 +11,8 @@
 
 struct platform_device;
 struct regmap;
+struct s7d_vdin;
+struct s7d_writeback;
 
 /* HDMI owns PHY/packets. Return only after its transmitter is safely off. */
 struct s7d_vpu_link {
@@ -40,6 +42,8 @@ struct s7d_vpu {
 	struct s7d_rdma rdma;
 	struct s7d_scanout scanout;
 	struct drm_crtc *crtc;
+	struct s7d_writeback *writeback;
+	struct s7d_vdin *vdin;
 	spinlock_t frame_lock; /* IRQ frame state, AFBC engine and replay flags. */
 	int vsync_irq;
 	int rdma_irq;
