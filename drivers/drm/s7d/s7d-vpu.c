@@ -84,6 +84,17 @@ static u32 vpu_read(struct s7d_vpu *v, u32 reg)
 	return readl(v->regs + reg * 4);
 }
 
+/* Encoder field counter and line, the line relative to the current field. */
+static u32 s7d_vpu_info(struct s7d_vpu *v)
+{
+	u32 info = vpu_read(v, v->info_reg);
+	u32 line = (info >> 16) & 0x1fff;
+
+	if (v->field_lines && line >= v->field_lines)
+		info = (info & ~(0x1fffU << 16)) | ((line - v->field_lines) << 16);
+	return info;
+}
+
 static int vpu_update(struct s7d_vpu *v, u32 reg, u32 mask, u32 value)
 {
 	u32 observed;
@@ -122,7 +133,7 @@ static int s7d_vpu_afbc_write(void *data, u32 reg, u32 value)
 	if (ret)
 		return ret;
 	if (reg == AFBC_COMMAND)
-		v->afbc_command_counter = vpu_read(v, v->info_reg);
+		v->afbc_command_counter = s7d_vpu_info(v);
 	return regmap_write(v->regmap, reg * 4, value);
 }
 
@@ -150,13 +161,13 @@ static int s7d_vpu_afbc_check_start(void *data, u64 sequence, u8 field)
 	if (!v->acquired || !(vpu_read(v, ENCP_EN) & BIT(0)) ||
 	    sequence != READ_ONCE(v->scanout.vblank_seq))
 		return -EHOSTDOWN;
-	before = vpu_read(v, v->info_reg);
+	before = s7d_vpu_info(v);
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
 	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
 	vd1 = vpu_read(v, VD1_GEN);
 	vd2 = vpu_read(v, VD2_GEN);
 	arbiter = vpu_read(v, ASYNC_STAT);
-	after = vpu_read(v, v->info_reg);
+	after = s7d_vpu_info(v);
 	if ((before >> 29) != field || (after >> 29) != field ||
 	    ((fifo | fifo2) & OSD_FIFO_STATE) || ((vd1 | vd2) & VD1_BUSY) ||
 	    !(arbiter & ASYNC_IDLE) ||
@@ -454,7 +465,7 @@ static int s7d_vpu_afbc_replay_publish(struct s7d_vpu *v, u64 sequence,
 	if (ret)
 		return s7d_afbc_engine_fail(&v->afbc, ret, AFBC_COMMAND);
 	v->afbc_replay_armed_ns = ktime_get_mono_fast_ns();
-	after = vpu_read(v, v->info_reg);
+	after = s7d_vpu_info(v);
 	if ((before >> 29) != (after >> 29) ||
 	    ((after >> 16) & 0x1fff) < ((before >> 16) & 0x1fff))
 		return s7d_afbc_engine_fail(&v->afbc, -ETIMEDOUT, ENCP_INFO_READ);
@@ -479,7 +490,7 @@ static int s7d_vpu_afbc_replay_prepare_next(struct s7d_vpu *v)
 	lockdep_assert_held(&v->frame_lock);
 	if (!v->afbc_replay_pending_cookie || !s7d_rdma_loop_can_replace(&v->rdma))
 		return 0;
-	before = vpu_read(v, v->info_reg);
+	before = s7d_vpu_info(v);
 	line = (before >> 16) & 0x1fff;
 	if (line >= v->replay_prepare_end ||
 	    !v->scanout.vblank_seq ||
@@ -1788,6 +1799,8 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 			return s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
 	}
 	v->info_reg = state->encp.enci ? ENCI_INFO_READ : ENCP_INFO_READ;
+	v->field_lines = state->encp.interlace && !state->encp.enci ?
+		(state->base.adjusted_mode.vtotal + 1) / 2 : 0;
 	v->venc_en = state->encp.enci ? ENCI_EN : ENCP_EN;
 	v->flip_start = state->encp.flip_start;
 	v->flip_end = state->encp.flip_end;
@@ -1899,7 +1912,7 @@ const struct s7d_crtc_ops s7d_vpu_crtc_ops = {
 static void s7d_vpu_trace_frame(struct s7d_vpu *v, unsigned int kind, int result)
 {
 	if (trace_s7d_frame_enabled())
-		trace_s7d_frame(kind, vpu_read(v, v->info_reg),
+		trace_s7d_frame(kind, s7d_vpu_info(v),
 			       drm_crtc_vblank_count(v->crtc), result);
 }
 
@@ -2068,7 +2081,7 @@ static int s7d_vpu_afbc_replay_replace(struct s7d_vpu *v,
 	    (result != S7D_RDMA_APPLIED && result != S7D_RDMA_REPLAY) ||
 	    cookie != v->afbc_replay_cookie)
 		return 0;
-	before = vpu_read(v, v->info_reg);
+	before = s7d_vpu_info(v);
 	if ((before >> 29) != frame->field ||
 	    ((before >> 16) & 0x1fff) >= v->flip_end)
 		return 0;
@@ -2135,7 +2148,7 @@ static bool s7d_vpu_gfcd_latched(struct s7d_vpu *v, u8 field)
 	spin_unlock_irqrestore(&s->lock, flags);
 	if (!head || vpu_read(v, S7D_GFCD_HEAD) != head)
 		return false;
-	info = vpu_read(v, v->info_reg);
+	info = s7d_vpu_info(v);
 	return (info >> 29) == field && ((info >> 16) & 0x1fff) < v->flip_end;
 }
 
@@ -2159,13 +2172,13 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	    cookie != v->afbc_replay_cookie)
 		result = S7D_RDMA_NO_IRQ;
 	afbc_error = v->afbc.phase == S7D_AFBC_ERROR;
-	before = vpu_read(v, v->info_reg);
+	before = s7d_vpu_info(v);
 	fifo = vpu_read(v, OSD1_CTRL + OSD_FIFO_OFFSET);
 	fifo2 = vpu_read(v, OSD2_CTRL + OSD_FIFO_OFFSET);
 	vd1 = vpu_read(v, VD1_GEN);
 	vd2 = vpu_read(v, VD2_GEN);
 	arbiter = vpu_read(v, ASYNC_STAT);
-	after = vpu_read(v, v->info_reg);
+	after = s7d_vpu_info(v);
 	frame.field = after >> 29;
 	frame.idle = (before >> 29) == frame.field &&
 		     !((fifo | fifo2) & OSD_FIFO_STATE) && !((vd1 | vd2) & VD1_BUSY) &&
@@ -2228,11 +2241,11 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 				drm_crtc_accurate_vblank_count(v->crtc), &value);
 		}
 		v->crc_armed = false;
-		value = vpu_read(v, v->info_reg);
+		value = s7d_vpu_info(v);
 		if ((value >> 29) == frame.field &&
 		    ((value >> 16) & 0x1fff) < v->flip_end) {
 			writel(1, v->regs + 0x1db3 * 4);
-			value = vpu_read(v, v->info_reg);
+			value = s7d_vpu_info(v);
 			v->crc_field = frame.field;
 			v->crc_armed = (value >> 29) == frame.field &&
 				((value >> 16) & 0x1fff) < v->flip_end;
