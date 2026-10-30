@@ -2,9 +2,9 @@
 # Copyright (c) 2026 Hardkernel Co., Ltd.
 
 config DRM_S7D
-	bool "Amlogic S7D display controller and HDMI transmitter (experimental)"
+	tristate "Amlogic S7D display controller and HDMI transmitter (experimental)"
 	depends on AMLOGIC_C5_DISPLAY_RESOURCES
-	depends on DRM = y && I2C = y && AMLOGIC_CPU_INFO = y
+	depends on DRM && I2C && AMLOGIC_CPU_INFO
 	depends on DMA_CMA && REGMAP_MMIO
 	depends on !AMLOGIC_MEDIA_ENABLE
 	select PHY_MESON_S7D_HDMI
@@ -18,7 +18,9 @@ config DRM_S7D
 	help
 	  Build the S7D VPU execution path and RGB8 TMDS bridge, with
 	  DRM EDID/SCDC helpers, CCF consumers and generic PHY ownership.
-	  Static device trees and built-in drivers only; unbind is suppressed.
+	  Built in or as the module s7d-drm. Unbinding stops the output and
+	  frees its resources; buffers the hardware may still read after a
+	  failed stop are leaked.
 	  Register one CRTC, linear RGB primary, linear YUV VD1/VD2 video and
 	  shared OSD2 cursor/overlay planes, and an HDMI connector.
 	  Cursor and RGB overlay cannot be visible together. Video is progressive

@@ -6,12 +6,15 @@
 struct drm_atomic_state;
 struct drm_bridge;
 struct drm_connector;
+struct platform_driver;
 struct s7d_vpu_link;
 
 int s7d_hdmi_connector_atomic_check(struct drm_connector *connector,
 				  struct drm_atomic_state *atomic);
 
 /* Obtain the native bridge's VPU handoff/prepare callbacks before attaching it. */
+extern struct platform_driver s7d_hdmi_driver;
+
 int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link);
 void s7d_hdmi_bridge_eld_updated(struct drm_bridge *bridge, struct drm_connector *connector);
 int s7d_hdmi_bridge_set_connector(struct drm_bridge *bridge, struct drm_connector *connector);

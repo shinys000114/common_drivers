@@ -2006,24 +2006,43 @@ static int s7d_hdmi_resume(struct device *dev)
 
 static DEFINE_SIMPLE_DEV_PM_OPS(s7d_hdmi_pm_ops, s7d_hdmi_suspend, s7d_hdmi_resume);
 
-/* Static DT and built-in driver only until failed-stop removal can retain devres. */
+/* The display, a consumer through its device link, has already unbound. */
+static void s7d_hdmi_remove(struct platform_device *pdev)
+{
+	struct s7d_hdmi *h = platform_get_drvdata(pdev);
+	int ret;
+
+	drm_bridge_remove(&h->bridge);
+	/* The audio codec still reaches the TX while it goes away. */
+	devm_release_action(&pdev->dev, s7d_hdmi_codec_unregister, h);
+	mutex_lock(&h->lock);
+	WRITE_ONCE(h->stopping, true);
+	WRITE_ONCE(h->hpd_enabled, false);
+	mutex_unlock(&h->lock);
+	disable_irq(h->irq);
+	cancel_delayed_work_sync(&h->hpd_recovery);
+	cancel_delayed_work_sync(&h->scdc_check);
+	ret = s7d_hdmi_quiesce(h);
+	if (ret)
+		dev_err(&pdev->dev, "TX did not stop: %d\n", ret);
+	s7d_hdmi_ddc_unregister(&h->ddc);
+	clk_bulk_disable_unprepare(ARRAY_SIZE(h->basic), h->basic);
+	pm_runtime_put(&pdev->dev);
+}
+
 static const struct of_device_id s7d_hdmi_match[] = {
 	{ .compatible = "amlogic,s7d-hdmi-tx" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s7d_hdmi_match);
 
-static struct platform_driver s7d_hdmi_driver = {
+struct platform_driver s7d_hdmi_driver = {
 	.probe = s7d_hdmi_probe,
+	.remove = s7d_hdmi_remove,
 	.shutdown = s7d_hdmi_shutdown,
 	.driver = {
 		.name = "s7d-hdmi-tx",
 		.of_match_table = s7d_hdmi_match,
-		.suppress_bind_attrs = true,
 		.pm = pm_sleep_ptr(&s7d_hdmi_pm_ops),
 	},
 };
-builtin_platform_driver(s7d_hdmi_driver);
-
-MODULE_DESCRIPTION("Amlogic S7D HDMI transmitter");
-MODULE_LICENSE("GPL");

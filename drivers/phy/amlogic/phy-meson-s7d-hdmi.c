@@ -221,6 +221,7 @@ int s7d_hdmi_phy_is_enabled(struct phy *phy)
 	phy_pm_runtime_put(phy);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(s7d_hdmi_phy_is_enabled);
 
 static int s7d_phy_probe(struct platform_device *pdev)
 {
