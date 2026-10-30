@@ -18,6 +18,8 @@
 #include "common/s7d-codec-dos.h"
 #include "common/s7d-codec-firmware.h"
 #include "h264/s7d-h264-backend.h"
+#include "hevc/s7d-hevc-v4l2.h"
+#include "common/s7d-hevc-engine.h"
 #include "common/s7d-v4l2-device.h"
 
 struct s7d_vdec {
@@ -28,6 +30,8 @@ struct s7d_vdec {
 	struct s7d_h264_decoder *decoder;
 	/* One decoder node; the OUTPUT format picks the codec. */
 	struct s7d_v4l2_device *video;
+	struct s7d_hevc_v4l2 *hevc;
+	struct s7d_hevc_engine *hevc_engine;
 	struct module *tee_owner;
 	bool reserved_memory;
 };
@@ -147,6 +151,18 @@ static int s7d_vdec_release(struct s7d_vdec *vdec)
 			return ret;
 		vdec->video = NULL;
 	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) && vdec->hevc) {
+		ret = s7d_hevc_v4l2_destroy(vdec->hevc);
+		if (ret)
+			return ret;
+		vdec->hevc = NULL;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_ENGINE) && vdec->hevc_engine) {
+		ret = s7d_hevc_engine_destroy(vdec->hevc_engine);
+		if (ret)
+			return ret;
+		vdec->hevc_engine = NULL;
+	}
 	if (vdec->decoder) {
 		ret = s7d_h264_decoder_destroy(vdec->decoder);
 		if (ret)
@@ -179,6 +195,11 @@ static int s7d_vdec_stop(struct s7d_vdec *vdec)
 
 	if (vdec->video)
 		s7d_v4l2_device_unregister(vdec->video);
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) && vdec->hevc) {
+		ret = s7d_hevc_v4l2_shutdown(vdec->hevc);
+		if (ret)
+			error = ret;
+	}
 	if (vdec->video) {
 		ret = s7d_v4l2_device_shutdown(vdec->video);
 		if (ret && !error)
@@ -246,6 +267,28 @@ static int s7d_vdec_probe(struct platform_device *pdev)
 					vdec->decoder);
 	if (ret)
 		goto fail;
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_ENGINE)) {
+		vdec->hevc_engine = s7d_hevc_engine_create(vdec->dev, vdec->dos, THIS_MODULE);
+		if (IS_ERR(vdec->hevc_engine)) {
+			ret = PTR_ERR(vdec->hevc_engine);
+			vdec->hevc_engine = NULL;
+			goto fail;
+		}
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL)) {
+		vdec->hevc = s7d_hevc_v4l2_create(vdec->dev, vdec->dos, vdec->firmware,
+						vdec->hevc_engine, THIS_MODULE);
+		if (IS_ERR(vdec->hevc)) {
+			ret = PTR_ERR(vdec->hevc);
+			vdec->hevc = NULL;
+			goto fail;
+		}
+		ret = s7d_v4l2_device_add_codec(vdec->video, s7d_hevc_v4l2_core(vdec->hevc),
+						s7d_hevc_v4l2_factory(vdec->hevc),
+						vdec->hevc);
+		if (ret)
+			goto fail;
+	}
 	ret = s7d_v4l2_device_register(vdec->video);
 	if (ret)
 		goto fail;
@@ -305,6 +348,16 @@ static int s7d_vdec_prepare(struct device *dev)
 	ret = s7d_h264_decoder_suspend_check(vdec->decoder);
 	if (ret)
 		return ret;
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) && vdec->hevc) {
+		ret = s7d_hevc_v4l2_suspend_check(vdec->hevc);
+		if (ret)
+			return ret;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_ENGINE) && vdec->hevc_engine) {
+		ret = s7d_hevc_engine_suspend_check(vdec->hevc_engine);
+		if (ret)
+			return ret;
+	}
 	return s7d_codec_dos_suspend_check(vdec->dos);
 }
 

@@ -16,3 +16,19 @@ config VIDEO_AMLOGIC_S7D
 	  The initial H.264 path uses the Amlogic TEE firmware service,
 	  vmalloc input and 32-bit coherent capture buffers on the codec DMA
 	  device.
+
+config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
+	bool "Amlogic S7D experimental HEVC decoder"
+	depends on VIDEO_AMLOGIC_S7D
+	default n
+	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
+	help
+	  Register an additional standard V4L2 node for progressive Main 8-bit
+	  HEVC up to 1920x1080, with NV12M output and reference-picture reorder.
+	  The initial path accepts one independent slice without tiles. Main10,
+	  long-term references and dynamic resolution changes are not supported.
+	  Hardware validation is incomplete. Leave this disabled for normal
+	  H.264-only operation.
+
+config VIDEO_AMLOGIC_S7D_HEVC_ENGINE
+	bool
