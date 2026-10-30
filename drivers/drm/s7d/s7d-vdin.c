@@ -165,6 +165,7 @@
 #define VD_WR_ARB_BUSY		0x00000004U
 #define VD_WRITE_DONE_FLAG	0x40000000U
 #define VD_ASYNC_STAT		0x27adU
+#define VD_ENCI_INFO_READ	0x271cU
 #define VD_ENCP_INFO_READ	0x271dU
 #define VD_AXI_WRITE_IDLE_MASK	0x00030000U
 #define VD_AXI_WRITE_IDLE	0x00030000U
@@ -298,8 +299,9 @@ static enum drm_mode_status vdin_mode_valid(void *data, const struct drm_display
 			 DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC;
 	struct s7d_encp_state encp;
 
-	/* VDIN reads the VPP output, whatever polarity the encoder sends. */
-	if (!mode || (mode->flags & ~(sync | DRM_MODE_FLAG_INTERLACE)))
+	/* VDIN reads the VPP output, before ENCI repeats its pixels. */
+	if (!mode || (mode->flags & ~(sync | DRM_MODE_FLAG_INTERLACE |
+				      DRM_MODE_FLAG_DBLCLK)))
 		return MODE_BAD;
 	return s7d_encp_build_state(mode, &encp);
 }
@@ -749,8 +751,11 @@ static bool vdin_geometry_matches(struct s7d_vdin *v, const struct drm_display_m
  */
 static int vdin_field(struct s7d_vdin *v)
 {
-	u32 line = (vdin_read(v, VD_ENCP_INFO_READ) >> 16) & VD_COUNTER_MASK;
-	bool bottom = line >= v->mode.vtotal / 2;
+	bool enci = v->mode.flags & DRM_MODE_FLAG_DBLCLK;
+	u32 info = vdin_read(v, enci ? VD_ENCI_INFO_READ : VD_ENCP_INFO_READ);
+	/* ENCP counts frame lines; ENCI restarts per field, its counter gives parity. */
+	bool bottom = enci ? (info >> 29) & 1 :
+		((info >> 16) & VD_COUNTER_MASK) >= v->mode.vtotal / 2;
 
 	if (vdin_read(v, VD_LINE_INT) & VD_WRITE_DONE_FLAG) {
 		/* The first done may close a field that began before arming. */
