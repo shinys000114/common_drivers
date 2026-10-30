@@ -61,6 +61,17 @@ unsigned char get_meson_cpu_version(int level)
 }
 EXPORT_SYMBOL(get_meson_cpu_version);
 
+int meson_cpu_version_read(unsigned int level, unsigned char *value)
+{
+	if (!value || level > MESON_CPU_VERSION_LVL_MAX)
+		return -EINVAL;
+	if (!smp_load_acquire(&init_done))
+		return -EPROBE_DEFER;
+	*value = cpuinfo_chip_id[level];
+	return 0;
+}
+EXPORT_SYMBOL_GPL(meson_cpu_version_read);
+
 void cpuinfo_get_chipid(unsigned char *cid, unsigned int size)
 {
 	if (!init_done) {
@@ -152,7 +163,7 @@ static int cpuinfo_probe(struct platform_device *pdev)
 	meson_sm_mutex_unlock();
 
 	if (ret == 0) {
-		init_done = 1;
+		smp_store_release(&init_done, 1);
 		pr_info("serial = ");
 		for (i = 0; i < CHIPID_LEN; i++)
 			pr_cont("%02x", cpuinfo_chip_id[i]);
