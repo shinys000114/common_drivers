@@ -18,3 +18,7 @@
 *.swp
 *.tmp
 dtbs-list
+/Documentation/odroid-c5/
+/Documentation/odroid-c5/
+/Documentation/odroid-c5/
+/common_drivers/.semcode.db/
