@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/amlogic,s7d-ge2d.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D GE2D Acceleration Unit
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description:
+  The S7D 2D graphic acceleration unit. Its registers start at word 0xa0
+  of the window, it takes buffer addresses directly instead of canvas
+  indexes and it has its own power domain.
+
+properties:
+  compatible:
+    const: amlogic,s7d-ge2d
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: GE2D core clock gate, below the shared VAPB clock
+      - description: GE2D bus clock
+
+  resets:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  memory-region:
+    maxItems: 1
+    description: CMA area for the frame buffers, if the default is too small.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - resets
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/amlogic,s7d-clkc.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/power/s7d-pd.h>
+    #include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
+
+    ge2d@ff040000 {
+        compatible = "amlogic,s7d-ge2d";
+        reg = <0xff040000 0x400>;
+        interrupts = <GIC_SPI 217 IRQ_TYPE_EDGE_RISING>;
+        clocks = <&clkc CLKID_GE2D>, <&clkc CLKID_SYS_GE2D>;
+        resets = <&reset RESET_GE2D>;
+        power-domains = <&pwrdm PDID_S7D_GE2D>;
+    };
