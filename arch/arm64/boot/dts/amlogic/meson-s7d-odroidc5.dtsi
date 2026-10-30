@@ -109,6 +109,10 @@
 	status = "disabled";
 };
 
+&aocec {
+	status = "disabled";
+};
+
 &fb {
 	status = "disabled";
 };
@@ -193,6 +197,25 @@
 				remote-endpoint = <&c5_hdmi_in>;
 			};
 		};
+	};
+
+	c5_cec: cec@fe044040 {
+		compatible = "amlogic,s7d-cecb";
+		reg = <0 0xfe044040 0 0x14>, <0 0xfe010280 0 0x8>,
+		      <0 0xfe0102dc 0 0x4>;
+		reg-names = "cecb", "handoff", "wake";
+		interrupts = <GIC_SPI 180 IRQ_TYPE_EDGE_RISING>;
+		clocks = <&clkc CLKID_SYS_CEC>, <&clkc CLKID_CECB_CLK>;
+		clock-names = "apb", "core";
+		assigned-clocks = <&clkc CLKID_CECB_DUAL_MUX>, <&clkc CLKID_CECB_CLK>;
+		assigned-clock-parents = <&clkc CLKID_CECB_DUAL_DIV>,
+					 <&clkc CLKID_CECB_DUAL>;
+		resets = <&reset RESET_CEC>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&eecec_b>;
+		mboxes = <&mbox_fifo S7D_REE2AO_AOCEC>;
+		mbox-names = "aocpu";
+		hdmi-phandle = <&s7d_hdmi_tx>;
 	};
 
 	s7d_hdmi_tx: hdmi@fe300000 {
