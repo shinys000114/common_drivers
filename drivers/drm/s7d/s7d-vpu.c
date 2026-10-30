@@ -1311,6 +1311,38 @@ static int program_video2_pps(struct s7d_vpu *v,
 	return vpu_update(v, pps->control.reg, pps->control.mask, pps->control.value);
 }
 
+/*
+ * Memory arbiter routing, request enables and urgency as the firmware sets
+ * them at boot. Deep suspend power-cycles the VPU, so set them every modeset.
+ */
+static int program_arbiter(struct s7d_vpu *v)
+{
+	static const struct {
+		u16 reg;
+		u32 mask;
+		u32 value;
+	} arbiter[] = {
+		/* OSD2, VD1 AFBCD and Mali AFBCD on VPP arbiter 1, the rest on 0. */
+		{ 0x3978, GENMASK(24, 20) | GENMASK(27, 26), BIT(21) | BIT(23) | BIT(27) },
+		{ 0x3979, 0xf3ff, 0xf3ff },
+		{ RDARB_MODE_L2, GENMASK(22, 20) | GENMASK(18, 16), 0 },
+		{ 0x279e, 0x3f3f, 0x3f3f },
+		{ 0x27c2, GENMASK(19, 0), 0xffff }, /* Read urgency */
+		{ 0x27c3, GENMASK(9, 0), 0 }, /* Write urgency */
+		{ 0x27a2, U32_MAX, BIT(17) }, /* Write arbiter mode */
+		{ 0x270a, BIT(17) | BIT(13) | BIT(9) | BIT(5) | BIT(1), 0 },
+	};
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(arbiter); i++) {
+		ret = vpu_update(v, arbiter[i].reg, arbiter[i].mask, arbiter[i].value);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 {
 	const struct s7d_hdmi_output_state *output = &state->output;
@@ -1336,6 +1368,9 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 	unsigned int i;
 	int ret;
 
+	ret = program_arbiter(v);
+	if (ret)
+		return ret;
 	/* VPP, like postblend, runs on field lines for an interlaced output. */
 	ret = s7d_vpp_setup(v->regs, state->base.adjusted_mode.hdisplay,
 			    state->base.adjusted_mode.vdisplay >> state->encp.interlace,

@@ -199,7 +199,8 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		{ 0x1de4, GENMASK(29, 0), 0 },
 		{ 0x1d21, 0x3fff3fff, (height << 16) | width },
 		{ 0x1da5, 0x1fff1fff, (width << 16) | height },
-		{ 0x1d22, GENMASK(15, 0), 0x0808 }, /* Pre/post hold lines */
+		{ 0x1d22, U32_MAX, 0x08080808 }, /* Hold lines */
+		{ 0x1dc7, GENMASK(23, 0), 0x808000 }, /* OSD scaler pad, firmware value */
 		/* 4096-pixel FIFO, not active width. Never replay force-go pulses. */
 		{ 0x1d27, U32_MAX, 0xfff01000 },
 	};
