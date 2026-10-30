@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/amlogic,s7d-tdm-formatters.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D TDM formatters
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description:
+  TDM input and output formatters of the S7D audio block. TDMIN writes
+  its slot count to CTRL0; TDMOUT has no CTRL1 gain switch.
+
+properties:
+  compatible:
+    enum:
+      - amlogic,s7d-tdmin
+      - amlogic,s7d-tdmout
+
+  clocks:
+    items:
+      - description: Peripheral clock
+      - description: Bit clock
+      - description: Bit clock input multiplexer
+      - description: Sample clock
+      - description: Sample clock input multiplexer
+
+  clock-names:
+    items:
+      - const: pclk
+      - const: sclk
+      - const: sclk_sel
+      - const: lrclk
+      - const: lrclk_sel
+
+  reg:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - resets
+
+allOf:
+  - $ref: component-common.yaml#
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/amlogic,s7d-audio-clkc.h>
+    #include <dt-bindings/reset/amlogic,s7d-audio-reset.h>
+
+    audio-controller@540 {
+        compatible = "amlogic,s7d-tdmout";
+        reg = <0x540 0x40>;
+        resets = <&clkc_audio S7D_AUDIO_RESET_TDMOUTB>;
+        clocks = <&clkc_audio CLKID_AUDIO_GATE_TDMOUTB>,
+                 <&clkc_audio S7D_AUDIO_CLK_TDMOUT_B_SCLK>,
+                 <&clkc_audio S7D_AUDIO_CLK_TDMOUT_B_SCLK_SEL>,
+                 <&clkc_audio S7D_AUDIO_CLK_TDMOUT_B_LRCLK>,
+                 <&clkc_audio S7D_AUDIO_CLK_TDMOUT_B_LRCLK>;
+        clock-names = "pclk", "sclk", "sclk_sel", "lrclk", "lrclk_sel";
+    };

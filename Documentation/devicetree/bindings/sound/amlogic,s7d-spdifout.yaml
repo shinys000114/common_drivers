@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/amlogic,s7d-spdifout.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D SPDIF output
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description:
+  SPDIF A and B outputs of the S7D audio block. The channel mask is
+  CTRL0[15:0] and the source can be any of the four FRDDRs.
+
+properties:
+  compatible:
+    const: amlogic,s7d-spdifout
+
+  reg:
+    maxItems: 1
+
+  "#sound-dai-cells":
+    const: 0
+
+  clocks:
+    items:
+      - description: Peripheral clock
+      - description: SPDIF output master clock
+
+  clock-names:
+    items:
+      - const: pclk
+      - const: mclk
+
+  resets:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - "#sound-dai-cells"
+  - clocks
+  - clock-names
+  - resets
+
+allOf:
+  - $ref: dai-common.yaml#
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/amlogic,s7d-audio-clkc.h>
+    #include <dt-bindings/reset/amlogic,s7d-audio-reset.h>
+
+    audio-controller@680 {
+        compatible = "amlogic,s7d-spdifout";
+        reg = <0x680 0x50>;
+        #sound-dai-cells = <0>;
+        clocks = <&clkc_audio CLKID_AUDIO_GATE_SPDIFOUT_B>,
+                 <&clkc_audio CLKID_AUDIO_SPDIFOUT_B>;
+        clock-names = "pclk", "mclk";
+        resets = <&clkc_audio S7D_AUDIO_RESET_SPDIFOUTB>;
+    };

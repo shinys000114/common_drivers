@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/amlogic,s7d-audio-clkc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D audio clock controller
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  Clock and reset controller of the S7D audio bus. It provides the audio
+  gates, the MCLK A-F generators, the MST A-F bit and sample clocks, the
+  TDMIN/TDMOUT bit and sample clock selection, the SPDIFOUT A clock and the
+  MCLK pad 1 clock. It also provides the audio block resets of SW_RESET0/1.
+  The node keeps the audio power domain, the bus clock and the bus reset
+  released while it is bound.
+
+  The TDM clock selectors only expose the internal MST A-F sources; the
+  slave clock inputs are not wired.
+
+  Clock IDs are defined in dt-bindings/clock/amlogic,s7d-audio-clkc.h and
+  reset IDs in dt-bindings/reset/amlogic,s7d-audio-reset.h.
+
+properties:
+  compatible:
+    const: amlogic,s7d-audio-clkc
+
+  reg:
+    items:
+      - description: Clock and reset registers, at audio bus offset 0x000.
+      - description: MCLK pad clock registers, at audio bus offset 0xe80.
+
+  '#clock-cells':
+    const: 1
+
+  '#reset-cells':
+    const: 1
+
+  clocks:
+    items:
+      - description: Peripheral bus clock.
+      - description: HIFI1 PLL, used for the 44.1 kHz rate family.
+      - description: HIFI0 PLL, used for the 48 kHz rate family.
+      - description: Fixed PLL divided by three.
+      - description: Fixed PLL divided by four.
+      - description: Crystal oscillator.
+
+  clock-names:
+    items:
+      - const: pclk
+      - const: hifi1
+      - const: hifi0
+      - const: fclk-div3
+      - const: fclk-div4
+      - const: xtal
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    items:
+      - const: audio
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - '#clock-cells'
+  - '#reset-cells'
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    bus {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        clock-controller@fe330000 {
+            compatible = "amlogic,s7d-audio-clkc";
+            reg = <0x0 0xfe330000 0x0 0xb8>,
+                  <0x0 0xfe330e80 0x0 0x10>;
+            #clock-cells = <1>;
+            #reset-cells = <1>;
+            clocks = <&clkc 0>, <&clkc 1>, <&clkc 2>,
+                     <&clkc 3>, <&clkc 4>, <&xtal>;
+            clock-names = "pclk", "hifi1", "hifi0", "fclk-div3",
+                          "fclk-div4", "xtal";
+            resets = <&reset 0>;
+            reset-names = "audio";
+            power-domains = <&pwrdm 0>;
+        };
+    };
