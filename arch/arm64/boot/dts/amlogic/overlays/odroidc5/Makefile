@@ -1,6 +1,7 @@
 # dtb-y += overlay.dtbo
 
 dtb-y += \
+	analog_audio.dtbo \
 	dht11.dtbo \
 	display_vu5.dtbo \
 	display_vu5a.dtbo \

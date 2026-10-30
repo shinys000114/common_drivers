@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Copyright (c) 2026 Hardkernel Co., Ltd. */
+/dts-v1/;
+/plugin/;
+
+/* The internal codec output is enabled by default; kept for old configs. */
+&c5_t9015 {
+	status = "okay";
+};

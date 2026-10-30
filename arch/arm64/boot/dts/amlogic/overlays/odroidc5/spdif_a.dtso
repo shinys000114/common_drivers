@@ -1,6 +1,11 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/* Copyright (c) 2026 Hardkernel Co., Ltd. */
+
 /dts-v1/;
 /plugin/;
 
-&spdifa {
-	status = "okay";
+/* Route SPDIF A to GPIOH_4 (40-pin header pin 29). */
+&c5_spdifout_a {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spdif_out_a_h4_pins>;
 };

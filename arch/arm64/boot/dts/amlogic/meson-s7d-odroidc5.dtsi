@@ -69,8 +69,415 @@
 };
 
 #include <dt-bindings/clock/amlogic,s7d-clkc.h>
+#include <dt-bindings/clock/amlogic,s7d-audio-clkc.h>
 #include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
+#include <dt-bindings/reset/amlogic,s7d-audio-reset.h>
+#include <dt-bindings/reset/amlogic,meson-axg-audio-arb.h>
+#include <dt-bindings/sound/meson-g12a-toacodec.h>
+#include <dt-bindings/sound/meson-g12a-tohdmitx.h>
 #include <dt-bindings/power/s7d-pd.h>
+
+&audiobus {
+	status = "disabled";
+};
+
+&amlogic_codec {
+	status = "disabled";
+};
+
+&{/soc/aml_snd_iomap} {
+	status = "disabled";
+};
+
+/* The native card takes the vendor card's node name and device order. */
+/delete-node/ &{/auge_sound};
+
+/ {
+	c5_tdmif_a: audio-controller-0 {
+		compatible = "amlogic,axg-tdm-iface";
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "TDM_A";
+		clocks = <&c5_audio_clkc S7D_AUDIO_CLK_MST_A_SCLK>,
+			 <&c5_audio_clkc S7D_AUDIO_CLK_MST_A_LRCLK>,
+			 <&c5_audio_clkc CLKID_AUDIO_MCLK_A>;
+		clock-names = "sclk", "lrclk", "mclk";
+		status = "disabled";
+	};
+
+	c5_tdmif_b: audio-controller-1 {
+		compatible = "amlogic,axg-tdm-iface";
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "TDM_B";
+		clocks = <&c5_audio_clkc S7D_AUDIO_CLK_MST_B_SCLK>,
+			 <&c5_audio_clkc S7D_AUDIO_CLK_MST_B_LRCLK>,
+			 <&c5_audio_clkc CLKID_AUDIO_MCLK_B>;
+		clock-names = "sclk", "lrclk", "mclk";
+	};
+
+	c5_tdmif_c: audio-controller-2 {
+		compatible = "amlogic,axg-tdm-iface";
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "TDM_C";
+		clocks = <&c5_audio_clkc S7D_AUDIO_CLK_MST_C_SCLK>,
+			 <&c5_audio_clkc S7D_AUDIO_CLK_MST_C_LRCLK>,
+			 <&c5_audio_clkc CLKID_AUDIO_MCLK_C>;
+		clock-names = "sclk", "lrclk", "mclk";
+	};
+
+	/*
+	 * Same name, node name and PCM order as the vendor card, which
+	 * userspace already knows: hw:0,0 HDMI (I2S), hw:0,1 HDMI (SPDIF),
+	 * hw:0,2 line out, hw:0,3 SPDIF out. hw:0,4 captures TDMIN_LB.
+	 */
+	c5_sound: auge_sound {
+		compatible = "amlogic,s7d-sound-card";
+		model = "AML-AUGESOUND";
+		audio-aux-devs = <&c5_tdmout_a>, <&c5_tdmout_b>, <&c5_tdmout_c>,
+				 <&c5_tdmin_lb>;
+		/* The i2s overlay replaces the routes to add TDM_A. */
+		audio-routing = "TDMOUT_B IN 0", "FRDDR_A OUT 1",
+				"SPDIFOUT_B IN 1", "FRDDR_B OUT 4",
+				"TDMOUT_C IN 2", "FRDDR_C OUT 2",
+				"TDMOUT_A IN 2", "FRDDR_C OUT 0",
+				"SPDIFOUT_A IN 3", "FRDDR_D OUT 3",
+				"TDM_B Playback", "TDMOUT_B OUT",
+				"TDM_C Playback", "TDMOUT_C OUT",
+				"TDMIN_LB IN 13", "TDM_B Loopback",
+				"TDMIN_LB IN 14", "TDM_C Loopback",
+				"TODDR_A IN 6", "TDMIN_LB OUT";
+		/*
+		 * Saved mixer state restored by userspace wins over these, so
+		 * they are the same with and without the i2s overlay: hw:0,2
+		 * also feeds TDMOUT_A, which only runs once TDM_A is enabled.
+		 */
+		amlogic,mixer-defaults =
+			"FRDDR_A SINK 1 SEL", "OUT 1",
+			"FRDDR_A SRC 1 EN Switch", "on",
+			"TDMOUT_B SRC SEL", "IN 0",
+			"TOHDMITX I2S SRC", "I2S B",
+			"TOHDMITX I2S OUT EN Switch", "on",
+			"FRDDR_B SINK 1 SEL", "OUT 4",
+			"FRDDR_B SRC 1 EN Switch", "on",
+			"SPDIFOUT_B SRC SEL", "IN 1",
+			"TOHDMITX SPDIF SRC", "SPDIF B",
+			"TOHDMITX SPDIF OUT EN Switch", "on",
+			"FRDDR_C SINK 1 SEL", "OUT 2",
+			"FRDDR_C SRC 1 EN Switch", "on",
+			"TDMOUT_C SRC SEL", "IN 2",
+			"FRDDR_C SINK 2 SEL", "OUT 0",
+			"FRDDR_C SRC 2 EN Switch", "on",
+			"TDMOUT_A SRC SEL", "IN 2",
+			"TOACODEC SRC", "I2S C",
+			"TOACODEC OUT EN Switch", "on",
+			"ACODEC Playback Volume", "255",
+			"FRDDR_D SINK 1 SEL", "OUT 3",
+			"FRDDR_D SRC 1 EN Switch", "on",
+			"SPDIFOUT_A SRC SEL", "IN 3",
+			"TDMIN_LB SRC SEL", "IN 13",
+			"TODDR_A SRC SEL", "IN 6";
+
+		dai-link-0 {
+			sound-dai = <&c5_frddr_a>;
+		};
+
+		dai-link-1 {
+			sound-dai = <&c5_frddr_b>;
+		};
+
+		dai-link-2 {
+			sound-dai = <&c5_frddr_c>;
+		};
+
+		dai-link-3 {
+			sound-dai = <&c5_frddr_d>;
+		};
+
+		dai-link-4 {
+			sound-dai = <&c5_toddr_a>;
+		};
+
+		dai-link-5 {
+			sound-dai = <&c5_tdmif_b>;
+			dai-format = "i2s";
+			dai-tdm-slot-tx-mask-0 = <1 1>;
+			dai-tdm-slot-rx-mask-0 = <1 1>;
+			mclk-fs = <256>;
+
+			codec {
+				sound-dai = <&c5_tohdmitx TOHDMITX_I2S_IN_B>;
+			};
+		};
+
+		dai-link-6 {
+			sound-dai = <&c5_tohdmitx TOHDMITX_I2S_OUT>;
+
+			codec {
+				sound-dai = <&s7d_hdmi_tx 0>;
+			};
+		};
+
+		dai-link-7 {
+			sound-dai = <&c5_spdifout_b>;
+
+			codec {
+				sound-dai = <&c5_tohdmitx TOHDMITX_SPDIF_IN_B>;
+			};
+		};
+
+		dai-link-8 {
+			sound-dai = <&c5_tohdmitx TOHDMITX_SPDIF_OUT>;
+
+			codec {
+				sound-dai = <&s7d_hdmi_tx 1>;
+			};
+		};
+
+		dai-link-9 {
+			sound-dai = <&c5_tdmif_c>;
+			dai-format = "i2s";
+			dai-tdm-slot-tx-mask-0 = <1 1>;
+			dai-tdm-slot-rx-mask-0 = <1 1>;
+			mclk-fs = <256>;
+
+			codec {
+				sound-dai = <&c5_toacodec TOACODEC_IN_C>;
+			};
+		};
+
+		dai-link-10 {
+			sound-dai = <&c5_toacodec TOACODEC_OUT>;
+
+			codec {
+				sound-dai = <&c5_t9015>;
+			};
+		};
+
+		/* The spdif_a overlay routes the output to GPIOH_4. */
+		dai-link-11 {
+			sound-dai = <&c5_spdifout_a>;
+
+			codec {
+				sound-dai = <&c5_spdif_codec>;
+			};
+		};
+
+		/* The i2s overlay enables it and supplies the external codec. */
+		c5_i2s_link: dai-link-12 {
+			sound-dai = <&c5_tdmif_a>;
+			dai-format = "i2s";
+			dai-tdm-slot-tx-mask-0 = <1 1>;
+			mclk-fs = <256>;
+			status = "disabled";
+		};
+	};
+
+	c5_spdif_codec: spdif-dit {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
+	};
+
+	soc {
+		c5_audio: bus@fe330000 {
+			compatible = "simple-bus";
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges = <0 0 0 0xfe330000 0 0x1000>;
+
+			c5_audio_clkc: clock-controller@0 {
+				compatible = "amlogic,s7d-audio-clkc";
+				reg = <0 0x0 0 0xb8>, <0 0xe80 0 0x10>;
+				#clock-cells = <1>;
+				#reset-cells = <1>;
+				clocks = <&clkc CLKID_SYS_AUDIO>,
+					 <&clkc CLKID_HIFI1_PLL>, <&clkc CLKID_HIFI_PLL>,
+					 <&clkc CLKID_FCLK_DIV3>, <&clkc CLKID_FCLK_DIV4>,
+					 <&xtal>;
+				clock-names = "pclk", "hifi1", "hifi0", "fclk-div3",
+					      "fclk-div4", "xtal";
+				resets = <&reset RESET_AUDIO>;
+				reset-names = "audio";
+				power-domains = <&pwrdm PDID_S7D_AUDIO>;
+			};
+
+			c5_toddr_a: audio-controller@100 {
+				compatible = "amlogic,s7d-toddr";
+				reg = <0 0x100 0 0x2c>;
+				#sound-dai-cells = <0>;
+				sound-name-prefix = "TODDR_A";
+				interrupts = <GIC_SPI 32 IRQ_TYPE_EDGE_RISING>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_TODDRA>;
+				resets = <&c5_audio_arb AXG_ARB_TODDR_A>,
+					 <&c5_audio_clkc S7D_AUDIO_RESET_TODDRA>;
+				reset-names = "arb", "rst";
+				amlogic,fifo-depth = <1024>;
+			};
+
+			c5_frddr_a: audio-controller@1c0 {
+				compatible = "amlogic,s7d-frddr";
+				reg = <0 0x1c0 0 0x2c>;
+				#sound-dai-cells = <0>;
+				sound-name-prefix = "FRDDR_A";
+				interrupts = <GIC_SPI 36 IRQ_TYPE_EDGE_RISING>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_FRDDRA>;
+				resets = <&c5_audio_arb AXG_ARB_FRDDR_A>,
+					 <&c5_audio_clkc S7D_AUDIO_RESET_FRDDRA>;
+				reset-names = "arb", "rst";
+				amlogic,fifo-depth = <1024>;
+			};
+
+			c5_frddr_b: audio-controller@200 {
+				compatible = "amlogic,s7d-frddr";
+				reg = <0 0x200 0 0x2c>;
+				#sound-dai-cells = <0>;
+				sound-name-prefix = "FRDDR_B";
+				interrupts = <GIC_SPI 37 IRQ_TYPE_EDGE_RISING>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_FRDDRB>;
+				resets = <&c5_audio_arb AXG_ARB_FRDDR_B>,
+					 <&c5_audio_clkc S7D_AUDIO_RESET_FRDDRB>;
+				reset-names = "arb", "rst";
+				amlogic,fifo-depth = <1024>;
+			};
+
+			c5_frddr_c: audio-controller@240 {
+				compatible = "amlogic,s7d-frddr";
+				reg = <0 0x240 0 0x2c>;
+				#sound-dai-cells = <0>;
+				sound-name-prefix = "FRDDR_C";
+				interrupts = <GIC_SPI 38 IRQ_TYPE_EDGE_RISING>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_FRDDRC>;
+				resets = <&c5_audio_arb AXG_ARB_FRDDR_C>,
+					 <&c5_audio_clkc S7D_AUDIO_RESET_FRDDRC>;
+				reset-names = "arb", "rst";
+				amlogic,fifo-depth = <1024>;
+			};
+
+			c5_audio_arb: reset-controller@280 {
+				compatible = "amlogic,meson-sm1-audio-arb";
+				reg = <0 0x280 0 0x4>;
+				#reset-cells = <1>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_DDR_ARB>;
+			};
+
+			c5_tdmin_lb: audio-controller@3c0 {
+				compatible = "amlogic,s7d-tdmin";
+				reg = <0 0x3c0 0 0x40>;
+				sound-name-prefix = "TDMIN_LB";
+				resets = <&c5_audio_clkc S7D_AUDIO_RESET_TDMINLB>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_TDMINLB>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMIN_LB_SCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMIN_LB_SCLK_SEL>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMIN_LB_LRCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMIN_LB_LRCLK>;
+				clock-names = "pclk", "sclk", "sclk_sel", "lrclk", "lrclk_sel";
+			};
+
+			c5_spdifout_a: audio-controller@480 {
+				compatible = "amlogic,s7d-spdifout";
+				reg = <0 0x480 0 0x50>;
+				#sound-dai-cells = <0>;
+				sound-name-prefix = "SPDIFOUT_A";
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_SPDIFOUT_A>,
+					 <&c5_audio_clkc CLKID_AUDIO_SPDIFOUT_A>;
+				clock-names = "pclk", "mclk";
+				resets = <&c5_audio_clkc S7D_AUDIO_RESET_SPDIFOUT>;
+			};
+
+			c5_tdmout_a: audio-controller@500 {
+				compatible = "amlogic,s7d-tdmout";
+				reg = <0 0x500 0 0x40>;
+				sound-name-prefix = "TDMOUT_A";
+				resets = <&c5_audio_clkc S7D_AUDIO_RESET_TDMOUTA>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_TDMOUTA>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_A_SCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_A_SCLK_SEL>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_A_LRCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_A_LRCLK>;
+				clock-names = "pclk", "sclk", "sclk_sel", "lrclk", "lrclk_sel";
+			};
+
+			c5_tdmout_b: audio-controller@540 {
+				compatible = "amlogic,s7d-tdmout";
+				reg = <0 0x540 0 0x40>;
+				sound-name-prefix = "TDMOUT_B";
+				resets = <&c5_audio_clkc S7D_AUDIO_RESET_TDMOUTB>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_TDMOUTB>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_B_SCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_B_SCLK_SEL>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_B_LRCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_B_LRCLK>;
+				clock-names = "pclk", "sclk", "sclk_sel", "lrclk", "lrclk_sel";
+			};
+
+			c5_tdmout_c: audio-controller@580 {
+				compatible = "amlogic,s7d-tdmout";
+				reg = <0 0x580 0 0x40>;
+				sound-name-prefix = "TDMOUT_C";
+				resets = <&c5_audio_clkc S7D_AUDIO_RESET_TDMOUTC>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_TDMOUTC>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_C_SCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_C_SCLK_SEL>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_C_LRCLK>,
+					 <&c5_audio_clkc S7D_AUDIO_CLK_TDMOUT_C_LRCLK>;
+				clock-names = "pclk", "sclk", "sclk_sel", "lrclk", "lrclk_sel";
+			};
+
+			c5_spdifout_b: audio-controller@680 {
+				compatible = "amlogic,s7d-spdifout";
+				reg = <0 0x680 0 0x50>;
+				#sound-dai-cells = <0>;
+				sound-name-prefix = "SPDIFOUT_B";
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_SPDIFOUT_B>,
+					 <&c5_audio_clkc CLKID_AUDIO_SPDIFOUT_B>;
+				clock-names = "pclk", "mclk";
+				resets = <&c5_audio_clkc S7D_AUDIO_RESET_SPDIFOUTB>;
+			};
+
+			c5_toacodec: audio-controller@740 {
+				compatible = "amlogic,s7d-toacodec";
+				reg = <0 0x740 0 0x4>;
+				#sound-dai-cells = <1>;
+				sound-name-prefix = "TOACODEC";
+				resets = <&c5_audio_clkc S7D_AUDIO_RESET_TOACODEC>;
+			};
+
+			c5_tohdmitx: audio-controller@744 {
+				compatible = "amlogic,s7d-tohdmitx";
+				reg = <0 0x744 0 0x4>;
+				#sound-dai-cells = <1>;
+				sound-name-prefix = "TOHDMITX";
+				clocks = <&c5_audio_clkc CLKID_AUDIO_MCLK_A>,
+					 <&c5_audio_clkc CLKID_AUDIO_MCLK_B>,
+					 <&c5_audio_clkc CLKID_AUDIO_MCLK_C>;
+				clock-names = "mclk-a", "mclk-b", "mclk-c";
+				resets = <&c5_audio_clkc S7D_AUDIO_RESET_TOHDMITX>;
+			};
+
+			c5_frddr_d: audio-controller@880 {
+				compatible = "amlogic,s7d-frddr";
+				reg = <0 0x880 0 0x2c>;
+				#sound-dai-cells = <0>;
+				sound-name-prefix = "FRDDR_D";
+				interrupts = <GIC_SPI 46 IRQ_TYPE_EDGE_RISING>;
+				clocks = <&c5_audio_clkc CLKID_AUDIO_GATE_FRDDRD>;
+				resets = <&c5_audio_arb AXG_ARB_FRDDR_D>,
+					 <&c5_audio_clkc S7D_AUDIO_RESET_FRDDRD>;
+				reset-names = "arb", "rst";
+				amlogic,fifo-depth = <1024>;
+			};
+		};
+
+		c5_t9015: audio-controller@fe01a000 {
+			compatible = "amlogic,t9015";
+			reg = <0 0xfe01a000 0 0x24>;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "ACODEC";
+			clocks = <&clkc CLKID_SYS_ACODEC>;
+			clock-names = "pclk";
+			resets = <&reset RESET_ACODEC>;
+			AVDD-supply = <&VDDAO_1V8>;
+		};
+	};
+};
 
 /* Keep the pwrdm label: all inherited power-domain references follow it. */
 /delete-node/ &pwrdm;
@@ -247,6 +654,20 @@
 			c5_hdmi_in: endpoint {
 				remote-endpoint = <&c5_vpu_out>;
 			};
+		};
+	};
+};
+
+&periphs_pinctrl {
+	/* 40-pin header: BCLK 23, LRCLK 24, data out 21 and MCLK 7. */
+	c5_i2s_pins: c5-i2s-pins {
+		mux-tdm {
+			groups = "tdm_sclk0", "tdm_fs0", "tdm_d0";
+			function = "tdm";
+		};
+		mux-mclk {
+			groups = "mclk_1_d4";
+			function = "mclk";
 		};
 	};
 };
