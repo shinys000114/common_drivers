@@ -287,17 +287,16 @@ static const struct drm_mode_config_helper_funcs s7d_mode_config_helper_funcs = 
 	.atomic_commit_tail = s7d_atomic_commit_tail,
 };
 
-static void s7d_release_dma_pool(void *dev)
+/* GEM buffers can outlive the device binding until their last user closes. */
+static void s7d_release_dma_pool(struct drm_device *drm, void *dev)
 {
 	of_reserved_mem_device_release(dev);
 }
 
-static void s7d_drm_unlink_hdmi(void *data)
-{
-	device_link_del(data);
-}
-
-/* System sleep orders the transmitter around the display that drives it. */
+/*
+ * Order system sleep around the transmitter that drives the display, and
+ * unbind the display first when the transmitter goes away.
+ */
 static int s7d_drm_link_hdmi(struct device *dev, struct drm_bridge *bridge)
 {
 	struct platform_device *hdmi = of_find_device_by_node(bridge->of_node);
@@ -305,11 +304,9 @@ static int s7d_drm_link_hdmi(struct device *dev, struct drm_bridge *bridge)
 
 	if (!hdmi)
 		return -EPROBE_DEFER;
-	link = device_link_add(dev, &hdmi->dev, DL_FLAG_STATELESS);
+	link = device_link_add(dev, &hdmi->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
 	put_device(&hdmi->dev);
-	if (!link)
-		return dev_err_probe(dev, -EINVAL, "HDMI device link\n");
-	return devm_add_action_or_reset(dev, s7d_drm_unlink_hdmi, link);
+	return link ? 0 : dev_err_probe(dev, -EINVAL, "HDMI device link\n");
 }
 
 static int s7d_drm_probe(struct platform_device *pdev)
@@ -350,13 +347,6 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
-	/* Do not compete with the firmware-sized default CMA or vendor GPU heap. */
-	ret = of_reserved_mem_device_init_by_name(dev, dev->of_node, "scanout");
-	if (ret)
-		return dev_err_probe(dev, ret, "scanout DMA pool\n");
-	ret = devm_add_action_or_reset(dev, s7d_release_dma_pool, dev);
-	if (ret)
-		return ret;
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return ret;
@@ -364,6 +354,13 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	if (IS_ERR(display))
 		return PTR_ERR(display);
 	drm = &display->drm;
+	/* Do not compete with the firmware-sized default CMA or vendor GPU heap. */
+	ret = of_reserved_mem_device_init_by_name(dev, dev->of_node, "scanout");
+	if (ret)
+		return dev_err_probe(dev, ret, "scanout DMA pool\n");
+	ret = drmm_add_action_or_reset(drm, s7d_release_dma_pool, dev);
+	if (ret)
+		return ret;
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
@@ -519,6 +516,27 @@ fini_vpu:
 	return dev_err_probe(dev, ret, "DRM initialization\n");
 }
 
+static void s7d_drm_remove(struct platform_device *pdev)
+{
+	struct s7d_drm *display = platform_get_drvdata(pdev);
+	struct drm_device *drm = &display->drm;
+	int ret;
+
+	drm_dev_unplug(drm);
+	drm_kms_helper_poll_fini(drm);
+	drm_atomic_helper_shutdown(drm);
+	ret = s7d_crtc_shutdown(display->vpu.crtc);
+	if (!ret)
+		ret = s7d_writeback_shutdown(display->vpu.writeback);
+	s7d_hdmi_bridge_set_connector(display->bridge, NULL);
+	if (!ret)
+		ret = s7d_vpu_fini(&display->vpu);
+	/* Free everything else; buffers the hardware may still read are leaked. */
+	if (ret)
+		dev_err(&pdev->dev, "display did not stop (%d); leaking its scanout buffers\n",
+			ret);
+}
+
 static void s7d_drm_shutdown(struct platform_device *pdev)
 {
 	struct s7d_drm *display = platform_get_drvdata(pdev);
@@ -576,18 +594,34 @@ static const struct of_device_id s7d_drm_match[] = {
 };
 MODULE_DEVICE_TABLE(of, s7d_drm_match);
 
-/* Built-in/static DT: forbid unbind until failed-stop devres retention is supported. */
 static struct platform_driver s7d_drm_platform_driver = {
 	.probe = s7d_drm_probe,
+	.remove = s7d_drm_remove,
 	.shutdown = s7d_drm_shutdown,
 	.driver = {
 		.name = "s7d-drm",
 		.of_match_table = s7d_drm_match,
-		.suppress_bind_attrs = true,
 		.pm = pm_sleep_ptr(&s7d_drm_pm_ops),
 	},
 };
-builtin_platform_driver(s7d_drm_platform_driver);
+
+/* The transmitter registers its bridge before the display looks it up. */
+static struct platform_driver * const s7d_drivers[] = {
+	&s7d_hdmi_driver,
+	&s7d_drm_platform_driver,
+};
+
+static int __init s7d_drm_init(void)
+{
+	return platform_register_drivers(s7d_drivers, ARRAY_SIZE(s7d_drivers));
+}
+module_init(s7d_drm_init);
+
+static void __exit s7d_drm_exit(void)
+{
+	platform_unregister_drivers(s7d_drivers, ARRAY_SIZE(s7d_drivers));
+}
+module_exit(s7d_drm_exit);
 
 MODULE_DESCRIPTION("Amlogic S7D DRM/KMS");
 MODULE_LICENSE("GPL");
