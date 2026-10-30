@@ -27,6 +27,19 @@ s7d-vdec-y := \
 
 s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_ENGINE) += common/s7d-hevc-engine.o
 
+s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL) += \
+	av1/s7d-av1-input.o \
+	av1/s7d-av1-workspace.o \
+	av1/s7d-av1-dma-context.o \
+	av1/s7d-av1-sequence.o \
+	av1/s7d-av1-rpm.o \
+	av1/s7d-av1-dpb.o \
+	av1/s7d-av1-reference.o \
+	av1/s7d-av1-picture.o \
+	av1/s7d-av1-protocol.o \
+	av1/s7d-av1-runner.o \
+	av1/s7d-av1-v4l2.o
+
 s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL) += \
 	hevc/s7d-hevc-input.o \
 	hevc/s7d-hevc-dpb.o \

@@ -15,6 +15,7 @@
 #include <linux/string.h>
 #include <linux/suspend.h>
 
+#include "av1/s7d-av1-v4l2.h"
 #include "common/s7d-codec-dos.h"
 #include "common/s7d-codec-firmware.h"
 #include "h264/s7d-h264-backend.h"
@@ -36,6 +37,7 @@ struct s7d_vdec {
 	struct s7d_hevc_v4l2 *hevc;
 	struct s7d_hevc_engine *hevc_engine;
 	struct s7d_vp9_v4l2 *vp9;
+	struct s7d_av1_v4l2 *av1;
 	struct s7d_jpeg_encoder *jpeg;
 	struct s7d_jpeg_v4l2 *jpeg_video;
 	struct module *tee_owner;
@@ -181,6 +183,12 @@ static int s7d_vdec_release(struct s7d_vdec *vdec)
 			return ret;
 		vdec->vp9 = NULL;
 	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL) && vdec->av1) {
+		ret = s7d_av1_v4l2_destroy(vdec->av1);
+		if (ret)
+			return ret;
+		vdec->av1 = NULL;
+	}
 	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_HEVC_ENGINE) && vdec->hevc_engine) {
 		ret = s7d_hevc_engine_destroy(vdec->hevc_engine);
 		if (ret)
@@ -228,6 +236,11 @@ static int s7d_vdec_stop(struct s7d_vdec *vdec)
 	}
 	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL) && vdec->vp9) {
 		ret = s7d_vp9_v4l2_shutdown(vdec->vp9);
+		if (ret && !error)
+			error = ret;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL) && vdec->av1) {
+		ret = s7d_av1_v4l2_shutdown(vdec->av1);
 		if (ret && !error)
 			error = ret;
 	}
@@ -344,6 +357,20 @@ static int s7d_vdec_probe(struct platform_device *pdev)
 		if (ret)
 			goto fail;
 	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL)) {
+		vdec->av1 = s7d_av1_v4l2_create(vdec->dev, vdec->dos, vdec->firmware,
+					       vdec->hevc_engine, THIS_MODULE);
+		if (IS_ERR(vdec->av1)) {
+			ret = PTR_ERR(vdec->av1);
+			vdec->av1 = NULL;
+			goto fail;
+		}
+		ret = s7d_v4l2_device_add_codec(vdec->video, s7d_av1_v4l2_core(vdec->av1),
+						s7d_av1_v4l2_factory(vdec->av1),
+						vdec->av1);
+		if (ret)
+			goto fail;
+	}
 	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL)) {
 		vdec->jpeg = s7d_jpeg_encoder_create(vdec->dev, vdec->dos, vdec->firmware,
 						    THIS_MODULE);
@@ -430,6 +457,11 @@ static int s7d_vdec_prepare(struct device *dev)
 	}
 	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL) && vdec->vp9) {
 		ret = s7d_vp9_v4l2_suspend_check(vdec->vp9);
+		if (ret)
+			return ret;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL) && vdec->av1) {
+		ret = s7d_av1_v4l2_suspend_check(vdec->av1);
 		if (ret)
 			return ret;
 	}
