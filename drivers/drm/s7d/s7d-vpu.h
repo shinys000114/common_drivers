@@ -57,6 +57,8 @@ struct s7d_vpu {
 	bool enci_enabled;
 	/* Line and field counter of the encoder that runs. */
 	u32 info_reg;
+	/* Interlaced ENCP counts frame lines; the bottom field starts here. */
+	u16 field_lines;
 	u32 venc_en;
 	bool boot_held;
 	bool touched;
