@@ -16,6 +16,9 @@
 #include <drm/drm_blend.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_modeset_helper.h>
+#include <drm/drm_bridge.h>
+#include <drm/drm_bridge_connector.h>
+#include <drm/drm_connector.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_dma_helper.h>
@@ -27,13 +30,47 @@
 
 #include "s7d-fb.h"
 #include "s7d-gem.h"
+#include "s7d-hdmi.h"
+#include "s7d-hdmi-output.h"
 #include "s7d-plane.h"
 #include "s7d-vpu.h"
 
 struct s7d_drm {
 	struct drm_device drm;
 	struct s7d_vpu vpu;
+	struct drm_bridge *bridge;
+	struct drm_connector_funcs connector_funcs;
+	void (*connector_reset)(struct drm_connector *connector);
+	struct drm_connector_helper_funcs connector_helpers;
+	int (*get_modes)(struct drm_connector *connector);
 };
+
+static void s7d_connector_reset(struct drm_connector *connector)
+{
+	struct s7d_drm *display = container_of(connector->dev, struct s7d_drm, drm);
+
+	display->connector_reset(connector);
+	/* As the HDMI connector reset helper: default to the property maximum. */
+	if (connector->state) {
+		connector->state->max_requested_bpc = S7D_HDMI_MAX_BPC;
+		connector->state->max_bpc = S7D_HDMI_MAX_BPC;
+	}
+}
+
+static int s7d_connector_get_modes(struct drm_connector *connector)
+{
+	struct s7d_drm *display = container_of(connector->dev, struct s7d_drm, drm);
+	int count;
+
+	count = display->get_modes(connector);
+	s7d_hdmi_bridge_eld_updated(display->bridge, connector);
+	return count;
+}
+
+static void s7d_connector_clear(struct drm_device *drm, void *data)
+{
+	s7d_hdmi_bridge_set_connector(data, NULL);
+}
 
 DEFINE_DRM_GEM_DMA_FOPS(s7d_drm_fops);
 
@@ -136,6 +173,10 @@ static void s7d_release_dma_pool(void *dev)
 static int s7d_drm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct drm_connector *connector;
+	struct drm_encoder *encoder;
+	struct drm_bridge *bridge;
+	struct s7d_vpu_link link;
 	struct drm_plane *primary, *cursor, *overlay, *video, *video2;
 	struct drm_device *drm;
 	struct s7d_drm *display;
@@ -151,6 +192,12 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	if (major != MESON_CPU_MAJOR_ID_S7D || revision != S7D_OSD_REV_B)
 		return dev_err_probe(dev, -ENODEV, "unsupported SoC %#x revision %#x\n",
 				     major, revision);
+	ret = drm_of_find_panel_or_bridge(dev->of_node, 0, 0, NULL, &bridge);
+	if (ret)
+		return dev_err_probe(dev, ret, "HDMI bridge\n");
+	ret = s7d_hdmi_bridge_link(bridge, &link);
+	if (ret)
+		return dev_err_probe(dev, ret, "incompatible HDMI bridge\n");
 	ret = dma_set_mask(dev, DMA_BIT_MASK(36));
 	if (ret)
 		return ret;
@@ -183,7 +230,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	drm->mode_config.cursor_width = 256;
 	drm->mode_config.cursor_height = 256;
 	drm->mode_config.normalize_zpos = true;
-	ret = s7d_vpu_init(pdev, &display->vpu, NULL);
+	ret = s7d_vpu_init(pdev, &display->vpu, &link);
 	if (ret)
 		return dev_err_probe(dev, ret, "VPU resources\n");
 	/* Cache read-only retained-state admission before building IN_FORMATS. */
@@ -234,11 +281,68 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = drm_vblank_init(drm, 1);
 	if (ret)
 		goto fini_vpu;
+	encoder = drmm_plain_encoder_alloc(drm, NULL, DRM_MODE_ENCODER_TMDS, "S7D HDMI");
+	if (IS_ERR(encoder)) {
+		ret = PTR_ERR(encoder);
+		goto fini_vpu;
+	}
+	encoder->possible_crtcs = BIT(0);
+	ret = drm_bridge_attach(encoder, bridge, NULL, DRM_BRIDGE_ATTACH_NO_CONNECTOR);
+	if (ret)
+		goto fini_vpu;
+	connector = drm_bridge_connector_init(drm, encoder);
+	if (IS_ERR(connector)) {
+		ret = PTR_ERR(connector);
+		goto fini_vpu;
+	}
+	ret = drm_mode_create_content_type_property(drm);
+	if (ret)
+		goto fini_vpu;
+	drm_connector_attach_content_type_property(connector);
+	ret = drm_connector_attach_broadcast_rgb_property(connector);
+	if (ret)
+		goto fini_vpu;
+	ret = drm_mode_create_hdmi_colorspace_property(connector,
+		BIT(DRM_MODE_COLORIMETRY_SMPTE_170M_YCC) |
+		BIT(DRM_MODE_COLORIMETRY_BT709_YCC) |
+		BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
+		BIT(DRM_MODE_COLORIMETRY_BT2020_YCC));
+	if (ret)
+		goto fini_vpu;
+	drm_object_attach_property(&connector->base, connector->colorspace_property,
+				   DRM_MODE_COLORIMETRY_DEFAULT);
+	ret = drm_connector_attach_hdr_output_metadata_property(connector);
+	if (ret)
+		goto fini_vpu;
+	display->bridge = bridge;
+	display->connector_funcs = *connector->funcs;
+	display->connector_reset = display->connector_funcs.reset;
+	display->connector_funcs.reset = s7d_connector_reset;
+	connector->funcs = &display->connector_funcs;
+	display->connector_helpers = *connector->helper_private;
+	display->get_modes = display->connector_helpers.get_modes;
+	display->connector_helpers.get_modes = s7d_connector_get_modes;
+	display->connector_helpers.atomic_check = s7d_hdmi_connector_atomic_check;
+	drm_connector_helper_add(connector, &display->connector_helpers);
+	ret = drmm_add_action_or_reset(drm, s7d_connector_clear, bridge);
+	if (ret)
+		goto fini_vpu;
+	ret = s7d_hdmi_bridge_set_connector(bridge, connector);
+	if (ret)
+		goto fini_vpu;
+	ret = drm_connector_attach_encoder(connector, encoder);
+	if (ret)
+		goto fini_vpu;
 	drm_mode_config_reset(drm);
-	if (!primary->state || !display->vpu.crtc->state) {
+	if (!primary->state || !display->vpu.crtc->state || !connector->state ||
+	    !bridge->base.state) {
 		ret = -ENOMEM;
 		goto fini_vpu;
 	}
+	connector->ycbcr_420_allowed = true;
+	ret = drm_connector_attach_max_bpc_property(connector, 8, S7D_HDMI_MAX_BPC);
+	if (ret)
+		goto fini_vpu;
 	drm_crtc_vblank_off(display->vpu.crtc);
 	platform_set_drvdata(pdev, display);
 	/* No framebuffer/RDMA takeover occurs before the first atomic commit. */
@@ -250,6 +354,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	return 0;
 
 fini_vpu:
+	s7d_hdmi_bridge_set_connector(bridge, NULL);
 	/* No commit can have started before a successful drm_dev_register(). */
 	WARN_ON(s7d_vpu_fini(&display->vpu));
 	return dev_err_probe(dev, ret, "DRM initialization\n");

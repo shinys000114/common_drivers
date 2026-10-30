@@ -7,7 +7,11 @@ obj-$(CONFIG_DRM_S7D) += s7d-drm.o
 
 s7d-drm-y := \
 	s7d-drv.o \
+	s7d-hdmi.o \
 	s7d-hdmi-output.o \
+	s7d-hdmi-audio.o \
+	s7d-hdmi-io.o \
+	s7d-hdmi-ddc.o \
 	s7d-vpu.o \
 	s7d-vpp.o \
 	s7d-gamma.o \

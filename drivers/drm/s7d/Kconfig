@@ -7,9 +7,14 @@ config DRM_S7D
 	depends on DRM = y && I2C = y && AMLOGIC_CPU_INFO = y
 	depends on DMA_CMA && REGMAP_MMIO
 	depends on !AMLOGIC_MEDIA_ENABLE
+	select PHY_MESON_S7D_HDMI
 	select RESET_S7D_VPU
 	select DRM_KMS_HELPER
 	select DRM_GEM_DMA_HELPER
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_HDMI_HELPER
+	select DRM_BRIDGE_CONNECTOR
+	select SND_SOC_HDMI_CODEC if SND_SOC
 	help
 	  Build the S7D VPU execution path and RGB8 TMDS bridge, with
 	  DRM EDID/SCDC helpers, CCF consumers and generic PHY ownership.
