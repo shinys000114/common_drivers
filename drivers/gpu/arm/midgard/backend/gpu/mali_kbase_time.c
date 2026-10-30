@@ -359,7 +359,9 @@ int kbase_backend_time_init(struct kbase_device *kbdev)
 	u64 freq;
 	u64 common_factor;
 
-	kbase_pm_register_access_enable(kbdev);
+	err = kbase_pm_register_access_enable(kbdev);
+	if (err)
+		return err;
 	freq = kbase_arch_timer_get_cntfrq(kbdev);
 
 	if (!freq) {
