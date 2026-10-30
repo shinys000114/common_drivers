@@ -1,0 +1,228 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/amlogic,s7d-vpu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D display controller
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  The display controller owns the VCBUS window containing the OSD and video
+  fetchers, scalers, blenders, ENCP encoder, and display RDMA engine. Its sole
+  output connects to the S7D HDMI transmitter. Clock, shared reset, and power
+  registers belong to their respective providers and must not be mapped here.
+  Local AFBC resets are provided by a child using the same VCBUS regmap.
+  An available reset child requires all four AFBC reset consumers. A disabled
+  child leaves these optional, allowing board overrides to retain the entries
+  without registering or accessing the local reset provider.
+
+properties:
+  compatible:
+    const: amlogic,s7d-vpu
+
+  reg:
+    maxItems: 1
+    description: The 256 KiB VCBUS register window.
+
+  reg-names:
+    const: vcbus
+
+  interrupts:
+    items:
+      - description: VIU1 vertical synchronization, rising edge.
+      - description: Display RDMA completion, rising edge.
+
+  interrupt-names:
+    items:
+      - const: vsync
+      - const: rdma
+
+  clocks:
+    items:
+      - description: VPU processing clock.
+      - description: VPU peripheral bus clock.
+      - description: VPU interrupt gate.
+      - description: ENCP pixel clock.
+      - description: Crystal reference clock.
+      - description: HDMI pixel PLL.
+      - description: Video source input mux.
+      - description: ENCP clock mux.
+      - description: Video divider selected by the ENCP mux.
+      - description: HDMI PLL shared output.
+      - description: HDMI TMDS serial clock.
+      - description: ENCI pixel clock for 480i and 576i.
+      - description: ENCI clock mux, set to the ENCP mux's divider.
+    minItems: 11
+
+  clock-names:
+    minItems: 11
+    items:
+      - const: vpu
+      - const: vapb
+      - const: intr
+      - const: encp
+      - const: xtal
+      - const: pixel-pll
+      - const: pixel-source
+      - const: pixel-mux
+      - const: pixel-parent
+      - const: hdmi-shared
+      - const: hdmi-serial
+      - const: enci
+      - const: enci-mux
+
+  resets:
+    minItems: 4
+    maxItems: 8
+
+  reset-names:
+    minItems: 4
+    items:
+      - const: viu
+      - const: venc
+      - const: vencp
+      - const: rdma
+      - const: afbc-regs
+      - const: afbc-logic
+      - const: afbc-arbiter-regs
+      - const: afbc-arbiter-logic
+
+  power-domains:
+    maxItems: 1
+    description: Shared VPU and HDMI firmware power domain.
+
+  memory-region:
+    minItems: 1
+    maxItems: 2
+    description: |
+      A dedicated reusable shared-dma-pool for scanout allocations. An optional
+      second region records the firmware framebuffer reservation, which remains
+      reserved and is not returned to the allocator by this driver.
+
+  memory-region-names:
+    minItems: 1
+    items:
+      - const: scanout
+      - const: boot-logo
+
+  reset-controller:
+    $ref: /schemas/reset/amlogic,s7d-vpu-reset.yaml#
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: ENCP output to the S7D HDMI transmitter input.
+    properties:
+      endpoint:
+        $ref: /schemas/graph.yaml#/properties/endpoint
+        required:
+          - remote-endpoint
+    required:
+      - endpoint
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - power-domains
+  - memory-region
+  - memory-region-names
+  - port
+
+allOf:
+  - if:
+      required:
+        - reset-controller
+      properties:
+        reset-controller:
+          properties:
+            status:
+              enum: [okay, ok]
+    then:
+      properties:
+        resets:
+          minItems: 8
+        reset-names:
+          minItems: 8
+  - if:
+      not:
+        required:
+          - reset-controller
+    then:
+      properties:
+        resets:
+          maxItems: 4
+        reset-names:
+          maxItems: 4
+  - if:
+      properties:
+        memory-region-names:
+          contains:
+            const: boot-logo
+    then:
+      properties:
+        memory-region:
+          minItems: 2
+    else:
+      properties:
+        memory-region:
+          maxItems: 1
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/amlogic,s7d-clkc.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/power/s7d-pd.h>
+    #include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
+    #include <dt-bindings/reset/amlogic,s7d-vpu-reset.h>
+
+    display-controller@ff000000 {
+        compatible = "amlogic,s7d-vpu";
+        reg = <0xff000000 0x40000>;
+        reg-names = "vcbus";
+        interrupts = <GIC_SPI 197 IRQ_TYPE_EDGE_RISING>,
+                     <GIC_SPI 215 IRQ_TYPE_EDGE_RISING>;
+        interrupt-names = "vsync", "rdma";
+        clocks = <&clkc CLKID_VPU>, <&clkc CLKID_VAPB>,
+                 <&clkc CLKID_SYS_VPU_INTR>, <&clkc CLKID_ENCP>, <&xtal>,
+                 <&clkc CLKID_HDMI_PLL>, <&clkc CLKID_VIDEO_SRC0_IN_MUX>,
+                 <&clkc CLKID_ENCP_MUX>, <&clkc CLKID_VIDEO0_DIV1>,
+                 <&clkc CLKID_HDMI_SHARED>, <&clkc CLKID_HDMI_SERIAL>,
+                 <&clkc CLKID_ENCI>, <&clkc CLKID_ENCI_MUX>;
+        clock-names = "vpu", "vapb", "intr", "encp", "xtal", "pixel-pll",
+                      "pixel-source", "pixel-mux", "pixel-parent",
+                      "hdmi-shared", "hdmi-serial", "enci", "enci-mux";
+        resets = <&reset RESET_VIU>, <&reset RESET_VENC>,
+                 <&reset RESET_VENCP>, <&reset RESET_RDMA>,
+                 <&vpu_reset S7D_VPU_RESET_AFBCD_REGS>,
+                 <&vpu_reset S7D_VPU_RESET_AFBCD_LOGIC>,
+                 <&vpu_reset S7D_VPU_RESET_AFBC_ARBITER_REGS>,
+                 <&vpu_reset S7D_VPU_RESET_AFBC_ARBITER_LOGIC>;
+        reset-names = "viu", "venc", "vencp", "rdma", "afbc-regs",
+                      "afbc-logic", "afbc-arbiter-regs", "afbc-arbiter-logic";
+        power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
+        memory-region = <&display_cma>, <&boot_logo>;
+        memory-region-names = "scanout", "boot-logo";
+
+        vpu_reset: reset-controller {
+            compatible = "amlogic,s7d-vpu-reset";
+            #reset-cells = <1>;
+        };
+
+        port {
+            vpu_out: endpoint {
+                remote-endpoint = <&hdmi_in>;
+            };
+        };
+    };

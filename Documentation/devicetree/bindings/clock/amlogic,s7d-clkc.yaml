@@ -1,0 +1,109 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/amlogic,s7d-clkc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D clock and analogue controller
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  The controller provides the S7D clock muxes, dividers, gates and PLLs.
+  Output specifiers use dt-bindings/clock/amlogic,s7d-clkc.h. Firmware
+  supplies clocks through SCMI; consumers use the clock framework rather
+  than programming those firmware-owned PLLs directly.
+
+  The basic resource is the digital clock bank. The pll resource contains
+  the analogue clock registers, including the HDMI PLL at offsets 0x1c0
+  through 0x1cc. The optional HDMI PHY child shares this analogue window
+  and must not declare an overlapping reg resource. HDMI PLL and PHY are
+  not independent MMIO devices.
+
+properties:
+  compatible:
+    const: amlogic,s7d-clkc
+
+  reg:
+    items:
+      - description: Digital clock registers, 0x49c bytes.
+      - description: Analogue PLL and HDMI PHY registers, 0x384 bytes.
+
+  reg-names:
+    items:
+      - const: basic
+      - const: pll
+
+  '#clock-cells':
+    const: 1
+
+  clocks:
+    items:
+      - description: Crystal reference clock.
+      - description: SCMI GP0 PLL source.
+      - description: SCMI HIFI0 PLL source.
+      - description: SCMI Ethernet HIFI1 PLL source.
+      - description: SCMI system clock.
+      - description: SCMI AXI clock.
+      - description: SCMI fixed PLL.
+      - description: SCMI GP1 PLL.
+      - description: SCMI CPU clock.
+      - description: SCMI DSU clock.
+      - description: SCMI PWM G clock.
+      - description: SCMI PWM I clock.
+
+  clock-names:
+    items:
+      - const: xtal
+      - const: gp0_pll_src
+      - const: hifi0_pll_src
+      - const: hifi1_pll_src
+      - const: sys_clk
+      - const: axi_clk
+      - const: fixed_pll
+      - const: gp1_pll
+      - const: cpu_clk
+      - const: dsu_clk
+      - const: pwm_g
+      - const: pwm_i
+
+  hdmi-phy:
+    $ref: /schemas/phy/amlogic,s7d-hdmi-phy.yaml#
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - '#clock-cells'
+  - clocks
+  - clock-names
+
+additionalProperties: false
+
+examples:
+  - |
+    clkc: clock-controller@fe000000 {
+        compatible = "amlogic,s7d-clkc";
+        reg = <0xfe000000 0x49c>, <0xfe008000 0x384>;
+        reg-names = "basic", "pll";
+        #clock-cells = <1>;
+        clocks = <&xtal>, <&scmi_clk 4>, <&scmi_clk 8>,
+                 <&scmi_clk 10>, <&scmi_clk 12>, <&scmi_clk 13>,
+                 <&scmi_clk 16>, <&scmi_clk 17>, <&scmi_clk 14>,
+                 <&scmi_clk 15>, <&scmi_clk 19>, <&scmi_clk 21>;
+        clock-names = "xtal", "gp0_pll_src", "hifi0_pll_src",
+                      "hifi1_pll_src", "sys_clk", "axi_clk", "fixed_pll",
+                      "gp1_pll", "cpu_clk", "dsu_clk", "pwm_g", "pwm_i";
+
+        hdmi-phy {
+            compatible = "amlogic,s7d-hdmi-phy";
+            #phy-cells = <0>;
+            clocks = <&clkc 254>;
+            clock-names = "pixel";
+            resets = <&reset 22>;
+            reset-names = "phy";
+            power-domains = <&pwrdm 3>;
+        };
+    };

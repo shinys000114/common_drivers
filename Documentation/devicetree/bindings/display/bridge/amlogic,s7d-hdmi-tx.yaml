@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/bridge/amlogic,s7d-hdmi-tx.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D HDMI transmitter
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  The transmitter contains the HDMI TOP and core register banks, DDC controller,
+  HPD detection, packet generator, and I2S audio insertion. Register accesses use
+  the firmware SMC interface; the banks are reserved but not directly mapped.
+  The analogue transmitter is a separate PHY and the pixel clocks are supplied
+  by the clock controller. The input is connected to the S7D VPU ENCP output.
+  The driver supplies the HDMI connector and a zero-cell playback codec DAI.
+
+allOf:
+  - $ref: /schemas/sound/dai-common.yaml#
+
+properties:
+  compatible:
+    const: amlogic,s7d-hdmi-tx
+
+  reg:
+    items:
+      - description: 64 KiB HDMI TOP register window.
+      - description: 64 KiB HDMI core register window.
+
+  reg-names:
+    items:
+      - const: top
+      - const: core
+
+  interrupts:
+    maxItems: 1
+    description: HDMI TOP interrupt, level high.
+
+  clocks:
+    items:
+      - description: Peripheral bus gate.
+      - description: Transmitter system clock.
+      - description: Transmitter peripheral interface clock.
+      - description: Transmitter 200 MHz reference clock.
+      - description: Pixel clock.
+      - description: Front-end clock.
+      - description: Audio packet clock.
+      - description: Pixel clock mux.
+      - description: Front-end clock mux.
+      - description: Common video divider selected by both video muxes.
+      - description: Half-rate video divider for the 4:2:0 pixel clock.
+
+  clock-names:
+    items:
+      - const: apb
+      - const: sys
+      - const: prif
+      - const: 200m
+      - const: pixel
+      - const: fe
+      - const: aud
+      - const: pixel-mux
+      - const: fe-mux
+      - const: video-parent
+      - const: video-div2
+
+  resets:
+    maxItems: 2
+
+  reset-names:
+    items:
+      - const: tx
+      - const: apb
+
+  power-domains:
+    maxItems: 1
+    description: Shared VPU and HDMI firmware power domain.
+
+  phys:
+    maxItems: 1
+
+  phy-names:
+    const: hdmi
+
+  amlogic,spd-vendor:
+    $ref: /schemas/types.yaml#/definitions/string
+    default: Amlogic
+    description:
+      Vendor name sent in the Source Product Description InfoFrame, at most 8
+      characters.
+
+  amlogic,spd-product:
+    $ref: /schemas/types.yaml#/definitions/string
+    default: S7D
+    description:
+      Product description sent in the SPD InfoFrame, at most 16 characters.
+
+  amlogic,spd-source-type:
+    $ref: /schemas/types.yaml#/definitions/string
+    enum: [unknown, stb, dvd, d-vhs, hdd, dvc, dsc, vcd, game, pc, bd, sacd,
+           hd-dvd, pmp]
+    default: pc
+    description:
+      CTA-861 source device information sent in the SPD InfoFrame. Sinks may
+      use it to label the input or to choose their picture processing.
+
+  '#sound-dai-cells':
+    const: 1
+    description: Audio input, 0 for I2S and 1 for SPDIF.
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: Input from the S7D VPU ENCP encoder.
+    properties:
+      endpoint:
+        $ref: /schemas/graph.yaml#/properties/endpoint
+        required:
+          - remote-endpoint
+    required:
+      - endpoint
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - power-domains
+  - phys
+  - phy-names
+  - '#sound-dai-cells'
+  - port
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/amlogic,s7d-clkc.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/power/s7d-pd.h>
+    #include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
+
+    hdmi@fe300000 {
+        compatible = "amlogic,s7d-hdmi-tx";
+        #sound-dai-cells = <1>;
+        reg = <0xfe300000 0x10000>, <0xfe310000 0x10000>;
+        reg-names = "top", "core";
+        interrupts = <GIC_SPI 204 IRQ_TYPE_LEVEL_HIGH>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&hdmitx_hpd &hdmitx_ddc>;
+        clocks = <&clkc CLKID_SYS_HDMITX_APB>, <&clkc CLKID_HDMITX_SYS>,
+                 <&clkc CLKID_HDMITX_PRIF>, <&clkc CLKID_HDMITX_200M>,
+                 <&clkc CLKID_HDMITX_PIXEL>, <&clkc CLKID_HDMITX_FE>,
+                 <&clkc CLKID_HDMITX_AUD>, <&clkc CLKID_HDMITX_PIXEL_MUX>,
+                 <&clkc CLKID_HDMITX_FE_MUX>, <&clkc CLKID_VIDEO0_DIV1>,
+                 <&clkc CLKID_VIDEO0_DIV2>;
+        clock-names = "apb", "sys", "prif", "200m", "pixel", "fe", "aud",
+                      "pixel-mux", "fe-mux", "video-parent", "video-div2";
+        assigned-clocks = <&clkc CLKID_HDMITX_AUD_MUX>;
+        assigned-clock-parents = <&clkc CLKID_FCLK_DIV5>;
+        resets = <&reset RESET_HDMI_TX>, <&reset RESET_HDMITX_CAPB3>;
+        reset-names = "tx", "apb";
+        power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
+        phys = <&hdmi_phy>;
+        phy-names = "hdmi";
+
+        port {
+            hdmi_in: endpoint {
+                remote-endpoint = <&vpu_out>;
+            };
+        };
+    };
