@@ -1006,3 +1006,5 @@
 		amlogic,feed_watchdog_mode = <0>;
 	};
 };
+
+#include "meson-s7d-odroidc5.dtsi"
