@@ -42,11 +42,12 @@ config DRM_S7D
 	  cannot run together with AFBC;
 	  joint primary/video changes require a stopped modeset.
 	  Requires retained firmware output on S7D revision B, with SDR RGB8 TMDS up to 594 MHz.
-	  Do not enable with legacy media/display writers. System sleep supports
-	  s2idle after the driver takes over, retaining the shared display domain.
+	  Do not enable with legacy media/display writers. System sleep, including
+	  deep sleep where firmware powers the display domain off, restores the
+	  output after the driver has taken over.
 	  HDMI PCM uses SND_SOC_HDMI_CODEC with the Amlogic AXG sound card
-	  (SND_MESON_AXG_SOUND_CARD). Deep sleep, hibernation and cold HDMI SRAM
-	  initialization are not supported.
+	  (SND_MESON_AXG_SOUND_CARD). Cold HDMI SRAM initialization is not
+	  supported.
 
 config DRM_S7D_GFCD
 	bool "S7D GFCD compressed primary plane (experimental)"
