@@ -51,6 +51,7 @@ obj-$(CONFIG_AMLOGIC_USB)		+= usb/
 obj-$(CONFIG_AMLOGIC_IRBLASTER)		+= irblaster/
 obj-$(CONFIG_ODROID_CUSTOM_DISPLAY_MODES)	+= odroid/
 obj-$(CONFIG_AMLOGIC_DRM)		+= drm/
+obj-$(CONFIG_DRM_S7D) += drm/s7d/
 obj-$(CONFIG_AMLOGIC_CRYPTO_DMA)	+= crypto/
 obj-$(CONFIG_RTC_LIB)			+= rtc/
 obj-y					+= pci/

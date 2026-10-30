@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config DRM_S7D
+	bool "Amlogic S7D display controller and HDMI transmitter (experimental)"
+	depends on AMLOGIC_C5_DISPLAY_RESOURCES
+	depends on DRM = y && I2C = y && AMLOGIC_CPU_INFO = y
+	depends on DMA_CMA && REGMAP_MMIO
+	depends on !AMLOGIC_MEDIA_ENABLE
+	select RESET_S7D_VPU
+	select DRM_KMS_HELPER
+	select DRM_GEM_DMA_HELPER
+	help
+	  Build the S7D VPU execution path and RGB8 TMDS bridge, with
+	  DRM EDID/SCDC helpers, CCF consumers and generic PHY ownership.
+	  Static device trees and built-in drivers only; unbind is suppressed.
+	  Register one CRTC, linear RGB primary, linear YUV VD1/VD2 video and
+	  shared OSD2 cursor/overlay planes, and an HDMI connector.
+	  Cursor and RGB overlay cannot be visible together. Video is progressive
+	  8-bit NV12/NV21/UYVY/VYUY with BT.601/709 limited/full-range conversion.
+	  Each local OSD scaler supports up to 4x enlargement and 2:1 reduction,
+	  including simultaneous primary and RGB overlay scaling. Linear RGB
+	  scaling requires opaque pixels and input width up to 1920.
+	  VD1 supports up to 4x enlargement and 8x downscaling
+	  in 1080p output modes. Linear video and OSD scaling may run together
+	  within a checked combined clock budget. VD2 uses independent classic PPS
+	  for sources up to 2048x1080. Four inputs require an opaque bottom plane.
+	  VD2 does not combine with AFBC.
+	  AFBC ABGR8888 supports a primary or OSD2 overlay up to 4096x2160,
+	  with opaque global alpha and optional premultiplied pixel alpha.
+	  AFBC scaling uses the same local OSD limits and uncropped source.
+	  An AFBC primary can use a linear OSD2 cursor or
+	  overlay. Mali AFBCD can decode the primary and the OSD2 overlay together
+	  (no cursor), up to 3840x2160 decoded pixels in total; adding or
+	  removing one of them requires a stopped modeset. An opaque AFBC primary can
+	  combine with VD1 up to 1080p at 148.5 MHz, but local OSD and VD1 scaling
+	  cannot run together with AFBC;
+	  joint primary/video changes require a stopped modeset.
+	  Requires retained firmware output on S7D revision B, with SDR RGB8 TMDS up to 594 MHz.
+	  Do not enable with legacy media/display writers. System sleep supports
+	  s2idle after the driver takes over, retaining the shared display domain.
+	  HDMI PCM uses SND_SOC_HDMI_CODEC with the Amlogic AXG sound card
+	  (SND_MESON_AXG_SOUND_CARD). Deep sleep, hibernation and cold HDMI SRAM
+	  initialization are not supported.
+
+config DRM_S7D_GFCD
+	bool "S7D GFCD compressed primary plane (experimental)"
+	depends on DRM_S7D
+	help
+	  Use GFCD for AFBC primaries that Mali AFBCD cannot read
+	  (XBGR8888), and for ABGR8888 with the GFCD primary policy. Supports
+	  ABGR8888 and XBGR8888 in the 32x8 tiled AFBC layout, with framebuffers
+	  up to 4096x2160, width aligned to 32 and height aligned to 8.
+	  Integer source windows up to 1920x1080 at 148.5 MHz are supported.
+	  XBGR8888 always ignores X and uses opaque pixels. The local
+	  OSD1 scaler supports up to 4x enlargement or 2x reduction into a
+	  1920x1080 output with opaque pixels, subject to the core clock budget.
+	  Unscaled ABGR8888 also supports premultiplied alpha.
+	  GFCD also reads RGBA8888 AFRC primaries (SCAN layout, coding unit
+	  16, 24 or 32 bytes) with dimensions aligned to 64x16, within the
+	  same window, scaler and alpha limits and without reflection.
+	  Linear or Mali AFBCD OSD2 overlays remain available; video and
+	  simultaneous GFCD surfaces are excluded.
+	  Requires the retained GFCD automatic clock and reset configuration.
+	  Keep disabled to use only the Mali AFBCD backend.
+
+choice
+	prompt "S7D AFBC primary decoder policy"
+	depends on DRM_S7D
+	default DRM_S7D_AFBC_POLICY_MALI
+	help
+	  Select which decoder reads an ABGR8888 AFBC primary. The
+	  s7d_drm.afbc_policy parameter (0 Mali, 1 GFCD) overrides it.
+
+config DRM_S7D_AFBC_POLICY_MALI
+	bool "Mali AFBCD"
+	help
+	  Decode every ABGR8888 AFBC plane with Mali AFBCD, S0 for the
+	  primary and S1 for the OSD2 overlay. GFCD only reads XBGR8888 AFBC
+	  and AFRC.
+
+config DRM_S7D_AFBC_POLICY_GFCD_PRIMARY
+	bool "GFCD within its envelope"
+	depends on DRM_S7D_GFCD
+	help
+	  Decode an AFBC primary up to 1920x1080 at 148.5 MHz with GFCD,
+	  leaving Mali AFBCD S1 for the OSD2 overlay.
+
+endchoice
