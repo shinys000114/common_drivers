@@ -259,6 +259,23 @@ static const struct i2c_adapter_quirks s7d_ddc_quirks = {
 	.max_write_len = 2,
 };
 
+static int ddc_setup(struct s7d_hdmi_ddc *ddc)
+{
+	int ret;
+
+	/* Match the vendor EDID path's 50 kHz profile at a 200 MHz parent. */
+	ret = s7d_hdmi_update_checked(ddc->core, DDC_CYP, 0x3, 2);
+	if (ret)
+		return ret;
+	ret = s7d_hdmi_update_checked(ddc->core, DDC_DUTY, 0x3, 0);
+	if (ret)
+		return ret;
+	ret = s7d_hdmi_update_checked(ddc->core, DDC_DELAY, 0xff, 0x3d);
+	if (ret)
+		return ret;
+	return ddc_recover(ddc);
+}
+
 int s7d_hdmi_ddc_register(struct device *dev, struct s7d_hdmi_ddc *ddc,
 			struct regmap *core)
 {
@@ -266,17 +283,7 @@ int s7d_hdmi_ddc_register(struct device *dev, struct s7d_hdmi_ddc *ddc,
 
 	ddc->core = core;
 	mutex_init(&ddc->lock);
-	/* Match the vendor EDID path's 50 kHz profile at a 200 MHz parent. */
-	ret = s7d_hdmi_update_checked(core, DDC_CYP, 0x3, 2);
-	if (ret)
-		return ret;
-	ret = s7d_hdmi_update_checked(core, DDC_DUTY, 0x3, 0);
-	if (ret)
-		return ret;
-	ret = s7d_hdmi_update_checked(core, DDC_DELAY, 0xff, 0x3d);
-	if (ret)
-		return ret;
-	ret = ddc_recover(ddc);
+	ret = ddc_setup(ddc);
 	if (ret)
 		return ret;
 	strscpy(ddc->adapter.name, "S7D HDMI DDC", sizeof(ddc->adapter.name));
@@ -291,4 +298,21 @@ int s7d_hdmi_ddc_register(struct device *dev, struct s7d_hdmi_ddc *ddc,
 void s7d_hdmi_ddc_unregister(struct s7d_hdmi_ddc *ddc)
 {
 	i2c_del_adapter(&ddc->adapter);
+}
+
+void s7d_hdmi_ddc_suspend(struct s7d_hdmi_ddc *ddc)
+{
+	i2c_mark_adapter_suspended(&ddc->adapter);
+}
+
+int s7d_hdmi_ddc_resume(struct s7d_hdmi_ddc *ddc)
+{
+	int ret;
+
+	mutex_lock(&ddc->lock);
+	ret = ddc_setup(ddc);
+	ddc->fault = !!ret;
+	mutex_unlock(&ddc->lock);
+	i2c_mark_adapter_resumed(&ddc->adapter);
+	return ret;
 }

@@ -49,7 +49,9 @@
 #define TOP_PIN_STATUS	0x038
 #define TOP_INFILTER	0x074
 #define TOP_SCRATCH	0x07c
+#define TOP_HS_INTR	0x084
 #define TOP_ACTIVE	0x08c
+#define TOP_I2C_BUSY	0x0a0
 #define HPD_IRQS	(BIT(1) | BIT(2))
 /* TOP_INTR_STAT[31:30] are read-only core IRQ shadows, not reserved bits. */
 #define TOP_STATUS_VALID	(GENMASK(31, 30) | GENMASK(8, 0))
@@ -58,6 +60,7 @@
 #define CORE_INTR2	0x0265
 #define CORE_INTR2_MASK	0x026b
 #define CORE_INTR5_MASK	0x026d
+#define CORE_GCP_AUTO	0x06e3
 #define CORE_GCP_STATUS	0x06e5
 #define CORE_TPI_SC	0x061a
 #define CORE_INFO_SELECT 0x06bf
@@ -107,6 +110,8 @@ struct s7d_hdmi {
 	struct s7d_hdmi_output_state prepared_output;
 	bool hpd_enabled;
 	bool stopping;
+	/* The HPD handler masked its IRQ after a failed acknowledgment. */
+	bool hpd_masked;
 	struct delayed_work hpd_recovery;
 	/* Sink TMDS_Config while scrambling, rechecked as vc4 does; else 0. */
 	struct delayed_work scdc_check;
@@ -1571,6 +1576,7 @@ static void s7d_hdmi_hpd_recovery(struct work_struct *work)
 		mutex_unlock(&h->lock);
 		return;
 	}
+	WRITE_ONCE(h->hpd_masked, false);
 	enable_irq(h->irq);
 	mutex_unlock(&h->lock);
 	s7d_hdmi_audio_hpd(h);
@@ -1631,6 +1637,7 @@ static irqreturn_t s7d_hdmi_irq(int irq, void *data)
 		return IRQ_NONE;
 	s7d_hdmi_audio_hpd(h);
 	if (ret < 0) {
+		WRITE_ONCE(h->hpd_masked, true);
 		disable_irq_nosync(irq);
 		dev_err_ratelimited(h->dev, "HPD acknowledgment failed: %d; retrying with IRQ masked\n",
 				    ret);
@@ -1706,6 +1713,63 @@ static int s7d_hdmi_init_spd(struct s7d_hdmi *h)
 	spd.sdi = sdi;
 	ret = hdmi_spd_infoframe_pack(&spd, h->spd, sizeof(h->spd));
 	return ret < 0 ? ret : 0;
+}
+
+/* Deep suspend can power-cycle the domain, leaving the TX in soft reset. */
+static int s7d_hdmi_tx_reset(struct s7d_hdmi *h)
+{
+	return top_write(h, TOP_RESET, U32_MAX, 0);
+}
+
+/* TX setup that lives in the VPU/HDMI domain and is lost with its power. */
+static int s7d_hdmi_hw_init(struct s7d_hdmi *h)
+{
+	int ret;
+
+	ret = top_write(h, TOP_MASK, 0x1ff, 0);
+	if (ret)
+		return ret;
+	ret = top_write(h, TOP_SCRATCH, U32_MAX, 1);
+	if (ret)
+		return ret;
+	ret = top_write(h, TOP_HPD_FILTER, U32_MAX, 0x80007000);
+	if (ret)
+		return ret;
+	/* The firmware boot values below are lost when deep suspend cuts power. */
+	ret = top_write(h, TOP_CLK, BIT(3), BIT(3)); /* I2S clock to audio input */
+	if (ret)
+		return ret;
+	ret = top_write(h, TOP_I2C_BUSY, U32_MAX, 30);
+	if (ret)
+		return ret;
+	ret = top_write(h, TOP_HS_INTR, U32_MAX, 0x10);
+	if (ret)
+		return ret;
+	ret = s7d_hdmi_write_checked(h, h->core, CORE_GCP_AUTO, GENMASK(3, 2), BIT(3));
+	if (ret)
+		return ret;
+	ret = top_write(h, TOP_INFILTER, 0x07ff0000, BIT(24));
+	if (ret)
+		return ret;
+	/*
+	 * The level TX line also carries the core INTR2/INTR5 shadows, which
+	 * nothing here handles; mask any source left on before the IRQ starts.
+	 * This is defensive, so a failed write only warns.
+	 */
+	if (regmap_write(h->core, CORE_INTR2_MASK, 0) ||
+	    regmap_write(h->core, CORE_INTR5_MASK, 0))
+		dev_warn(h->dev, "could not mask core TX interrupts\n");
+	return 0;
+}
+
+static int s7d_hdmi_hpd_start(struct s7d_hdmi *h)
+{
+	int ret;
+
+	ret = regmap_write(h->top, TOP_CLEAR, 0x1ff);
+	if (ret)
+		return ret;
+	return top_write(h, TOP_MASK, 0x1ff, HPD_IRQS);
 }
 
 static int s7d_hdmi_probe(struct platform_device *pdev)
@@ -1827,26 +1891,9 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 			goto disable_basic;
 		h->video_on = true;
 	}
-	ret = top_write(h, TOP_MASK, 0x1ff, 0);
+	ret = s7d_hdmi_hw_init(h);
 	if (ret)
 		goto disable_video;
-	ret = top_write(h, TOP_SCRATCH, U32_MAX, 1);
-	if (ret)
-		goto disable_video;
-	ret = top_write(h, TOP_HPD_FILTER, U32_MAX, 0x80007000);
-	if (ret)
-		goto disable_video;
-	ret = top_write(h, TOP_INFILTER, 0x07ff0000, BIT(24));
-	if (ret)
-		goto disable_video;
-	/*
-	 * The level TX line also carries the core INTR2/INTR5 shadows, which
-	 * nothing here handles; mask any source left on before the IRQ starts.
-	 * This is defensive, so a failed write only warns.
-	 */
-	if (regmap_write(h->core, CORE_INTR2_MASK, 0) ||
-	    regmap_write(h->core, CORE_INTR5_MASK, 0))
-		dev_warn(dev, "could not mask core TX interrupts\n");
 	ret = s7d_hdmi_ddc_register(dev, &h->ddc, h->core);
 	if (ret)
 		goto disable_video;
@@ -1861,10 +1908,7 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	/* ENCP drives 1080i; s7d_encp_build_state() rejects the others. */
 	h->bridge.interlace_allowed = true;
 	h->bridge.ddc = &h->ddc.adapter;
-	ret = regmap_write(h->top, TOP_CLEAR, 0x1ff);
-	if (ret)
-		goto remove_ddc;
-	ret = top_write(h, TOP_MASK, 0x1ff, HPD_IRQS);
+	ret = s7d_hdmi_hpd_start(h);
 	if (ret)
 		goto remove_ddc;
 	audio.data = h;
@@ -1910,6 +1954,58 @@ put_pm:
 	return dev_err_probe(dev, ret, "HDMI initialization\n");
 }
 
+static int s7d_hdmi_suspend(struct device *dev)
+{
+	struct s7d_hdmi *h = dev_get_drvdata(dev);
+
+	/* The display device, a consumer of this one, has stopped the link. */
+	mutex_lock(&h->lock);
+	if (h->prepared || h->phy_on || h->video_on) {
+		mutex_unlock(&h->lock);
+		return -EBUSY;
+	}
+	WRITE_ONCE(h->stopping, true);
+	mutex_unlock(&h->lock);
+	disable_irq(h->irq);
+	/* Undo the handler's own mask so resume leaves a single depth. */
+	if (READ_ONCE(h->hpd_masked))
+		enable_irq(h->irq);
+	cancel_delayed_work_sync(&h->hpd_recovery);
+	cancel_delayed_work_sync(&h->scdc_check);
+	s7d_hdmi_ddc_suspend(&h->ddc);
+	return 0;
+}
+
+static int s7d_hdmi_resume(struct device *dev)
+{
+	struct s7d_hdmi *h = dev_get_drvdata(dev);
+	int ret;
+
+	/* Deep suspend can reset the TX like a cold boot; redo all setup. */
+	ret = s7d_hdmi_tx_reset(h);
+	if (!ret)
+		ret = s7d_hdmi_hw_init(h);
+	if (!ret)
+		ret = s7d_hdmi_ddc_resume(&h->ddc);
+	if (!ret)
+		ret = s7d_hdmi_hpd_start(h);
+	if (ret) {
+		dev_err(dev, "TX restore failed: %d\n", ret);
+		return ret;
+	}
+	mutex_lock(&h->lock);
+	WRITE_ONCE(h->stopping, false);
+	WRITE_ONCE(h->hpd_masked, false);
+	mutex_unlock(&h->lock);
+	enable_irq(h->irq);
+	/* The sink may have changed while asleep. */
+	if (READ_ONCE(h->hpd_enabled))
+		drm_bridge_hpd_notify(&h->bridge, s7d_hdmi_detect(&h->bridge));
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(s7d_hdmi_pm_ops, s7d_hdmi_suspend, s7d_hdmi_resume);
+
 /* Static DT and built-in driver only until failed-stop removal can retain devres. */
 static const struct of_device_id s7d_hdmi_match[] = {
 	{ .compatible = "amlogic,s7d-hdmi-tx" },
@@ -1924,6 +2020,7 @@ static struct platform_driver s7d_hdmi_driver = {
 		.name = "s7d-hdmi-tx",
 		.of_match_table = s7d_hdmi_match,
 		.suppress_bind_attrs = true,
+		.pm = pm_sleep_ptr(&s7d_hdmi_pm_ops),
 	},
 };
 builtin_platform_driver(s7d_hdmi_driver);
