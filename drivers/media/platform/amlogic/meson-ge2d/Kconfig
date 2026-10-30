@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config VIDEO_S7D_GE2D
+	tristate "Amlogic S7D 2D graphic acceleration unit"
+	depends on ARCH_MESON_ODROID_COMMON && OF && COMMON_CLK && PM
+	depends on V4L_MEM2MEM_DRIVERS && VIDEO_DEV
+	depends on VIDEO_MESON_GE2D=n && AMLOGIC_MEDIA_ENABLE=n
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	help
+	  V4L2 mem2mem driver for the S7D GE2D: RGB format conversion,
+	  cropping, flips and rotation. Forked from the upstream Meson GE2D
+	  driver, which depends on ARCH_MESON, with the S7D register block,
+	  direct address registers and runtime power management.
