@@ -14,11 +14,6 @@ static unsigned int power_domain;
 struct generic_pm_domain **power_domains;
 static unsigned int pdid_start, pdid_max;
 
-int get_max_id(void)
-{
-	return pdid_max;
-}
-
 static ssize_t power_on_store(struct device *dev,
 			      struct device_attribute *attr,
 			      const char *buf, size_t count)
