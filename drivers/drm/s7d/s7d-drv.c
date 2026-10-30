@@ -563,6 +563,8 @@ static int s7d_drm_resume(struct device *dev)
 	int ret;
 
 	ret = drm_mode_config_helper_resume(&display->drm);
+	/* A sink swapped while asleep keeps HPD high; have clients reprobe. */
+	drm_kms_helper_hotplug_event(&display->drm);
 	return ret ? ret : s7d_crtc_last_error(display->vpu.crtc);
 }
 
