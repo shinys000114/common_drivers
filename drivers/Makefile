@@ -44,6 +44,7 @@ obj-$(CONFIG_AMLOGIC_UVM)		+= uvm/
 obj-y					+= dvb/
 obj-y					+= dvb_ci/
 obj-$(CONFIG_AMLOGIC_MEDIA_ENABLE)	+= media/
+obj-$(CONFIG_CEC_MESON_S7D) += media/cec/platform/meson/
 obj-$(CONFIG_AMLOGIC_WATERMARK)		+= aml_watermark/
 obj-$(CONFIG_AMLOGIC_TRUSTED_KEYS)	+= aml_trusted_keys/
 obj-$(CONFIG_AMLOGIC_AMFC)		+= amfc/

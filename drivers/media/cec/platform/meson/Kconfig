@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+config CEC_MESON_S7D
+	bool "Amlogic S7D standard CEC controller"
+	depends on DRM_S7D && OF && COMMON_CLK
+	depends on RESET_CONTROLLER && AMLOGIC_MEDIA_ENABLE = n
+	select CEC_CORE
+	select CEC_NOTIFIER
+	help
+	  Provide the standard CEC adapter for the S7D CECB controller and
+	  S7D HDMI transmitter. The controller uses independent CCF clocks,
+	  reset and pinctrl resources. For deep suspend and power off the
+	  controller is handed to the AOCPU firmware, which wakes the system
+	  when the TV selects this source.
+
+config CEC_MESON_S7D_AOCPU
+	bool "Pass CEC identity and wake messages to the S7D AOCPU"
+	depends on CEC_MESON_S7D && AMLOGIC_MHU_MBOX
+	help
+	  Send the OSD name and vendor ID to the AOCPU firmware before sleep,
+	  and deliver the CEC message that woke the system after resume. This
+	  uses the vendor AOCPU mailbox driver and its message layout.
+	  Without it, wake still works, but the firmware answers with its
+	  default name and the wake message is lost.
