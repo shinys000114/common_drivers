@@ -644,8 +644,21 @@
 			 <&clkc CLKID_VIDEO0_DIV2>;
 		clock-names = "apb", "sys", "prif", "200m", "pixel", "fe", "aud",
 			      "pixel-mux", "fe-mux", "video-parent", "video-div2";
-		assigned-clocks = <&clkc CLKID_HDMITX_AUD_MUX>;
-		assigned-clock-parents = <&clkc CLKID_FCLK_DIV5>;
+		/* Firmware sets the 200 MHz DDC/HPD clocks only when it drives HDMI. */
+		assigned-clocks = <&clkc CLKID_HDMITX_AUD_MUX>,
+				  <&clkc CLKID_HDMITX_SYS_MUX>,
+				  <&clkc CLKID_HDMITX_PRIF_MUX>,
+				  <&clkc CLKID_HDMITX_200M_MUX>,
+				  <&clkc CLKID_HDMITX_SYS>,
+				  <&clkc CLKID_HDMITX_PRIF>,
+				  <&clkc CLKID_HDMITX_200M>;
+		assigned-clock-parents = <&clkc CLKID_FCLK_DIV5>,
+					 <&clkc CLKID_FCLK_DIV5>,
+					 <&clkc CLKID_FCLK_DIV5>,
+					 <&clkc CLKID_FCLK_DIV5>,
+					 <0>, <0>, <0>;
+		assigned-clock-rates = <0>, <0>, <0>, <0>,
+				       <200000000>, <200000000>, <200000000>;
 		resets = <&reset RESET_HDMI_TX>, <&reset RESET_HDMITX_CAPB3>;
 		reset-names = "tx", "apb";
 		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
