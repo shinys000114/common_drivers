@@ -44,3 +44,15 @@ s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL) += \
 	jpeg/s7d-jpeg-backend.o \
 	jpeg/s7d-jpeg-v4l2.o
 
+
+s7d-vdec-$(CONFIG_VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL) += \
+	vp9/s7d-vp9-header-prefix.o \
+	vp9/s7d-vp9-prefix.o \
+	vp9/s7d-vp9-input.o \
+	vp9/s7d-vp9-context.o \
+	vp9/s7d-vp9-dma-context.o \
+	vp9/s7d-vp9-dpb.o \
+	vp9/s7d-vp9-inter-picture.o \
+	vp9/s7d-vp9-protocol.o \
+	vp9/s7d-vp9-backend.o \
+	vp9/s7d-vp9-v4l2.o
