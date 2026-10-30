@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Copyright (c) 2026 Hardkernel Co., Ltd. */
+#include <linux/align.h>
+#include <linux/bits.h>
+#include <linux/errno.h>
+#include <linux/overflow.h>
+
+#include <drm/drm_fb_dma_helper.h>
+#include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_rect.h>
+
+#include "s7d-osd.h"
+
+int s7d_osd_build_state(struct drm_framebuffer *fb, const struct drm_rect *src,
+			u64 dma_mask, struct s7d_osd_state *state)
+{
+	struct drm_gem_dma_object *obj;
+	u64 base, bytes, end, object_end;
+	u32 x1, y1, x2, y2, color, block_mode = 5, cpp = 4, expand = 0;
+	u32 endian = BIT(15);
+	bool alpha;
+
+	if (!fb || !src || !state || !fb->format || !fb->obj[0] ||
+	    fb->modifier != DRM_FORMAT_MOD_LINEAR)
+		return -EINVAL;
+	switch (fb->format->format) {
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ARGB8888:
+		color = 1;
+		break;
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+		color = 2;
+		break;
+	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_RGBA8888:
+		color = 0;
+		break;
+	case DRM_FORMAT_BGRX8888:
+	case DRM_FORMAT_BGRA8888:
+		color = 3;
+		break;
+	case DRM_FORMAT_XBGR2101010:
+	case DRM_FORMAT_ABGR2101010:
+		color = 14;
+		break;
+	case DRM_FORMAT_RGB565:
+		block_mode = 4;
+		color = 2;
+		cpp = 2;
+		expand = BIT(0);
+		break;
+	case DRM_FORMAT_RGB888:
+	case DRM_FORMAT_BGR888:
+		block_mode = 7;
+		color = fb->format->format == DRM_FORMAT_RGB888 ? 0 : 5;
+		cpp = 3;
+		break;
+	default:
+		return -EINVAL;
+	}
+	alpha = fb->format->format == DRM_FORMAT_ARGB8888 ||
+		fb->format->format == DRM_FORMAT_ABGR8888 ||
+		fb->format->format == DRM_FORMAT_ABGR2101010 ||
+		fb->format->format == DRM_FORMAT_RGBA8888 ||
+		fb->format->format == DRM_FORMAT_BGRA8888;
+	if (!fb->width || !fb->height ||
+	    fb->width > S7D_OSD_MAX_SIZE || fb->height > S7D_OSD_MAX_SIZE)
+		return -EINVAL;
+	if (src->x1 < 0 || src->y1 < 0 || src->x2 <= src->x1 || src->y2 <= src->y1 ||
+	    ((src->x1 | src->y1 | src->x2 | src->y2) & 0xffff))
+		return -EINVAL;
+	x1 = src->x1 >> 16;
+	y1 = src->y1 >> 16;
+	x2 = src->x2 >> 16;
+	y2 = src->y2 >> 16;
+	if (x2 > fb->width || y2 > fb->height)
+		return -EINVAL;
+
+	/*
+	 * The proven linear vendor path aligns rows to 64 bytes. Retain that
+	 * restriction, but use the framebuffer's actual pitch, not its width.
+	 * The vendor programs only the low 12 stride bits, in 16-byte units.
+	 */
+	if (!IS_ALIGNED(fb->pitches[0], S7D_OSD_PITCH_ALIGN) ||
+	    fb->pitches[0] < fb->width * cpp ||
+	    (fb->pitches[0] >> 4) > 0xfff)
+		return -EINVAL;
+	obj = drm_fb_dma_get_gem_obj(fb, 0);
+	if (!obj)
+		return -EINVAL;
+
+	/* Include row padding so a burst cannot fetch past the GEM allocation. */
+	bytes = (u64)fb->pitches[0] * fb->height;
+	if (check_add_overflow((u64)fb->offsets[0], bytes, &object_end) ||
+	    object_end > obj->base.size)
+		return -EINVAL;
+	if (check_add_overflow((u64)obj->dma_addr, (u64)fb->offsets[0], &base) ||
+	    check_add_overflow(base, bytes - 1, &end))
+		return -ERANGE;
+	if (!IS_ALIGNED(base, 16) || end > dma_mask || end > GENMASK_ULL(35, 0))
+		return -ERANGE;
+
+	/* Base stays at the framebuffer origin; source cropping uses W1/W2. */
+	*state = (struct s7d_osd_state) {
+		.block_config = endian | (block_mode << 8) | (color << 2),
+		.frame_addr = base >> 4,
+		.stride = fb->pitches[0] >> 4,
+		.scope_x = ((x2 - 1) << 16) | x1,
+		.scope_y = ((y2 - 1) << 16) | y1,
+		.alpha_config = (alpha ? BIT(2) : 0x7fc0) | expand,
+	};
+	return 0;
+}

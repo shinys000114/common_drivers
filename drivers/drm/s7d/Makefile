@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+
+ccflags-y += -I$(src)
+
+obj-$(CONFIG_DRM_S7D) += s7d-drm.o
+
+s7d-drm-y := \
+	s7d-drv.o \
+	s7d-hdmi-output.o \
+	s7d-vpu.o \
+	s7d-vpp.o \
+	s7d-gamma.o \
+	s7d-crtc.o \
+	s7d-caps.o \
+	s7d-bandwidth.o \
+	s7d-plane.o \
+	s7d-gem.o \
+	s7d-osd.o \
+	s7d-video.o \
+	s7d-video-pipeline.o \
+	s7d-csc.o \
+	s7d-postblend.o \
+	s7d-encp.o \
+	s7d-osd-pipeline.o \
+	s7d-scanout.o \
+	s7d-rdma.o \
+	s7d-afbc.o \
+	s7d-afbc-engine.o \
+	s7d-afrc.o \
+	s7d-fb.o \
+	s7d-filter.o \
+	s7d-osd-scaler.o \
+	s7d-video-scaler.o \
+	s7d-video2-scaler.o \
+	s7d-gfcd.o
