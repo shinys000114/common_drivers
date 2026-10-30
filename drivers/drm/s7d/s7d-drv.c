@@ -6,10 +6,10 @@
 #include <linux/dma-mapping.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
-#include <linux/suspend.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -292,6 +292,26 @@ static void s7d_release_dma_pool(void *dev)
 	of_reserved_mem_device_release(dev);
 }
 
+static void s7d_drm_unlink_hdmi(void *data)
+{
+	device_link_del(data);
+}
+
+/* System sleep orders the transmitter around the display that drives it. */
+static int s7d_drm_link_hdmi(struct device *dev, struct drm_bridge *bridge)
+{
+	struct platform_device *hdmi = of_find_device_by_node(bridge->of_node);
+	struct device_link *link;
+
+	if (!hdmi)
+		return -EPROBE_DEFER;
+	link = device_link_add(dev, &hdmi->dev, DL_FLAG_STATELESS);
+	put_device(&hdmi->dev);
+	if (!link)
+		return dev_err_probe(dev, -EINVAL, "HDMI device link\n");
+	return devm_add_action_or_reset(dev, s7d_drm_unlink_hdmi, link);
+}
+
 static int s7d_drm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -321,6 +341,9 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = s7d_hdmi_bridge_link(bridge, &link);
 	if (ret)
 		return dev_err_probe(dev, ret, "incompatible HDMI bridge\n");
+	ret = s7d_drm_link_hdmi(dev, bridge);
+	if (ret)
+		return ret;
 	ret = dma_set_mask(dev, DMA_BIT_MASK(36));
 	if (ret)
 		return ret;
@@ -516,8 +539,8 @@ static int s7d_drm_suspend(struct device *dev)
 	struct s7d_drm *display = dev_get_drvdata(dev);
 	int ret, restore;
 
-	/* Only s2idle retains the shared domain and DDC/HPD clock context. */
-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE || display->vpu.boot_held)
+	/* The firmware output is still held; there is no state to save yet. */
+	if (display->vpu.boot_held)
 		return -EBUSY;
 	ret = drm_mode_config_helper_suspend(&display->drm);
 	if (ret)
@@ -543,18 +566,7 @@ static int s7d_drm_resume(struct device *dev)
 	return ret ? ret : s7d_crtc_last_error(display->vpu.crtc);
 }
 
-static int s7d_drm_freeze(struct device *dev)
-{
-	/* Hibernation needs restoration of context lost across power removal. */
-	return -EBUSY;
-}
-
-static const struct dev_pm_ops s7d_drm_pm_ops = {
-	.suspend = s7d_drm_suspend,
-	.resume = s7d_drm_resume,
-	.freeze = s7d_drm_freeze,
-	.poweroff = s7d_drm_freeze,
-};
+static DEFINE_SIMPLE_DEV_PM_OPS(s7d_drm_pm_ops, s7d_drm_suspend, s7d_drm_resume);
 
 static const struct of_device_id s7d_drm_match[] = {
 	{ .compatible = "amlogic,s7d-vpu" },
@@ -570,7 +582,7 @@ static struct platform_driver s7d_drm_platform_driver = {
 		.name = "s7d-drm",
 		.of_match_table = s7d_drm_match,
 		.suppress_bind_attrs = true,
-		.pm = &s7d_drm_pm_ops,
+		.pm = pm_sleep_ptr(&s7d_drm_pm_ops),
 	},
 };
 builtin_platform_driver(s7d_drm_platform_driver);
