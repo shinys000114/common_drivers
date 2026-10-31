@@ -92,11 +92,14 @@ static bool video_same_config(const struct s7d_scanout_buffers *a,
 		S7D_VIDEO_UPDATE_REG_COUNT : S7D_VIDEO2_UPDATE_REG_COUNT;
 	u32 base = slot == S7D_PLANE_VIDEO ? 0x4820 : 0x48a0;
 
+	if (x->fb && x->pipeline.control.reg == 0x4840)
+		base = 0x4846;	/* FBC header and body */
+
 	if (!x->fb && !y->fb)
 		return true;
 	if (!video_owned(a, x, slot) || !video_owned(b, y, slot) ||
 	    x->pipeline.update_count != count || y->pipeline.update_count != count ||
-	    !(x->pipeline.control.value & BIT(0)) ||
+	    !(x->pipeline.control.value & s7d_video_enable_bit(&x->pipeline.control)) ||
 	    memcmp(x->pipeline.setup, y->pipeline.setup, sizeof(x->pipeline.setup)) ||
 	    memcmp(&x->pipeline.control, &y->pipeline.control, sizeof(x->pipeline.control)) ||
 	    memcmp(&x->pipeline.scaler, &y->pipeline.scaler, sizeof(x->pipeline.scaler)) ||

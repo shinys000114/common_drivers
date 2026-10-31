@@ -235,6 +235,21 @@ static bool display_write_valid(u32 reg, u32 value)
 		return (value & BIT(20)) &&
 		       !(value & ~(BIT(20) | GENMASK(10, 8))) &&
 		       ((value >> 8) & 7) <= 4;
+	case 0x4840:
+		return value == (BIT(19) | 0x1700);
+	case 0x4846:
+	case 0x4847:
+		return true;
+	case 0x4842:
+		return !(value & ~0x1fff1fffU);
+	case 0x484d:
+		return !(value & ~0x03ff03ffU);
+	case 0x484e:
+	case 0x484f:
+	case 0x4850:
+		return !(value & ~0x1fff1fffU);
+	case 0x4844:
+		return value == ((2 << 12) | 0x100);
 	case 0x4880:
 	case 0x4800:
 		return value == 0x38400052 || value == 0x38400053 ||

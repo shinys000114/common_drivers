@@ -90,6 +90,7 @@ struct s7d_vpu {
 	int afbc_admission_error[2];
 	u32 afbc_command_counter;
 	bool video_enable[2];
+	bool vd1_fbc;
 	u8 static_video_mask;
 	bool pixel_protected;
 	bool pll_protected;

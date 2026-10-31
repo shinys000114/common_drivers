@@ -12,6 +12,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_rect.h>
 
+#include "s7d-video.h"
 #include "s7d-afbc.h"
 #include "s7d-afrc.h"
 #include "s7d-fb.h"
@@ -98,7 +99,8 @@ s7d_fb_create(struct drm_device *dev, struct drm_file *file,
 	struct drm_rect source;
 	int ret;
 
-	if (cmd->modifier[0] == DRM_FORMAT_MOD_LINEAR)
+	if (cmd->modifier[0] == DRM_FORMAT_MOD_LINEAR ||
+	    s7d_video_fbc_modifier(cmd->pixel_format, cmd->modifier[0]))
 		return drm_gem_fb_create(dev, file, cmd);
 	if (s7d_afrc_cu(cmd->modifier[0]) >= 0)
 		return s7d_fb_create_afrc(dev, file, cmd);
