@@ -136,7 +136,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	ret = drm_atomic_helper_check_plane_state(base, crtc_state,
 						 min_scale,
 						 max_scale,
-						 true, false);
+						 true, true);
 	if (ret || !base->visible)
 		return ret;
 	if (scaled && plane->slot != S7D_PLANE_VIDEO && plane->slot != S7D_PLANE_VIDEO2 &&
