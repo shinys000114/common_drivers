@@ -36,6 +36,8 @@ struct s7d_vpu {
 	struct clk *enci_mux;
 	struct reset_control_bulk_data resets[3];
 	struct reset_control_bulk_data local_resets[4];
+	/* VD1 Amlogic FBC decoder and line buffer; optional */
+	struct reset_control_bulk_data vd1_fbc_resets[2];
 	struct s7d_afbc_engine afbc;
 	struct delayed_work afbc_timeout;
 	unsigned long afbc_deadline;
