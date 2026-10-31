@@ -14,6 +14,7 @@ enum s7d_csc_input_order {
 	S7D_CSC_INPUT_YCBCR,
 	S7D_CSC_INPUT_YCRCB,
 	S7D_CSC_INPUT_CRCBY,
+	S7D_CSC_INPUT_CBCRY,
 };
 
 struct s7d_csc_reg {

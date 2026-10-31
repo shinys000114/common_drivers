@@ -450,6 +450,8 @@ static enum s7d_csc_input_order s7d_crtc_csc_order(const struct s7d_plane_state 
 			return S7D_CSC_INPUT_YCRCB;
 		if (video->video.format == DRM_FORMAT_VUY888)
 			return S7D_CSC_INPUT_CRCBY;
+		if (video->video.format == DRM_FORMAT_XVYU2101010)
+			return S7D_CSC_INPUT_CBCRY;
 	}
 	return S7D_CSC_INPUT_YCBCR;
 }

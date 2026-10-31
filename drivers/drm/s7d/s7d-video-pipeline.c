@@ -54,10 +54,11 @@ static int check_layout(const struct s7d_video_state *layout,
 	u32 chroma_x, chroma_y;
 	bool semi422 = layout->format == DRM_FORMAT_NV16 ||
 		layout->format == DRM_FORMAT_NV61;
-	bool full_chroma = layout->format == DRM_FORMAT_VUY888;
+	bool deep = layout->format == DRM_FORMAT_XVYU2101010;
+	bool full_chroma = deep || layout->format == DRM_FORMAT_VUY888;
 	bool packed = full_chroma || layout->format == DRM_FORMAT_UYVY ||
 		layout->format == DRM_FORMAT_VYUY;
-	u32 cpp = full_chroma ? 3 : packed ? 2 : 1;
+	u32 cpp = deep ? 4 : full_chroma ? 3 : packed ? 2 : 1;
 
 	if (!dst || (layout->reflection & ~(S7D_VIDEO_REFLECT_X | S7D_VIDEO_REFLECT_Y)) ||
 	    (layout->format != DRM_FORMAT_NV12 &&
@@ -131,6 +132,7 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 		.control = SET(VD1_GEN_REG, VD1_GEN_MASK, VD1_GEN_VALUE),
 	};
 	u32 width, height, color;
+	bool deep, full_chroma;
 
 	if (!out || !hold_lines || hold_lines > 63)
 		return -EINVAL;
@@ -143,6 +145,8 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 	}
 	if (check_layout(layout, dst, &width, &height))
 		return -EINVAL;
+	deep = layout->format == DRM_FORMAT_XVYU2101010;
+	full_chroma = deep || layout->format == DRM_FORMAT_VUY888;
 	if (vd2) {
 		next.scaler.src_width = width;
 		next.scaler.src_height = height;
@@ -152,11 +156,15 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 			height != next.scaler.dst_height;
 	} else if (s7d_video_scaler_build(width, height, drm_rect_width(dst),
 					  drm_rect_height(dst),
-					  layout->format == DRM_FORMAT_VUY888, &next.scaler)) {
+					  full_chroma, &next.scaler)) {
 		return -EINVAL;
 	}
-	if (layout->format == DRM_FORMAT_VUY888) {
-		next.setup[0].value = (next.setup[0].value & ~BIT(1)) | BIT(16) | (2 << 14);
+	if (full_chroma) {
+		/* Bytes per pixel minus one; 10-bit 4:4:4 also needs bits mode 2. */
+		next.setup[0].value = (next.setup[0].value & ~BIT(1)) | BIT(16) |
+			((deep ? 3 : 2) << 14);
+		if (deep)
+			next.setup[1].value |= 2 << 8;
 		next.control.value = next.setup[0].value;
 		next.setup[2].value = BIT(29);
 		color = 0;
