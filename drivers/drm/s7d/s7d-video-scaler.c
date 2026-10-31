@@ -163,7 +163,7 @@ int s7d_video_scaler_build(u32 src_width, u32 src_height,
 		*out = next;
 		return 0;
 	}
-	if (src_width < 16 || src_height < 16 || dst_width > 1920 || dst_height > 1080 ||
+	if (src_width < 16 || src_height < 16 || dst_width > 4096 || dst_height > 2160 ||
 	    src_width > dst_width * S7D_VIDEO_SCALER_MAX_DOWNSCALE ||
 	    src_height > dst_height * S7D_VIDEO_SCALER_MAX_DOWNSCALE ||
 	    dst_width > src_width * S7D_VIDEO_SCALER_MAX_UPSCALE ||
@@ -265,9 +265,18 @@ int s7d_video_scaler_check_mode(const struct s7d_video_scaler_state *state,
 		return -EINVAL;
 	if (!state->enabled)
 		return 0;
-	if (!width || !height || width > 1920 || height > 1080 ||
+	if (!width || !height || width > 4096 || height > 2160 ||
 	    state->dst_width > width || state->dst_height > height ||
-	    !pixel_rate || pixel_rate > 148500000 || core_rate / 2 < pixel_rate)
+	    !pixel_rate || pixel_rate > 594000000 || core_rate < pixel_rate)
+		return -ERANGE;
+	/*
+	 * Enlargement reads at most one source pixel per output pixel, so the
+	 * SAFA keeps up at one pixel per core cycle, as the vendor models it up
+	 * to UHD. A reduction reads more lines than it writes: keep it to FHD.
+	 */
+	if ((state->src_width > state->dst_width || state->src_height > state->dst_height) &&
+	    (width > 1920 || height > 1080 || pixel_rate > 148500000 ||
+	     core_rate / 2 < pixel_rate))
 		return -ERANGE;
 	return 0;
 }
