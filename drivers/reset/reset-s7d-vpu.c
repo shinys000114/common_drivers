@@ -35,6 +35,8 @@ static const struct s7d_vpu_reset_desc reset_descs[] = {
 	[S7D_VPU_RESET_AFBC_ARBITER_LOGIC] = { VIU_SW_RESET, 19 },
 	[S7D_VPU_RESET_VDIN1] = { VDIN_TOP_MISC, 27 },
 	[S7D_VPU_RESET_WRMIF1] = { VDIN_TOP_MISC, 30 },
+	[S7D_VPU_RESET_VD1_AFBC] = { VIU_SW_RESET, 24 },
+	[S7D_VPU_RESET_VD1_LBUF] = { VIU_SW_RESET, 25 },
 };
 
 static int s7d_vpu_reset_level(struct reset_controller_dev *rcdev,
