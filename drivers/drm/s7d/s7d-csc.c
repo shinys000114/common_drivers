@@ -62,13 +62,17 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 			struct s7d_csc_state *state)
 {
 	/* Q10 coefficients; rows are R, G, B and columns are Y, Cb, Cr. */
-	static const s16 coeffs[2][2][3][3] = {
+	static const s16 coeffs[3][2][3][3] = {
 		{
 			{{1192, 0, 1634}, {1192, -401, -832}, {1192, 2066, 0}},
 			{{1024, 0, 1436}, {1024, -352, -731}, {1024, 1815, 0}},
 		}, {
 			{{1192, 0, 1836}, {1192, -218, -546}, {1192, 2163, 0}},
 			{{1024, 0, 1613}, {1024, -192, -479}, {1024, 1900, 0}},
+		}, {
+			/* BT.2020 non-constant luminance */
+			{{1192, 0, 1719}, {1192, -192, -666}, {1192, 2193, 0}},
+			{{1024, 0, 1510}, {1024, -169, -585}, {1024, 1927, 0}},
 		},
 	};
 	static const u8 columns[][3] = {
@@ -91,6 +95,9 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 		break;
 	case DRM_COLOR_YCBCR_BT709:
 		enc = 1;
+		break;
+	case DRM_COLOR_YCBCR_BT2020:
+		enc = 2;
 		break;
 	default:
 		return -EINVAL;
