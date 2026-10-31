@@ -163,7 +163,8 @@ void s7d_crtc_primary_dependency(struct drm_crtc *crtc, struct drm_atomic_state 
 	 * commit still waits for the fence and the decoder rereads the buffer.
 	 */
 	if (!state->primary_dependency && state->afbc_unchanged &&
-	    state->buffers.afbc.plan.surface_mask && state->buffers.video.fb &&
+	    state->buffers.afbc.plan.surface_mask &&
+	    (state->buffers.video.fb || state->buffers.video2.fb) &&
 	    state->video_submitted) {
 		state->primary_dependency = true;
 		return;
@@ -184,7 +185,8 @@ void s7d_crtc_osd2_dependency(struct drm_crtc *crtc, struct drm_atomic_state *at
 	state = to_s7d_crtc_state(base);
 	/* As for the primary: a fence added after check keeps the decoder state. */
 	if (!state->osd2_dependency && state->afbc_unchanged &&
-	    state->buffers.afbc.plan.surface_mask && state->buffers.video.fb &&
+	    state->buffers.afbc.plan.surface_mask &&
+	    (state->buffers.video.fb || state->buffers.video2.fb) &&
 	    state->video_submitted) {
 		state->osd2_dependency = true;
 		return;
@@ -241,8 +243,10 @@ static void s7d_crtc_check_video_update(struct s7d_crtc_state *state,
 	     state->video2.scaler.dst_height != old->video2.scaler.dst_height))
 		state->base.mode_changed = true;
 	if (old && old->valid && old->base.active &&
-	    ((state->buffers.afbc.plan.surface_mask && state->buffers.video.fb) ||
-	     (old->buffers.afbc.plan.surface_mask && old->buffers.video.fb)) &&
+	    ((state->buffers.afbc.plan.surface_mask &&
+	      (state->buffers.video.fb || state->buffers.video2.fb)) ||
+	     (old->buffers.afbc.plan.surface_mask &&
+	      (old->buffers.video.fb || old->buffers.video2.fb))) &&
 	    ((state->video_submitted && state->primary_submitted) ||
 	     !s7d_scanout_video_same_config(&old->buffers, &state->buffers)))
 		state->base.mode_changed = true;
@@ -275,11 +279,13 @@ static int s7d_crtc_check_afbc_video(const struct s7d_crtc_state *state)
 {
 	const struct drm_display_mode *mode = &state->base.adjusted_mode;
 
-	if (!state->buffers.afbc.plan.surface_mask || !state->buffers.fb[S7D_PLANE_VIDEO])
+	if (!state->buffers.afbc.plan.surface_mask ||
+	    (!state->buffers.fb[S7D_PLANE_VIDEO] && !state->buffers.fb[S7D_PLANE_VIDEO2]))
 		return 0;
 	if (state->buffers.afbc.plan.surface_mask != BIT(0) ||
 	    state->buffers.afbc.plan.surface[0].osd.alpha_config != 0x7fc2 ||
 	    state->buffers.fb[S7D_PLANE_RGB] || state->video.scaler.enabled ||
+	    state->video2.scaler.enabled ||
 	    state->osd.scalers[0].enabled || state->osd.scalers[1].enabled ||
 	    mode->hdisplay > 1920 || mode->vdisplay > 1080 ||
 	    mode->clock > 148500 || state->encp.flip_end <= state->encp.flip_start)
@@ -668,7 +674,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		return -EINVAL;
 	if (s7d_encp_build_state(&base->adjusted_mode, &state->encp) != MODE_OK)
 		return -EINVAL;
-	if (video && state->buffers.afbc.plan.surface_mask)
+	if ((video || video2) && state->buffers.afbc.plan.surface_mask)
 		video_hold = state->encp.fifo_hold_lines;
 	ret = s7d_video_build_pipeline(video ? &video->video : NULL,
 				       video ? &video_dst : NULL, video_hold,
@@ -682,7 +688,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		    sizeof(state->video.setup))))
 		base->mode_changed = true;
 	ret = s7d_video_build_vd2_pipeline(video2 ? &video2->video : NULL,
-		video2 ? &video2_dst : NULL, &state->video2);
+		video2 ? &video2_dst : NULL, video_hold, &state->video2);
 	if (ret)
 		return ret;
 	if (old && old->active &&
@@ -779,8 +785,9 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		to_s7d_crtc_state(old)->valid &&
 		!drm_atomic_crtc_needs_modeset(base) &&
 		s7d_scanout_afbc_equal(&to_s7d_crtc_state(old)->buffers, &state->buffers);
-	/* Submit cannot restage AFBC beside VD1, so that takes a modeset. */
-	if (state->buffers.afbc.plan.surface_mask && state->buffers.video.fb &&
+	/* Submit cannot restage AFBC beside video, so that takes a modeset. */
+	if (state->buffers.afbc.plan.surface_mask &&
+	    (state->buffers.video.fb || state->buffers.video2.fb) &&
 	    state->video_submitted &&
 	    !state->afbc_unchanged && old && old->active &&
 	    !drm_atomic_crtc_needs_modeset(base))

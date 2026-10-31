@@ -33,8 +33,6 @@ int s7d_display_check_resources(const struct s7d_display_resources *r)
 			(r->afbc & ~BIT(S7D_INPUT_OSD2)) ||
 			(r->inputs & S7D_VIDEO_INPUTS)))
 		return -EINVAL;
-	if (r->afbc && (r->inputs & BIT(S7D_INPUT_VD2)))
-		return -EINVAL;
 	if (r->afbc && (r->scalers & BIT(S7D_INPUT_VD1)) &&
 	    (r->scalers & S7D_OSD_INPUTS))
 		return -EINVAL;

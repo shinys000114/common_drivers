@@ -212,7 +212,7 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 }
 
 int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
-			       const struct drm_rect *dst,
+			       const struct drm_rect *dst, unsigned int hold_lines,
 			       struct s7d_video_pipeline_state *out)
 {
 	struct s7d_video_pipeline_state next;
@@ -221,7 +221,7 @@ int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
 
 	if (!out)
 		return -EINVAL;
-	ret = s7d_video_build_pipeline_common(layout, dst, 8, true, &next);
+	ret = s7d_video_build_pipeline_common(layout, dst, hold_lines, true, &next);
 	if (ret)
 		return ret;
 	if (layout && (next.scaler.src_width > 2048 ||
