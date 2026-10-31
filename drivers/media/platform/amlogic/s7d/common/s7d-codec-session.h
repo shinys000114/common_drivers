@@ -43,6 +43,11 @@ struct s7d_codec_surface_request {
 	size_t min_size[S7D_CODEC_MAX_PLANES];
 	/* All planes follow each other in dmabuf[0] (single-buffer NV12). */
 	bool contiguous;
+	/*
+	 * Contiguous only: bytes of dmabuf[0] in front of plane 0, a region the
+	 * backend fills through s7d_codec_surface_copy_prefix_dma().
+	 */
+	size_t prefix;
 };
 
 /* Retained by value with each picture when its OUTPUT buffer is recycled. */
@@ -60,6 +65,8 @@ struct s7d_codec_frame {
 	u32 sequence;
 	u32 flags;
 	size_t bytesused[S7D_CODEC_MAX_PLANES];
+	/* Bytes written in the surface prefix, if it has one. */
+	size_t prefix_bytesused;
 };
 
 struct s7d_codec_callbacks {
@@ -102,6 +109,9 @@ int s7d_codec_surface_pin(struct s7d_codec_session *session,
 			  struct s7d_codec_surface **out);
 int s7d_codec_surface_dma(struct s7d_codec_surface *surface, unsigned int plane,
 			  dma_addr_t *addr, size_t *size);
+/* Start of dmabuf[0] and the prefix length; zero length without a prefix. */
+int s7d_codec_surface_prefix(struct s7d_codec_surface *surface,
+			     dma_addr_t *addr, size_t *size);
 int s7d_codec_surface_queue(struct s7d_codec_surface *surface);
 /* The backend has stopped acquiring this queued, non-DPB surface. */
 int s7d_codec_surface_return_queued(struct s7d_codec_surface *surface);
@@ -116,6 +126,12 @@ int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
 			       u64 generation,
 			       const struct s7d_codec_dma_copy_plane planes[2],
 			       bool (*cancelled)(void *priv), void *priv);
+/* As copy_dma, but plane i lands at prefix byte offset[i]; spans stay apart. */
+int s7d_codec_surface_copy_prefix_dma(struct s7d_codec_surface *dst, u64 dst_token,
+				      u64 generation,
+				      const struct s7d_codec_dma_copy_plane planes[2],
+				      const size_t offset[2],
+				      bool (*cancelled)(void *priv), void *priv);
 /* Physically idle, unpublished picture; consumes its sole DPB reference. */
 int s7d_codec_surface_discard(struct s7d_codec_surface *surface, u64 token);
 int s7d_codec_surface_ref_get(struct s7d_codec_surface *surface);

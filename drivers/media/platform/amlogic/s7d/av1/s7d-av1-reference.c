@@ -403,6 +403,12 @@ int s7d_av1_references_output(struct s7d_av1_references *references,
 	next.pitch = backing->pitch;
 	next.y_bytes = backing->y_bytes;
 	next.uv_bytes = backing->uv_bytes;
+	next.body = backing->body;
+	next.header = backing->header;
+	next.body_offset = (u64)backing->body.address - s7d_codec_dma_addr(next.memory);
+	next.header_cpu = references->cpu[slot] + references->layout.header_offset;
+	next.backing.address = backing->body.address;
+	next.backing.bytes = references->layout.used_bytes;
 	*output = next;
 	return 0;
 }

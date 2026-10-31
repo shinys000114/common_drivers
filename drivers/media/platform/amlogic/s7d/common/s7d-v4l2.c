@@ -25,6 +25,13 @@
 #define S7D_OUTPUT_DEFAULT_SIZE SZ_2M
 #define S7D_OUTPUT_MAX_SIZE SZ_16M
 
+/* How the client lays out each CAPTURE buffer; kept across source changes. */
+enum s7d_capture_mode {
+	S7D_CAPTURE_MPLANE,	/* NV12M/NV21M */
+	S7D_CAPTURE_SINGLE,	/* NV12/NV21 in one buffer */
+	S7D_CAPTURE_AM08C,	/* FBC header and body, then NV12, in one buffer */
+};
+
 enum s7d_v4l2_state {
 	S7D_V4L2_IDLE,
 	S7D_V4L2_INITIALIZING,
@@ -68,8 +75,7 @@ struct s7d_v4l2_context {
 	struct s7d_codec_layout layout;
 	struct v4l2_pix_format_mplane output;
 	struct v4l2_pix_format_mplane capture;
-	/* The client chose single-buffer NV12/NV21; kept across source changes. */
-	bool capture_contiguous;
+	enum s7d_capture_mode capture_mode;
 	struct s7d_v4l2_buffer *surface[S7D_CODEC_MAX_CAPTURE_BUFFERS];
 	struct s7d_v4l2_buffer *active_input;
 	enum s7d_v4l2_state state;
@@ -148,22 +154,46 @@ static bool s7d_contiguous_fourcc(u32 fourcc)
 	return fourcc == V4L2_PIX_FMT_NV12 || fourcc == V4L2_PIX_FMT_NV21;
 }
 
+static enum s7d_capture_mode s7d_fourcc_mode(const struct s7d_v4l2_codec *codec,
+					     u32 fourcc)
+{
+	if (fourcc == V4L2_PIX_FMT_AM08C)
+		return codec->am08c ? S7D_CAPTURE_AM08C : S7D_CAPTURE_MPLANE;
+	return s7d_contiguous_fourcc(fourcc) ? S7D_CAPTURE_SINGLE : S7D_CAPTURE_MPLANE;
+}
+
 /* Single-buffer NV12 puts chroma at bytesperline * height, right after luma. */
 static bool s7d_layout_contiguous(const struct s7d_codec_layout *layout)
 {
 	return (u64)layout->pitch[0] * layout->storage_height == layout->size[0];
 }
 
-static bool s7d_capture_fits(struct vb2_buffer *vb, const struct s7d_codec_layout *layout)
+/* AM08C: FBC bytes in front of the NV12 copy, from the reported width/height. */
+static u32 s7d_am08c_prefix(const struct s7d_codec_layout *layout)
+{
+	return s7d_am08c_nv12_offset(layout->coded_width, layout->storage_height);
+}
+
+/* The mode cannot change while CAPTURE buffers exist; queue_lock holders read it. */
+static u32 s7d_capture_prefix(const struct s7d_v4l2_context *ctx, struct vb2_buffer *vb,
+			      const struct s7d_codec_layout *layout)
+{
+	return vb->num_planes == 1 && ctx->capture_mode == S7D_CAPTURE_AM08C ?
+		s7d_am08c_prefix(layout) : 0;
+}
+
+static bool s7d_capture_fits(struct vb2_buffer *vb, const struct s7d_codec_layout *layout,
+			     u32 prefix)
 {
 	if (vb->num_planes == 1)
 		return s7d_layout_contiguous(layout) &&
-		       vb2_plane_size(vb, 0) >= (u64)layout->size[0] + layout->size[1];
+		       vb2_plane_size(vb, 0) >= (u64)prefix + layout->size[0] + layout->size[1];
 	return vb->num_planes == 2 && vb2_plane_size(vb, 0) >= layout->size[0] &&
 	       vb2_plane_size(vb, 1) >= layout->size[1];
 }
 
-static void s7d_capture_format(const struct s7d_codec_layout *layout, bool contiguous,
+static void s7d_capture_format(const struct s7d_codec_layout *layout,
+			       enum s7d_capture_mode mode,
 			       struct v4l2_pix_format_mplane *format)
 {
 	bool nv21 = layout->format == S7D_CODEC_CAPTURE_NV21M;
@@ -182,11 +212,15 @@ static void s7d_capture_format(const struct s7d_codec_layout *layout, bool conti
 	format->quantization = layout->colourimetry.quantization;
 	format->xfer_func = layout->colourimetry.xfer_func;
 	/* A luma plane padded past pitch * height can only be offered as NV12M. */
-	if (contiguous && s7d_layout_contiguous(layout)) {
+	if (mode != S7D_CAPTURE_MPLANE && s7d_layout_contiguous(layout)) {
 		format->pixelformat = nv21 ? V4L2_PIX_FMT_NV21 : V4L2_PIX_FMT_NV12;
 		format->num_planes = 1;
 		format->plane_fmt[0].bytesperline = layout->pitch[0];
 		format->plane_fmt[0].sizeimage = layout->size[0] + layout->size[1];
+		if (mode == S7D_CAPTURE_AM08C && !nv21) {
+			format->pixelformat = V4L2_PIX_FMT_AM08C;
+			format->plane_fmt[0].sizeimage += s7d_am08c_prefix(layout);
+		}
 		return;
 	}
 	format->pixelformat = nv21 ? V4L2_PIX_FMT_NV21M : V4L2_PIX_FMT_NV12M;
@@ -289,6 +323,7 @@ bool s7d_v4l2_codec_valid(const struct s7d_v4l2_codec *codec)
 		(codec->output_format == V4L2_PIX_FMT_HEVC ||
 		 codec->output_format == V4L2_PIX_FMT_VP9 ||
 		 codec->output_format == V4L2_PIX_FMT_AV1) && !codec->nv21 &&
+		(!codec->am08c || codec->output_format == V4L2_PIX_FMT_AV1) &&
 		codec->max_width <= 1920 && codec->max_height <= 1080 &&
 		codec->max_input_size <= SZ_2M;
 }
@@ -362,13 +397,19 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *form
 			return -EINVAL;
 		format->pixelformat = formats[format->index];
 	} else {
-		static const u32 formats[] = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12 };
+		/* AM08C last: generic clients keep picking NV12M/NV12. */
+		static const u32 formats[] = {
+			V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_AM08C,
+		};
 
-		if (format->index >= ARRAY_SIZE(formats))
+		if (format->index >= ARRAY_SIZE(formats) - !ctx->codec.am08c)
 			return -EINVAL;
 		format->pixelformat = formats[format->index];
 	}
 	format->flags = 0;
+	if (format->pixelformat == V4L2_PIX_FMT_AM08C)
+		strscpy(format->description, "Amlogic FBC 8-bit + NV12",
+			sizeof(format->description));
 	return 0;
 }
 
@@ -400,7 +441,7 @@ int s7d_v4l2_try_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format
 			return ret;
 	}
 	layout.format = nv21 ? S7D_CODEC_CAPTURE_NV21M : S7D_CODEC_CAPTURE_NV12M;
-	s7d_capture_format(&layout, s7d_contiguous_fourcc(fourcc), pix);
+	s7d_capture_format(&layout, s7d_fourcc_mode(&ctx->codec, fourcc), pix);
 	if (!valid)
 		s7d_capture_follow_output(&ctx->output, pix);
 	return 0;
@@ -448,13 +489,13 @@ int s7d_v4l2_set_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format
 	if (s7d_output(format->type)) {
 		ctx->output = format->fmt.pix_mp;
 		ctx->layout = placeholder;
-		s7d_capture_format(&placeholder, ctx->capture_contiguous, &ctx->capture);
+		s7d_capture_format(&placeholder, ctx->capture_mode, &ctx->capture);
 		s7d_capture_follow_output(&ctx->output, &ctx->capture);
 		ctx->sequence_valid = false;
 		ctx->capture_layout_retained = false;
 	} else {
 		ctx->capture = format->fmt.pix_mp;
-		ctx->capture_contiguous = s7d_contiguous_fourcc(ctx->capture.pixelformat);
+		ctx->capture_mode = s7d_fourcc_mode(&ctx->codec, ctx->capture.pixelformat);
 		if (ctx->change_pending)
 			ctx->query_layout.format = s7d_nv21_fourcc(ctx->capture.pixelformat) ?
 				S7D_CODEC_CAPTURE_NV21M : S7D_CODEC_CAPTURE_NV12M;
@@ -739,7 +780,7 @@ static int s7d_reset(struct s7d_v4l2_context *ctx, bool capture_streaming)
 	ctx->prepared = false;
 	if (ctx->change_pending) {
 		ctx->layout.format = ctx->query_layout.format;
-		s7d_capture_format(&ctx->layout, ctx->capture_contiguous, &ctx->capture);
+		s7d_capture_format(&ctx->layout, ctx->capture_mode, &ctx->capture);
 		ctx->output.width = ctx->layout.coded_width;
 		ctx->output.height = ctx->layout.coded_height;
 	}
@@ -1114,7 +1155,8 @@ static void s7d_frame_ready(void *priv, const struct s7d_codec_frame *frame)
 	if (frame->flags & S7D_CODEC_FRAME_ERROR)
 		vbuf->flags |= V4L2_BUF_FLAG_ERROR;
 	if (vbuf->vb2_buf.num_planes == 1)
-		vb2_set_plane_payload(&vbuf->vb2_buf, 0, frame->bytesused[0] + frame->bytesused[1]);
+		vb2_set_plane_payload(&vbuf->vb2_buf, 0, frame->prefix_bytesused +
+				      frame->bytesused[0] + frame->bytesused[1]);
 	else
 		for (i = 0; i < 2; i++)
 			vb2_set_plane_payload(&vbuf->vb2_buf, i, frame->bytesused[i]);
@@ -1243,7 +1285,7 @@ int s7d_v4l2_reconfigure_result(struct s7d_v4l2_context *ctx,
 		ctx->change_draining = ctx->state == S7D_V4L2_DRAINING;
 		ctx->capture_stopping = true;
 		ctx->rebind_pending = false;
-		s7d_capture_format(&layout, ctx->capture_contiguous, &ctx->capture);
+		s7d_capture_format(&layout, ctx->capture_mode, &ctx->capture);
 		ctx->output.width = layout.coded_width;
 		ctx->output.height = layout.coded_height;
 	}
@@ -1288,7 +1330,7 @@ int s7d_v4l2_sequence_result(struct s7d_v4l2_context *ctx,
 		return 0;
 	} else {
 		ctx->layout = layout;
-		s7d_capture_format(&layout, ctx->capture_contiguous, &ctx->capture);
+		s7d_capture_format(&layout, ctx->capture_mode, &ctx->capture);
 		ctx->output.width = layout.coded_width;
 		ctx->output.height = layout.coded_height;
 		ctx->sequence_valid = true;
@@ -1418,7 +1460,11 @@ static int s7d_pin_capture(struct s7d_v4l2_context *ctx, struct vb2_buffer *vb)
 		return -ENOSPC;
 	if (buffer->surface)
 		return buffer->generation == request.generation ? 0 : -EOPNOTSUPP;
-	if (!s7d_capture_fits(vb, &ctx->layout))
+	request.prefix = s7d_capture_prefix(ctx, vb, &ctx->layout);
+	/* The FBC body must start 4 KiB aligned; so does all that follows. */
+	if (request.prefix)
+		request.dma_alignment = SZ_4K;
+	if (!s7d_capture_fits(vb, &ctx->layout, request.prefix))
 		return -EINVAL;
 	for (i = 0; i < 2; i++)
 		request.min_size[i] = ctx->layout.size[i];
@@ -1444,7 +1490,7 @@ static int s7d_buf_prepare(struct vb2_buffer *vb)
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	format = vb->vb2_queue->is_output ? ctx->output : ctx->capture;
 	if (!vb->vb2_queue->is_output && ctx->change_pending && !ctx->change_capture_off)
-		s7d_capture_format(&ctx->layout, ctx->capture_contiguous, &format);
+		s7d_capture_format(&ctx->layout, ctx->capture_mode, &format);
 	ret = ctx->retired ? -ESHUTDOWN : 0;
 	valid = ctx->sequence_valid;
 	detached = ctx->ops.clear_stream && !ctx->capture_ready;
@@ -1584,7 +1630,7 @@ static int s7d_reconfigure_start(struct s7d_v4l2_context *ctx)
 		vb = vb2_get_buffer(q, i);
 		if (!vb)
 			continue;
-		if (!s7d_capture_fits(vb, &layout))
+		if (!s7d_capture_fits(vb, &layout, s7d_capture_prefix(ctx, vb, &layout)))
 			return -ENOBUFS;
 		count++;
 	}
@@ -2447,7 +2493,7 @@ s7d_v4l2_context_create(struct device *dev, struct video_device *video,
 	ret = s7d_placeholder(codec, 1920, 1080, V4L2_PIX_FMT_NV12M, &ctx->layout);
 	if (ret)
 		goto free;
-	s7d_capture_format(&ctx->layout, false, &ctx->capture);
+	s7d_capture_format(&ctx->layout, S7D_CAPTURE_MPLANE, &ctx->capture);
 	s7d_capture_follow_output(&ctx->output, &ctx->capture);
 	ret = s7d_context_controls(ctx);
 	if (ret)
@@ -2510,7 +2556,9 @@ int s7d_v4l2_context_rebind(struct s7d_v4l2_context *ctx, struct s7d_codec_core 
 	ctx->layout = layout;
 	ctx->sequence_valid = false;
 	ctx->capture_layout_retained = false;
-	s7d_capture_format(&layout, ctx->capture_contiguous, &ctx->capture);
+	if (ctx->capture_mode == S7D_CAPTURE_AM08C && !codec->am08c)
+		ctx->capture_mode = S7D_CAPTURE_SINGLE;
+	s7d_capture_format(&layout, ctx->capture_mode, &ctx->capture);
 	s7d_capture_follow_output(&ctx->output, &ctx->capture);
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 unlock:

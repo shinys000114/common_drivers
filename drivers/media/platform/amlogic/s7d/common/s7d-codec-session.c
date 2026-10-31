@@ -451,14 +451,17 @@ int s7d_codec_surface_pin(struct s7d_codec_session *session,
 {
 	struct s7d_codec_core *core = session->core;
 	struct s7d_codec_surface *surface, *existing;
-	size_t total = 0;
+	size_t total;
 	unsigned int i, j;
 	int ret;
 
 	if (!out || !dmabuf || !request || !request->generation ||
 	    !request->num_planes || request->num_planes > S7D_CODEC_MAX_PLANES ||
-	    !is_power_of_2(request->dma_alignment))
+	    !is_power_of_2(request->dma_alignment) ||
+	    (request->prefix && (!request->contiguous ||
+				 !IS_ALIGNED(request->prefix, request->dma_alignment))))
 		return -EINVAL;
+	total = request->prefix;
 	for (i = 0; i < request->num_planes; i++) {
 		if (!request->min_size[i] ||
 		    check_add_overflow(total, request->min_size[i], &total))
@@ -500,8 +503,11 @@ int s7d_codec_surface_pin(struct s7d_codec_session *session,
 			ret = s7d_plane_pin(core, dmabuf[i], &surface->plane[i],
 					    request->contiguous ? total : request->min_size[i],
 					    request->dma_alignment);
-			if (!ret)
+			if (!ret) {
+				surface->plane[i].offset = request->prefix;
+				surface->plane[i].dma += request->prefix;
 				surface->plane[i].bytes = request->min_size[i];
+			}
 		}
 		if (ret)
 			goto unpin;
@@ -542,6 +548,25 @@ int s7d_codec_surface_dma(struct s7d_codec_surface *surface, unsigned int plane,
 	} else {
 		*addr = surface->plane[plane].dma;
 		*size = surface->plane[plane].bytes;
+	}
+	mutex_unlock(&core->lock);
+	return ret;
+}
+
+int s7d_codec_surface_prefix(struct s7d_codec_surface *surface,
+			     dma_addr_t *addr, size_t *size)
+{
+	struct s7d_codec_core *core = surface->session->core;
+	int ret = 0;
+
+	if (!addr || !size)
+		return -EINVAL;
+	mutex_lock(&core->lock);
+	if (surface->session->state != S7D_SESSION_OPEN) {
+		ret = -ESHUTDOWN;
+	} else {
+		*addr = surface->plane[0].dma - surface->request.prefix;
+		*size = surface->request.prefix;
 	}
 	mutex_unlock(&core->lock);
 	return ret;
@@ -687,10 +712,15 @@ static int s7d_copy_span(u32 pitch, u32 row_bytes, u32 rows, size_t *span)
 	return 0;
 }
 
-int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
-			       u64 generation,
-			       const struct s7d_codec_dma_copy_plane planes[2],
-			       bool (*cancelled)(void *priv), void *priv)
+/*
+ * Without @prefix_offset, plane i fills NV12 plane i. With it, plane i lands at
+ * that byte offset of the prefix in front of plane 0.
+ */
+static int s7d_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
+				u64 generation,
+				const struct s7d_codec_dma_copy_plane planes[2],
+				const size_t *prefix_offset,
+				bool (*cancelled)(void *priv), void *priv)
 {
 	struct s7d_codec_dma_copy_plane copy[2];
 	struct s7d_codec_session *session;
@@ -698,15 +728,16 @@ int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
 	struct dma_buf *target[2];
 	size_t target_offset[2];
 	dma_addr_t address[2];
-	size_t span[2], target_span;
+	size_t span[2], target_span[2];
 	unsigned int i, j;
 	int ret = 0;
 
 	if (!dst || !planes || !generation)
 		return -EINVAL;
 	memcpy(copy, planes, sizeof(copy));
-	if (copy[0].row_bytes != copy[1].row_bytes || (copy[0].row_bytes & 1) ||
-	    (copy[0].rows & 1) || copy[1].rows != copy[0].rows / 2)
+	if (!prefix_offset &&
+	    (copy[0].row_bytes != copy[1].row_bytes || (copy[0].row_bytes & 1) ||
+	     (copy[0].rows & 1) || copy[1].rows != copy[0].rows / 2))
 		return -EINVAL;
 	session = dst->session;
 	core = session->core;
@@ -718,6 +749,8 @@ int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
 		   generation <= session->retired_generation || !dst->writing ||
 		   !dst->dpb_refs || dst->user_owned || dst->write_token != dst_token) {
 		ret = -ESTALE;
+	} else if (prefix_offset && !dst->request.prefix) {
+		ret = -EINVAL;
 	}
 	for (i = 0; !ret && i < 2; i++) {
 		struct s7d_codec_dma *memory;
@@ -737,12 +770,29 @@ int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
 				    copy[i].rows, &span[i]);
 		if (!ret)
 			ret = s7d_copy_span(copy[i].destination_pitch, copy[i].row_bytes,
-					    copy[i].rows, &target_span);
+					    copy[i].rows, &target_span[i]);
 		if (ret)
 			break;
+		if (prefix_offset) {
+			/* The prefix ends where plane 0 starts, inside the same dma-buf. */
+			target[i] = dst->plane[0].dmabuf;
+			target_offset[i] = prefix_offset[i];
+			if (target_offset[i] > dst->request.prefix ||
+			    target_span[i] > dst->request.prefix - target_offset[i]) {
+				ret = -ERANGE;
+				break;
+			}
+		} else {
+			target[i] = dst->plane[i].dmabuf;
+			target_offset[i] = dst->plane[i].offset;
+			if (target_span[i] > dst->plane[i].bytes ||
+			    target_span[i] > dst->plane[i].dmabuf->size - dst->plane[i].offset) {
+				ret = -ERANGE;
+				break;
+			}
+		}
 		if (check_add_overflow(copy[i].offset, span[i], &end) ||
-		    end > memory->bytes || target_span > dst->plane[i].bytes ||
-		    target_span > dst->plane[i].dmabuf->size - dst->plane[i].offset ||
+		    end > memory->bytes ||
 		    check_add_overflow(memory->dma, (dma_addr_t)copy[i].offset, &address[i]) ||
 		    !s7d_dma_range(core, address[i], span[i])) {
 			ret = -ERANGE;
@@ -754,16 +804,21 @@ int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
 				ret = -EINVAL;
 				break;
 			}
+		if (!ret && dst->request.prefix &&
+		    (u64)address[i] < (u64)dst->plane[0].dma &&
+		    (u64)dst->plane[0].dma - dst->request.prefix <= (u64)address[i] + span[i] - 1)
+			ret = -EINVAL;
 	}
 	if (!ret && (u64)address[0] <= (u64)address[1] + span[1] - 1 &&
 	    (u64)address[1] <= (u64)address[0] + span[0] - 1)
 		ret = -EINVAL;
+	if (!ret && prefix_offset &&
+	    target_offset[0] <= target_offset[1] + target_span[1] - 1 &&
+	    target_offset[1] <= target_offset[0] + target_span[0] - 1)
+		ret = -EINVAL;
 	if (!ret) {
-		for (i = 0; i < 2; i++) {
-			target[i] = dst->plane[i].dmabuf;
-			target_offset[i] = dst->plane[i].offset;
+		for (i = 0; i < 2; i++)
 			get_dma_buf(target[i]);
-		}
 		s7d_codec_session_get(session);
 	}
 	mutex_unlock(&core->lock);
@@ -774,6 +829,27 @@ int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
 		dma_buf_put(target[i]);
 	s7d_codec_session_put(session);
 	return ret;
+}
+
+int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
+			       u64 generation,
+			       const struct s7d_codec_dma_copy_plane planes[2],
+			       bool (*cancelled)(void *priv), void *priv)
+{
+	return s7d_surface_copy_dma(dst, dst_token, generation, planes, NULL,
+				    cancelled, priv);
+}
+
+int s7d_codec_surface_copy_prefix_dma(struct s7d_codec_surface *dst, u64 dst_token,
+				      u64 generation,
+				      const struct s7d_codec_dma_copy_plane planes[2],
+				      const size_t offset[2],
+				      bool (*cancelled)(void *priv), void *priv)
+{
+	if (!offset)
+		return -EINVAL;
+	return s7d_surface_copy_dma(dst, dst_token, generation, planes, offset,
+				    cancelled, priv);
 }
 
 int s7d_codec_surface_discard(struct s7d_codec_surface *surface, u64 token)
@@ -859,6 +935,10 @@ int s7d_codec_session_frame_ready(struct s7d_codec_session *session,
 				ret = -EINVAL;
 				goto unlock;
 			}
+		if (frame->prefix_bytesused > surface->request.prefix) {
+			ret = -EINVAL;
+			goto unlock;
+		}
 		surface->displayed = true;
 		surface->user_owned = true;
 		session->callbacks.frame_ready(session->callback_priv, frame);

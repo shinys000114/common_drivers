@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 
+#include <asm/barrier.h>
+#include <asm/byteorder.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/list.h>
@@ -32,6 +34,8 @@ struct av1_backend {
 	struct s7d_av1_tu tu;
 	struct s7d_v4l2_drain drain;
 	struct s7d_v4l2_capture_buffer capture[S7D_CODEC_MAX_CAPTURE_BUFFERS];
+	/* AM08C: rebased FBC header, rewritten per frame; owned by the session. */
+	struct s7d_codec_dma *fbc_header;
 	struct s7d_codec_layout layout;
 	struct s7d_av1_sequence sequence;
 	u8 sequence_payload[S7D_AV1_SEQUENCE_MAX_BYTES];
@@ -301,12 +305,92 @@ static bool av1_copy_cancelled(void *priv)
 	return READ_ONCE(backend->closing);
 }
 
+/*
+ * AM08C: the FBC header holds absolute body addresses (word << 2). Copy the
+ * body behind the header room in the CAPTURE buffer, rebase every header word
+ * that points into the copied body, and copy the rebased header in front.
+ */
+static int av1_publish_fbc(struct av1_backend *backend, struct s7d_codec_surface *surface,
+			   u64 token, dma_addr_t base, size_t prefix)
+{
+	const struct s7d_av1_reference_output *output = &backend->result.output;
+	const struct s7d_codec_layout *layout = &backend->layout;
+	u32 header_size = s7d_am08c_header_size(layout->coded_width, layout->storage_height);
+	u32 body_size = s7d_am08c_body_size(layout->coded_width, layout->storage_height);
+	u32 header_used = s7d_am08c_header_used(layout->coded_width, layout->coded_height);
+	size_t offset[2] = { 0, header_size };
+	struct s7d_codec_dma_copy_plane plane[2];
+	struct s7d_av1_reference_layout fbc;
+	u64 src_body, src_end, dst_body, backing, backing_end, address;
+	const __le32 *src;
+	__le32 *dst;
+	u32 i, word, words, stray = 0;
+	int ret;
+
+	if (!backend->fbc_header || !output->header_cpu ||
+	    prefix != (size_t)header_size + body_size)
+		return -EINVAL;
+	/* What the hardware wrote for this picture, by the reference allocator's rules. */
+	ret = s7d_av1_reference_layout(layout->coded_width, layout->coded_height, 8,
+				       backend->sequence.use_128x128_superblock ? 128 : 64,
+				       &fbc);
+	if (ret)
+		return ret;
+	if (!header_used || header_used % 4 || header_used > header_size ||
+	    header_used > output->header.bytes ||
+	    header_size > s7d_codec_dma_size(backend->fbc_header) ||
+	    fbc.body_allocation > body_size || fbc.body_allocation > output->body.bytes)
+		return -ERANGE;
+	dst_body = (u64)base + header_size;
+	if (!IS_ALIGNED(dst_body, SZ_4K) || dst_body + fbc.body_allocation > (1ULL << 32))
+		return -ERANGE;
+	src_body = output->body.address;
+	src_end = src_body + fbc.body_allocation;
+	backing = output->backing.address;
+	backing_end = backing + output->backing.bytes;
+	src = (const __le32 *)output->header_cpu;
+	dst = s7d_codec_dma_cpu(backend->fbc_header);
+	words = header_used / 4;
+	for (i = 0; i < words; i++) {
+		word = le32_to_cpu(src[i]);
+		address = (u64)word << 2;
+		if (address >= src_body && address < src_end)
+			word = (u32)((address - src_body + dst_body) >> 2);
+		else if (address >= backing && address < backing_end)
+			stray++;
+		dst[i] = cpu_to_le32(word);
+	}
+	if (stray) {
+		dev_warn_ratelimited(backend->adapter->dev,
+				     "AV1 FBC: %u header words point outside the %u-byte body\n",
+				     stray, fbc.body_allocation);
+		return -EIO;
+	}
+	memset(dst + words, 0, header_size - header_used);
+	/* Rebased header stores precede the copy that reads them. */
+	dma_wmb();
+	plane[0] = (struct s7d_codec_dma_copy_plane) {
+		.memory = backend->fbc_header,
+		.source_pitch = SZ_4K, .destination_pitch = SZ_4K,
+		.row_bytes = SZ_4K, .rows = header_size / SZ_4K,
+	};
+	plane[1] = (struct s7d_codec_dma_copy_plane) {
+		.memory = output->memory, .offset = output->body_offset,
+		.source_pitch = SZ_4K, .destination_pitch = SZ_4K,
+		.row_bytes = SZ_4K, .rows = fbc.body_allocation / SZ_4K,
+	};
+	return s7d_codec_surface_copy_prefix_dma(surface, token, backend->generation, plane,
+						 offset, av1_copy_cancelled, backend);
+}
+
 static int av1_publish(struct av1_backend *backend)
 {
 	const struct s7d_av1_reference_output *output = &backend->result.output;
 	struct s7d_codec_dma_copy_plane plane[2];
 	struct s7d_codec_surface *surface = NULL;
 	struct s7d_codec_frame frame = { };
+	dma_addr_t base = 0;
+	size_t prefix = 0;
 	u64 token = 0;
 	u32 i, capture_index;
 	int ret = -EAGAIN, cleanup;
@@ -340,6 +424,10 @@ static int av1_publish(struct av1_backend *backend)
 		};
 	ret = s7d_codec_surface_copy_dma(surface, token, backend->generation, plane,
 					av1_copy_cancelled, backend);
+	if (!ret)
+		ret = s7d_codec_surface_prefix(surface, &base, &prefix);
+	if (!ret && prefix)
+		ret = av1_publish_fbc(backend, surface, token, base, prefix);
 	cleanup = s7d_codec_surface_written(surface, token);
 	if (!ret)
 		ret = cleanup;
@@ -358,8 +446,15 @@ static int av1_publish(struct av1_backend *backend)
 	frame.sequence = backend->frame_sequence;
 	if (output->output.picture.frame_type == S7D_AV1_KEY_FRAME)
 		frame.flags = S7D_CODEC_FRAME_KEY;
-	frame.bytesused[0] = backend->layout.pitch[0] * backend->layout.coded_height;
-	frame.bytesused[1] = frame.bytesused[0] / 2;
+	if (prefix) {
+		/* AM08C reports the whole buffer: FBC, then NV12 up to its padded height. */
+		frame.prefix_bytesused = prefix;
+		frame.bytesused[0] = backend->layout.size[0];
+		frame.bytesused[1] = backend->layout.size[1];
+	} else {
+		frame.bytesused[0] = backend->layout.pitch[0] * backend->layout.coded_height;
+		frame.bytesused[1] = frame.bytesused[0] / 2;
+	}
 	mutex_lock(&backend->notifications);
 	if (backend->frontend && !READ_ONCE(backend->closing))
 		ret = s7d_codec_session_frame_ready(backend->session, &frame);
@@ -597,6 +692,38 @@ static int av1_sync_initial(void *priv, u64 token)
 	return ret;
 }
 
+/* AM08C buffers need the header bounce; one per session, sized for the maximum. */
+static int av1_fbc_prepare(struct av1_backend *backend,
+			   const struct s7d_v4l2_capture_buffer *buffers, unsigned int count)
+{
+	const struct s7d_v4l2_codec *codec = &backend->adapter->factory.codec;
+	struct s7d_codec_dma *memory;
+	dma_addr_t base;
+	size_t prefix;
+	unsigned int i;
+	int ret;
+
+	lockdep_assert_held(&backend->lock);
+	if (backend->fbc_header)
+		return 0;
+	for (i = 0; i < count; i++) {
+		ret = s7d_codec_surface_prefix(buffers[i].surface, &base, &prefix);
+		if (ret)
+			return ret;
+		if (prefix)
+			break;
+	}
+	if (i == count)
+		return 0;
+	memory = s7d_codec_dma_alloc(backend->session,
+		s7d_am08c_header_size(codec->max_width,
+				      ALIGN(codec->max_height, S7D_CODEC_STORAGE_ALIGNMENT)));
+	if (IS_ERR(memory))
+		return PTR_ERR(memory);
+	backend->fbc_header = memory;
+	return 0;
+}
+
 static int av1_capture_start(void *priv, const struct s7d_codec_layout *layout,
 			     u64 generation,
 			     const struct s7d_v4l2_capture_buffer *buffers, unsigned int count)
@@ -618,6 +745,8 @@ static int av1_capture_start(void *priv, const struct s7d_codec_layout *layout,
 		ret = -EINVAL;
 	if (!ret)
 		ret = s7d_v4l2_validate_capture_pool(layout, generation, buffers, count);
+	if (!ret)
+		ret = av1_fbc_prepare(backend, buffers, count);
 	if (!ret) {
 		memcpy(backend->capture, buffers, sizeof(*buffers) * count);
 		backend->captures = count;
@@ -788,6 +917,8 @@ static int av1_release_epoch(struct av1_backend *backend)
 		backend->adapter->active = NULL;
 	session = backend->session;
 	backend->session = NULL;
+	/* Freed with the session. */
+	backend->fbc_header = NULL;
 	mutex_unlock(&backend->lock);
 	if (session)
 		s7d_codec_session_put(session);
@@ -973,6 +1104,7 @@ s7d_av1_v4l2_create(struct device *dev, struct s7d_codec_dos *dos,
 			.max_input_size = AV1_INPUT_BYTES,
 			.min_input_size = AV1_INPUT_BYTES,
 			.default_layout = s7d_v4l2_default_nv12_layout,
+			.am08c = true,
 		},
 		.ops = &av1_ops, .ready = av1_factory_ready,
 		.create = av1_factory_create, .destroy = av1_factory_destroy,

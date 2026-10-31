@@ -59,6 +59,13 @@ struct s7d_av1_reference_output {
 	u32 pitch;
 	u32 y_bytes;
 	u32 uv_bytes;
+	/* Compressed picture inside memory: body at body.address, header after it. */
+	struct s7d_av1_region body;
+	struct s7d_av1_region header;
+	size_t body_offset;
+	const u8 *header_cpu;
+	/* Every byte of the slot's backing, for stray header pointers. */
+	struct s7d_av1_region backing;
 };
 
 /* Caller retains the workspace owner; halt/join precedes initial allocation. */

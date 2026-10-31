@@ -4,7 +4,10 @@
 #ifndef S7D_V4L2_H
 #define S7D_V4L2_H
 
+#include <linux/align.h>
+#include <linux/math.h>
 #include <linux/poll.h>
+#include <linux/sizes.h>
 #include <linux/types.h>
 #include <linux/videodev2.h>
 #include "s7d-codec-session.h"
@@ -13,6 +16,55 @@
 #ifndef V4L2_PIX_FMT_AV1
 #define V4L2_PIX_FMT_AV1 v4l2_fourcc('A', 'V', '0', '1')
 #endif
+
+/*
+ * Driver-private CAPTURE format of the AV1 decoder: each frame in Amlogic FBC
+ * (scatter layout, mem-saving, 8-bit) followed by its linear NV12 copy, in a
+ * single plane. w and h are the CAPTURE format's width and height (G_FMT:
+ * coded width, height rounded up to 64); G_SELECTION gives the visible part.
+ *
+ *   offset 0:           FBC header, 32 bytes per 32x32 block, hdr =
+ *                       ALIGN(DIV_ROUND_UP(w, 32) * DIV_ROUND_UP(h, 32) * 32,
+ *                       4096) bytes reserved. Each little-endian u32 word,
+ *                       shifted left by 2, is the physical address of its
+ *                       compressed data in the body.
+ *   offset hdr:         FBC body, body = ALIGN(DIV_ROUND_UP(w, 64) *
+ *                       DIV_ROUND_UP(h, 32) * 3200, 4096) bytes, 4 KiB aligned.
+ *   offset nv12 = hdr + body:
+ *                       NV12 Y, pitch = bytesperline = ALIGN(w, 64), h rows;
+ *   offset nv12 + pitch * h:
+ *                       NV12 interleaved CbCr, same pitch, h / 2 rows.
+ *
+ * sizeimage = nv12 + pitch * h * 3 / 2. The header holds absolute addresses,
+ * so the buffer must stay where the driver wrote it (export it, never copy).
+ * DRM import: DRM_FORMAT_YUV420_8BIT with modifier
+ * DRM_FORMAT_MOD_AMLOGIC_FBC(AMLOGIC_FBC_LAYOUT_SCATTER,
+ * AMLOGIC_FBC_OPTION_MEM_SAVING), offsets[0] = 0, pitches[0] = w; or plain
+ * DRM_FORMAT_NV12 at offsets nv12 and nv12 + pitch * h, pitches = pitch.
+ */
+#define V4L2_PIX_FMT_AM08C v4l2_fourcc('A', '0', '8', 'C') /* Amlogic 8-bit FBC, scatter, mem-saving, plus NV12 */
+
+/* Header bytes the scatter layout uses for a picture. */
+static inline u32 s7d_am08c_header_used(u32 width, u32 height)
+{
+	return DIV_ROUND_UP(width, 32) * DIV_ROUND_UP(height, 32) * 32;
+}
+
+static inline u32 s7d_am08c_header_size(u32 width, u32 height)
+{
+	return ALIGN(s7d_am08c_header_used(width, height), SZ_4K);
+}
+
+static inline u32 s7d_am08c_body_size(u32 width, u32 height)
+{
+	return ALIGN(DIV_ROUND_UP(width, 64) * DIV_ROUND_UP(height, 32) * 3200, SZ_4K);
+}
+
+/* The NV12 copy follows the reserved FBC header and body. */
+static inline u32 s7d_am08c_nv12_offset(u32 width, u32 height)
+{
+	return s7d_am08c_header_size(width, height) + s7d_am08c_body_size(width, height);
+}
 
 struct device;
 struct file;
@@ -34,6 +86,8 @@ struct s7d_v4l2_codec {
 	int (*default_layout)(u32 width, u32 height, u32 fourcc,
 			      struct s7d_codec_layout *layout);
 	bool nv21;
+	/* CAPTURE may also offer V4L2_PIX_FMT_AM08C (AV1 only). */
+	bool am08c;
 };
 
 int s7d_v4l2_default_nv12_layout(u32 width, u32 height, u32 fourcc,
