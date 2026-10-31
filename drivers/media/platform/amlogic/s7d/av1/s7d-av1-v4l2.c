@@ -21,6 +21,10 @@
 #define AV1_INPUT_BYTES SZ_2M
 #define AV1_STAGING_BYTES (AV1_INPUT_BYTES * 11U)
 
+/* The S7D HEVC core decodes AV1 up to UHD, as the vendor driver allows. */
+#define AV1_MAX_WIDTH		4096
+#define AV1_MAX_HEIGHT		2304
+
 struct av1_backend {
 	struct s7d_av1_v4l2 *adapter;
 	struct list_head node;
@@ -219,7 +223,8 @@ static int av1_metadata(struct av1_backend *backend)
 	if (!payload)
 		return 0;
 	if (sequence.max_frame_width < 64 || sequence.max_frame_height < 64 ||
-	    sequence.max_frame_width > 1920 || sequence.max_frame_height > 1080 ||
+	    sequence.max_frame_width > AV1_MAX_WIDTH ||
+	    sequence.max_frame_height > AV1_MAX_HEIGHT ||
 	    ((sequence.max_frame_width | sequence.max_frame_height) & 1))
 		return -EOPNOTSUPP;
 	if (backend->sequence_valid)
@@ -1104,7 +1109,7 @@ s7d_av1_v4l2_create(struct device *dev, struct s7d_codec_dos *dos,
 		.codec = {
 			.engine = S7D_CODEC_ENGINE_HEVC,
 			.output_format = V4L2_PIX_FMT_AV1,
-			.max_width = 1920, .max_height = 1080,
+			.max_width = AV1_MAX_WIDTH, .max_height = AV1_MAX_HEIGHT,
 			.max_input_size = AV1_INPUT_BYTES,
 			.min_input_size = AV1_INPUT_BYTES,
 			.default_layout = s7d_v4l2_default_nv12_layout,

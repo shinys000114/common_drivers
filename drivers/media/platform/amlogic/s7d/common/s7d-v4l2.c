@@ -351,7 +351,10 @@ bool s7d_v4l2_codec_valid(const struct s7d_v4l2_codec *codec)
 		 codec->output_format == V4L2_PIX_FMT_VP9 ||
 		 codec->output_format == V4L2_PIX_FMT_AV1) && !codec->nv21 &&
 		(!codec->fbc || codec->output_format == V4L2_PIX_FMT_AV1) &&
-		codec->max_width <= 1920 && codec->max_height <= 1080 &&
+		(codec->max_width <= 1920 ||
+		 codec->output_format == V4L2_PIX_FMT_AV1) &&
+		(codec->max_height <= 1080 ||
+		 codec->output_format == V4L2_PIX_FMT_AV1) &&
 		codec->max_input_size <= SZ_2M;
 }
 
