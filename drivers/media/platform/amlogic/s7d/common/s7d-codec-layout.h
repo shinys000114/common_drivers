@@ -51,6 +51,8 @@ struct s7d_codec_layout {
 	u32 current_slots;
 	u32 extra_surfaces;
 	u32 min_capture_buffers;
+	/* Bits per coded sample: 8 or 10; 0 before a stream is known reads as 8. */
+	u32 bit_depth;
 	struct s7d_codec_colourimetry colourimetry;
 };
 

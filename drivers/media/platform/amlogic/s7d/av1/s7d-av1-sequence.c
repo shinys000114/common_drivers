@@ -283,7 +283,9 @@ int s7d_av1_admit_sequence(const struct s7d_av1_sequence *sequence)
 	    sequence->operating_points > S7D_AV1_OPERATING_POINTS ||
 	    !sequence->max_frame_width || !sequence->max_frame_height)
 		return -EINVAL;
-	if (sequence->profile || sequence->bit_depth != 8 ||
+	/* Main profile 4:2:0, 8 or 10 bits: profile 0 cannot carry 12 bits. */
+	if (sequence->profile ||
+	    (sequence->bit_depth != 8 && sequence->bit_depth != 10) ||
 	    sequence->monochrome || !sequence->subsampling_x ||
 	    !sequence->subsampling_y || sequence->enable_superres ||
 	    sequence->film_grain_params_present ||

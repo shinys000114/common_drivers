@@ -34,7 +34,7 @@ struct av1_backend {
 	struct s7d_av1_tu tu;
 	struct s7d_v4l2_drain drain;
 	struct s7d_v4l2_capture_buffer capture[S7D_CODEC_MAX_CAPTURE_BUFFERS];
-	/* AM08C: rebased FBC header, rewritten per frame; owned by the session. */
+	/* AM08C/AM10C: rebased FBC header, rewritten per frame; owned by the session. */
 	struct s7d_codec_dma *fbc_header;
 	struct s7d_codec_layout layout;
 	struct s7d_av1_sequence sequence;
@@ -230,6 +230,8 @@ static int av1_metadata(struct av1_backend *backend)
 					V4L2_PIX_FMT_NV12M, &backend->layout);
 	if (ret)
 		return ret;
+	/* The CAPTURE NV12 copy stays 8-bit; the depth selects the FBC format. */
+	backend->layout.bit_depth = sequence.bit_depth;
 	colour.flags = S7D_CODEC_COLOUR_SIGNAL_PRESENT;
 	if (sequence.color_range)
 		colour.flags |= S7D_CODEC_COLOUR_FULL_RANGE;
@@ -306,18 +308,20 @@ static bool av1_copy_cancelled(void *priv)
 }
 
 /*
- * AM08C: the FBC header holds absolute body addresses (word << 2). Copy the
- * body behind the header room in the CAPTURE buffer, rebase every header word
- * that points into the copied body, and copy the rebased header in front.
+ * AM08C/AM10C: the FBC header holds absolute body addresses (word << 2). Copy
+ * the body behind the header room in the CAPTURE buffer, rebase every header
+ * word that points into the copied body, and copy the rebased header in front.
  */
 static int av1_publish_fbc(struct av1_backend *backend, struct s7d_codec_surface *surface,
 			   u64 token, dma_addr_t base, size_t prefix)
 {
 	const struct s7d_av1_reference_output *output = &backend->result.output;
 	const struct s7d_codec_layout *layout = &backend->layout;
-	u32 header_size = s7d_am08c_header_size(layout->coded_width, layout->storage_height);
-	u32 body_size = s7d_am08c_body_size(layout->coded_width, layout->storage_height);
-	u32 header_used = s7d_am08c_header_used(layout->coded_width, layout->coded_height);
+	u32 bit_depth = layout->bit_depth;
+	u32 header_size = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
+	u32 body_size = s7d_amfbc_body_size(layout->coded_width, layout->storage_height,
+					    bit_depth);
+	u32 header_used = s7d_amfbc_header_used(layout->coded_width, layout->coded_height);
 	size_t offset[2] = { 0, header_size };
 	struct s7d_codec_dma_copy_plane plane[2];
 	struct s7d_av1_reference_layout fbc;
@@ -331,7 +335,7 @@ static int av1_publish_fbc(struct av1_backend *backend, struct s7d_codec_surface
 	    prefix != (size_t)header_size + body_size)
 		return -EINVAL;
 	/* What the hardware wrote for this picture, by the reference allocator's rules. */
-	ret = s7d_av1_reference_layout(layout->coded_width, layout->coded_height, 8,
+	ret = s7d_av1_reference_layout(layout->coded_width, layout->coded_height, bit_depth,
 				       backend->sequence.use_128x128_superblock ? 128 : 64,
 				       &fbc);
 	if (ret)
@@ -447,7 +451,7 @@ static int av1_publish(struct av1_backend *backend)
 	if (output->output.picture.frame_type == S7D_AV1_KEY_FRAME)
 		frame.flags = S7D_CODEC_FRAME_KEY;
 	if (prefix) {
-		/* AM08C reports the whole buffer: FBC, then NV12 up to its padded height. */
+		/* AM08C/AM10C report the whole buffer: FBC, then NV12 up to its padded height. */
 		frame.prefix_bytesused = prefix;
 		frame.bytesused[0] = backend->layout.size[0];
 		frame.bytesused[1] = backend->layout.size[1];
@@ -692,7 +696,7 @@ static int av1_sync_initial(void *priv, u64 token)
 	return ret;
 }
 
-/* AM08C buffers need the header bounce; one per session, sized for the maximum. */
+/* FBC buffers need the header bounce; one per session, sized for the maximum. */
 static int av1_fbc_prepare(struct av1_backend *backend,
 			   const struct s7d_v4l2_capture_buffer *buffers, unsigned int count)
 {
@@ -716,7 +720,7 @@ static int av1_fbc_prepare(struct av1_backend *backend,
 	if (i == count)
 		return 0;
 	memory = s7d_codec_dma_alloc(backend->session,
-		s7d_am08c_header_size(codec->max_width,
+		s7d_amfbc_header_size(codec->max_width,
 				      ALIGN(codec->max_height, S7D_CODEC_STORAGE_ALIGNMENT)));
 	if (IS_ERR(memory))
 		return PTR_ERR(memory);
@@ -1104,7 +1108,7 @@ s7d_av1_v4l2_create(struct device *dev, struct s7d_codec_dos *dos,
 			.max_input_size = AV1_INPUT_BYTES,
 			.min_input_size = AV1_INPUT_BYTES,
 			.default_layout = s7d_v4l2_default_nv12_layout,
-			.am08c = true,
+			.fbc = true,
 		},
 		.ops = &av1_ops, .ready = av1_factory_ready,
 		.create = av1_factory_create, .destroy = av1_factory_destroy,

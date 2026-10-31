@@ -64,7 +64,8 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 	int ret;
 
 	ret = s7d_av1_reference_layout(input->sequence->max_frame_width,
-		input->sequence->max_frame_height, 8, superblock, &layout);
+		input->sequence->max_frame_height, input->sequence->bit_depth,
+		superblock, &layout);
 	if (ret)
 		return ret;
 	uv_bytes = ALIGN(DIV_ROUND_UP(input->sequence->max_frame_width, superblock) *
@@ -143,9 +144,11 @@ static int picture_validate(const struct s7d_av1_picture_input *input)
 	    !id_equal(&picture->id, &input->backing[picture->id.slot].id) ||
 	    !frame->width || !frame->height || frame->decode_width != frame->width ||
 	    frame->width > input->sequence->max_frame_width ||
-	    frame->height > input->sequence->max_frame_height || frame->bit_depth != 8 ||
+	    frame->height > input->sequence->max_frame_height ||
+	    frame->bit_depth != input->sequence->bit_depth ||
 	    picture->width != frame->width || picture->height != frame->height ||
-	    picture->decode_width != frame->decode_width || picture->bit_depth != 8 ||
+	    picture->decode_width != frame->decode_width ||
+	    picture->bit_depth != frame->bit_depth ||
 	    picture->frame_type != frame->frame_type ||
 	    picture->order_hint != frame->order_hint ||
 	    input->backing[picture->id.slot].pitch != ALIGN(frame->width, 64) ||
@@ -172,7 +175,8 @@ static int picture_validate(const struct s7d_av1_picture_input *input)
 			if (!ref->decoded || ref->id.slot >= input->backing_count ||
 			    ref->id.slot == picture->id.slot ||
 			    !id_equal(&ref->id, &input->backing[ref->id.slot].id) ||
-			    !ref->width || !ref->height || ref->bit_depth != 8 ||
+			    !ref->width || !ref->height ||
+			    ref->bit_depth != input->sequence->bit_depth ||
 			    ref->decode_width != ref->width ||
 			    ref->width > input->sequence->max_frame_width ||
 			    ref->height > input->sequence->max_frame_height ||
@@ -331,7 +335,8 @@ int s7d_av1_picture_plan(const struct s7d_av1_picture_input *input,
 	next.backing_count = input->backing_count;
 	superblock = input->sequence->use_128x128_superblock ? 128 : 64;
 	ret = s7d_av1_reference_layout(dpb->current_picture.width,
-		dpb->current_picture.height, 8, superblock, &layout);
+		dpb->current_picture.height, dpb->current_picture.bit_depth,
+		superblock, &layout);
 	if (ret)
 		return ret;
 	next.body_bytes = layout.body_bytes;
@@ -539,9 +544,11 @@ static int program_output(struct regmap *map,
 	ret = write_many(map, registers, ARRAY_SIZE(registers));
 	if (!ret)
 		ret = regmap_update_bits(map, HREG(0x362d), BIT(1) | BIT(10), BIT(1));
+	/* HEVC_SAO_CTRL5: bit 9 is the 8-bit mem-saving compressed body. */
 	if (!ret)
 		ret = regmap_update_bits(map, HREG(0x3623), BIT(9) | BIT(10) |
-			BIT(14) | BIT(15) | GENMASK(23, 16), BIT(9) | BIT(10) | BIT(14));
+			BIT(14) | BIT(15) | GENMASK(23, 16),
+			(picture->bit_depth == 8 ? BIT(9) : 0) | BIT(10) | BIT(14));
 	if (!ret)
 		ret = regmap_update_bits(map, HREG(0x3602), GENMASK(15, 4) | GENMASK(1, 0),
 			0xff0 | BIT(15));

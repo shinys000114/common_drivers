@@ -43,6 +43,7 @@ struct s7d_av1_references {
 	u32 reserved_slot;
 	u32 max_width;
 	u32 max_height;
+	u32 bit_depth;
 	bool idle;
 	bool running;
 	bool prepared;
@@ -65,7 +66,8 @@ static int reference_layout(const struct s7d_av1_sequence *sequence,
 	int ret;
 
 	ret = s7d_av1_reference_layout(sequence->max_frame_width,
-		sequence->max_frame_height, 8, superblock, &next.compressed);
+		sequence->max_frame_height, sequence->bit_depth, superblock,
+		&next.compressed);
 	if (ret)
 		return ret;
 	pixels = ALIGN(sequence->max_frame_width, superblock) *
@@ -97,8 +99,9 @@ s7d_av1_references_create(struct s7d_codec_session *session,
 	ret = s7d_av1_admit_sequence(sequence);
 	if (ret)
 		return ERR_PTR(ret);
-	if (sequence->profile || sequence->bit_depth != 8 || sequence->monochrome ||
-	    !sequence->subsampling_x || !sequence->subsampling_y)
+	if (sequence->profile ||
+	    (sequence->bit_depth != 8 && sequence->bit_depth != 10) ||
+	    sequence->monochrome || !sequence->subsampling_x || !sequence->subsampling_y)
 		return ERR_PTR(-EOPNOTSUPP);
 	ret = s7d_av1_workspace_validate(workspace);
 	if (ret)
@@ -132,6 +135,7 @@ s7d_av1_references_create(struct s7d_codec_session *session,
 	references->reserved_slot = S7D_AV1_DPB_NO_SLOT;
 	references->max_width = sequence->max_frame_width;
 	references->max_height = sequence->max_frame_height;
+	references->bit_depth = sequence->bit_depth;
 	references->idle = true;
 	return references;
 }
@@ -291,7 +295,7 @@ int s7d_av1_references_prepare(struct s7d_av1_references *references,
 	if (!references->running || references->prepared || references->idle)
 		return -EBUSY;
 	if (!header->frame.show_existing &&
-	    (header->frame.bit_depth != 8 ||
+	    (header->frame.bit_depth != references->bit_depth ||
 	     header->frame.width > references->max_width ||
 	     header->frame.height > references->max_height))
 		return -EOPNOTSUPP;

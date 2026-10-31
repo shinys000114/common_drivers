@@ -29,7 +29,8 @@
 enum s7d_capture_mode {
 	S7D_CAPTURE_MPLANE,	/* NV12M/NV21M */
 	S7D_CAPTURE_SINGLE,	/* NV12/NV21 in one buffer */
-	S7D_CAPTURE_AM08C,	/* FBC header and body, then NV12, in one buffer */
+	S7D_CAPTURE_AM08C,	/* 8-bit FBC header and body, then NV12, in one buffer */
+	S7D_CAPTURE_AM10C,	/* 10-bit FBC header and body, then NV12, in one buffer */
 };
 
 enum s7d_v4l2_state {
@@ -158,8 +159,31 @@ static enum s7d_capture_mode s7d_fourcc_mode(const struct s7d_v4l2_codec *codec,
 					     u32 fourcc)
 {
 	if (fourcc == V4L2_PIX_FMT_AM08C)
-		return codec->am08c ? S7D_CAPTURE_AM08C : S7D_CAPTURE_MPLANE;
+		return codec->fbc ? S7D_CAPTURE_AM08C : S7D_CAPTURE_MPLANE;
+	if (fourcc == V4L2_PIX_FMT_AM10C)
+		return codec->fbc ? S7D_CAPTURE_AM10C : S7D_CAPTURE_MPLANE;
 	return s7d_contiguous_fourcc(fourcc) ? S7D_CAPTURE_SINGLE : S7D_CAPTURE_MPLANE;
+}
+
+/* Until a stream reports its depth, the layout reads as 8-bit. */
+static u32 s7d_layout_depth(const struct s7d_codec_layout *layout)
+{
+	return layout->bit_depth == 10 ? 10 : 8;
+}
+
+/* An FBC mode only applies to a stream of its own depth; others get NV12. */
+static enum s7d_capture_mode s7d_layout_mode(enum s7d_capture_mode mode,
+					     const struct s7d_codec_layout *layout)
+{
+	if ((mode == S7D_CAPTURE_AM08C && s7d_layout_depth(layout) != 8) ||
+	    (mode == S7D_CAPTURE_AM10C && s7d_layout_depth(layout) != 10))
+		return S7D_CAPTURE_SINGLE;
+	return mode;
+}
+
+static bool s7d_fbc_mode(enum s7d_capture_mode mode)
+{
+	return mode == S7D_CAPTURE_AM08C || mode == S7D_CAPTURE_AM10C;
 }
 
 /* Single-buffer NV12 puts chroma at bytesperline * height, right after luma. */
@@ -168,18 +192,19 @@ static bool s7d_layout_contiguous(const struct s7d_codec_layout *layout)
 	return (u64)layout->pitch[0] * layout->storage_height == layout->size[0];
 }
 
-/* AM08C: FBC bytes in front of the NV12 copy, from the reported width/height. */
-static u32 s7d_am08c_prefix(const struct s7d_codec_layout *layout)
+/* AM08C/AM10C: FBC bytes in front of the NV12 copy, from the reported width/height. */
+static u32 s7d_fbc_prefix(const struct s7d_codec_layout *layout)
 {
-	return s7d_am08c_nv12_offset(layout->coded_width, layout->storage_height);
+	return s7d_amfbc_nv12_offset(layout->coded_width, layout->storage_height,
+				     s7d_layout_depth(layout));
 }
 
 /* The mode cannot change while CAPTURE buffers exist; queue_lock holders read it. */
 static u32 s7d_capture_prefix(const struct s7d_v4l2_context *ctx, struct vb2_buffer *vb,
 			      const struct s7d_codec_layout *layout)
 {
-	return vb->num_planes == 1 && ctx->capture_mode == S7D_CAPTURE_AM08C ?
-		s7d_am08c_prefix(layout) : 0;
+	return vb->num_planes == 1 && s7d_fbc_mode(s7d_layout_mode(ctx->capture_mode, layout)) ?
+		s7d_fbc_prefix(layout) : 0;
 }
 
 static bool s7d_capture_fits(struct vb2_buffer *vb, const struct s7d_codec_layout *layout,
@@ -199,6 +224,7 @@ static void s7d_capture_format(const struct s7d_codec_layout *layout,
 	bool nv21 = layout->format == S7D_CODEC_CAPTURE_NV21M;
 	unsigned int i;
 
+	mode = s7d_layout_mode(mode, layout);
 	memset(format, 0, sizeof(*format));
 	/*
 	 * The format describes the buffer, padding rows included, so it agrees
@@ -217,9 +243,10 @@ static void s7d_capture_format(const struct s7d_codec_layout *layout,
 		format->num_planes = 1;
 		format->plane_fmt[0].bytesperline = layout->pitch[0];
 		format->plane_fmt[0].sizeimage = layout->size[0] + layout->size[1];
-		if (mode == S7D_CAPTURE_AM08C && !nv21) {
-			format->pixelformat = V4L2_PIX_FMT_AM08C;
-			format->plane_fmt[0].sizeimage += s7d_am08c_prefix(layout);
+		if (s7d_fbc_mode(mode) && !nv21) {
+			format->pixelformat = mode == S7D_CAPTURE_AM10C ?
+				V4L2_PIX_FMT_AM10C : V4L2_PIX_FMT_AM08C;
+			format->plane_fmt[0].sizeimage += s7d_fbc_prefix(layout);
 		}
 		return;
 	}
@@ -323,7 +350,7 @@ bool s7d_v4l2_codec_valid(const struct s7d_v4l2_codec *codec)
 		(codec->output_format == V4L2_PIX_FMT_HEVC ||
 		 codec->output_format == V4L2_PIX_FMT_VP9 ||
 		 codec->output_format == V4L2_PIX_FMT_AV1) && !codec->nv21 &&
-		(!codec->am08c || codec->output_format == V4L2_PIX_FMT_AV1) &&
+		(!codec->fbc || codec->output_format == V4L2_PIX_FMT_AV1) &&
 		codec->max_width <= 1920 && codec->max_height <= 1080 &&
 		codec->max_input_size <= SZ_2M;
 }
@@ -397,18 +424,32 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *form
 			return -EINVAL;
 		format->pixelformat = formats[format->index];
 	} else {
-		/* AM08C last: generic clients keep picking NV12M/NV12. */
+		/* FBC last: generic clients keep picking NV12M/NV12. */
 		static const u32 formats[] = {
 			V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_AM08C,
 		};
+		struct s7d_codec_layout layout;
+		unsigned long flags;
+		bool valid;
 
-		if (format->index >= ARRAY_SIZE(formats) - !ctx->codec.am08c)
+		if (format->index >= ARRAY_SIZE(formats) - !ctx->codec.fbc)
 			return -EINVAL;
 		format->pixelformat = formats[format->index];
+		/* Once the stream is known, only the FBC format of its depth. */
+		spin_lock_irqsave(&ctx->state_lock, flags);
+		layout = s7d_query_layout(ctx);
+		valid = ctx->sequence_valid;
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		if (format->pixelformat == V4L2_PIX_FMT_AM08C && valid &&
+		    s7d_layout_depth(&layout) == 10)
+			format->pixelformat = V4L2_PIX_FMT_AM10C;
 	}
 	format->flags = 0;
 	if (format->pixelformat == V4L2_PIX_FMT_AM08C)
 		strscpy(format->description, "Amlogic FBC 8-bit + NV12",
+			sizeof(format->description));
+	else if (format->pixelformat == V4L2_PIX_FMT_AM10C)
+		strscpy(format->description, "Amlogic FBC 10-bit + NV12",
 			sizeof(format->description));
 	return 0;
 }
@@ -2556,7 +2597,7 @@ int s7d_v4l2_context_rebind(struct s7d_v4l2_context *ctx, struct s7d_codec_core 
 	ctx->layout = layout;
 	ctx->sequence_valid = false;
 	ctx->capture_layout_retained = false;
-	if (ctx->capture_mode == S7D_CAPTURE_AM08C && !codec->am08c)
+	if (s7d_fbc_mode(ctx->capture_mode) && !codec->fbc)
 		ctx->capture_mode = S7D_CAPTURE_SINGLE;
 	s7d_capture_format(&layout, ctx->capture_mode, &ctx->capture);
 	s7d_capture_follow_output(&ctx->output, &ctx->capture);

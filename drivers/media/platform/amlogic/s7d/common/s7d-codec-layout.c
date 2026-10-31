@@ -116,7 +116,8 @@ int s7d_codec_validate_layout(const struct s7d_codec_layout *layout)
 	    layout->storage_height % S7D_CODEC_STORAGE_ALIGNMENT ||
 	    !layout->dpb_limit || layout->dpb_limit > 16 ||
 	    !layout->dpb_slots || layout->dpb_slots > layout->dpb_limit ||
-	    !layout->current_slots)
+	    !layout->current_slots ||
+	    (layout->bit_depth && layout->bit_depth != 8 && layout->bit_depth != 10))
 		return -EINVAL;
 	if (check_mul_overflow(layout->coded_width, layout->coded_height, &pixels) ||
 	    check_add_overflow(layout->visible_left, layout->visible_width, &right) ||
