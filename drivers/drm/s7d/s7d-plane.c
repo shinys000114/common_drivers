@@ -438,7 +438,8 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		return ERR_PTR(ret);
 	if (slot == S7D_PLANE_VIDEO || slot == S7D_PLANE_VIDEO2) {
 		ret = drm_plane_create_color_properties(&plane->base,
-			BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709),
+			BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709) |
+			BIT(DRM_COLOR_YCBCR_BT2020),
 			BIT(DRM_COLOR_YCBCR_LIMITED_RANGE) | BIT(DRM_COLOR_YCBCR_FULL_RANGE),
 			DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE);
 		if (ret)
