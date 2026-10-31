@@ -37,8 +37,12 @@ int s7d_codec_resolve_colour(const struct s7d_codec_colour *colour,
 		case 6:
 			next.colorspace = V4L2_COLORSPACE_SMPTE170M;
 			break;
+		case 9:
+			next.colorspace = V4L2_COLORSPACE_BT2020;
+			break;
 		case 4:
-		case 7 ... 12:
+		case 7 ... 8:
+		case 10 ... 12:
 		case 22:
 			return -EOPNOTSUPP;
 		}
@@ -52,11 +56,18 @@ int s7d_codec_resolve_colour(const struct s7d_codec_colour *colour,
 		switch (colour->transfer) {
 		case 1:
 		case 6:
+		case 14:
+		case 15:
 			next.xfer_func = V4L2_XFER_FUNC_709;
 			break;
+		case 16:
+			next.xfer_func = V4L2_XFER_FUNC_SMPTE2084;
+			break;
+		/* V4L2 has no HLG (18) transfer function. */
 		case 4:
 		case 5:
-		case 7 ... 18:
+		case 7 ... 13:
+		case 17 ... 18:
 			return -EOPNOTSUPP;
 		}
 		switch (colour->matrix) {
@@ -67,9 +78,16 @@ int s7d_codec_resolve_colour(const struct s7d_codec_colour *colour,
 		case 6:
 			next.ycbcr_enc = V4L2_YCBCR_ENC_601;
 			break;
+		case 9:
+			next.ycbcr_enc = V4L2_YCBCR_ENC_BT2020;
+			break;
+		case 10:
+			next.ycbcr_enc = V4L2_YCBCR_ENC_BT2020_CONST_LUM;
+			break;
 		case 0:
 		case 4:
-		case 7 ... 17:
+		case 7 ... 8:
+		case 11 ... 17:
 			return -EOPNOTSUPP;
 		}
 	}
