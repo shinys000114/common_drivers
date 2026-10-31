@@ -37,6 +37,8 @@ struct s7d_av1_obu {
 struct s7d_av1_picture_span {
 	u32 offset;
 	u32 bytes;
+	/* The frame header's show_existing_frame: no picture is decoded. */
+	bool show_existing;
 };
 
 struct s7d_av1_tu {

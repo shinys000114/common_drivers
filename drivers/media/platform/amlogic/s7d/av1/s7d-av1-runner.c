@@ -328,6 +328,25 @@ static int runner_halt(struct s7d_av1_runner *runner)
 	return ret;
 }
 
+int s7d_av1_runner_unbind(struct s7d_av1_runner *runner,
+			  u64 cookies[S7D_AV1_DPB_MAX_SLOTS], u32 *count)
+{
+	int ret;
+
+	if (!runner || !cookies || !count)
+		return -EINVAL;
+	*count = 0;
+	mutex_lock(&runner->control);
+	if (!runner->references)
+		ret = 0;
+	else if (!runner->quiesced || runner->job || runner->quarantined)
+		ret = -EBUSY;
+	else
+		ret = s7d_av1_references_unbind(runner->references, cookies, count);
+	mutex_unlock(&runner->control);
+	return ret;
+}
+
 void s7d_av1_runner_request_stop(struct s7d_av1_runner *runner)
 {
 	unsigned long flags;
@@ -476,6 +495,7 @@ s7d_av1_runner_create(struct device *dev, struct s7d_codec_dos *dos,
 static int runner_run(struct s7d_av1_runner *runner,
 		      struct s7d_codec_session *session, u64 lease_epoch,
 		      u64 input_token, const u8 *data, size_t bytes, u64 timestamp_ns,
+		      const struct s7d_av1_decode_target *target,
 		      struct s7d_av1_header_result *header_result,
 		      struct s7d_av1_decode_result *decode_result)
 {
@@ -487,7 +507,8 @@ static int runner_run(struct s7d_av1_runner *runner,
 	int ret, halted;
 
 	if (!runner || !session || !lease_epoch || !input_token || !data || !bytes ||
-	    (!header_result && !decode_result) || (header_result && decode_result))
+	    (!header_result && !decode_result) || (header_result && decode_result) ||
+	    !decode_result != !target || (target && target->memory && !target->external))
 		return -EINVAL;
 	if (bytes > S7D_AV1_INPUT_MAX_BYTES)
 		return -E2BIG;
@@ -525,6 +546,11 @@ static int runner_run(struct s7d_av1_runner *runner,
 	}
 	if (job->decode && runner->decode_count == U32_MAX) {
 		ret = -EOVERFLOW;
+		goto unlock;
+	}
+	if (job->decode && runner->references &&
+	    s7d_av1_references_external(runner->references) != target->external) {
+		ret = -EINVAL;
 		goto unlock;
 	}
 	if (job->decode && runner->references) {
@@ -583,7 +609,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 	if (job->decode && !runner->references) {
 		runner->references = s7d_av1_references_create(session,
 			s7d_av1_dma_context_workspace(runner->context),
-			&job->result.sequence, lease_epoch, 0, true);
+			&job->result.sequence, lease_epoch, 0, true, target->external);
 		if (IS_ERR(runner->references)) {
 			ret = PTR_ERR(runner->references);
 			runner->references = NULL;
@@ -598,7 +624,8 @@ static int runner_run(struct s7d_av1_runner *runner,
 	if (!ret)
 		ret = runner_preload(runner, job);
 	if (!ret && job->decode) {
-		ret = s7d_av1_references_run_begin(runner->references, lease_epoch, input_token);
+		ret = s7d_av1_references_run_begin(runner->references, lease_epoch, input_token,
+						   target->memory);
 		job->reference_run = !ret;
 	}
 	if (!ret)
@@ -754,16 +781,18 @@ int s7d_av1_runner_headers(struct s7d_av1_runner *runner,
 			   u64 input_token, const u8 *data, size_t bytes,
 			   struct s7d_av1_header_result *result)
 {
-	return runner_run(runner, session, lease_epoch, input_token, data, bytes, 0, result, NULL);
+	return runner_run(runner, session, lease_epoch, input_token, data, bytes, 0, NULL,
+			  result, NULL);
 }
 
 int s7d_av1_runner_decode(struct s7d_av1_runner *runner,
 			  struct s7d_codec_session *session, u64 lease_epoch,
 			  u64 input_token, const u8 *data, size_t bytes,
-			  u64 timestamp_ns, struct s7d_av1_decode_result *result)
+			  u64 timestamp_ns, const struct s7d_av1_decode_target *target,
+			  struct s7d_av1_decode_result *result)
 {
 	return runner_run(runner, session, lease_epoch, input_token, data, bytes, timestamp_ns,
-			  NULL, result);
+			  target, NULL, result);
 }
 
 int s7d_av1_runner_output_committed(struct s7d_av1_runner *runner,

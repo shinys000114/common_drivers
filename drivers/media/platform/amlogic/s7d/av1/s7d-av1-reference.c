@@ -37,6 +37,9 @@ struct s7d_av1_references {
 	struct s7d_av1_reference_state pending_state;
 	struct s7d_codec_dma *memory[S7D_AV1_DPB_MAX_SLOTS];
 	u8 *cpu[S7D_AV1_DPB_MAX_SLOTS];
+	/* External mode: what the hardware may see this picture, and slot memory cookies. */
+	struct s7d_av1_reference_backing view[S7D_AV1_DPB_MAX_SLOTS];
+	u64 binding[S7D_AV1_DPB_MAX_SLOTS];
 	u64 lease_epoch;
 	u64 input_token;
 	u64 last_token;
@@ -48,6 +51,7 @@ struct s7d_av1_references {
 	bool running;
 	bool prepared;
 	bool configured;
+	bool external;
 };
 
 static int stopped(int halt_status, bool joined)
@@ -57,7 +61,7 @@ static int stopped(int halt_status, bool joined)
 	return 0;
 }
 
-static int reference_layout(const struct s7d_av1_sequence *sequence,
+static int reference_layout(const struct s7d_av1_sequence *sequence, bool external,
 			    struct reference_layout *layout)
 {
 	struct reference_layout next = { 0 };
@@ -74,6 +78,13 @@ static int reference_layout(const struct s7d_av1_sequence *sequence,
 		ALIGN(sequence->max_frame_height, superblock);
 	next.uv_bytes = ALIGN(pixels / 2, SZ_64K);
 	next.y_bytes = next.uv_bytes * 2;
+	if (external) {
+		/* Header, body and NV12 come with each picture; only the MV stays here. */
+		next.used_bytes = next.compressed.mv_allocation;
+		next.allocation_bytes = next.used_bytes + SZ_64K - 1;
+		*layout = next;
+		return 0;
+	}
 	next.header_offset = next.compressed.body_allocation;
 	next.mv_offset = ALIGN(next.header_offset + next.compressed.header_capacity, SZ_64K);
 	next.linear_offset = next.mv_offset + next.compressed.mv_allocation;
@@ -87,7 +98,7 @@ struct s7d_av1_references *
 s7d_av1_references_create(struct s7d_codec_session *session,
 			  const struct s7d_av1_workspace *workspace,
 			  const struct s7d_av1_sequence *sequence,
-			  u64 lease_epoch, int halt_status, bool joined)
+			  u64 lease_epoch, int halt_status, bool joined, bool external)
 {
 	struct s7d_av1_references *references;
 	struct s7d_av1_dpb_sequence seq;
@@ -112,7 +123,7 @@ s7d_av1_references_create(struct s7d_codec_session *session,
 	    AV1_CDF_BANK_BYTES * S7D_AV1_DPB_MAX_SLOTS ||
 	    workspace->part[S7D_AV1_SEGMENT_MAP].bytes % S7D_AV1_DPB_MAX_SLOTS)
 		return ERR_PTR(-EINVAL);
-	ret = reference_layout(sequence, &layout);
+	ret = reference_layout(sequence, external, &layout);
 	if (ret)
 		return ERR_PTR(ret);
 	references = kzalloc(sizeof(*references), GFP_KERNEL);
@@ -137,7 +148,96 @@ s7d_av1_references_create(struct s7d_codec_session *session,
 	references->max_height = sequence->max_frame_height;
 	references->bit_depth = sequence->bit_depth;
 	references->idle = true;
+	references->external = external;
 	return references;
+}
+
+bool s7d_av1_references_external(const struct s7d_av1_references *references)
+{
+	return !IS_ERR_OR_NULL(references) && references->external;
+}
+
+static bool memory_region(const struct s7d_av1_region *region, u32 alignment, u32 minimum)
+{
+	return region->address && IS_ALIGNED(region->address, alignment) &&
+		region->bytes >= minimum &&
+		(u64)region->address + region->bytes <= (1ULL << 32);
+}
+
+static bool memory_overlap(const struct s7d_av1_region *a, const struct s7d_av1_region *b)
+{
+	return a->bytes && b->bytes &&
+		(u64)a->address < (u64)b->address + b->bytes &&
+		(u64)b->address < (u64)a->address + a->bytes;
+}
+
+/*
+ * What the hardware needs of a picture's own memory: the scatter header for
+ * every 32x32 block, the body the MMU maps page by page, and NV12 with a
+ * 64-aligned pitch over a 64-aligned height (the vendor CAPTURE layout).
+ */
+static int memory_validate(const struct s7d_av1_references *references,
+			   const struct s7d_av1_slot_memory *memory, u32 slot)
+{
+	u32 header = DIV_ROUND_UP(references->max_width, 32) *
+		DIV_ROUND_UP(references->max_height, 32) * 32;
+	u32 luma = ALIGN(references->max_width, 64) * ALIGN(references->max_height, 64);
+	const struct s7d_av1_region *region[] = {
+		&memory->header, &memory->body, &memory->linear,
+	};
+	u32 i, j;
+
+	if (!memory->cookie || !memory_region(&memory->header, 32, header) ||
+	    !memory_region(&memory->body, SZ_4K,
+			   references->layout.compressed.body_allocation) ||
+	    !memory_region(&memory->linear, 64, 0) ||
+	    memory->y_bytes < luma || memory->uv_bytes < luma / 2 ||
+	    !IS_ALIGNED(memory->y_bytes, 64) ||
+	    (u64)memory->y_bytes + memory->uv_bytes > memory->linear.bytes)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(region); i++)
+		for (j = i + 1; j < ARRAY_SIZE(region); j++)
+			if (memory_overlap(region[i], region[j]))
+				return -EINVAL;
+	for (i = 0; i < S7D_AV1_DPB_MAX_SLOTS; i++) {
+		const struct s7d_av1_reference_backing *other = &references->backing[i];
+
+		if (i == slot || !references->binding[i])
+			continue;
+		if (references->binding[i] == memory->cookie)
+			return -EEXIST;
+		for (j = 0; j < ARRAY_SIZE(region); j++)
+			if (memory_overlap(region[j], &other->header) ||
+			    memory_overlap(region[j], &other->body) ||
+			    memory_overlap(region[j], &other->linear))
+				return -EINVAL;
+	}
+	return 0;
+}
+
+static void bind_slot(struct s7d_av1_references *references, u32 slot,
+		      const struct s7d_av1_slot_memory *memory)
+{
+	struct s7d_av1_reference_backing *backing = &references->backing[slot];
+
+	backing->header = memory->header;
+	backing->body = memory->body;
+	backing->linear = memory->linear;
+	backing->y_bytes = memory->y_bytes;
+	backing->uv_bytes = memory->uv_bytes;
+	references->binding[slot] = memory->cookie;
+}
+
+static void unbind_slot(struct s7d_av1_references *references, u32 slot)
+{
+	struct s7d_av1_reference_backing *backing = &references->backing[slot];
+
+	memset(&backing->header, 0, sizeof(backing->header));
+	memset(&backing->body, 0, sizeof(backing->body));
+	memset(&backing->linear, 0, sizeof(backing->linear));
+	backing->y_bytes = 0;
+	backing->uv_bytes = 0;
+	references->binding[slot] = 0;
 }
 
 static int allocate_slot(struct s7d_av1_references *references, u32 slot)
@@ -167,16 +267,18 @@ static int allocate_slot(struct s7d_av1_references *references, u32 slot)
 	cpu = (u8 *)s7d_codec_dma_cpu(memory) + (base - dma);
 	next.id.slot = slot;
 	next.id.backing_cookie = base;
-	next.body.address = base;
-	next.body.bytes = layout->compressed.body_allocation;
-	next.header.address = base + layout->header_offset;
-	next.header.bytes = layout->compressed.header_capacity;
 	next.mv.address = base + layout->mv_offset;
 	next.mv.bytes = layout->compressed.mv_allocation;
-	next.linear.address = base + layout->linear_offset;
-	next.linear.bytes = layout->y_bytes + layout->uv_bytes;
-	next.y_bytes = layout->y_bytes;
-	next.uv_bytes = layout->uv_bytes;
+	if (!references->external) {
+		next.body.address = base;
+		next.body.bytes = layout->compressed.body_allocation;
+		next.header.address = base + layout->header_offset;
+		next.header.bytes = layout->compressed.header_capacity;
+		next.linear.address = base + layout->linear_offset;
+		next.linear.bytes = layout->y_bytes + layout->uv_bytes;
+		next.y_bytes = layout->y_bytes;
+		next.uv_bytes = layout->uv_bytes;
+	}
 	next.cdf.address = ws->part[S7D_AV1_CDF].address + slot * AV1_CDF_BANK_BYTES;
 	next.cdf.bytes = AV1_CDF_BANK_BYTES;
 	next.segment_map.bytes = ws->part[S7D_AV1_SEGMENT_MAP].bytes / S7D_AV1_DPB_MAX_SLOTS;
@@ -193,12 +295,14 @@ static int allocate_slot(struct s7d_av1_references *references, u32 slot)
 }
 
 int s7d_av1_references_run_begin(struct s7d_av1_references *references,
-				 u64 lease_epoch, u64 input_token)
+				 u64 lease_epoch, u64 input_token,
+				 const struct s7d_av1_slot_memory *memory)
 {
 	u32 owned, slot;
 	int ret;
 
-	if (IS_ERR_OR_NULL(references) || !input_token)
+	if (IS_ERR_OR_NULL(references) || !input_token ||
+	    (memory && !references->external))
 		return -EINVAL;
 	if (references->lease_epoch != lease_epoch || input_token <= references->last_token)
 		return -ESTALE;
@@ -213,9 +317,19 @@ int s7d_av1_references_run_begin(struct s7d_av1_references *references,
 			break;
 	if (slot == S7D_AV1_DPB_MAX_SLOTS)
 		return -ENOSPC;
+	/* The caller has not yet taken back the memory of a slot the DPB dropped. */
+	if (references->binding[slot])
+		return -EBUSY;
+	if (memory) {
+		ret = memory_validate(references, memory, slot);
+		if (ret)
+			return ret;
+	}
 	ret = allocate_slot(references, slot);
 	if (ret)
 		return ret;
+	if (memory)
+		bind_slot(references, slot, memory);
 	references->reserved_slot = slot;
 	references->input_token = input_token;
 	references->last_token = input_token;
@@ -283,8 +397,9 @@ int s7d_av1_references_prepare(struct s7d_av1_references *references,
 			       struct s7d_av1_reference_picture *picture)
 {
 	const struct s7d_av1_reference_state *primary = NULL;
+	const struct s7d_av1_reference_backing *backing;
 	struct s7d_av1_dpb_plan plan;
-	u32 slot;
+	u32 slot, owned, i;
 	int ret;
 
 	if (IS_ERR_OR_NULL(references) || !header || !metadata || !picture)
@@ -300,6 +415,9 @@ int s7d_av1_references_prepare(struct s7d_av1_references *references,
 	     header->frame.height > references->max_height))
 		return -EOPNOTSUPP;
 	slot = header->frame.show_existing ? S7D_AV1_DPB_NO_SLOT : references->reserved_slot;
+	/* External: a decoded picture needs the memory the caller bound at run begin. */
+	if (references->external && slot != S7D_AV1_DPB_NO_SLOT && !references->binding[slot])
+		return -ENODATA;
 	ret = s7d_av1_dpb_begin(&references->dpb, &header->frame, slot, metadata, &plan);
 	if (ret)
 		return ret;
@@ -311,10 +429,24 @@ int s7d_av1_references_prepare(struct s7d_av1_references *references,
 	} else {
 		references->pending_state = references->state[plan.current_picture.id.slot];
 	}
+	backing = references->backing;
+	if (references->external) {
+		/*
+		 * Show the hardware only the references and the current picture: an
+		 * unowned slot's memory may already belong to another picture.
+		 */
+		owned = plan.old_mask | (plan.decode ? BIT(slot) : 0);
+		for (i = 0; i < S7D_AV1_DPB_MAX_SLOTS; i++)
+			if (owned & BIT(i))
+				references->view[i] = references->backing[i];
+			else
+				memset(&references->view[i], 0, sizeof(references->view[i]));
+		backing = references->view;
+	}
 	references->prepared = true;
 	*picture = (struct s7d_av1_reference_picture) {
 		.plan = plan,
-		.backing = references->backing,
+		.backing = backing,
 		.count = S7D_AV1_DPB_MAX_SLOTS,
 		.primary = primary,
 		.state = &references->pending_state,
@@ -397,22 +529,23 @@ int s7d_av1_references_output(struct s7d_av1_references *references,
 	    backing->id.backing_cookie != next.output.picture.id.backing_cookie)
 		return -ESTALE;
 	dma_rmb();
+	next.linear = backing->linear;
+	next.pitch = backing->pitch;
+	next.y_bytes = backing->y_bytes;
+	next.uv_bytes = backing->uv_bytes;
+	if (references->external) {
+		next.cookie = references->binding[slot];
+		if (!next.cookie)
+			return -ESTALE;
+		*output = next;
+		return 0;
+	}
 	next.memory = references->memory[slot];
 	next.source_offset[0] = (u64)backing->linear.address -
 		s7d_codec_dma_addr(next.memory);
 	next.source_offset[1] = next.source_offset[0] + backing->y_bytes;
-	next.linear = backing->linear;
 	next.y = references->cpu[slot] + references->layout.linear_offset;
 	next.uv = next.y + backing->y_bytes;
-	next.pitch = backing->pitch;
-	next.y_bytes = backing->y_bytes;
-	next.uv_bytes = backing->uv_bytes;
-	next.body = backing->body;
-	next.header = backing->header;
-	next.body_offset = (u64)backing->body.address - s7d_codec_dma_addr(next.memory);
-	next.header_cpu = references->cpu[slot] + references->layout.header_offset;
-	next.backing.address = backing->body.address;
-	next.backing.bytes = references->layout.used_bytes;
 	*output = next;
 	return 0;
 }
@@ -425,6 +558,32 @@ int s7d_av1_references_output_committed(struct s7d_av1_references *references,
 	if (!references->idle || references->running)
 		return -EBUSY;
 	return s7d_av1_dpb_output_committed(&references->dpb, &output->output);
+}
+
+int s7d_av1_references_unbind(struct s7d_av1_references *references,
+			      u64 cookies[S7D_AV1_DPB_MAX_SLOTS], u32 *count)
+{
+	u32 owned, slot, released = 0;
+	int ret;
+
+	if (IS_ERR_OR_NULL(references) || !cookies || !count)
+		return -EINVAL;
+	*count = 0;
+	if (!references->external)
+		return 0;
+	if (!references->idle || references->running)
+		return -EBUSY;
+	ret = s7d_av1_dpb_owned_mask(&references->dpb, &owned);
+	if (ret)
+		return ret;
+	for (slot = 0; slot < S7D_AV1_DPB_MAX_SLOTS; slot++) {
+		if (!references->binding[slot] || (owned & BIT(slot)))
+			continue;
+		cookies[released++] = references->binding[slot];
+		unbind_slot(references, slot);
+	}
+	*count = released;
+	return 0;
 }
 
 int s7d_av1_references_parser_words(const struct s7d_av1_references *references,

@@ -60,7 +60,7 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 	struct s7d_av1_reference_layout layout;
 	u32 superblock = input->sequence->use_128x128_superblock ? 128 : 64;
 	u32 segment_bytes = ws->part[S7D_AV1_SEGMENT_MAP].bytes / 16;
-	u32 i, j, a, b, uv_bytes;
+	u32 i, j, a, b, header_bytes, luma_bytes;
 	int ret;
 
 	ret = s7d_av1_reference_layout(input->sequence->max_frame_width,
@@ -68,9 +68,15 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 		superblock, &layout);
 	if (ret)
 		return ret;
-	uv_bytes = ALIGN(DIV_ROUND_UP(input->sequence->max_frame_width, superblock) *
-		DIV_ROUND_UP(input->sequence->max_frame_height, superblock) *
-		superblock * superblock / 2, SZ_64K);
+	/*
+	 * Scatter header: 32 bytes per 32x32 block. Double write: NV12 at a
+	 * 64-aligned pitch over a 64-aligned height, as the vendor's CAPTURE
+	 * buffers; the internal slots reserve superblock-aligned planes.
+	 */
+	header_bytes = DIV_ROUND_UP(input->sequence->max_frame_width, 32) *
+		DIV_ROUND_UP(input->sequence->max_frame_height, 32) * 32;
+	luma_bytes = ALIGN(input->sequence->max_frame_width, 64) *
+		ALIGN(input->sequence->max_frame_height, 64);
 	if (!region_valid(&input->mmu_map, SZ_4K, S7D_AV1_MMU_MAP_BYTES) ||
 	    overlap(&input->mmu_map, &ws->backing) ||
 	    overlap(&input->mmu_map, &ws->rpm) || overlap(&input->mmu_map, &ws->lmem))
@@ -82,10 +88,11 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 			continue;
 		if (slot->id.slot != i ||
 		    !region_valid(&slot->body, SZ_4K, layout.body_allocation) ||
-		    !region_valid(&slot->header, 32, layout.header_capacity) ||
+		    !region_valid(&slot->header, 32, header_bytes) ||
 		    !region_valid(&slot->mv, SZ_64K, layout.mv_allocation) ||
-		    !region_valid(&slot->linear, SZ_64K, uv_bytes * 3) ||
-		    slot->y_bytes < uv_bytes * 2 || slot->uv_bytes < uv_bytes ||
+		    !region_valid(&slot->linear, 64, luma_bytes / 2 * 3) ||
+		    slot->y_bytes < luma_bytes || slot->uv_bytes < luma_bytes / 2 ||
+		    !IS_ALIGNED(slot->y_bytes, 64) ||
 		    (u64)slot->y_bytes + slot->uv_bytes > slot->linear.bytes ||
 		    slot->cdf.address != ws->part[S7D_AV1_CDF].address + i * CDF_BANK_BYTES ||
 		    slot->cdf.bytes != CDF_BANK_BYTES ||
@@ -343,8 +350,9 @@ int s7d_av1_picture_plan(const struct s7d_av1_picture_input *input,
 	next.header_bytes = layout.header_bytes;
 	next.lcu_total = DIV_ROUND_UP(dpb->current_picture.width, superblock) *
 		DIV_ROUND_UP(dpb->current_picture.height, superblock);
-	next.uv_bytes = ALIGN(next.lcu_total * superblock * superblock / 2, SZ_64K);
-	next.y_bytes = next.uv_bytes * 2;
+	/* Plane lengths are those of the picture's own memory, not recomputed. */
+	next.y_bytes = picture->y_bytes;
+	next.uv_bytes = picture->uv_bytes;
 	next.y_address = picture->linear.address;
 	next.uv_address = picture->linear.address + picture->y_bytes;
 	next.header_address = picture->header.address;

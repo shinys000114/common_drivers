@@ -40,6 +40,10 @@
  *
  * sizeimage = nv12 + pitch * h * 3 / 2. The header holds absolute addresses,
  * so the buffer must stay where the driver wrote it (export it, never copy).
+ * The decoder writes each picture straight into a buffer and keeps reading
+ * it as a reference while the stream refers to it; such a buffer is not
+ * written again until the reference is gone, even when it is requeued, so
+ * V4L2_CID_MIN_BUFFERS_FOR_CAPTURE covers the reference frames.
  * The NV12 copy of an AM10C frame is the decoder's 8-bit double write output.
  * DRM import, offsets[0] = 0, pitches[0] = w:
  *   AM08C: DRM_FORMAT_YUV420_8BIT with modifier
@@ -100,6 +104,11 @@ struct s7d_v4l2_codec {
 	bool nv21;
 	/* CAPTURE may also offer V4L2_PIX_FMT_AM08C/AM10C (AV1 only). */
 	bool fbc;
+	/*
+	 * AM08C/AM10C CAPTURE minimum, when the decoder keeps its references in
+	 * the CAPTURE buffers themselves; zero keeps the layout's minimum.
+	 */
+	u32 fbc_min_capture_buffers;
 };
 
 int s7d_v4l2_default_nv12_layout(u32 width, u32 height, u32 fourcc,

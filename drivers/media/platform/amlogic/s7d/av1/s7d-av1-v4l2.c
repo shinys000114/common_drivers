@@ -25,6 +25,26 @@
 #define AV1_MAX_WIDTH		4096
 #define AV1_MAX_HEIGHT		2304
 
+/*
+ * AM08C/AM10C: the eight reference frames and the picture being decoded live
+ * in CAPTURE buffers, plus one the client keeps on display, as for VP9.
+ */
+#define AV1_FBC_CAPTURE_MINIMUM	(S7D_AV1_DPB_REFERENCES + 2)
+
+/* What the decoder does with a CAPTURE buffer in AM08C/AM10C (zero-copy) mode. */
+enum av1_bind_state {
+	AV1_BIND_FREE,		/* not the decoder's: queued, or the client's */
+	AV1_BIND_PENDING,	/* acquired for the picture about to be decoded */
+	AV1_BIND_HIDDEN,	/* decoded and held by the DPB, never given out */
+	AV1_BIND_SHOWN,		/* held by the DPB and given out at least once */
+};
+
+struct av1_bind {
+	enum av1_bind_state state;
+	/* Surface write token of the picture it holds. */
+	u64 token;
+};
+
 struct av1_backend {
 	struct s7d_av1_v4l2 *adapter;
 	struct list_head node;
@@ -38,8 +58,14 @@ struct av1_backend {
 	struct s7d_av1_tu tu;
 	struct s7d_v4l2_drain drain;
 	struct s7d_v4l2_capture_buffer capture[S7D_CODEC_MAX_CAPTURE_BUFFERS];
-	/* AM08C/AM10C: rebased FBC header, rewritten per frame; owned by the session. */
-	struct s7d_codec_dma *fbc_header;
+	/*
+	 * AM08C/AM10C: each buffer is a DPB picture's memory, its header, body and
+	 * NV12 at the exported offsets (cookie = index + 1); a DPB-held buffer
+	 * keeps one surface DPB reference, so it is not written again even when
+	 * the client requeues it.
+	 */
+	struct av1_bind bind[S7D_CODEC_MAX_CAPTURE_BUFFERS];
+	struct s7d_av1_slot_memory slot_memory[S7D_CODEC_MAX_CAPTURE_BUFFERS];
 	struct s7d_codec_layout layout;
 	struct s7d_av1_sequence sequence;
 	u8 sequence_payload[S7D_AV1_SEQUENCE_MAX_BYTES];
@@ -53,6 +79,8 @@ struct av1_backend {
 	u64 picture_token;
 	u32 next_picture;
 	u32 captures;
+	/* Zero copy: index + 1 of the buffer acquired for the next picture. */
+	u32 pending;
 	u32 frame_sequence;
 	int failure;
 	int stop_error;
@@ -68,6 +96,7 @@ struct av1_backend {
 	bool execution_attempted;
 	bool drain_pending;
 	bool drain_notified;
+	bool zero_copy;
 };
 
 struct s7d_av1_v4l2 {
@@ -312,142 +341,126 @@ static bool av1_copy_cancelled(void *priv)
 	return READ_ONCE(backend->closing);
 }
 
-/*
- * AM08C/AM10C: the FBC header holds absolute body addresses (word << 2). Copy
- * the body behind the header room in the CAPTURE buffer, rebase every header
- * word that points into the copied body, and copy the rebased header in front.
- */
-static int av1_publish_fbc(struct av1_backend *backend, struct s7d_codec_surface *surface,
-			   u64 token, dma_addr_t base, size_t prefix)
+/* A free CAPTURE buffer, write-pinned with one DPB reference. */
+static int av1_acquire_free(struct av1_backend *backend, u32 *index, u64 *token)
 {
-	const struct s7d_av1_reference_output *output = &backend->result.output;
-	const struct s7d_codec_layout *layout = &backend->layout;
-	u32 bit_depth = layout->bit_depth;
-	u32 header_size = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
-	u32 body_size = s7d_amfbc_body_size(layout->coded_width, layout->storage_height,
-					    bit_depth);
-	u32 header_used = s7d_amfbc_header_used(layout->coded_width, layout->coded_height);
-	size_t offset[2] = { 0, header_size };
-	struct s7d_codec_dma_copy_plane plane[2];
-	struct s7d_av1_reference_layout fbc;
-	u64 src_body, src_end, dst_body, backing, backing_end, address;
-	const __le32 *src;
-	__le32 *dst;
-	u32 i, word, words, stray = 0;
+	struct s7d_codec_surface *surface;
+	u32 i;
 	int ret;
 
-	if (!backend->fbc_header || !output->header_cpu ||
-	    prefix != (size_t)header_size + body_size)
-		return -EINVAL;
-	/* What the hardware wrote for this picture, by the reference allocator's rules. */
-	ret = s7d_av1_reference_layout(layout->coded_width, layout->coded_height, bit_depth,
-				       backend->sequence.use_128x128_superblock ? 128 : 64,
-				       &fbc);
-	if (ret)
-		return ret;
-	if (!header_used || header_used % 4 || header_used > header_size ||
-	    header_used > output->header.bytes ||
-	    header_size > s7d_codec_dma_size(backend->fbc_header) ||
-	    fbc.body_allocation > body_size || fbc.body_allocation > output->body.bytes)
-		return -ERANGE;
-	dst_body = (u64)base + header_size;
-	if (!IS_ALIGNED(dst_body, SZ_4K) || dst_body + fbc.body_allocation > (1ULL << 32))
-		return -ERANGE;
-	src_body = output->body.address;
-	src_end = src_body + fbc.body_allocation;
-	backing = output->backing.address;
-	backing_end = backing + output->backing.bytes;
-	src = (const __le32 *)output->header_cpu;
-	dst = s7d_codec_dma_cpu(backend->fbc_header);
-	words = header_used / 4;
-	for (i = 0; i < words; i++) {
-		word = le32_to_cpu(src[i]);
-		address = (u64)word << 2;
-		if (address >= src_body && address < src_end)
-			word = (u32)((address - src_body + dst_body) >> 2);
-		else if (address >= backing && address < backing_end)
-			stray++;
-		dst[i] = cpu_to_le32(word);
+	for (i = 0; i < backend->captures; i++) {
+		if (backend->bind[i].state != AV1_BIND_FREE)
+			continue;
+		surface = backend->capture[i].surface;
+		ret = s7d_codec_surface_acquire(surface, token);
+		if (ret == -EAGAIN)
+			continue;
+		if (ret)
+			return ret;
+		*index = i;
+		return s7d_codec_surface_ref_get(surface);
 	}
-	if (stray) {
-		dev_warn_ratelimited(backend->adapter->dev,
-				     "AV1 FBC: %u header words point outside the %u-byte body\n",
-				     stray, fbc.body_allocation);
-		return -EIO;
-	}
-	memset(dst + words, 0, header_size - header_used);
-	/* Rebased header stores precede the copy that reads them. */
-	dma_wmb();
-	plane[0] = (struct s7d_codec_dma_copy_plane) {
-		.memory = backend->fbc_header,
-		.source_pitch = SZ_4K, .destination_pitch = SZ_4K,
-		.row_bytes = SZ_4K, .rows = header_size / SZ_4K,
-	};
-	plane[1] = (struct s7d_codec_dma_copy_plane) {
-		.memory = output->memory, .offset = output->body_offset,
-		.source_pitch = SZ_4K, .destination_pitch = SZ_4K,
-		.row_bytes = SZ_4K, .rows = fbc.body_allocation / SZ_4K,
-	};
-	return s7d_codec_surface_copy_prefix_dma(surface, token, backend->generation, plane,
-						 offset, av1_copy_cancelled, backend);
+	return -EAGAIN;
 }
 
-static int av1_publish(struct av1_backend *backend)
+/* Zero copy: the next decoded picture goes straight into a free CAPTURE buffer. */
+static int av1_acquire_target(struct av1_backend *backend)
+{
+	u32 index;
+	u64 token;
+	int ret;
+
+	if (backend->pending)
+		return 0;
+	ret = av1_acquire_free(backend, &index, &token);
+	if (ret)
+		return ret;
+	backend->bind[index] = (struct av1_bind) { .state = AV1_BIND_PENDING, .token = token };
+	backend->pending = index + 1;
+	return 0;
+}
+
+/* The DPB let go of this buffer; nothing reads or writes it for that slot again. */
+static int av1_release_capture(struct av1_backend *backend, u32 index)
+{
+	struct s7d_codec_surface *surface = backend->capture[index].surface;
+	struct av1_bind *bind = &backend->bind[index];
+	int ret = 0;
+
+	switch (bind->state) {
+	case AV1_BIND_PENDING:
+		/* Bound for a picture that turned out to be a show-existing frame. */
+		ret = s7d_codec_surface_written(surface, bind->token);
+		fallthrough;
+	case AV1_BIND_HIDDEN:
+		/* Never given out: straight back to the free pool. */
+		if (!ret)
+			ret = s7d_codec_surface_discard(surface, bind->token);
+		break;
+	case AV1_BIND_SHOWN:
+		/* Free again once the client requeues it, if it has not already. */
+		ret = s7d_codec_surface_ref_put(surface);
+		break;
+	default:
+		return -EPROTO;
+	}
+	if (ret)
+		return ret;
+	if (backend->pending == index + 1)
+		backend->pending = 0;
+	memset(bind, 0, sizeof(*bind));
+	return 0;
+}
+
+static int av1_unbind(struct av1_backend *backend)
+{
+	u64 cookie[S7D_AV1_DPB_MAX_SLOTS];
+	u32 i, count;
+	int ret;
+
+	if (!backend->zero_copy)
+		return 0;
+	ret = s7d_av1_runner_unbind(backend->adapter->runner, cookie, &count);
+	for (i = 0; !ret && i < count; i++)
+		ret = cookie[i] && cookie[i] <= backend->captures ?
+			av1_release_capture(backend, cookie[i] - 1) : -EPROTO;
+	return ret;
+}
+
+/* After a decode: the picture now sits in its buffer; drop what the DPB dropped. */
+static int av1_decoded(struct av1_backend *backend)
+{
+	struct av1_bind *bind;
+	int ret;
+
+	if (!backend->zero_copy)
+		return 0;
+	if (backend->pending && backend->result.picture_decoded) {
+		bind = &backend->bind[backend->pending - 1];
+		ret = s7d_codec_surface_written(backend->capture[backend->pending - 1].surface,
+						bind->token);
+		if (ret)
+			return ret;
+		bind->state = AV1_BIND_HIDDEN;
+		backend->pending = 0;
+	}
+	/* A shown picture stays owned until published; release after that. */
+	return backend->result.output_ready ? 0 : av1_unbind(backend);
+}
+
+/* Hand a written CAPTURE buffer holding the output picture to the client. */
+static int av1_deliver(struct av1_backend *backend, u32 index, u64 token)
 {
 	const struct s7d_av1_reference_output *output = &backend->result.output;
-	struct s7d_codec_dma_copy_plane plane[2];
-	struct s7d_codec_surface *surface = NULL;
 	struct s7d_codec_frame frame = { };
-	dma_addr_t base = 0;
-	size_t prefix = 0;
-	u64 token = 0;
-	u32 i, capture_index;
-	int ret = -EAGAIN, cleanup;
+	dma_addr_t base;
+	size_t prefix;
+	int ret;
 
-	if (output->output.picture.width != backend->layout.coded_width ||
-	    output->output.picture.height != backend->layout.coded_height ||
-	    output->pitch != backend->layout.pitch[0])
-		return -EOPNOTSUPP;
-	for (i = 0; i < backend->captures; i++) {
-		surface = backend->capture[i].surface;
-		ret = s7d_codec_surface_acquire(surface, &token);
-		if (ret != -EAGAIN)
-			break;
-	}
-	if (i == backend->captures)
-		return -EAGAIN;
+	ret = s7d_codec_surface_prefix(backend->capture[index].surface, &base, &prefix);
 	if (ret)
 		return ret;
-	capture_index = i;
-	ret = s7d_codec_surface_ref_get(surface);
-	if (ret)
-		return ret;
-	for (i = 0; i < 2; i++)
-		plane[i] = (struct s7d_codec_dma_copy_plane) {
-			.memory = output->memory,
-			.offset = output->source_offset[i],
-			.source_pitch = output->pitch,
-			.destination_pitch = backend->layout.pitch[i],
-			.row_bytes = backend->layout.coded_width,
-			.rows = backend->layout.coded_height >> i,
-		};
-	ret = s7d_codec_surface_copy_dma(surface, token, backend->generation, plane,
-					av1_copy_cancelled, backend);
-	if (!ret)
-		ret = s7d_codec_surface_prefix(surface, &base, &prefix);
-	if (!ret && prefix)
-		ret = av1_publish_fbc(backend, surface, token, base, prefix);
-	cleanup = s7d_codec_surface_written(surface, token);
-	if (!ret)
-		ret = cleanup;
-	if (!ret && av1_copy_cancelled(backend))
-		ret = -ECANCELED;
-	if (ret) {
-		if (!cleanup)
-			s7d_codec_surface_discard(surface, token);
-		return ret;
-	}
-	frame.surface_id = backend->capture[capture_index].surface_id;
+	frame.surface_id = backend->capture[index].surface_id;
 	frame.generation = backend->generation;
 	frame.write_token = token;
 	frame.timestamp_ns = output->output.metadata.timestamp_ns;
@@ -470,16 +483,177 @@ static int av1_publish(struct av1_backend *backend)
 	else
 		ret = -ECANCELED;
 	mutex_unlock(&backend->notifications);
+	return ret;
+}
+
+/* NV12/NV12M: copy the slot's NV12 double write into a free CAPTURE buffer. */
+static int av1_publish_nv12(struct av1_backend *backend)
+{
+	const struct s7d_av1_reference_output *output = &backend->result.output;
+	struct s7d_codec_dma_copy_plane plane[2];
+	struct s7d_codec_surface *surface;
+	u32 i, index;
+	u64 token;
+	int ret, cleanup;
+
+	ret = av1_acquire_free(backend, &index, &token);
+	if (ret)
+		return ret;
+	surface = backend->capture[index].surface;
+	for (i = 0; i < 2; i++)
+		plane[i] = (struct s7d_codec_dma_copy_plane) {
+			.memory = output->memory,
+			.offset = output->source_offset[i],
+			.source_pitch = output->pitch,
+			.destination_pitch = backend->layout.pitch[i],
+			.row_bytes = backend->layout.coded_width,
+			.rows = backend->layout.coded_height >> i,
+		};
+	ret = s7d_codec_surface_copy_dma(surface, token, backend->generation, plane,
+					av1_copy_cancelled, backend);
+	cleanup = s7d_codec_surface_written(surface, token);
+	if (!ret)
+		ret = cleanup;
+	if (!ret && av1_copy_cancelled(backend))
+		ret = -ECANCELED;
+	if (!ret)
+		ret = av1_deliver(backend, index, token);
 	if (ret) {
-		s7d_codec_surface_discard(surface, token);
+		if (!cleanup)
+			s7d_codec_surface_discard(surface, token);
 		return ret;
 	}
-	ret = s7d_codec_surface_ref_put(surface);
+	return s7d_codec_surface_ref_put(surface);
+}
+
+/*
+ * The header words of a copied AM08C/AM10C picture are physical addresses >> 2
+ * into the source body; point them into the copy's body instead.
+ */
+static int av1_fbc_rebase(struct av1_backend *backend, void *prefix,
+			  const struct s7d_av1_slot_memory *source,
+			  const struct s7d_av1_slot_memory *target)
+{
+	const struct s7d_codec_layout *layout = &backend->layout;
+	u32 used = s7d_amfbc_header_used(layout->coded_width, layout->coded_height);
+	u64 body = source->body.address, body_end = body + source->body.bytes;
+	u64 first = source->header.address;
+	u64 last = (u64)source->linear.address + source->linear.bytes;
+	__le32 *header = prefix;
+	u32 i, word, stray = 0;
+	u64 address;
+
+	if (!used || used % 4 || used > source->header.bytes || used > target->header.bytes)
+		return -ERANGE;
+	for (i = 0; i < used / 4; i++) {
+		word = le32_to_cpu(header[i]);
+		address = (u64)word << 2;
+		if (address >= body && address < body_end)
+			header[i] = cpu_to_le32((u32)((address - body + target->body.address) >> 2));
+		else if (address >= first && address < last)
+			stray++;
+	}
+	if (stray) {
+		dev_warn_ratelimited(backend->adapter->dev,
+				     "AV1 FBC: %u header words point outside the %u-byte body\n",
+				     stray, source->body.bytes);
+		return -EIO;
+	}
+	/* Rebased header stores precede the publication that exports them. */
+	dma_wmb();
+	return 0;
+}
+
+/*
+ * AM08C/AM10C fallback: the picture must be shown again while the client still
+ * holds its buffer (show-existing of a frame already given out), so copy the
+ * whole buffer into a free one and rebase the copy's header.
+ */
+static int av1_publish_copy(struct av1_backend *backend, u32 source)
+{
+	const size_t bytes[2] = { backend->layout.size[0], backend->layout.size[1] };
+	struct s7d_codec_surface *surface;
+	u32 index;
+	u64 token;
+	void *prefix;
+	int ret, cleanup;
+
+	ret = av1_acquire_free(backend, &index, &token);
+	if (ret)
+		return ret;
+	surface = backend->capture[index].surface;
+	ret = s7d_codec_surface_copy_all(surface, token, backend->capture[source].surface,
+					 backend->bind[source].token, bytes,
+					 av1_copy_cancelled, backend);
+	if (!ret)
+		ret = s7d_codec_surface_prefix_cpu(surface, token, &prefix);
+	if (!ret)
+		ret = av1_fbc_rebase(backend, prefix, &backend->slot_memory[source],
+				     &backend->slot_memory[index]);
+	cleanup = s7d_codec_surface_written(surface, token);
+	if (!ret)
+		ret = cleanup;
+	if (!ret && av1_copy_cancelled(backend))
+		ret = -ECANCELED;
+	if (!ret)
+		ret = av1_deliver(backend, index, token);
+	if (ret) {
+		if (!cleanup)
+			s7d_codec_surface_discard(surface, token);
+		return ret;
+	}
+	return s7d_codec_surface_ref_put(surface);
+}
+
+/*
+ * AM08C/AM10C: the hardware wrote the picture into its CAPTURE buffer; give
+ * that buffer out. A picture shown again (show-existing) goes out in place
+ * when the client has requeued its buffer, and as a copy while it holds it.
+ */
+static int av1_publish_bound(struct av1_backend *backend)
+{
+	u64 cookie = backend->result.output.cookie;
+	struct av1_bind *bind;
+	u32 index;
+	int ret;
+
+	if (!cookie || cookie > backend->captures)
+		return -EPROTO;
+	index = cookie - 1;
+	bind = &backend->bind[index];
+	if (bind->state == AV1_BIND_SHOWN) {
+		ret = s7d_codec_surface_reshow(backend->capture[index].surface, bind->token);
+		if (ret == -EBUSY)
+			return av1_publish_copy(backend, index);
+		if (ret)
+			return ret;
+		bind->state = AV1_BIND_HIDDEN;
+	} else if (bind->state != AV1_BIND_HIDDEN) {
+		return -EPROTO;
+	}
+	ret = av1_deliver(backend, index, bind->token);
+	if (ret)
+		return ret;
+	bind->state = AV1_BIND_SHOWN;
+	return 0;
+}
+
+static int av1_publish(struct av1_backend *backend)
+{
+	const struct s7d_av1_reference_output *output = &backend->result.output;
+	int ret;
+
+	if (output->output.picture.width != backend->layout.coded_width ||
+	    output->output.picture.height != backend->layout.coded_height ||
+	    output->pitch != backend->layout.pitch[0])
+		return -EOPNOTSUPP;
+	ret = backend->zero_copy ? av1_publish_bound(backend) : av1_publish_nv12(backend);
 	if (!ret)
 		ret = s7d_av1_runner_output_committed(backend->adapter->runner, output);
-	if (!ret)
-		backend->frame_sequence++;
-	return ret;
+	if (ret)
+		return ret;
+	backend->frame_sequence++;
+	return av1_unbind(backend);
 }
 
 static void av1_work(struct work_struct *work)
@@ -531,6 +705,9 @@ static void av1_work(struct work_struct *work)
 			if (!backend->output_pending) {
 				u32 offset = backend->tu.picture[backend->next_picture].offset;
 				u32 bytes = backend->tu.picture[backend->next_picture].bytes;
+				struct s7d_av1_decode_target target = {
+					.external = backend->zero_copy,
+				};
 				u64 picture_token;
 				const u8 *data;
 
@@ -538,9 +715,22 @@ static void av1_work(struct work_struct *work)
 					ret = -EOVERFLOW;
 					goto failed;
 				}
+				/* Any buffer the decoder takes means a full stop to give it back. */
+				backend->execution_attempted = true;
+				if (backend->zero_copy &&
+				    !backend->tu.picture[backend->next_picture].show_existing) {
+					mutex_unlock(&backend->lock);
+					ret = av1_acquire_target(backend);
+					mutex_lock(&backend->lock);
+					if (ret == -EAGAIN || (!ret && backend->closing))
+						goto unlock;
+					if (ret)
+						goto failed;
+				}
+				if (backend->pending)
+					target.memory = &backend->slot_memory[backend->pending - 1];
 				picture_token = ++backend->picture_token;
 				data = s7d_codec_dma_cpu(backend->input.memory);
-				backend->execution_attempted = true;
 				mutex_lock(&adapter->resources);
 				adapter->runner_closed = false;
 				mutex_unlock(&adapter->resources);
@@ -548,7 +738,9 @@ static void av1_work(struct work_struct *work)
 				memset(&backend->result, 0, sizeof(backend->result));
 				ret = s7d_av1_runner_decode(adapter->runner, backend->session,
 					backend->lease_epoch, picture_token, data + offset, bytes,
-					backend->input.timestamp_ns, &backend->result);
+					backend->input.timestamp_ns, &target, &backend->result);
+				if (!ret)
+					ret = av1_decoded(backend);
 				mutex_lock(&backend->lock);
 				backend->output_pending = backend->result.output_ready;
 				if (ret) {
@@ -701,35 +893,71 @@ static int av1_sync_initial(void *priv, u64 token)
 	return ret;
 }
 
-/* FBC buffers need the header bounce; one per session, sized for the maximum. */
-static int av1_fbc_prepare(struct av1_backend *backend,
-			   const struct s7d_v4l2_capture_buffer *buffers, unsigned int count)
+/*
+ * AM08C/AM10C buffers become the DPB's picture memory, at the offsets the
+ * format exports: FBC header first, its body after it, the NV12 double write
+ * behind both. Anything else fails CAPTURE setup.
+ */
+static int av1_zero_copy_prepare(struct av1_backend *backend,
+				 const struct s7d_v4l2_capture_buffer *buffers,
+				 unsigned int count)
 {
-	const struct s7d_v4l2_codec *codec = &backend->adapter->factory.codec;
-	struct s7d_codec_dma *memory;
-	dma_addr_t base;
-	size_t prefix;
-	unsigned int i;
+	const struct s7d_codec_layout *layout = &backend->layout;
+	u32 depth = layout->bit_depth == 10 ? 10 : 8;
+	u32 header = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
+	u32 body = s7d_amfbc_body_size(layout->coded_width, layout->storage_height, depth);
+	u32 luma = layout->pitch[0] * layout->storage_height;
+	struct s7d_av1_reference_layout fbc;
+	dma_addr_t base, plane[2];
+	size_t prefix, bytes;
+	unsigned int i, prefixed = 0;
 	int ret;
 
 	lockdep_assert_held(&backend->lock);
-	if (backend->fbc_header)
-		return 0;
+	backend->zero_copy = false;
 	for (i = 0; i < count; i++) {
 		ret = s7d_codec_surface_prefix(buffers[i].surface, &base, &prefix);
 		if (ret)
 			return ret;
-		if (prefix)
-			break;
+		prefixed += !!prefix;
 	}
-	if (i == count)
+	if (!prefixed)
 		return 0;
-	memory = s7d_codec_dma_alloc(backend->session,
-		s7d_amfbc_header_size(codec->max_width,
-				      ALIGN(codec->max_height, S7D_CODEC_STORAGE_ALIGNMENT)));
-	if (IS_ERR(memory))
-		return PTR_ERR(memory);
-	backend->fbc_header = memory;
+	if (prefixed != count || count < AV1_FBC_CAPTURE_MINIMUM)
+		return -EINVAL;
+	/* What the hardware writes for a picture of this size must fit the format. */
+	ret = s7d_av1_reference_layout(layout->coded_width, layout->coded_height, depth,
+				       backend->sequence.use_128x128_superblock ? 128 : 64,
+				       &fbc);
+	if (ret)
+		return ret;
+	if (fbc.body_allocation > body ||
+	    s7d_amfbc_header_used(layout->coded_width, layout->coded_height) > header ||
+	    (u64)layout->pitch[0] * layout->storage_height != layout->size[0])
+		return -ERANGE;
+	for (i = 0; i < count; i++) {
+		ret = s7d_codec_surface_prefix(buffers[i].surface, &base, &prefix);
+		if (!ret)
+			ret = s7d_codec_surface_dma(buffers[i].surface, 0, &plane[0], &bytes);
+		if (!ret)
+			ret = s7d_codec_surface_dma(buffers[i].surface, 1, &plane[1], &bytes);
+		if (ret)
+			return ret;
+		/* Body at 4 KiB for the MMU, NV12 64-aligned, all below 4 GiB. */
+		if (prefix != (size_t)header + body || !IS_ALIGNED(base, SZ_4K) ||
+		    plane[0] != base + prefix || plane[1] != plane[0] + luma ||
+		    (u64)plane[1] + luma / 2 > (1ULL << 32))
+			return -ERANGE;
+		backend->slot_memory[i] = (struct s7d_av1_slot_memory) {
+			.cookie = i + 1,
+			.header = { .address = base, .bytes = header },
+			.body = { .address = base + header, .bytes = body },
+			.linear = { .address = plane[0], .bytes = luma + luma / 2 },
+			.y_bytes = luma,
+			.uv_bytes = luma / 2,
+		};
+	}
+	backend->zero_copy = true;
 	return 0;
 }
 
@@ -754,8 +982,12 @@ static int av1_capture_start(void *priv, const struct s7d_codec_layout *layout,
 		ret = -EINVAL;
 	if (!ret)
 		ret = s7d_v4l2_validate_capture_pool(layout, generation, buffers, count);
-	if (!ret)
-		ret = av1_fbc_prepare(backend, buffers, count);
+	if (!ret) {
+		memset(backend->bind, 0, sizeof(backend->bind));
+		memset(backend->slot_memory, 0, sizeof(backend->slot_memory));
+		backend->pending = 0;
+		ret = av1_zero_copy_prepare(backend, buffers, count);
+	}
 	if (!ret) {
 		memcpy(backend->capture, buffers, sizeof(*buffers) * count);
 		backend->captures = count;
@@ -797,7 +1029,11 @@ static int av1_capture_stop(void *priv, u64 generation)
 	ret = av1_capture_stop_check(backend, generation);
 	if (!ret) {
 		memset(backend->capture, 0, sizeof(backend->capture));
+		memset(backend->bind, 0, sizeof(backend->bind));
+		memset(backend->slot_memory, 0, sizeof(backend->slot_memory));
 		backend->captures = 0;
+		backend->pending = 0;
+		backend->zero_copy = false;
 		backend->generation = 0;
 	}
 	mutex_unlock(&backend->lock);
@@ -926,8 +1162,6 @@ static int av1_release_epoch(struct av1_backend *backend)
 		backend->adapter->active = NULL;
 	session = backend->session;
 	backend->session = NULL;
-	/* Freed with the session. */
-	backend->fbc_header = NULL;
 	mutex_unlock(&backend->lock);
 	if (session)
 		s7d_codec_session_put(session);
@@ -949,6 +1183,11 @@ static int av1_reset(void *priv)
 		memset(&backend->drain, 0, sizeof(backend->drain));
 		memset(&backend->result, 0, sizeof(backend->result));
 		memset(backend->capture, 0, sizeof(backend->capture));
+		/* The stopped session took every CAPTURE binding with it. */
+		memset(backend->bind, 0, sizeof(backend->bind));
+		memset(backend->slot_memory, 0, sizeof(backend->slot_memory));
+		backend->pending = 0;
+		backend->zero_copy = false;
 		backend->lease_epoch = 0;
 		backend->generation = 0;
 		backend->initial_token = 0;
@@ -1114,6 +1353,7 @@ s7d_av1_v4l2_create(struct device *dev, struct s7d_codec_dos *dos,
 			.min_input_size = AV1_INPUT_BYTES,
 			.default_layout = s7d_v4l2_default_nv12_layout,
 			.fbc = true,
+			.fbc_min_capture_buffers = AV1_FBC_CAPTURE_MINIMUM,
 		},
 		.ops = &av1_ops, .ready = av1_factory_ready,
 		.create = av1_factory_create, .destroy = av1_factory_destroy,

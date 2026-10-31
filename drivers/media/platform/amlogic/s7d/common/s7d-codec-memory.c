@@ -184,6 +184,16 @@ static const struct dma_buf_ops s7d_memory_dmabuf_ops = {
 	.release = s7d_memory_release,
 };
 
+void *s7d_codec_memory_cpu(struct dma_buf *dmabuf)
+{
+	struct s7d_codec_memory *mem;
+
+	if (!dmabuf || dmabuf->ops != &s7d_memory_dmabuf_ops)
+		return NULL;
+	mem = dmabuf->priv;
+	return mem->cpu;
+}
+
 static int s7d_memory_copy_wait(struct dma_buf *const dst[2],
 				struct dma_buf *const src[2],
 				struct dma_resv *resv[4], unsigned int *count_out,

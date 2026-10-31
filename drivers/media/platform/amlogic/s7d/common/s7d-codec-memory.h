@@ -17,6 +17,9 @@ int s7d_codec_memory_copy(struct dma_buf *const dst[2], const size_t dst_offset[
 			  struct dma_buf *const src[2], const size_t src_offset[2],
 			  const size_t bytes[2], bool (*cancelled)(void *priv), void *priv);
 
+/* CPU view of a dma-buf this exporter made (coherent, lives with the dma-buf). */
+void *s7d_codec_memory_cpu(struct dma_buf *dmabuf);
+
 /* Internal: the session owner has validated and pinned every source plane. */
 int s7d_codec_memory_copy_dma(struct dma_buf *const dst[2], const size_t dst_offset[2],
 			      const struct s7d_codec_dma_copy_plane *planes,

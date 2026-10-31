@@ -110,6 +110,7 @@ int s7d_av1_split_tu(const u8 *data, size_t bytes,
 			frame = obu.type;
 			show_existing = !sequence->reduced_still_picture_header &&
 				(data[obu.payload_offset] & 0x80);
+			next.picture[next.picture_count - 1].show_existing = show_existing;
 			if (show_existing && sequence->frame_id_numbers_present)
 				return -EOPNOTSUPP;
 			tiles = false;

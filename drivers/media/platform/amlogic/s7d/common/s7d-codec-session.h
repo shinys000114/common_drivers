@@ -45,7 +45,7 @@ struct s7d_codec_surface_request {
 	bool contiguous;
 	/*
 	 * Contiguous only: bytes of dmabuf[0] in front of plane 0, a region the
-	 * backend fills through s7d_codec_surface_copy_prefix_dma().
+	 * backend's hardware writes (AV1 AM08C/AM10C FBC).
 	 */
 	size_t prefix;
 };
@@ -121,17 +121,26 @@ int s7d_codec_surface_written(struct s7d_codec_surface *surface, u64 token);
 int s7d_codec_surface_copy(struct s7d_codec_surface *dst, u64 dst_token,
 			   struct s7d_codec_surface *src, u64 src_token,
 			   const size_t bytes[2], bool (*cancelled)(void *priv), void *priv);
+/*
+ * As copy, for two contiguous surfaces with the same prefix: the prefix and
+ * bytes[i] of each plane, so the whole frame. The source stays read-only.
+ */
+int s7d_codec_surface_copy_all(struct s7d_codec_surface *dst, u64 dst_token,
+			       struct s7d_codec_surface *src, u64 src_token,
+			       const size_t bytes[2], bool (*cancelled)(void *priv), void *priv);
+/* CPU view of the prefix of a write-pinned, DPB-held surface (coherent CAPTURE). */
+int s7d_codec_surface_prefix_cpu(struct s7d_codec_surface *surface, u64 token, void **cpu);
+/*
+ * A displayed surface still held by the DPB that the client queued again: hand
+ * the content it already holds (token) to frame_ready once more, unwritten.
+ * -EBUSY while the client owns it.
+ */
+int s7d_codec_surface_reshow(struct s7d_codec_surface *surface, u64 token);
 /* Halt/join and retain the source output pin until this synchronous copy returns. */
 int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
 			       u64 generation,
 			       const struct s7d_codec_dma_copy_plane planes[2],
 			       bool (*cancelled)(void *priv), void *priv);
-/* As copy_dma, but plane i lands at prefix byte offset[i]; spans stay apart. */
-int s7d_codec_surface_copy_prefix_dma(struct s7d_codec_surface *dst, u64 dst_token,
-				      u64 generation,
-				      const struct s7d_codec_dma_copy_plane planes[2],
-				      const size_t offset[2],
-				      bool (*cancelled)(void *priv), void *priv);
 /* Physically idle, unpublished picture; consumes its sole DPB reference. */
 int s7d_codec_surface_discard(struct s7d_codec_surface *surface, u64 token);
 int s7d_codec_surface_ref_get(struct s7d_codec_surface *surface);

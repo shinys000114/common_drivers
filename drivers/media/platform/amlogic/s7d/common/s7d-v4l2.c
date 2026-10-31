@@ -192,6 +192,24 @@ static bool s7d_layout_contiguous(const struct s7d_codec_layout *layout)
 	return (u64)layout->pitch[0] * layout->storage_height == layout->size[0];
 }
 
+/* The chosen CAPTURE format is AM08C/AM10C; s7d_capture_format()'s rules. */
+static bool s7d_layout_fbc(enum s7d_capture_mode mode, const struct s7d_codec_layout *layout)
+{
+	return s7d_fbc_mode(s7d_layout_mode(mode, layout)) && s7d_layout_contiguous(layout) &&
+	       layout->format != S7D_CODEC_CAPTURE_NV21M;
+}
+
+/* An FBC decoder keeps its references in CAPTURE, so it needs more of them. */
+static u32 s7d_capture_minimum(const struct s7d_v4l2_context *ctx,
+			       const struct s7d_codec_layout *layout)
+{
+	u32 minimum = layout->min_capture_buffers;
+
+	if (s7d_layout_fbc(ctx->capture_mode, layout))
+		minimum = max(minimum, ctx->codec.fbc_min_capture_buffers);
+	return minimum;
+}
+
 /* AM08C/AM10C: FBC bytes in front of the NV12 copy, from the reported width/height. */
 static u32 s7d_fbc_prefix(const struct s7d_codec_layout *layout)
 {
@@ -342,7 +360,9 @@ bool s7d_v4l2_codec_valid(const struct s7d_v4l2_codec *codec)
 	      !IS_ALIGNED(codec->min_input_size, PAGE_SIZE))) ||
 	    !IS_ALIGNED(codec->max_input_size, PAGE_SIZE) ||
 	    (codec->max_capture_buffers && (codec->max_capture_buffers < 3 ||
-	     codec->max_capture_buffers > S7D_CODEC_MAX_CAPTURE_BUFFERS)))
+	     codec->max_capture_buffers > S7D_CODEC_MAX_CAPTURE_BUFFERS)) ||
+	    (codec->fbc_min_capture_buffers && (!codec->fbc ||
+	     codec->fbc_min_capture_buffers > s7d_capture_limit(codec))))
 		return false;
 	if (codec->engine == S7D_CODEC_ENGINE_VDEC)
 		return codec->output_format == V4L2_PIX_FMT_H264;
@@ -998,6 +1018,7 @@ static bool s7d_queues_idle(struct s7d_v4l2_context *ctx)
 int s7d_v4l2_streamon(struct s7d_v4l2_context *ctx, struct file *file,
 		    enum v4l2_buf_type type)
 {
+	struct s7d_codec_layout layout;
 	struct vb2_queue *q;
 	unsigned long flags;
 	unsigned int minimum;
@@ -1007,7 +1028,8 @@ int s7d_v4l2_streamon(struct s7d_v4l2_context *ctx, struct file *file,
 		return -EINVAL;
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	retired = ctx->retired;
-	minimum = s7d_query_layout(ctx).min_capture_buffers;
+	layout = s7d_query_layout(ctx);
+	minimum = s7d_capture_minimum(ctx, &layout);
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	if (retired)
 		return -ESHUTDOWN;
@@ -1404,10 +1426,12 @@ static int s7d_capture_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct s7d_v4l2_context *ctx = container_of(ctrl->handler,
 					struct s7d_v4l2_context, controls);
+	struct s7d_codec_layout layout;
 	unsigned long flags;
 
 	spin_lock_irqsave(&ctx->state_lock, flags);
-	ctrl->val = ctx->sequence_valid ? s7d_query_layout(ctx).min_capture_buffers : 1;
+	layout = s7d_query_layout(ctx);
+	ctrl->val = ctx->sequence_valid ? s7d_capture_minimum(ctx, &layout) : 1;
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	return 0;
 }
@@ -1435,6 +1459,7 @@ static int s7d_queue_setup(struct vb2_queue *q, unsigned int *buffers,
 {
 	struct s7d_v4l2_context *ctx = vb2_get_drv_priv(q);
 	struct v4l2_pix_format_mplane format;
+	struct s7d_codec_layout layout;
 	unsigned long flags;
 	unsigned int i, minimum;
 	bool retired;
@@ -1446,7 +1471,8 @@ static int s7d_queue_setup(struct vb2_queue *q, unsigned int *buffers,
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	format = q->is_output ? ctx->output : ctx->capture;
 	retired = ctx->retired;
-	minimum = q->is_output ? 1 : s7d_query_layout(ctx).min_capture_buffers;
+	layout = s7d_query_layout(ctx);
+	minimum = q->is_output ? 1 : s7d_capture_minimum(ctx, &layout);
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	if (retired)
 		return -ESHUTDOWN;
@@ -1618,7 +1644,7 @@ static int s7d_capture_rebind(struct s7d_v4l2_context *ctx)
 			.generation = generation,
 		};
 	}
-	if (count < layout.min_capture_buffers) {
+	if (count < s7d_capture_minimum(ctx, &layout)) {
 		ret = -ENOBUFS;
 		goto unlock;
 	}
@@ -1678,7 +1704,7 @@ static int s7d_reconfigure_start(struct s7d_v4l2_context *ctx)
 			return -ENOBUFS;
 		count++;
 	}
-	if (count < layout.min_capture_buffers)
+	if (count < s7d_capture_minimum(ctx, &layout))
 		return -ENOBUFS;
 	if (check_add_overflow((size_t)ctx->output.plane_fmt[0].sizeimage,
 			      ((size_t)ctx->codec.staging_headroom + SZ_16K +
@@ -2030,7 +2056,7 @@ static int s7d_start_streaming(struct vb2_queue *q, unsigned int count)
 		s7d_device_run(ctx);
 		return 0;
 	}
-	if (!valid || count < layout.min_capture_buffers ||
+	if (!valid || count < s7d_capture_minimum(ctx, &layout) ||
 	    (!ctx->session && !ctx->ops.clear_stream)) {
 		ret = -EAGAIN;
 		goto return_queued;
