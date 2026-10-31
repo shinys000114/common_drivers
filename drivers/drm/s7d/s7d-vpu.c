@@ -607,7 +607,8 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 		}
 		transaction = S7D_SCANOUT_TRANSACTION_REPLAY;
 	}
-	if (state->buffers.afbc.plan.surface_mask && state->buffers.video.fb &&
+	if (state->buffers.afbc.plan.surface_mask &&
+	    (state->buffers.video.fb || state->buffers.video2.fb) &&
 	    state->video_submitted && !state->afbc_unchanged) {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -686,8 +687,10 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	core_rate = clk_get_rate(v->clocks[0].clk);
 	if (core_rate < state->pixel_rate)
 		return -ERANGE;
-	if (state->buffers.afbc.plan.surface_mask && state->buffers.video.fb &&
-	    core_rate < 2 * state->pixel_rate)
+	/* The decoder and each video input take a pixel per core cycle. */
+	if (state->buffers.afbc.plan.surface_mask &&
+	    core_rate < (1 + !!state->buffers.video.fb + !!state->buffers.video2.fb) *
+	    state->pixel_rate)
 		return -ERANGE;
 	ret = s7d_osd_scaler_check_mode(state->osd.scalers,
 		state->base.adjusted_mode.htotal, state->pixel_rate,
@@ -1710,8 +1713,9 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	v->core_protected = true;
 	if (clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
 		return -ERANGE;
-	if (state->buffers.afbc.plan.surface_mask && state->buffers.video.fb &&
-	    clk_get_rate(v->clocks[0].clk) < 2 * state->pixel_rate)
+	if (state->buffers.afbc.plan.surface_mask &&
+	    clk_get_rate(v->clocks[0].clk) < (1 + !!state->buffers.video.fb +
+	    !!state->buffers.video2.fb) * state->pixel_rate)
 		return -ERANGE;
 	ret = s7d_osd_scaler_check_mode(state->osd.scalers,
 		state->base.adjusted_mode.htotal, state->pixel_rate,

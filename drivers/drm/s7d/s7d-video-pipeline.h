@@ -47,7 +47,7 @@ int s7d_video_build_pipeline(const struct s7d_video_state *layout,
 			     struct s7d_video_pipeline_state *out);
 
 int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
-			       const struct drm_rect *dst,
+			       const struct drm_rect *dst, unsigned int hold_lines,
 			       struct s7d_video_pipeline_state *out);
 
 #endif
