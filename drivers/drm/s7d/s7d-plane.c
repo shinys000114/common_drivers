@@ -153,6 +153,10 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 			return -EINVAL;
 		ret = s7d_video_build_state(base->fb, &base->src, plane->dma_mask,
 					    &state->video);
+		/* An FBC body is at most the uncompressed 4:2:0 frame. */
+		if (!ret && state->video.fbc.enabled)
+			state->compressed_size = (u32)state->video.fbc.width *
+				state->video.fbc.height * (state->video.fbc.ten_bit ? 15 : 12) / 8;
 		if (!ret) {
 			state->video.reflection =
 				(base->rotation & DRM_MODE_REFLECT_X ? S7D_VIDEO_REFLECT_X : 0) |
@@ -258,6 +262,23 @@ static bool s7d_rgb_format_mod_supported(struct drm_plane *plane,
 		(gfcd && s7d_afrc_cu(modifier) >= 0 && format == DRM_FORMAT_RGBA8888);
 }
 
+static bool s7d_vd1_format_mod_supported(struct drm_plane *plane,
+					 u32 format, u64 modifier)
+{
+	if (format == DRM_FORMAT_YUV420_8BIT || format == DRM_FORMAT_YUV420_10BIT)
+		return s7d_video_fbc_modifier(format, modifier);
+	return modifier == DRM_FORMAT_MOD_LINEAR;
+}
+
+static const struct drm_plane_funcs s7d_vd1_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.reset = s7d_plane_reset,
+	.atomic_duplicate_state = s7d_plane_duplicate_state,
+	.atomic_destroy_state = s7d_plane_destroy_state,
+	.format_mod_supported = s7d_vd1_format_mod_supported,
+};
+
 static const struct drm_plane_funcs s7d_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
@@ -327,7 +348,8 @@ static const struct drm_plane_helper_funcs s7d_plane_helper_funcs = {
 bool s7d_plane_is_native(const struct drm_plane *plane)
 {
 	return plane && (plane->funcs == &s7d_plane_funcs ||
-			 plane->funcs == &s7d_rgb_plane_funcs) &&
+			 plane->funcs == &s7d_rgb_plane_funcs ||
+			 plane->funcs == &s7d_vd1_plane_funcs) &&
 		plane->helper_private == &s7d_plane_helper_funcs;
 }
 
@@ -369,6 +391,15 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		DRM_FORMAT_NV12, DRM_FORMAT_NV21, DRM_FORMAT_NV16, DRM_FORMAT_NV61,
 		DRM_FORMAT_UYVY, DRM_FORMAT_VYUY,
 		DRM_FORMAT_VUY888, DRM_FORMAT_XVYU2101010,
+		/* VD1 only: decoder frames through the Amlogic FBC decoder */
+		DRM_FORMAT_YUV420_8BIT, DRM_FORMAT_YUV420_10BIT,
+	};
+	static const u64 vd1_modifiers[] = {
+		DRM_FORMAT_MOD_LINEAR,
+		DRM_FORMAT_MOD_AMLOGIC_FBC(AMLOGIC_FBC_LAYOUT_SCATTER, 0),
+		DRM_FORMAT_MOD_AMLOGIC_FBC(AMLOGIC_FBC_LAYOUT_SCATTER,
+					   AMLOGIC_FBC_OPTION_MEM_SAVING),
+		DRM_FORMAT_MOD_INVALID,
 	};
 	const u32 *plane_formats = formats;
 	unsigned int format_count = ARRAY_SIZE(formats);
@@ -409,7 +440,12 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		name = slot == S7D_PLANE_VIDEO ? "S7D VD1" : "S7D VD2";
 		zpos = slot == S7D_PLANE_VIDEO ? 1 : 2;
 		plane_formats = video_formats;
-		format_count = ARRAY_SIZE(video_formats);
+		format_count = ARRAY_SIZE(video_formats) -
+			(slot == S7D_PLANE_VIDEO ? 0 : 2);
+		if (slot == S7D_PLANE_VIDEO) {
+			funcs = &s7d_vd1_plane_funcs;
+			plane_modifiers = vd1_modifiers;
+		}
 		break;
 	default:
 		return ERR_PTR(-EINVAL);

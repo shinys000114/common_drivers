@@ -44,6 +44,9 @@
 #define VD2_BLEND		0x1dfc
 #define VD1_PATH		0x1a0a
 #define VD1_GEN			0x4800
+#define AFBC_ENABLE		0x4840
+#define AFBC_ENABLE_RESET	0x00241602
+#define VD1_PATH_AFBC		(BIT(22) | BIT(12) | BIT(10))
 #define VD2_GEN			0x4880
 #define VD2_PATH		0x1a0b
 #define VD1_BUSY		BIT(17)
@@ -952,6 +955,15 @@ static int s7d_vpu_stop_hw(void *data)
 			return ret;
 		}
 	}
+	/*
+	 * Drop the VD1 FBC decoder and its path, as vendor vd1_path_select() does,
+	 * and return the decoder to its reset value, which the MIF path needs.
+	 */
+	writel(AFBC_ENABLE_RESET, v->regs + AFBC_ENABLE * 4);
+	ret = vpu_update(v, VD1_PATH, VD1_PATH_AFBC, 0);
+	if (ret)
+		return ret;
+	v->vd1_fbc = false;
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		/*
 		 * Keep the local OSD clock running until disable reaches OSD_ENABLE and DMA
@@ -1420,6 +1432,8 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 	for (i = 0; i < S7D_VIDEO_SETUP_REG_COUNT; i++) {
 		const struct s7d_video_reg_setting *s = &state->video.setup[i];
 
+		if (!s->mask)
+			continue;
 		ret = vpu_update(v, s->reg, s->mask, s->value);
 		if (ret)
 			return ret;
@@ -1427,6 +1441,8 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 	for (i = 0; i < S7D_VIDEO_SETUP_REG_COUNT; i++) {
 		const struct s7d_video_reg_setting *s = &state->video2.setup[i];
 
+		if (!s->mask)
+			continue;
 		ret = vpu_update(v, s->reg, s->mask, s->value);
 		if (ret)
 			return ret;
@@ -1590,11 +1606,14 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		if (ret)
 			return ret;
 	}
-	v->video_enable[0] = state->video.control.value & BIT(0);
+	v->vd1_fbc = state->video.control.reg == AFBC_ENABLE;
+	v->video_enable[0] = state->video.control.value &
+		s7d_video_enable_bit(&state->video.control);
 	v->video_enable[1] = state->video2.control.value & BIT(0);
 	ret = vpu_update(v, state->video.control.reg,
 			 state->video.control.mask | BIT(30),
-			 state->video.control.value & ~BIT(0));
+			 state->video.control.value &
+			 ~s7d_video_enable_bit(&state->video.control));
 	if (ret)
 		return ret;
 	return vpu_update(v, state->video2.control.reg,
@@ -1849,7 +1868,9 @@ static int s7d_vpu_start(void *data)
 		}
 	}
 	if (!ret)
-		ret = vpu_update(v, VD1_GEN, BIT(0), v->video_enable[0] ? BIT(0) : 0);
+		ret = v->vd1_fbc ?
+			vpu_update(v, AFBC_ENABLE, BIT(8), v->video_enable[0] ? BIT(8) : 0) :
+			vpu_update(v, VD1_GEN, BIT(0), v->video_enable[0] ? BIT(0) : 0);
 	if (!ret)
 		ret = vpu_update(v, VD2_GEN, BIT(0), v->video_enable[1] ? BIT(0) : 0);
 	if (!ret)
@@ -2189,6 +2210,9 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 		     (arbiter & ASYNC_IDLE);
 	video_mask = (vd1 & BIT(0) ? BIT(0) : 0) |
 		(vd2 & BIT(0) ? BIT(1) : 0);
+	/* The FBC decoder fetches VD1 while the MIF stays off. */
+	if (v->vd1_fbc && (vpu_read(v, AFBC_ENABLE) & BIT(8)))
+		video_mask |= BIT(0);
 	/* Unchanged video inputs keep their buffers across the OSD flip. */
 	frame.early = frame.idle &&
 		(!video_mask || video_mask == v->static_video_mask) &&

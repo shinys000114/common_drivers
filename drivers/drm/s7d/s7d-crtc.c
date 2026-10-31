@@ -635,6 +635,13 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	}
 	if (!state->buffers.fb[S7D_PLANE_PRIMARY])
 		return -EINVAL;
+	/*
+	 * The graphics decoders restart inside the ENCP flip window by the VD1 MIF
+	 * hold lines; the video FBC decoder has no such hold.
+	 */
+	if (video && video->video.fbc.enabled &&
+	    (state->buffers.afbc.plan.surface_mask || state->buffers.gfcd.fb))
+		return -EINVAL;
 	interlace = base->adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE;
 	field_height = base->adjusted_mode.vdisplay >> interlace;
 	/* Interlaced output scales linear OSD planes into fields only. */

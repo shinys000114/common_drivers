@@ -3,6 +3,7 @@
 #include <linux/bits.h>
 #include <linux/errno.h>
 #include <linux/limits.h>
+#include <linux/string.h>
 #include <linux/types.h>
 
 #include <asm/byteorder.h>
@@ -38,6 +39,23 @@
 #define VPP_LINE_IN_LENGTH	0x1d01
 #define VPP_PIC_IN_HEIGHT		0x1d02
 #define VPP_SC_MISC		0x1d19
+#define VD1_PATH		0x1a0a
+#define VD1_PATH_AFBC		(BIT(22) | BIT(12) | BIT(10))
+/* VD1 Amlogic FBC decoder, SC2 register array */
+#define AFBC_ENABLE		0x4840
+#define AFBC_ENABLE_RESET	0x00241602
+#define AFBC_MODE		0x4841
+#define AFBC_SIZE_IN		0x4842
+#define AFBC_DEC_DEF_COLOR	0x4843
+#define AFBC_CONV_CTRL		0x4844
+#define AFBC_HEAD_BADDR		0x4846
+#define AFBC_BODY_BADDR		0x4847
+#define AFBC_VD_CFMT_CTRL	0x484b
+#define AFBC_MIF_HOR_SCOPE	0x484d
+#define AFBC_MIF_VER_SCOPE	0x484e
+#define AFBC_PIXEL_HOR_SCOPE	0x484f
+#define AFBC_PIXEL_VER_SCOPE	0x4850
+#define AFBCDEC_IQUANT_ENABLE	0x4852
 
 #define VD1_GEN_MASK		(GENMASK(29, 18) | \
 				 (GENMASK(16, 0) & ~BIT(5)))
@@ -93,6 +111,62 @@ static int check_layout(const struct s7d_video_state *layout,
 	return 0;
 }
 
+/*
+ * Vendor vd1_set_dcu() compressed branch and vd_afbc_setting_tl1() for S7D:
+ * the decoder replaces the MIF, which stays disabled, and the control word
+ * becomes AFBC_ENABLE (dec_enable is bit 8, dos_uncomp_mode bit 19).
+ */
+static int build_fbc(const struct s7d_video_state *layout, const struct drm_rect *dst,
+		     struct s7d_video_pipeline_state *next,
+		     struct s7d_video_pipeline_state *out)
+{
+	const struct s7d_video_fbc *fbc = &layout->fbc;
+	u32 width = (layout->scope_x[1] & 0xffff) - (layout->scope_x[1] >> 16) + 1;
+	u32 height = (layout->scope_y[1] & 0xffff) - (layout->scope_y[1] >> 16) + 1;
+	u32 mode = (3 << 24) | (8 << 16) | (2 << 14) | BIT(29) |
+		(fbc->ten_bit ? 0x2a00 : 0) | (fbc->mem_saving ? BIT(28) : 0);
+
+	if (!dst || dst->x1 < 0 || dst->y1 < 0 || dst->x2 > 8192 || dst->y2 > 8192 ||
+	    dst->x2 <= dst->x1 || dst->y2 <= dst->y1 ||
+	    ((dst->x1 | dst->y1 | dst->x2 | dst->y2 | width | height) & 1) ||
+	    !fbc->width || !fbc->height || fbc->width > S7D_VIDEO_MAX_WIDTH ||
+	    fbc->height > S7D_VIDEO_MAX_HEIGHT || layout->reflection ||
+	    s7d_video_scaler_build(width, height, drm_rect_width(dst),
+				   drm_rect_height(dst), false, &next->scaler))
+		return -EINVAL;
+	next->setup[S7D_VIDEO_SETUP_REG_COUNT - 5] =
+		(struct s7d_video_reg_setting)SET(AFBC_MODE, U32_MAX, mode);
+	next->setup[S7D_VIDEO_SETUP_REG_COUNT - 4] =
+		(struct s7d_video_reg_setting)SET(AFBC_DEC_DEF_COLOR, U32_MAX,
+						  fbc->ten_bit ? 0x3ff80200 : 0x3ff20080);
+	next->setup[S7D_VIDEO_SETUP_REG_COUNT - 3] =
+		(struct s7d_video_reg_setting)SET(AFBC_VD_CFMT_CTRL, U32_MAX, 0x10310c11);
+	next->setup[S7D_VIDEO_SETUP_REG_COUNT - 2] =
+		(struct s7d_video_reg_setting)SET(AFBCDEC_IQUANT_ENABLE, U32_MAX, 0);
+	next->setup[S7D_VIDEO_SETUP_REG_COUNT - 1] =
+		(struct s7d_video_reg_setting)SET(VD1_PATH, VD1_PATH_AFBC | BIT(9) | BIT(8),
+						  VD1_PATH_AFBC);
+	next->control = (struct s7d_video_reg_setting)SET(AFBC_ENABLE, U32_MAX,
+							   BIT(19) | 0x1700);
+	next->update[0] = (struct s7d_rdma_entry)REG(AFBC_HEAD_BADDR, layout->frame_addr[0]);
+	next->update[1] = (struct s7d_rdma_entry)REG(AFBC_BODY_BADDR, 0);
+	next->update[2] = (struct s7d_rdma_entry)REG(AFBC_SIZE_IN,
+		(ALIGN(fbc->width, 32) << 16) | ALIGN(fbc->height, 4));
+	next->update[3] = (struct s7d_rdma_entry)REG(AFBC_MIF_HOR_SCOPE, layout->scope_x[0]);
+	next->update[4] = (struct s7d_rdma_entry)REG(AFBC_MIF_VER_SCOPE, layout->scope_y[0]);
+	next->update[5] = (struct s7d_rdma_entry)REG(AFBC_PIXEL_HOR_SCOPE, layout->scope_x[1]);
+	next->update[6] = (struct s7d_rdma_entry)REG(AFBC_PIXEL_VER_SCOPE, layout->scope_y[1]);
+	/* lbuf_len 0x100 for VD1, 4:2:0 */
+	next->update[7] = (struct s7d_rdma_entry)REG(AFBC_CONV_CTRL, (2 << 12) | 0x100);
+	next->update[8] = (struct s7d_rdma_entry)REG(VD1_GEN_REG2, 0);
+	next->update[9] = (struct s7d_rdma_entry)REG(VD1_FMT_W, (width << 16) | (width >> 1));
+	next->update[10] = (struct s7d_rdma_entry)REG(VPP_LINE_IN_LENGTH, width);
+	next->update[11] = (struct s7d_rdma_entry)REG(VPP_PIC_IN_HEIGHT, height);
+	next->update_count = S7D_VIDEO_UPDATE_REG_COUNT;
+	*out = *next;
+	return 0;
+}
+
 static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 					   const struct drm_rect *dst,
 					   unsigned int hold_lines, bool vd2,
@@ -128,6 +202,11 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 			SET(VD1_DUMMY_PIXEL, 0xffffff00, 0x00808000),
 			/* The interleaved UV plane does not use a separate CR base. */
 			SET(VD1_BADDR_CR, U32_MAX, 0),
+			/*
+			 * The FBC decoder stays at its reset value, which the MIF path
+			 * also needs; the VPP setup selects that path.
+			 */
+			SET(AFBC_ENABLE, U32_MAX, AFBC_ENABLE_RESET),
 		},
 		.control = SET(VD1_GEN_REG, VD1_GEN_MASK, VD1_GEN_VALUE),
 	};
@@ -143,6 +222,8 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 		*out = next;
 		return 0;
 	}
+	if (layout->fbc.enabled)
+		return vd2 ? -EINVAL : build_fbc(layout, dst, &next, out);
 	if (check_layout(layout, dst, &width, &height))
 		return -EINVAL;
 	deep = layout->format == DRM_FORMAT_XVYU2101010;
@@ -229,6 +310,12 @@ int s7d_video_build_vd2_pipeline(const struct s7d_video_state *layout,
 		return -EINVAL;
 	/* S7D selects the same MIF layout at 0x4880 and a separate VD2 PPS. */
 	for (i = 0; i < S7D_VIDEO_SETUP_REG_COUNT; i++) {
+		if (next.setup[i].reg == AFBC_ENABLE) {
+			/* VD1 only; later entries are FBC setup and stay unused. */
+			memset(&next.setup[i], 0, (S7D_VIDEO_SETUP_REG_COUNT - i) *
+			       sizeof(next.setup[i]));
+			break;
+		}
 		if (next.setup[i].reg == VPP_SC_MISC) {
 			next.setup[i].reg = 0x3958;
 			next.setup[i].mask = BIT(24) | GENMASK(22, 15);
