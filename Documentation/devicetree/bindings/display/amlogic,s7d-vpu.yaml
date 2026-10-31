@@ -77,7 +77,7 @@ properties:
 
   resets:
     minItems: 4
-    maxItems: 8
+    maxItems: 12
 
   reset-names:
     minItems: 4
@@ -90,6 +90,10 @@ properties:
       - const: afbc-logic
       - const: afbc-arbiter-regs
       - const: afbc-arbiter-logic
+      - const: vdin1
+      - const: wrmif1
+      - const: vd1-afbc
+      - const: vd1-lbuf
 
   power-domains:
     maxItems: 1
