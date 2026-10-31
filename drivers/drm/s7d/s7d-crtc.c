@@ -278,13 +278,19 @@ static int s7d_crtc_check_afbc_area(const struct s7d_afbc_plan *plan)
 static int s7d_crtc_check_afbc_video(const struct s7d_crtc_state *state)
 {
 	const struct drm_display_mode *mode = &state->base.adjusted_mode;
+	const struct s7d_video_scaler_state *vsc = &state->video.scaler;
 
 	if (!state->buffers.afbc.plan.surface_mask ||
 	    (!state->buffers.fb[S7D_PLANE_VIDEO] && !state->buffers.fb[S7D_PLANE_VIDEO2]))
 		return 0;
+	/*
+	 * The decoder restarts inside the ENCP flip window while every video
+	 * fetch holds off. VD1 may only enlarge, as a reduction reads more
+	 * lines in the shortened prefill; VD2 stays unscaled.
+	 */
 	if (state->buffers.afbc.plan.surface_mask != BIT(0) ||
-	    state->buffers.afbc.plan.surface[0].osd.alpha_config != 0x7fc2 ||
-	    state->buffers.fb[S7D_PLANE_RGB] || state->video.scaler.enabled ||
+	    (vsc->enabled && (vsc->dst_width < vsc->src_width ||
+			      vsc->dst_height < vsc->src_height)) ||
 	    state->video2.scaler.enabled ||
 	    state->osd.scalers[0].enabled || state->osd.scalers[1].enabled ||
 	    mode->hdisplay > 1920 || mode->vdisplay > 1080 ||
