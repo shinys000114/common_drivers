@@ -32,7 +32,7 @@
 
 static int s7d_postblend_sources(const struct s7d_display_resources *r,
 				const u32 zpos[S7D_INPUT_COUNT], u8 opaque,
-				u32 sources[S7D_INPUT_COUNT])
+				u32 sources[S7D_INPUT_COUNT], bool *din0_premult)
 {
 	static const u8 source_id[] = {
 		[S7D_INPUT_OSD1] = 3,
@@ -57,9 +57,12 @@ static int s7d_postblend_sources(const struct s7d_display_resources *r,
 			if (zpos[j] < zpos[i])
 				rank++;
 		}
-		/* DIN0 keeps the vendor premult label, valid for opaque sources. */
+		/*
+		 * DIN0 keeps the vendor premult label for opaque sources; a
+		 * translucent bottom input gets the label of the other ports.
+		 */
 		if (four && !rank && !(opaque & BIT(i)))
-			return -EINVAL;
+			*din0_premult = false;
 		port = four ? rank : rank + 1;
 		if (!four && rank == 1 && !(r->inputs & S7D_VIDEO_INPUTS))
 			port++;
@@ -82,6 +85,7 @@ int s7d_postblend_build_state(u32 width, u32 height,
 	u32 video2_h = 0x1fff0000, video2_v = 0x1fff0000;
 	u32 input_width = width, input_height = height;
 	u32 sources[S7D_INPUT_COUNT] = {0}, pre_src = 0;
+	bool din0_premult = true;
 	int ret;
 
 	if (!state || !resources || !zpos || !video_alpha || !width || !height ||
@@ -98,7 +102,7 @@ int s7d_postblend_build_state(u32 width, u32 height,
 		opaque &= ~BIT(S7D_INPUT_VD1);
 	if (video_alpha[1] != DRM_BLEND_ALPHA_OPAQUE)
 		opaque &= ~BIT(S7D_INPUT_VD2);
-	ret = s7d_postblend_sources(resources, zpos, opaque, sources);
+	ret = s7d_postblend_sources(resources, zpos, opaque, sources, &din0_premult);
 	if (ret)
 		return ret;
 	if (video_dst) {
@@ -137,7 +141,8 @@ int s7d_postblend_build_state(u32 width, u32 height,
 			REG(VPP_POSTBLEND_VD1_V, video_v),
 			REG(0x1d1e, video2_h),
 			REG(0x1d1f, video2_v),
-			REG(VD1_BLEND_SRC_CTRL, BIT(16) | (sources[0] << 8) | pre_src),
+			REG(VD1_BLEND_SRC_CTRL, (din0_premult ? BIT(16) : 0) |
+			    (sources[0] << 8) | pre_src),
 			REG(VD2_BLEND_SRC_CTRL, (sources[1] << 8) | (video2_dst ? BIT(20) : 0)),
 			/* Bit 20 keeps logical OSD1 on the postblend path. */
 			REG(OSD1_BLEND_SRC_CTRL, BIT(20) | (sources[2] << 8)),

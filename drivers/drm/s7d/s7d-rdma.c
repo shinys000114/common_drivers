@@ -224,8 +224,7 @@ static bool display_write_valid(u32 reg, u32 value)
 		       (value & (BIT(7) | BIT(6))) == (BIT(7) | BIT(6)) &&
 		       (value >> 18) <= 256;
 	case 0x1dfb:
-		return (value & BIT(16)) &&
-		       !(value & ~(BIT(16) | GENMASK(10, 8) | BIT(4) | BIT(0))) &&
+		return !(value & ~(BIT(16) | GENMASK(10, 8) | BIT(4) | BIT(0))) &&
 		       ((value >> 8) & 7) <= 4 &&
 		       (!(value & 0xff) || (value & 0xff) == 0x11);
 	case 0x1dfc:
