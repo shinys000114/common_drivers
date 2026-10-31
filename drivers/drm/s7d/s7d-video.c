@@ -36,8 +36,9 @@ int s7d_video_build_state(struct drm_framebuffer *fb, const struct drm_rect *src
 		cpp = 2;
 		break;
 	case DRM_FORMAT_VUY888:
+	case DRM_FORMAT_XVYU2101010:
 		planes = 1;
-		cpp = 3;
+		cpp = fb->format->cpp[0];
 		full_chroma = true;
 		break;
 	default:

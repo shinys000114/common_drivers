@@ -79,6 +79,7 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 		[S7D_CSC_INPUT_YCBCR] = {0, 1, 2},
 		[S7D_CSC_INPUT_YCRCB] = {0, 2, 1},
 		[S7D_CSC_INPUT_CRCBY] = {2, 1, 0},
+		[S7D_CSC_INPUT_CBCRY] = {1, 2, 0},
 	};
 	struct s7d_csc_state next;
 	const s16 (*coeff)[3];
@@ -87,7 +88,7 @@ int s7d_csc_build_state(enum drm_color_encoding encoding,
 	unsigned int i;
 	int pre[3] = {0, -512, -512};
 
-	if (!state || (unsigned int)input_order > S7D_CSC_INPUT_CRCBY)
+	if (!state || (unsigned int)input_order > S7D_CSC_INPUT_CBCRY)
 		return -EINVAL;
 	switch (encoding) {
 	case DRM_COLOR_YCBCR_BT601:
