@@ -963,6 +963,19 @@ static int s7d_vpu_stop_hw(void *data)
 	ret = vpu_update(v, VD1_PATH, VD1_PATH_AFBC, 0);
 	if (ret)
 		return ret;
+	/*
+	 * A decode can leave the FBC decoder unable to deliver a complete frame
+	 * until it is reset (writeback then waits forever); VD1 has drained.
+	 */
+	if (v->vd1_fbc) {
+		ret = reset_control_bulk_assert(ARRAY_SIZE(v->vd1_fbc_resets),
+						v->vd1_fbc_resets);
+		if (!ret)
+			ret = reset_control_bulk_deassert(ARRAY_SIZE(v->vd1_fbc_resets),
+							  v->vd1_fbc_resets);
+		if (ret)
+			return ret;
+	}
 	v->vd1_fbc = false;
 	for (i = 0; i < ARRAY_SIZE(osds); i++) {
 		/*
@@ -2361,9 +2374,13 @@ static int s7d_vpu_local_resets_init(struct s7d_vpu *v)
 	v->local_resets[3].id = "afbc-arbiter-logic";
 	ret = devm_reset_control_bulk_get_exclusive(v->dev,
 		ARRAY_SIZE(v->local_resets), v->local_resets);
-	if (!ret)
-		v->afbc_available = true;
-	return ret;
+	if (ret)
+		return ret;
+	v->afbc_available = true;
+	v->vd1_fbc_resets[0].id = "vd1-afbc";
+	v->vd1_fbc_resets[1].id = "vd1-lbuf";
+	return devm_reset_control_bulk_get_optional_exclusive(v->dev,
+		ARRAY_SIZE(v->vd1_fbc_resets), v->vd1_fbc_resets);
 }
 
 int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,

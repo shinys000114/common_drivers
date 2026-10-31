@@ -594,10 +594,12 @@
 			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBC_ARBITER_REGS>,
 			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBC_ARBITER_LOGIC>,
 			 <&c5_vpu_local_reset S7D_VPU_RESET_VDIN1>,
-			 <&c5_vpu_local_reset S7D_VPU_RESET_WRMIF1>;
+			 <&c5_vpu_local_reset S7D_VPU_RESET_WRMIF1>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_VD1_AFBC>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_VD1_LBUF>;
 		reset-names = "viu", "venc", "vencp", "rdma", "afbc-regs",
 			      "afbc-logic", "afbc-arbiter-regs", "afbc-arbiter-logic",
-			      "vdin1", "wrmif1";
+			      "vdin1", "wrmif1", "vd1-afbc", "vd1-lbuf";
 		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
 		/* Retain the firmware reservation; the driver does not free this RAM. */
 		memory-region = <&c5_display_cma>, <&logo_reserved>;
