@@ -292,7 +292,8 @@ int s7d_av1_admit_sequence(const struct s7d_av1_sequence *sequence)
 	    sequence->max_frame_width > 4096 ||
 	    sequence->max_frame_height > 2304 ||
 	    (sequence->op[0].idc && sequence->op[0].idc != 0x101) ||
-	    (sequence->op[0].level_idx > 13 && sequence->op[0].level_idx != 31))
+	    /* 4096x2304 exceeds every level up to 5.3; 6.0 is the first to hold it. */
+	    (sequence->op[0].level_idx > 16 && sequence->op[0].level_idx != 31))
 		return -EOPNOTSUPP;
 	return 0;
 }
