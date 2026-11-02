@@ -444,7 +444,7 @@ static int get_irqs(struct kbase_device *kbdev, struct platform_device *pdev)
 		 * first then try using Lower case names. If both attempts fail then
 		 * we assume there is no IRQ resource specified for the GPU.
 		 */
-		irq = platform_get_irq_byname(pdev, irq_names_caps[i]);
+		irq = platform_get_irq_byname_optional(pdev, irq_names_caps[i]);
 		if (irq < 0) {
 			static const char *const irq_names[] = { "job", "mmu", "gpu" };
 
