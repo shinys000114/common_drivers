@@ -538,7 +538,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 	}
 	job->decode = !!decode_result;
 	job->timestamp_ns = timestamp_ns;
-	job->source = kmemdup(data, bytes, GFP_KERNEL);
+	job->source = kvmemdup(data, bytes, GFP_KERNEL);
 	if (!job->source) {
 		ret = -ENOMEM;
 		goto unlock;
@@ -633,7 +633,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 	ret = s7d_av1_dma_context_stage(runner->context, job->source, bytes, lease_epoch,
 				       input_token, &job->input);
 	job->staged = !ret;
-	kfree(job->source);
+	kvfree(job->source);
 	job->source = NULL;
 	if (!ret)
 		ret = runner_preload(runner, job);
@@ -774,18 +774,18 @@ stop:
 	spin_unlock_irqrestore(&runner->irq_lock, flags);
 	runner->failure = ret;
 	mutex_unlock(&runner->control);
-	kfree(job->source);
+	kvfree(job->source);
 	kfree(job);
 	return ret;
 retained:
 	runner->failure = ret;
 	mutex_unlock(&runner->control);
-	kfree(job->source);
+	kvfree(job->source);
 	job->source = NULL;
 	return ret;
 unlock:
 	mutex_unlock(&runner->control);
-	kfree(job->source);
+	kvfree(job->source);
 	kfree(job);
 	return ret;
 }

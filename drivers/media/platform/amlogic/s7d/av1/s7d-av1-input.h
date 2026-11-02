@@ -6,7 +6,7 @@
 
 #include <linux/types.h>
 
-#define S7D_AV1_INPUT_MAX_BYTES (4U * 1024U * 1024U)
+#define S7D_AV1_INPUT_MAX_BYTES (8U * 1024U * 1024U)
 #define S7D_AV1_AMLV_BYTES 20U
 #define S7D_AV1_TU_MAX_PICTURES 16U
 

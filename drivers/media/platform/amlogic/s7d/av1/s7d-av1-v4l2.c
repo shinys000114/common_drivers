@@ -18,8 +18,10 @@
 #include "../common/s7d-codec-dos.h"
 #include "../common/s7d-v4l2-device.h"
 
-#define AV1_INPUT_BYTES SZ_2M
-#define AV1_STAGING_BYTES (AV1_INPUT_BYTES * 11U)
+/* A UHD key TU can exceed 6 MiB. */
+#define AV1_INPUT_BYTES SZ_8M
+/* Each staged OBU gains a 20-byte record header: room for 52k OBUs per TU. */
+#define AV1_STAGING_BYTES (AV1_INPUT_BYTES + SZ_1M)
 
 /* The S7D HEVC core decodes AV1 up to UHD, as the vendor driver allows. */
 #define AV1_MAX_WIDTH		4096
