@@ -57,7 +57,7 @@
 		interrupts = <GIC_SPI 144 IRQ_TYPE_LEVEL_HIGH>,
 			     <GIC_SPI 145 IRQ_TYPE_LEVEL_HIGH>,
 			     <GIC_SPI 146 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "GPU", "MMU", "JOB";
+		interrupt-names = "gpu", "mmu", "job";
 		clocks = <&clkc CLKID_MALI>, <&clkc CLKID_MALI_STACK>;
 		clock-names = "core", "stacks";
 		assigned-clocks = <&clkc CLKID_MALI>, <&clkc CLKID_MALI_STACK>;
