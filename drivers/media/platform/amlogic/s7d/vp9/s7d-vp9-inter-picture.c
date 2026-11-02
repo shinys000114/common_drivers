@@ -93,17 +93,24 @@ static bool overlaps_workspace(const struct s7d_vp9_workspace *ws,
 	       overlaps(region, &ws->mmu_map);
 }
 
-/* A surface's memory: NV12 Y and UV, then its FBC header and body, if any. */
+/*
+ * A surface's memory: NV12 Y and UV (none if fbc_only), then its FBC header
+ * and body, if any.
+ */
 static u32 surface_regions(const struct s7d_vp9_hw_surface *s, bool compressed,
 			   struct s7d_vp9_region region[4])
 {
-	region[0] = s->plane[0];
-	region[1] = s->plane[1];
-	if (!compressed || !s->header.bytes)
-		return 2;
-	region[2] = s->header;
-	region[3] = s->body;
-	return 4;
+	u32 parts = 0;
+
+	if (!s->fbc_only) {
+		region[parts++] = s->plane[0];
+		region[parts++] = s->plane[1];
+	}
+	if (compressed && s->header.bytes) {
+		region[parts++] = s->header;
+		region[parts++] = s->body;
+	}
+	return parts;
 }
 
 int s7d_vp9_compressed_mv_size(u32 width, u32 height, u32 *bytes)
@@ -230,7 +237,8 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 	struct s7d_vp9_region mine[4], theirs[4];
 	const struct s7d_vp9_header_prefix *h;
 	const struct s7d_codec_layout *l;
-	u32 i, j, a, b, end, parts, other_parts, scatter, body;
+	const struct s7d_vp9_hw_surface *target;
+	u32 i, j, a, b, end, parts, other_parts, scatter, body, nv12;
 	int ret;
 
 	if (!f || !plan || !f->header || !f->rpm || !f->layout || !f->surface)
@@ -272,14 +280,19 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 			continue;
 		if (s->width != h->width || s->height != h->height)
 			return -EOPNOTSUPP;
+		/* Without NV12 a surface is its own FBC, written compressed only. */
+		if (s->fbc_only && (!f->compressed || !s->header.bytes))
+			return -EINVAL;
 		/* Header and body 4 KiB aligned: ANC2AXI and the MMU map pages. */
 		if (f->compressed && s->header.bytes &&
 		    (!IS_ALIGNED(s->header.address, 4096) || s->header.bytes < scatter ||
 		     !IS_ALIGNED(s->body.address, 4096) || s->body.bytes < body))
 			return -EINVAL;
 		parts = surface_regions(s, f->compressed, mine);
+		nv12 = s->fbc_only ? 0 : 2;
 		for (a = 0; a < parts; a++) {
-			if (region_valid(&mine[a], a < 2 ? l->size[a] : 1, a < 2 ? 32 : 4096) ||
+			if (region_valid(&mine[a], a < nv12 ? l->size[a] : 1,
+					 a < nv12 ? 32 : 4096) ||
 			    overlaps_workspace(f->workspace, &mine[a]) ||
 			    overlaps(&mine[a], &f->current_mv) ||
 			    (!h->keyframe && !h->intra_only &&
@@ -352,23 +365,28 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 	next.picture.size = (h->height << 16) | h->width;
 	next.picture.body_bytes = s7d_vp9_fbc_body_bytes(h->width, h->height, h->bit_depth);
 	next.picture.header_bytes = s7d_vp9_fbc_header_bytes(h->width, h->height);
+	target = &f->surface[f->current_physical];
 	/*
 	 * Linear, little-endian NV12, 64-byte lines; [0] disables the compressed
-	 * output, which the MMU mode writes alongside the double write.
+	 * output, which the MMU mode writes alongside the double write. Without
+	 * NV12 (AM08F/AM10F), as vendor vvp9.c config_sao_hw for double_write_mode
+	 * 0: [1] disables the double write, DBLK_CFGB [9:8] = 1 keeps only the
+	 * first (compressed) write, and the double write starts at 0xffffffff.
 	 */
-	next.picture.sao_ctrl1 = (2 << 14) | 0xff0 | (f->compressed ? 0 : 1);
+	next.picture.sao_ctrl1 = (2 << 14) | 0xff0 | (f->compressed ? 0 : 1) |
+		(target->fbc_only ? BIT(1) : 0);
 	next.picture.ipp_axiif = (2 << 8) | 0xf;
 	/* [8] compressed write, [9] double write. */
-	next.picture.dblk_cfgb = (f->compressed ? 0xff01 : 0xfe01) |
+	next.picture.dblk_cfgb = (!f->compressed ? 0xfe01 : target->fbc_only ? 0xfd01 : 0xff01) |
 		(h->width >= 1280 ? BIT(4) : 0);
 	filter_plan(f->rpm, &next.picture);
 	next.physical_count = f->physical_count;
-	next.current_y = f->surface[f->current_physical].plane[0].address;
-	next.current_uv = f->surface[f->current_physical].plane[1].address;
-	next.current_header = f->surface[f->current_physical].header.address;
+	next.current_y = target->fbc_only ? U32_MAX : target->plane[0].address;
+	next.current_uv = target->fbc_only ? U32_MAX : target->plane[1].address;
+	next.current_header = target->header.address;
 	next.compressed = f->compressed;
-	next.y_bytes = l->size[0];
-	next.uv_bytes = l->size[1];
+	next.y_bytes = target->fbc_only ? 0 : l->size[0];
+	next.uv_bytes = target->fbc_only ? 0 : l->size[1];
 	next.mv_above = f->workspace->part[S7D_VP9_MPRED_ABOVE].address;
 	next.current_mv = f->current_mv.address;
 	next.previous_mv = f->previous_mv.address;

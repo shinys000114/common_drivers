@@ -46,24 +46,31 @@ static bool protocol_overlap(const struct s7d_vp9_region *a,
 	       (u64)b->address < (u64)a->address + a->bytes;
 }
 
-/* A surface's memory: NV12 Y and UV, then its FBC header and body, if any. */
+/*
+ * A surface's memory: NV12 Y and UV (none if fbc_only), then its FBC header
+ * and body, if any.
+ */
 static u32 protocol_regions(const struct s7d_vp9_hw_surface *s, bool compressed,
 			    struct s7d_vp9_region region[4])
 {
-	region[0] = s->plane[0];
-	region[1] = s->plane[1];
-	if (!compressed || !s->header.bytes)
-		return 2;
-	region[2] = s->header;
-	region[3] = s->body;
-	return 4;
+	u32 parts = 0;
+
+	if (!s->fbc_only) {
+		region[parts++] = s->plane[0];
+		region[parts++] = s->plane[1];
+	}
+	if (compressed && s->header.bytes) {
+		region[parts++] = s->header;
+		region[parts++] = s->body;
+	}
+	return parts;
 }
 
 static int protocol_validate(const struct s7d_vp9_protocol_frame *f)
 {
 	struct s7d_vp9_region mine[4], theirs[4];
 	const struct s7d_codec_layout *l;
-	u32 i, j, a, b, unused, parts, other_parts;
+	u32 i, j, a, b, unused, parts, other_parts, nv12;
 	int ret;
 
 	if (!f || !f->layout || !f->surface || !f->physical_count ||
@@ -98,12 +105,16 @@ static int protocol_validate(const struct s7d_vp9_protocol_frame *f)
 			continue;
 		if (s->width != l->coded_width || s->height != l->coded_height)
 			return -EOPNOTSUPP;
+		/* Without NV12 a surface is its own FBC, written compressed only. */
+		if (s->fbc_only && (!f->compressed || !s->header.bytes))
+			return -EINVAL;
 		parts = protocol_regions(s, f->compressed, mine);
+		nv12 = s->fbc_only ? 0 : 2;
 		for (a = 0; a < parts; a++) {
 			const struct s7d_vp9_region *p = &mine[a];
 
-			if (!p->address || !IS_ALIGNED(p->address, a < 2 ? 32 : 4096) ||
-			    p->bytes < (a < 2 ? l->size[a] : 1) ||
+			if (!p->address || !IS_ALIGNED(p->address, a < nv12 ? 32 : 4096) ||
+			    p->bytes < (a < nv12 ? l->size[a] : 1) ||
 			    (u64)p->address + p->bytes > (1ULL << 32) ||
 			    protocol_overlap(p, &f->workspace->backing) ||
 			    protocol_overlap(p, &f->workspace->rpm) ||

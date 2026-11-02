@@ -35,6 +35,8 @@ struct s7d_hevc_picture_buffers {
 	const struct s7d_hevc_dma_region *mv;
 	/* MMU firmware: FBC references, NV12 by double write; else linear DW 0x10. */
 	bool compressed;
+	/* Compressed only: no NV12 double write, surface address/bytes zero (AM08F/AM10F). */
+	bool fbc_only;
 };
 
 /* Bytes the hardware writes per picture in FBC (vendor compute_losless_comp_*). */

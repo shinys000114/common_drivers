@@ -75,7 +75,7 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 	/*
 	 * Scatter header: 32 bytes per 32x32 block. Double write: NV12 at a
 	 * 64-aligned pitch over a 64-aligned height, as the vendor's CAPTURE
-	 * buffers.
+	 * buffers; a slot with caller FBC (not scattered) may have none.
 	 */
 	header_bytes = DIV_ROUND_UP(input->sequence->max_frame_width, 32) *
 		DIV_ROUND_UP(input->sequence->max_frame_height, 32) * 32;
@@ -87,18 +87,21 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 		return -EINVAL;
 	for (i = 0; i < input->backing_count; i++) {
 		const struct s7d_av1_reference_backing *slot = &input->backing[i];
+		bool nv12;
 
 		if (!slot->id.backing_cookie)
 			continue;
+		nv12 = slot->scattered || slot->luma.address || slot->luma.bytes ||
+		       slot->chroma.address || slot->chroma.bytes;
 		if (slot->id.slot != i ||
 		    /* A scattered body is mapped page by page for its own picture. */
 		    (slot->scattered ? slot->body.address || slot->body.bytes :
 		     !region_valid(&slot->body, SZ_4K, layout.body_allocation)) ||
 		    !region_valid(&slot->header, 32, header_bytes) ||
 		    !region_valid(&slot->mv, SZ_64K, layout.mv_allocation) ||
-		    !region_valid(&slot->luma, 64, luma_bytes) ||
-		    !region_valid(&slot->chroma, 64, luma_bytes / 2) ||
-		    !IS_ALIGNED(slot->luma.bytes, 64) ||
+		    (nv12 && (!region_valid(&slot->luma, 64, luma_bytes) ||
+			      !region_valid(&slot->chroma, 64, luma_bytes / 2) ||
+			      !IS_ALIGNED(slot->luma.bytes, 64))) ||
 		    slot->cdf.address != ws->part[S7D_AV1_CDF].address + i * CDF_BANK_BYTES ||
 		    slot->cdf.bytes != CDF_BANK_BYTES ||
 		    slot->segment_map.address != ws->part[S7D_AV1_SEGMENT_MAP].address +
@@ -355,7 +358,10 @@ int s7d_av1_picture_plan(const struct s7d_av1_picture_input *input,
 	next.header_bytes = layout.header_bytes;
 	next.lcu_total = DIV_ROUND_UP(dpb->current_picture.width, superblock) *
 		DIV_ROUND_UP(dpb->current_picture.height, superblock);
-	/* Plane lengths are those of the picture's own memory, not recomputed. */
+	/*
+	 * Plane lengths are those of the picture's own memory, not recomputed;
+	 * all zero for a picture without NV12.
+	 */
 	next.y_bytes = picture->luma.bytes;
 	next.uv_bytes = picture->chroma.bytes;
 	next.y_address = picture->luma.address;
@@ -530,6 +536,15 @@ static int program_output(struct regmap *map,
 			  const struct s7d_av1_hw_picture_plan *plan)
 {
 	const struct s7d_av1_dpb_picture *picture = &input->dpb->current_picture;
+	/*
+	 * Without NV12 the picture is written compressed only, as vendor
+	 * config_sao_hw for double_write_mode 0 (vav1.c): SAO_CTRL1 [1] dw_disable
+	 * and DBLK_CFGB [9:8] = 1, first (compressed) write only. Its double write
+	 * addresses then point nowhere, as vvp9.c config_sao_hw, with no lengths.
+	 */
+	bool double_write = plan->y_bytes;
+	u32 y = double_write ? plan->y_address : U32_MAX;
+	u32 uv = double_write ? plan->uv_address : U32_MAX;
 	const struct reg_sequence registers[] = {
 		{ HREG(0x3123), (picture->height << 16) | picture->width },
 		{ HREG(0x300d), (picture->height << 16) | picture->width },
@@ -544,12 +559,12 @@ static int program_output(struct regmap *map,
 		{ HREG(0x3628), plan->header_address },
 		{ HREG(0x3666), plan->grain_table },
 		{ HREG(0x3667), GRAIN_BANK_BYTES * 8 },
-		{ HREG(0x360b), plan->y_address },
+		{ HREG(0x360b), y },
 		{ HREG(0x360c), plan->y_bytes },
-		{ HREG(0x360d), plan->uv_address },
+		{ HREG(0x360d), uv },
 		{ HREG(0x360e), plan->uv_bytes },
-		{ HREG(0x360f), plan->y_address },
-		{ HREG(0x3610), plan->uv_address },
+		{ HREG(0x360f), y },
+		{ HREG(0x3610), uv },
 		{ HREG(0x3677), 0 },
 	};
 	int ret;
@@ -564,14 +579,15 @@ static int program_output(struct regmap *map,
 			(picture->bit_depth == 8 ? BIT(9) : 0) | BIT(10) | BIT(14));
 	if (!ret)
 		ret = regmap_update_bits(map, HREG(0x3602), GENMASK(15, 4) | GENMASK(1, 0),
-			0xff0 | BIT(15));
+			0xff0 | BIT(15) | (double_write ? 0 : BIT(1)));
 	if (!ret)
 		ret = regmap_update_bits(map, HREG(0x3621), BIT(1), 0);
 	if (!ret)
 		ret = regmap_update_bits(map, HREG(0x340b), GENMASK(5, 0) |
 			GENMASK(9, 8) | BIT(12), 0xf | BIT(9));
 	if (!ret)
-		ret = regmap_update_bits(map, HREG(0x350b), GENMASK(9, 8), GENMASK(9, 8));
+		ret = regmap_update_bits(map, HREG(0x350b), GENMASK(9, 8),
+					 double_write ? GENMASK(9, 8) : BIT(8));
 	return ret;
 }
 

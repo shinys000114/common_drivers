@@ -58,7 +58,8 @@ struct s7d_av1_reference_picture {
 
 /*
  * The caller memory (a CAPTURE buffer) a decoded picture is written to: its
- * NV12 double write, and with AM08C/AM10C (fbc) its FBC header and body too.
+ * NV12 double write, and with AM08C/AM10C (fbc) its FBC header and body too;
+ * with AM08F/AM10F (fbc, luma and chroma empty) only the header and body.
  * Otherwise the slot keeps the FBC header (coherent) and body (scattered
  * system pages, only those the picture used once it is decoded) itself; the
  * MV always stays with the slot.

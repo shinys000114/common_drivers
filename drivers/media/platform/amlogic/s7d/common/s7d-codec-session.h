@@ -48,6 +48,11 @@ struct s7d_codec_surface_request {
 	 * backend's hardware writes (AV1 AM08C/AM10C FBC).
 	 */
 	size_t prefix;
+	/*
+	 * Contiguous, no prefix: the two planes are an FBC header and its body
+	 * (AM08F/AM10F), not NV12; no NV12 copy reaches such a surface.
+	 */
+	bool fbc_only;
 };
 
 /* Retained by value with each picture when its OUTPUT buffer is recycled. */
@@ -109,6 +114,8 @@ int s7d_codec_surface_pin(struct s7d_codec_session *session,
 			  struct s7d_codec_surface **out);
 int s7d_codec_surface_dma(struct s7d_codec_surface *surface, unsigned int plane,
 			  dma_addr_t *addr, size_t *size);
+/* The surface holds FBC header and body as its planes (request.fbc_only). */
+bool s7d_codec_surface_fbc_only(const struct s7d_codec_surface *surface);
 /* Start of dmabuf[0] and the prefix length; zero length without a prefix. */
 int s7d_codec_surface_prefix(struct s7d_codec_surface *surface,
 			     dma_addr_t *addr, size_t *size);
@@ -128,7 +135,10 @@ int s7d_codec_surface_copy(struct s7d_codec_surface *dst, u64 dst_token,
 int s7d_codec_surface_copy_all(struct s7d_codec_surface *dst, u64 dst_token,
 			       struct s7d_codec_surface *src, u64 src_token,
 			       const size_t bytes[2], bool (*cancelled)(void *priv), void *priv);
-/* CPU view of the prefix of a write-pinned, DPB-held surface (coherent CAPTURE). */
+/*
+ * CPU view of the prefix (or, fbc_only, the header plane) of a write-pinned,
+ * DPB-held surface (coherent CAPTURE).
+ */
 int s7d_codec_surface_prefix_cpu(struct s7d_codec_surface *surface, u64 token, void **cpu);
 /*
  * A displayed surface still held by the DPB that the client queued again: hand

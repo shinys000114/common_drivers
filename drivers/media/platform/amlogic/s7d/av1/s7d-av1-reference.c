@@ -180,6 +180,7 @@ static bool memory_overlap(const struct s7d_av1_region *a, const struct s7d_av1_
  * What the hardware needs of a picture's own memory: NV12 with a 64-aligned
  * pitch over a 64-aligned height (the vendor CAPTURE layout), and with fbc the
  * scatter header for every 32x32 block and the body the MMU maps page by page.
+ * With fbc the NV12 may be absent (AM08F/AM10F): the picture is FBC only.
  */
 static int memory_validate(const struct s7d_av1_references *references,
 			   const struct s7d_av1_slot_memory *memory, u32 slot)
@@ -190,11 +191,13 @@ static int memory_validate(const struct s7d_av1_references *references,
 	const struct s7d_av1_region *region[] = {
 		&memory->header, &memory->body, &memory->luma, &memory->chroma,
 	};
+	bool nv12 = !references->fbc || memory->luma.address || memory->luma.bytes ||
+		    memory->chroma.address || memory->chroma.bytes;
 	u32 i, j;
 
-	if (!memory->cookie || !memory_region(&memory->luma, 64, luma) ||
-	    !memory_region(&memory->chroma, 64, luma / 2) ||
-	    !IS_ALIGNED(memory->luma.bytes, 64))
+	if (!memory->cookie || (nv12 && (!memory_region(&memory->luma, 64, luma) ||
+					 !memory_region(&memory->chroma, 64, luma / 2) ||
+					 !IS_ALIGNED(memory->luma.bytes, 64))))
 		return -EINVAL;
 	if (references->fbc ?
 	    !memory_region(&memory->header, 32, header) ||

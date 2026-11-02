@@ -31,6 +31,8 @@ enum s7d_capture_mode {
 	S7D_CAPTURE_SINGLE,	/* NV12/NV21 in one buffer */
 	S7D_CAPTURE_AM08C,	/* 8-bit FBC header and body, then NV12, in one buffer */
 	S7D_CAPTURE_AM10C,	/* 10-bit FBC header and body, then NV12, in one buffer */
+	S7D_CAPTURE_AM08F,	/* 8-bit FBC header and body only, in one buffer */
+	S7D_CAPTURE_AM10F,	/* 10-bit FBC header and body only, in one buffer */
 };
 
 enum s7d_v4l2_state {
@@ -162,6 +164,10 @@ static enum s7d_capture_mode s7d_fourcc_mode(const struct s7d_v4l2_codec *codec,
 		return codec->fbc ? S7D_CAPTURE_AM08C : S7D_CAPTURE_MPLANE;
 	if (fourcc == V4L2_PIX_FMT_AM10C)
 		return codec->fbc ? S7D_CAPTURE_AM10C : S7D_CAPTURE_MPLANE;
+	if (fourcc == V4L2_PIX_FMT_AM08F)
+		return codec->fbc ? S7D_CAPTURE_AM08F : S7D_CAPTURE_MPLANE;
+	if (fourcc == V4L2_PIX_FMT_AM10F)
+		return codec->fbc ? S7D_CAPTURE_AM10F : S7D_CAPTURE_MPLANE;
 	return s7d_contiguous_fourcc(fourcc) ? S7D_CAPTURE_SINGLE : S7D_CAPTURE_MPLANE;
 }
 
@@ -175,15 +181,24 @@ static u32 s7d_layout_depth(const struct s7d_codec_layout *layout)
 static enum s7d_capture_mode s7d_layout_mode(enum s7d_capture_mode mode,
 					     const struct s7d_codec_layout *layout)
 {
-	if ((mode == S7D_CAPTURE_AM08C && s7d_layout_depth(layout) != 8) ||
-	    (mode == S7D_CAPTURE_AM10C && s7d_layout_depth(layout) != 10))
+	u32 depth = s7d_layout_depth(layout);
+
+	if (((mode == S7D_CAPTURE_AM08C || mode == S7D_CAPTURE_AM08F) && depth != 8) ||
+	    ((mode == S7D_CAPTURE_AM10C || mode == S7D_CAPTURE_AM10F) && depth != 10))
 		return S7D_CAPTURE_SINGLE;
 	return mode;
 }
 
+/* AM08F/AM10F: FBC header and body, no NV12 copy. */
+static bool s7d_fbc_only_mode(enum s7d_capture_mode mode)
+{
+	return mode == S7D_CAPTURE_AM08F || mode == S7D_CAPTURE_AM10F;
+}
+
 static bool s7d_fbc_mode(enum s7d_capture_mode mode)
 {
-	return mode == S7D_CAPTURE_AM08C || mode == S7D_CAPTURE_AM10C;
+	return mode == S7D_CAPTURE_AM08C || mode == S7D_CAPTURE_AM10C ||
+	       s7d_fbc_only_mode(mode);
 }
 
 /* Single-buffer NV12 puts chroma at bytesperline * height, right after luma. */
@@ -192,7 +207,7 @@ static bool s7d_layout_contiguous(const struct s7d_codec_layout *layout)
 	return (u64)layout->pitch[0] * layout->storage_height == layout->size[0];
 }
 
-/* The chosen CAPTURE format is AM08C/AM10C; s7d_capture_format()'s rules. */
+/* The chosen CAPTURE format is an FBC one; s7d_capture_format()'s rules. */
 static bool s7d_layout_fbc(enum s7d_capture_mode mode, const struct s7d_codec_layout *layout)
 {
 	return s7d_fbc_mode(s7d_layout_mode(mode, layout)) && s7d_layout_contiguous(layout) &&
@@ -210,7 +225,10 @@ static u32 s7d_capture_minimum(const struct s7d_v4l2_context *ctx,
 	return minimum;
 }
 
-/* AM08C/AM10C: FBC bytes in front of the NV12 copy, from the reported width/height. */
+/*
+ * FBC header and body bytes from the reported width/height: in front of the
+ * NV12 copy (AM08C/AM10C), or all of the buffer (AM08F/AM10F).
+ */
 static u32 s7d_fbc_prefix(const struct s7d_codec_layout *layout)
 {
 	return s7d_amfbc_nv12_offset(layout->coded_width, layout->storage_height,
@@ -225,12 +243,21 @@ static u32 s7d_capture_prefix(const struct s7d_v4l2_context *ctx, struct vb2_buf
 		s7d_fbc_prefix(layout) : 0;
 }
 
+/* A single-plane AM08F/AM10F buffer: FBC header and body, nothing else. */
+static bool s7d_capture_fbc_only(const struct s7d_v4l2_context *ctx, struct vb2_buffer *vb,
+				 const struct s7d_codec_layout *layout)
+{
+	return vb->num_planes == 1 &&
+	       s7d_fbc_only_mode(s7d_layout_mode(ctx->capture_mode, layout));
+}
+
 static bool s7d_capture_fits(struct vb2_buffer *vb, const struct s7d_codec_layout *layout,
-			     u32 prefix)
+			     u32 prefix, bool fbc_only)
 {
 	if (vb->num_planes == 1)
 		return s7d_layout_contiguous(layout) &&
-		       vb2_plane_size(vb, 0) >= (u64)prefix + layout->size[0] + layout->size[1];
+		       vb2_plane_size(vb, 0) >= (u64)prefix +
+			(fbc_only ? 0 : (u64)layout->size[0] + layout->size[1]);
 	return vb->num_planes == 2 && vb2_plane_size(vb, 0) >= layout->size[0] &&
 	       vb2_plane_size(vb, 1) >= layout->size[1];
 }
@@ -282,9 +309,19 @@ static void s7d_capture_format(const struct s7d_codec_layout *layout,
 		format->plane_fmt[0].bytesperline = layout->pitch[0];
 		format->plane_fmt[0].sizeimage = layout->size[0] + layout->size[1];
 		if (s7d_fbc_mode(mode) && !nv21) {
-			format->pixelformat = mode == S7D_CAPTURE_AM10C ?
-				V4L2_PIX_FMT_AM10C : V4L2_PIX_FMT_AM08C;
-			format->plane_fmt[0].sizeimage += s7d_fbc_prefix(layout);
+			static const u32 fourcc[] = {
+				[S7D_CAPTURE_AM08C] = V4L2_PIX_FMT_AM08C,
+				[S7D_CAPTURE_AM10C] = V4L2_PIX_FMT_AM10C,
+				[S7D_CAPTURE_AM08F] = V4L2_PIX_FMT_AM08F,
+				[S7D_CAPTURE_AM10F] = V4L2_PIX_FMT_AM10F,
+			};
+
+			format->pixelformat = fourcc[mode];
+			/* AM08F/AM10F: the FBC alone; bytesperline keeps the NV12 pitch. */
+			if (s7d_fbc_only_mode(mode))
+				format->plane_fmt[0].sizeimage = s7d_fbc_prefix(layout);
+			else
+				format->plane_fmt[0].sizeimage += s7d_fbc_prefix(layout);
 		}
 		return;
 	}
@@ -351,6 +388,9 @@ int s7d_v4l2_validate_capture_pool(const struct s7d_codec_layout *layout,
 			if (buffers[i].surface == buffers[j].surface ||
 			    buffers[i].surface_id == buffers[j].surface_id)
 				return -EINVAL;
+		/* AM08F/AM10F planes are FBC; s7d_v4l2_fbc_capture_pool() checks them. */
+		if (s7d_codec_surface_fbc_only(buffers[i].surface))
+			continue;
 		for (j = 0; j < 2; j++) {
 			ret = s7d_codec_surface_dma(buffers[i].surface, j, &address, &bytes);
 			if (ret)
@@ -373,8 +413,8 @@ int s7d_v4l2_fbc_capture_pool(const struct s7d_codec_layout *layout,
 	u32 body = s7d_amfbc_body_size(layout->coded_width, layout->storage_height, depth);
 	u32 luma = layout->pitch[0] * layout->storage_height;
 	dma_addr_t base, plane[2];
-	size_t prefix, bytes;
-	unsigned int i, prefixed = 0;
+	size_t prefix, bytes[2];
+	unsigned int i, prefixed = 0, fbc_only = 0;
 	int ret;
 
 	*fbc = false;
@@ -383,21 +423,33 @@ int s7d_v4l2_fbc_capture_pool(const struct s7d_codec_layout *layout,
 		if (ret)
 			return ret;
 		prefixed += !!prefix;
+		fbc_only += s7d_codec_surface_fbc_only(buffers[i].surface);
 	}
-	if (!prefixed)
+	if (!prefixed && !fbc_only)
 		return 0;
-	if (prefixed != count)
+	if (prefixed + fbc_only != count || (prefixed && fbc_only))
 		return -EINVAL;
 	if ((u64)layout->pitch[0] * layout->storage_height != layout->size[0])
 		return -ERANGE;
 	for (i = 0; i < count; i++) {
 		ret = s7d_codec_surface_prefix(buffers[i].surface, &base, &prefix);
 		if (!ret)
-			ret = s7d_codec_surface_dma(buffers[i].surface, 0, &plane[0], &bytes);
+			ret = s7d_codec_surface_dma(buffers[i].surface, 0, &plane[0], &bytes[0]);
 		if (!ret)
-			ret = s7d_codec_surface_dma(buffers[i].surface, 1, &plane[1], &bytes);
+			ret = s7d_codec_surface_dma(buffers[i].surface, 1, &plane[1], &bytes[1]);
 		if (ret)
 			return ret;
+		if (fbc_only) {
+			/* AM08F/AM10F: the planes are the header, then its 4 KiB aligned body. */
+			if (bytes[0] != header || bytes[1] != body || !IS_ALIGNED(plane[0], SZ_4K) ||
+			    plane[1] != plane[0] + header || (u64)plane[1] + body > (1ULL << 32))
+				return -ERANGE;
+			regions[i] = (struct s7d_amfbc_buffer) {
+				.header = plane[0], .header_bytes = header,
+				.body = plane[1], .body_bytes = body,
+			};
+			continue;
+		}
 		/* Body at 4 KiB for the MMU, NV12 64-aligned, all below 4 GiB. */
 		if (prefix != (size_t)header + body || !IS_ALIGNED(base, SZ_4K) ||
 		    plane[0] != base + prefix || plane[1] != plane[0] + luma ||
@@ -411,6 +463,21 @@ int s7d_v4l2_fbc_capture_pool(const struct s7d_codec_layout *layout,
 	}
 	*fbc = true;
 	return 0;
+}
+
+void s7d_v4l2_fbc_frame_bytes(const struct s7d_codec_layout *layout,
+			      const struct s7d_amfbc_buffer *region,
+			      struct s7d_codec_frame *frame)
+{
+	if (s7d_amfbc_fbc_only(region)) {
+		frame->prefix_bytesused = 0;
+		frame->bytesused[0] = region->header_bytes;
+		frame->bytesused[1] = region->body_bytes;
+		return;
+	}
+	frame->prefix_bytesused = region->header_bytes + region->body_bytes;
+	frame->bytesused[0] = layout->size[0];
+	frame->bytesused[1] = layout->size[1];
 }
 
 static u32 s7d_capture_limit(const struct s7d_v4l2_codec *codec)
@@ -517,12 +584,13 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *form
 		/* FBC last: generic clients keep picking NV12M/NV12. */
 		static const u32 formats[] = {
 			V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_AM08C,
+			V4L2_PIX_FMT_AM08F,
 		};
 		struct s7d_codec_layout layout;
 		unsigned long flags;
 		bool valid;
 
-		if (format->index >= ARRAY_SIZE(formats) - !ctx->codec.fbc)
+		if (format->index >= ARRAY_SIZE(formats) - (ctx->codec.fbc ? 0 : 2))
 			return -EINVAL;
 		format->pixelformat = formats[format->index];
 		/* Once the stream is known, only the FBC format of its depth. */
@@ -530,9 +598,12 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *form
 		layout = s7d_query_layout(ctx);
 		valid = ctx->sequence_valid;
 		spin_unlock_irqrestore(&ctx->state_lock, flags);
-		if (format->pixelformat == V4L2_PIX_FMT_AM08C && valid &&
-		    s7d_layout_depth(&layout) == 10)
-			format->pixelformat = V4L2_PIX_FMT_AM10C;
+		if (valid && s7d_layout_depth(&layout) == 10) {
+			if (format->pixelformat == V4L2_PIX_FMT_AM08C)
+				format->pixelformat = V4L2_PIX_FMT_AM10C;
+			else if (format->pixelformat == V4L2_PIX_FMT_AM08F)
+				format->pixelformat = V4L2_PIX_FMT_AM10F;
+		}
 	}
 	format->flags = 0;
 	if (format->pixelformat == V4L2_PIX_FMT_AM08C)
@@ -540,6 +611,12 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *form
 			sizeof(format->description));
 	else if (format->pixelformat == V4L2_PIX_FMT_AM10C)
 		strscpy(format->description, "Amlogic FBC 10-bit + NV12",
+			sizeof(format->description));
+	else if (format->pixelformat == V4L2_PIX_FMT_AM08F)
+		strscpy(format->description, "Amlogic FBC 8-bit",
+			sizeof(format->description));
+	else if (format->pixelformat == V4L2_PIX_FMT_AM10F)
+		strscpy(format->description, "Amlogic FBC 10-bit",
 			sizeof(format->description));
 	return 0;
 }
@@ -1587,6 +1664,7 @@ static int s7d_pin_capture(struct s7d_v4l2_context *ctx, struct vb2_buffer *vb)
 	};
 	unsigned long flags;
 	unsigned int i;
+	bool fbc_only;
 	int ret;
 
 	lockdep_assert_held(&ctx->queue_lock);
@@ -1598,13 +1676,22 @@ static int s7d_pin_capture(struct s7d_v4l2_context *ctx, struct vb2_buffer *vb)
 	if (buffer->surface)
 		return buffer->generation == request.generation ? 0 : -EOPNOTSUPP;
 	request.prefix = s7d_capture_prefix(ctx, vb, &ctx->layout);
+	fbc_only = s7d_capture_fbc_only(ctx, vb, &ctx->layout);
 	/* The FBC body must start 4 KiB aligned; so does all that follows. */
 	if (request.prefix)
 		request.dma_alignment = SZ_4K;
-	if (!s7d_capture_fits(vb, &ctx->layout, request.prefix))
+	if (!s7d_capture_fits(vb, &ctx->layout, request.prefix, fbc_only))
 		return -EINVAL;
 	for (i = 0; i < 2; i++)
 		request.min_size[i] = ctx->layout.size[i];
+	/* AM08F/AM10F: plane 0 is the FBC header, plane 1 its body; no NV12. */
+	if (fbc_only) {
+		request.min_size[0] = s7d_amfbc_header_size(ctx->layout.coded_width,
+							    ctx->layout.storage_height);
+		request.min_size[1] = request.prefix - request.min_size[0];
+		request.prefix = 0;
+		request.fbc_only = true;
+	}
 	ret = s7d_codec_vb2_pin(ctx->session, vb, &request, &buffer->surface);
 	if (ret)
 		return ret;
@@ -1767,7 +1854,8 @@ static int s7d_reconfigure_start(struct s7d_v4l2_context *ctx)
 		vb = vb2_get_buffer(q, i);
 		if (!vb)
 			continue;
-		if (!s7d_capture_fits(vb, &layout, s7d_capture_prefix(ctx, vb, &layout)))
+		if (!s7d_capture_fits(vb, &layout, s7d_capture_prefix(ctx, vb, &layout),
+				      s7d_capture_fbc_only(ctx, vb, &layout)))
 			return -ENOBUFS;
 		count++;
 	}

@@ -145,6 +145,10 @@ struct s7d_hevc_decoder {
 	bool compressed;
 	/* AM08C/AM10C: FBC bytes in front of each CAPTURE buffer's NV12, else 0. */
 	u32 fbc_prefix;
+	/* AM08F/AM10F: compressed output only, no NV12 double write. */
+	bool fbc_only;
+	/* What each DQBUF reports beyond fbc_prefix: NV12, or FBC header and body. */
+	size_t frame_bytes[2];
 	struct s7d_hevc_engine *irq_engine;
 	u64 irq_binding;
 	int release_error;
@@ -380,7 +384,7 @@ static int hevc_emit(struct s7d_hevc_decoder *decoder, bool drain,
 			.timestamp_ns = out.metadata.timestamp_ns,
 			.timestamp_meta = out.metadata.timestamp_meta,
 			.sequence = decoder->output_sequence, .flags = out.flags,
-			.bytesused = { decoder->layout.size[0], decoder->layout.size[1] },
+			.bytesused = { decoder->frame_bytes[0], decoder->frame_bytes[1] },
 			/* AM08C/AM10C report the whole buffer: FBC, then NV12. */
 			.prefix_bytesused = decoder->fbc_prefix,
 		};
@@ -404,7 +408,7 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 {
 	struct s7d_hevc_picture_buffers buffers = {
 		.count = decoder->captures, .surface = decoder->surface, .mv = decoder->mv,
-		.compressed = decoder->compressed,
+		.compressed = decoder->compressed, .fbc_only = decoder->fbc_only,
 	};
 	u8 raw[S7D_HEVC_RPM_BYTES];
 	unsigned long flags;
@@ -934,6 +938,9 @@ static int hevc_validate_capture(const struct s7d_codec_layout *layout,
 			if (capture[i].surface == capture[j].surface ||
 			    capture[i].surface_id == capture[j].surface_id)
 				return -EINVAL;
+		/* AM08F/AM10F: no NV12; s7d_v4l2_fbc_capture_pool() takes the FBC. */
+		if (s7d_codec_surface_fbc_only(capture[i].surface))
+			continue;
 		for (j = 0; j < 2; j++) {
 			ret = s7d_codec_surface_dma(capture[i].surface, j, &address, &bytes);
 			if (ret)
@@ -958,6 +965,7 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 	struct s7d_amfbc_buffer fbc[S7D_HEVC_MAX_CAPTURE_BUFFERS];
 	struct s7d_hevc_dma_region header, body;
 	struct s7d_codec_layout checked;
+	struct s7d_codec_frame sizes = { };
 	unsigned long flags;
 	u32 i, fbc_header = 0, fbc_bytes = 0;
 	bool compressed, zero_copy = false;
@@ -1040,7 +1048,14 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 		}
 	}
 	decoder->compressed = compressed;
-	decoder->fbc_prefix = zero_copy ? fbc[0].header_bytes + fbc[0].body_bytes : 0;
+	decoder->fbc_only = zero_copy && s7d_amfbc_fbc_only(&fbc[0]);
+	sizes.bytesused[0] = layout->size[0];
+	sizes.bytesused[1] = layout->size[1];
+	if (zero_copy)
+		s7d_v4l2_fbc_frame_bytes(layout, &fbc[0], &sizes);
+	decoder->fbc_prefix = sizes.prefix_bytesused;
+	decoder->frame_bytes[0] = sizes.bytesused[0];
+	decoder->frame_bytes[1] = sizes.bytesused[1];
 	ret = s7d_hevc_engine_bind(decoder->irq_engine, session, decoder->epoch,
 				   &hevc_irq_ops, decoder, &decoder->irq_binding);
 	if (ret) {
@@ -1630,6 +1645,8 @@ int s7d_hevc_decoder_stream_close(struct s7d_hevc_decoder *decoder,
 	decoder->rps_set_id = 0;
 	decoder->compressed = false;
 	decoder->fbc_prefix = 0;
+	decoder->fbc_only = false;
+	memset(decoder->frame_bytes, 0, sizeof(decoder->frame_bytes));
 	memset(decoder->write_token, 0, sizeof(decoder->write_token));
 	ret = 0;
 out:

@@ -32,6 +32,7 @@ struct s7d_av1_hw_picture_plan {
 	u32 cache_canvas[2];
 	u32 body_bytes;
 	u32 header_bytes;
+	/* NV12 double write; all zero when the picture is FBC only (AM08F/AM10F). */
 	u32 y_address;
 	u32 uv_address;
 	u32 y_bytes;

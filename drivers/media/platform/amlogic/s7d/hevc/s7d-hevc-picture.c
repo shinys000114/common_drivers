@@ -385,6 +385,16 @@ static int hevc_picture_program(struct regmap *map,
 	const struct s7d_hevc_dma_region *read_mv = col_valid ?
 		&buffers->mv[refs->collocated.slot] : write_mv;
 	bool compressed = buffers->compressed;
+	/*
+	 * AM08F/AM10F: compressed output only, as vendor vh265.c config_sao_hw for
+	 * double_write_mode 0: SAO_CTRL1 [1] dw_disable, DBLK_CFGB [9:8] = 1 (first,
+	 * compressed write only), and the double write start left at 0xffffffff.
+	 */
+	bool double_write = !compressed || !buffers->fbc_only;
+	u32 y = double_write ? surface->address[0] : U32_MAX;
+	u32 uv = double_write ? surface->address[1] : U32_MAX;
+	u32 y_bytes = double_write ? layout->size[0] : 0;
+	u32 uv_bytes = double_write ? layout->size[1] : 0;
 	u32 body_bytes = s7d_hevc_fbc_body_bytes(geometry->coded_width,
 		geometry->coded_height, host->bit_depth_luma);
 	u32 slice_type = refs->slice_type;
@@ -594,14 +604,14 @@ static int hevc_picture_program(struct regmap *map,
 	}
 	{
 		const struct reg_sequence seq[] = {
-			{ HEVC_SAO_Y_START_ADDR, surface->address[0] },
-			{ HEVC_SAO_Y_LENGTH, layout->size[0] },
-			{ HEVC_SAO_C_START_ADDR, surface->address[1] },
-			{ HEVC_SAO_C_LENGTH, layout->size[1] },
-			{ HEVC_SAO_Y_WPTR, surface->address[0] },
-			{ HEVC_SAO_C_WPTR, surface->address[1] },
+			{ HEVC_SAO_Y_START_ADDR, y },
+			{ HEVC_SAO_Y_LENGTH, y_bytes },
+			{ HEVC_SAO_C_START_ADDR, uv },
+			{ HEVC_SAO_C_LENGTH, uv_bytes },
+			{ HEVC_SAO_Y_WPTR, y },
+			{ HEVC_SAO_C_WPTR, uv },
 			/* [8] compressed write, [9] double write. */
-			{ HEVC_DBLK_CFGB, (compressed ? 0xff00 : 0xfe00) |
+			{ HEVC_DBLK_CFGB, (!compressed ? 0xfe00 : double_write ? 0xff00 : 0xfd00) |
 				(geometry->coded_width >= 1280 ? BIT(4) : 0) },
 			{ HEVC_DBLK_CFG2, pic_size },
 			{ HEVC_DBLK_CFG1, dblk1 },
@@ -614,10 +624,11 @@ static int hevc_picture_program(struct regmap *map,
 		return ret;
 	/*
 	 * Linear, little-endian NV12, 64-byte lines; [0] disables the compressed
-	 * output, which MMU mode writes alongside the double write.
+	 * output, which MMU mode writes alongside the double write; [1] disables
+	 * the double write (AM08F/AM10F).
 	 */
 	ret = regmap_update_bits(map, HEVC_SAO_CTRL1, 0xfff3,
-				 compressed ? 0x8ff0 : 0x8ff1);
+				 !compressed ? 0x8ff1 : double_write ? 0x8ff0 : 0x8ff2);
 	if (ret)
 		return ret;
 	ret = regmap_update_bits(map, HEVCD_IPP_AXIIF_CONFIG,
@@ -636,17 +647,27 @@ static bool hevc_overlaps(u32 address, u32 bytes, u32 other, u32 other_bytes)
 	       (u64)other < (u64)address + bytes;
 }
 
-/* A surface's regions: NV12 Y and UV, then FBC header and body if compressed. */
+/*
+ * A surface's regions: NV12 Y and UV unless fbc_only, then FBC header and
+ * body if compressed.
+ */
 static u32 hevc_surface_regions(const struct s7d_hevc_surface *surface,
-				bool compressed, struct s7d_hevc_dma_region region[4])
+				const struct s7d_hevc_picture_buffers *buffers,
+				struct s7d_hevc_dma_region region[4])
 {
-	region[0] = (struct s7d_hevc_dma_region) { surface->address[0], surface->bytes[0] };
-	region[1] = (struct s7d_hevc_dma_region) { surface->address[1], surface->bytes[1] };
-	if (!compressed)
-		return 2;
-	region[2] = (struct s7d_hevc_dma_region) { surface->header, surface->header_bytes };
-	region[3] = (struct s7d_hevc_dma_region) { surface->body, surface->body_bytes };
-	return 4;
+	u32 parts = 0;
+
+	if (!buffers->fbc_only) {
+		region[parts++] = (struct s7d_hevc_dma_region) {
+			surface->address[0], surface->bytes[0] };
+		region[parts++] = (struct s7d_hevc_dma_region) {
+			surface->address[1], surface->bytes[1] };
+	}
+	if (!buffers->compressed)
+		return parts;
+	region[parts++] = (struct s7d_hevc_dma_region) { surface->header, surface->header_bytes };
+	region[parts++] = (struct s7d_hevc_dma_region) { surface->body, surface->body_bytes };
+	return parts;
 }
 
 static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
@@ -670,14 +691,16 @@ static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 	u32 header = hevc_fbc_scatter_bytes(geometry->coded_width, geometry->coded_height);
 	u32 body = ALIGN(s7d_hevc_fbc_body_bytes(geometry->coded_width,
 				geometry->coded_height, host->bit_depth_luma), 4096);
+	u32 nv12 = buffers->fbc_only ? 0 : 2;
 	u32 i, j, part, other, parts, other_parts;
 	int ret;
 
 	if (count < layout->min_capture_buffers ||
 	    count > S7D_HEVC_MAX_CAPTURE_BUFFERS)
 		return -EINVAL;
-	/* The linear path reads 8-bit references only. */
-	if (!buffers->compressed && host->bit_depth_luma != 8)
+	/* The linear path reads 8-bit references only; no NV12 means compressed. */
+	if ((!buffers->compressed && host->bit_depth_luma != 8) ||
+	    (buffers->fbc_only && !buffers->compressed))
 		return -EINVAL;
 	ret = hevc_workspace_check(ws, count * stride);
 	if (ret)
@@ -699,12 +722,12 @@ static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 		    (!IS_ALIGNED(surface->header, 4096) || surface->header_bytes < header ||
 		     !IS_ALIGNED(surface->body, 4096) || surface->body_bytes < body))
 			return -EINVAL;
-		parts = hevc_surface_regions(surface, buffers->compressed, mine);
+		parts = hevc_surface_regions(surface, buffers, mine);
 		for (part = 0; part < parts; part++) {
 			const struct s7d_hevc_dma_region *a = &mine[part];
 
-			if (!a->address || (part < 2 && (!IS_ALIGNED(a->address, 64) ||
-							 a->bytes < layout->size[part])) ||
+			if (!a->address || (part < nv12 && (!IS_ALIGNED(a->address, 64) ||
+							    a->bytes < layout->size[part])) ||
 			    (u64)a->address + a->bytes > (1ULL << 32))
 				return -EINVAL;
 			for (j = 0; j < ARRAY_SIZE(region); j++)
@@ -713,7 +736,7 @@ static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 					return -EINVAL;
 			for (j = 0; j <= i; j++) {
 				other_parts = hevc_surface_regions(&buffers->surface[j],
-								   buffers->compressed, theirs);
+								   buffers, theirs);
 				for (other = 0; other < other_parts; other++) {
 					if (j == i && other >= part)
 						continue;

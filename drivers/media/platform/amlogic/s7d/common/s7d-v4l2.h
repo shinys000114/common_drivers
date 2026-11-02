@@ -57,6 +57,23 @@
 #define V4L2_PIX_FMT_AM08C v4l2_fourcc('A', '0', '8', 'C') /* Amlogic 8-bit FBC, scatter, mem-saving, plus NV12 */
 #define V4L2_PIX_FMT_AM10C v4l2_fourcc('A', '1', '0', 'C') /* Amlogic 10-bit FBC, scatter, + NV12 */
 
+/*
+ * AM08F/AM10F: AM08C/AM10C without the NV12 copy. The single plane holds the
+ * FBC header at offset 0 and the FBC body at offset hdr, with the offsets,
+ * sizes and alignment documented above, and nothing after the body:
+ * sizeimage = hdr + body. bytesperline stays ALIGN(w, 64) as for
+ * AM08C/AM10C; no row of the buffer has that pitch. The decoder writes only
+ * its compressed output (no double write). AM08F carries an 8-bit stream
+ * (mem-saving body), AM10F a 10-bit one (full body); a stream is only offered
+ * the one of its own depth, and a client that set the other one gets NV12, as
+ * with AM08C/AM10C. References, V4L2_CID_MIN_BUFFERS_FOR_CAPTURE and the
+ * absolute header addresses work as for AM08C/AM10C. DRM import is the FBC
+ * one above (offsets[0] = 0, pitches[0] = w, the same format and modifier);
+ * there is no NV12 alternative.
+ */
+#define V4L2_PIX_FMT_AM08F v4l2_fourcc('A', '0', '8', 'F') /* Amlogic 8-bit FBC, scatter, mem-saving */
+#define V4L2_PIX_FMT_AM10F v4l2_fourcc('A', '1', '0', 'F') /* Amlogic 10-bit FBC, scatter */
+
 /* Header bytes the scatter layout uses for a picture; the same for both depths. */
 static inline u32 s7d_amfbc_header_used(u32 width, u32 height)
 {
@@ -102,10 +119,10 @@ struct s7d_v4l2_codec {
 	int (*default_layout)(u32 width, u32 height, u32 fourcc,
 			      struct s7d_codec_layout *layout);
 	bool nv21;
-	/* CAPTURE may also offer V4L2_PIX_FMT_AM08C/AM10C (AV1, HEVC and VP9). */
+	/* CAPTURE may also offer AM08C/AM10C and AM08F/AM10F (AV1, HEVC and VP9). */
 	bool fbc;
 	/*
-	 * AM08C/AM10C CAPTURE minimum, when the decoder keeps its references in
+	 * AM08C/AM10C/AM08F/AM10F CAPTURE minimum, when the decoder keeps its references in
 	 * the CAPTURE buffers themselves; zero keeps the layout's minimum.
 	 */
 	u32 fbc_min_capture_buffers;
@@ -135,27 +152,44 @@ int s7d_v4l2_validate_capture_pool(const struct s7d_codec_layout *layout,
 				   const struct s7d_v4l2_capture_buffer *buffers,
 				   unsigned int count);
 
-/* Where an AM08C/AM10C CAPTURE buffer holds a picture, as the format documents. */
+/*
+ * Where an AM08C/AM10C/AM08F/AM10F CAPTURE buffer holds a picture, as the
+ * format documents.
+ */
 struct s7d_amfbc_buffer {
 	u32 header;
 	u32 header_bytes;
 	u32 body;
 	u32 body_bytes;
-	/* NV12 luma; chroma follows at nv12 + nv12_luma_bytes. */
+	/* NV12 luma; chroma follows at nv12 + nv12_luma_bytes. Zero for AM08F/AM10F. */
 	u32 nv12;
 	u32 nv12_luma_bytes;
 };
 
+/* AM08F/AM10F: the buffer has no NV12 copy; the decoder writes FBC only. */
+static inline bool s7d_amfbc_fbc_only(const struct s7d_amfbc_buffer *buffer)
+{
+	return !buffer->nv12_luma_bytes;
+}
+
 /*
  * A pool the decoder writes straight into: every buffer must carry the FBC
- * prefix of @layout's AM08C/AM10C format (header, body 4 KiB aligned, NV12
- * right behind), all below 4 GiB. *fbc reads false, with no regions filled,
- * when no buffer has a prefix; a mixed pool is -EINVAL.
+ * of @layout's AM08C/AM10C format (header, body 4 KiB aligned, NV12 right
+ * behind) or every buffer that of its AM08F/AM10F format (header and body
+ * only), all below 4 GiB. *fbc reads false, with no regions filled, when no
+ * buffer carries FBC; a mixed pool is -EINVAL.
  */
 int s7d_v4l2_fbc_capture_pool(const struct s7d_codec_layout *layout,
 			      const struct s7d_v4l2_capture_buffer *buffers,
 			      unsigned int count, struct s7d_amfbc_buffer *regions,
 			      bool *fbc);
+/*
+ * What a DQBUF of @region's buffer reports: AM08C/AM10C the whole buffer (FBC
+ * as the prefix, then the NV12 planes of @layout), AM08F/AM10F header and body.
+ */
+void s7d_v4l2_fbc_frame_bytes(const struct s7d_codec_layout *layout,
+			      const struct s7d_amfbc_buffer *region,
+			      struct s7d_codec_frame *frame);
 
 struct s7d_v4l2_drain {
 	u64 epoch;

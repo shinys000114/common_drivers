@@ -113,6 +113,8 @@ struct s7d_vp9_decoder {
 	u32 mv_bank;
 	/* AM08C/AM10C: FBC bytes in front of each CAPTURE buffer's NV12, else 0. */
 	u32 fbc_prefix;
+	/* What each DQBUF reports beyond fbc_prefix: NV12, or FBC header and body. */
+	size_t frame_bytes[2];
 	u32 fbc_count;
 	int failure;
 	int release_error;
@@ -122,8 +124,10 @@ struct s7d_vp9_decoder {
 	bool previous_show_frame;
 	/* FBC references through the SAO MMU (10-bit, or an FBC CAPTURE format). */
 	bool compressed;
-	/* Each picture's FBC lives in its AM08C/AM10C CAPTURE buffer. */
+	/* Each picture's FBC lives in its AM08C/AM10C/AM08F/AM10F CAPTURE buffer. */
 	bool zero_copy;
+	/* AM08F/AM10F: compressed output only, no NV12 double write. */
+	bool fbc_only;
 	bool firmware_loaded;
 	bool context_ready;
 	bool irq_accept;
@@ -564,8 +568,9 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 {
 	struct s7d_amfbc_buffer fbc[S7D_VP9_MAX_PHYSICAL];
 	u32 i, j, fbc_count = 0, fbc_header = 0, fbc_bytes = 0;
-	struct s7d_vp9_region region[2];
-	bool compressed, zero_copy = false;
+	struct s7d_vp9_region region[2] = { };
+	struct s7d_codec_frame sizes = { };
+	bool compressed, zero_copy = false, fbc_only;
 	unsigned long flags;
 	int ret;
 
@@ -589,6 +594,8 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 		ret = s7d_vp9_dpb_init(&decoder->dpb, generation, count);
 	if (ret)
 		goto out;
+	/* AM08F/AM10F: the FBC alone, no NV12 planes to bind. */
+	fbc_only = zero_copy && s7d_amfbc_fbc_only(&fbc[0]);
 	/*
 	 * Only the MMU mode decodes 10-bit: its references are FBC and the NV12
 	 * double write stays 8-bit (S7D has no P010). For NV12 CAPTURE the FBC
@@ -624,13 +631,15 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 				ret = -EINVAL;
 				goto failed;
 			}
-		ret = s7d_vp9_dma_context_bind_surface(decoder->context, decoder->epoch,
-						       capture[i].surface, layout, region);
-		if (ret)
-			goto failed;
+		if (!fbc_only) {
+			ret = s7d_vp9_dma_context_bind_surface(decoder->context, decoder->epoch,
+							       capture[i].surface, layout, region);
+			if (ret)
+				goto failed;
+		}
 		decoder->surface[i] = (struct s7d_vp9_hw_surface) {
 			.plane = { region[0], region[1] }, .width = layout->coded_width,
-			.height = layout->coded_height, .valid = true,
+			.height = layout->coded_height, .valid = true, .fbc_only = fbc_only,
 		};
 		if (zero_copy) {
 			decoder->surface[i].header = (struct s7d_vp9_region) {
@@ -654,8 +663,15 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 		goto failed;
 	decoder->compressed = compressed;
 	decoder->zero_copy = zero_copy;
+	decoder->fbc_only = fbc_only;
 	decoder->fbc_count = fbc_count;
-	decoder->fbc_prefix = zero_copy ? fbc[0].header_bytes + fbc[0].body_bytes : 0;
+	sizes.bytesused[0] = layout->size[0];
+	sizes.bytesused[1] = layout->size[1];
+	if (zero_copy)
+		s7d_v4l2_fbc_frame_bytes(layout, &fbc[0], &sizes);
+	decoder->fbc_prefix = sizes.prefix_bytesused;
+	decoder->frame_bytes[0] = sizes.bytesused[0];
+	decoder->frame_bytes[1] = sizes.bytesused[1];
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->captures = count;
 	memcpy(decoder->capture, capture, sizeof(*capture) * count);
@@ -822,7 +838,7 @@ static int vp9_frame_ready(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 		.sequence = decoder->output_sequence,
 		.flags = job->header.show_existing ? 0 :
 			 job->header.keyframe ? S7D_CODEC_FRAME_KEY : S7D_CODEC_FRAME_P,
-		.bytesused = { decoder->layout.size[0], decoder->layout.size[1] },
+		.bytesused = { decoder->frame_bytes[0], decoder->frame_bytes[1] },
 		/* AM08C/AM10C report the whole buffer: FBC, then NV12. */
 		.prefix_bytesused = decoder->fbc_prefix,
 	};
@@ -919,21 +935,27 @@ static bool vp9_copy_cancelled(void *priv)
 }
 
 /*
- * AM08C/AM10C: copy the whole picture, FBC included, into the current slot.
- * The header words are physical addresses >> 2 into the source body; point
- * the copy's words into its own body.
+ * AM08C/AM10C: copy the whole picture, FBC included, into the current slot;
+ * AM08F/AM10F: its FBC header and body, the buffer's two planes. The header
+ * words are physical addresses >> 2 into the source body; point the copy's
+ * words into its own body.
  */
 static int vp9_copy_fbc(struct s7d_vp9_decoder *decoder, struct vp9_job *job,
 			u32 source, u64 source_token)
 {
-	const size_t bytes[2] = { decoder->layout.size[0], decoder->layout.size[1] };
 	const struct s7d_vp9_hw_surface *from = &decoder->surface[source];
 	const struct s7d_vp9_hw_surface *to = &decoder->surface[job->current_slot];
+	const size_t bytes[2] = {
+		decoder->fbc_only ? from->header.bytes : decoder->layout.size[0],
+		decoder->fbc_only ? from->body.bytes : decoder->layout.size[1],
+	};
 	u32 used = s7d_amfbc_header_used(decoder->layout.coded_width,
 					 decoder->layout.coded_height);
 	u64 body = from->body.address, body_end = body + from->body.bytes;
 	u64 first = from->header.address;
-	u64 last = (u64)from->plane[1].address + from->plane[1].bytes;
+	/* The source buffer: header, body and, unless AM08F/AM10F, NV12. */
+	u64 last = decoder->fbc_only ? body_end :
+		(u64)from->plane[1].address + from->plane[1].bytes;
 	u32 i, word, stray = 0;
 	u64 address;
 	u8 *header;
@@ -942,9 +964,14 @@ static int vp9_copy_fbc(struct s7d_vp9_decoder *decoder, struct vp9_job *job,
 	if (!used || used % 4 || used > from->header.bytes || used > to->header.bytes ||
 	    from->body.bytes > to->body.bytes)
 		return -ERANGE;
-	ret = s7d_codec_surface_copy_all(decoder->capture[job->current_slot].surface,
-		job->write_token, decoder->capture[source].surface, source_token, bytes,
-		vp9_copy_cancelled, decoder);
+	if (decoder->fbc_only)
+		ret = s7d_codec_surface_copy(decoder->capture[job->current_slot].surface,
+			job->write_token, decoder->capture[source].surface, source_token, bytes,
+			vp9_copy_cancelled, decoder);
+	else
+		ret = s7d_codec_surface_copy_all(decoder->capture[job->current_slot].surface,
+			job->write_token, decoder->capture[source].surface, source_token, bytes,
+			vp9_copy_cancelled, decoder);
 	if (!ret)
 		ret = s7d_codec_surface_prefix_cpu(decoder->capture[job->current_slot].surface,
 						   job->write_token, (void **)&header);
@@ -1293,7 +1320,9 @@ int s7d_vp9_decoder_stream_close(struct s7d_vp9_decoder *decoder,
 	decoder->hidden_mask = 0;
 	decoder->compressed = false;
 	decoder->zero_copy = false;
+	decoder->fbc_only = false;
 	decoder->fbc_prefix = 0;
+	memset(decoder->frame_bytes, 0, sizeof(decoder->frame_bytes));
 	decoder->fbc_count = 0;
 	memset(decoder->fbc_index, VP9_NO_FBC, sizeof(decoder->fbc_index));
 	memset(decoder->surface, 0, sizeof(decoder->surface));

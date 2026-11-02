@@ -24,6 +24,11 @@ struct s7d_vp9_hw_surface {
 	u32 width;
 	u32 height;
 	bool valid;
+	/*
+	 * AM08F/AM10F: no NV12 (plane[] zero), only its own header and body, so
+	 * the picture is written compressed only; needs the compressed mode.
+	 */
+	bool fbc_only;
 };
 
 struct s7d_vp9_picture_frame {

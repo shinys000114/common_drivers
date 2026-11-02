@@ -459,7 +459,9 @@ int s7d_codec_surface_pin(struct s7d_codec_session *session,
 	    !request->num_planes || request->num_planes > S7D_CODEC_MAX_PLANES ||
 	    !is_power_of_2(request->dma_alignment) ||
 	    (request->prefix && (!request->contiguous ||
-				 !IS_ALIGNED(request->prefix, request->dma_alignment))))
+				 !IS_ALIGNED(request->prefix, request->dma_alignment))) ||
+	    (request->fbc_only && (request->prefix || !request->contiguous ||
+				   request->num_planes != 2)))
 		return -EINVAL;
 	total = request->prefix;
 	for (i = 0; i < request->num_planes; i++) {
@@ -551,6 +553,12 @@ int s7d_codec_surface_dma(struct s7d_codec_surface *surface, unsigned int plane,
 	}
 	mutex_unlock(&core->lock);
 	return ret;
+}
+
+bool s7d_codec_surface_fbc_only(const struct s7d_codec_surface *surface)
+{
+	/* The request is fixed from pin to unpin. */
+	return surface->request.fbc_only;
 }
 
 int s7d_codec_surface_prefix(struct s7d_codec_surface *surface,
@@ -674,6 +682,7 @@ static int s7d_surface_copy(struct s7d_codec_surface *dst, u64 dst_token,
 		ret = -ESHUTDOWN;
 	} else if (src->request.num_planes != 2 || dst->request.num_planes != 2 ||
 		   src->request.generation != dst->request.generation ||
+		   src->request.fbc_only != dst->request.fbc_only ||
 		   !src->written || src->writing || !src->dpb_refs ||
 		   src->write_token != src_token || !dst->writing || !dst->dpb_refs ||
 		   dst->user_owned || dst->write_token != dst_token) {
@@ -738,11 +747,12 @@ int s7d_codec_surface_prefix_cpu(struct s7d_codec_surface *surface, u64 token, v
 	mutex_lock(&core->lock);
 	if (surface->session->state != S7D_SESSION_OPEN) {
 		ret = -ESHUTDOWN;
-	} else if (!surface->request.prefix || !surface->writing || !surface->dpb_refs ||
+	} else if ((!surface->request.prefix && !surface->request.fbc_only) ||
+		   !surface->writing || !surface->dpb_refs ||
 		   surface->user_owned || surface->write_token != token) {
 		ret = -ESTALE;
 	} else {
-		/* The prefix starts the dma-buf; plane 0 follows it. */
+		/* The prefix (fbc_only: the header plane) starts the dma-buf. */
 		*cpu = s7d_codec_memory_cpu(surface->plane[0].dmabuf);
 		if (!*cpu)
 			ret = -EINVAL;
@@ -808,7 +818,7 @@ int s7d_codec_surface_copy_dma(struct s7d_codec_surface *dst, u64 dst_token,
 	mutex_lock(&core->lock);
 	if (session->state != S7D_SESSION_OPEN) {
 		ret = -ESHUTDOWN;
-	} else if (dst->request.num_planes != 2 ||
+	} else if (dst->request.num_planes != 2 || dst->request.fbc_only ||
 		   dst->request.generation != generation ||
 		   generation <= session->retired_generation || !dst->writing ||
 		   !dst->dpb_refs || dst->user_owned || dst->write_token != dst_token) {

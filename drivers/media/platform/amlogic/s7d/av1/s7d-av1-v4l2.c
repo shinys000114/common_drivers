@@ -472,6 +472,7 @@ static int av1_decoded(struct av1_backend *backend)
 static int av1_deliver(struct av1_backend *backend, u32 index, u64 token)
 {
 	const struct s7d_av1_reference_output *output = &backend->result.output;
+	const struct s7d_av1_slot_memory *memory = &backend->slot_memory[index];
 	struct s7d_codec_frame frame = { };
 	dma_addr_t base;
 	size_t prefix;
@@ -488,7 +489,11 @@ static int av1_deliver(struct av1_backend *backend, u32 index, u64 token)
 	frame.sequence = backend->frame_sequence;
 	if (output->output.picture.frame_type == S7D_AV1_KEY_FRAME)
 		frame.flags = S7D_CODEC_FRAME_KEY;
-	if (prefix) {
+	if (backend->fbc && !memory->luma.bytes) {
+		/* AM08F/AM10F report the FBC header and body. */
+		frame.bytesused[0] = memory->header.bytes;
+		frame.bytesused[1] = memory->body.bytes;
+	} else if (prefix) {
 		/* AM08C/AM10C report the whole buffer: FBC, then NV12 up to its padded height. */
 		frame.prefix_bytesused = prefix;
 		frame.bytesused[0] = backend->layout.size[0];
@@ -507,8 +512,8 @@ static int av1_deliver(struct av1_backend *backend, u32 index, u64 token)
 }
 
 /*
- * The header words of a copied AM08C/AM10C picture are physical addresses >> 2
- * into the source body; point them into the copy's body instead.
+ * The header words of a copied AM08C/AM10C/AM08F/AM10F picture are physical
+ * addresses >> 2 into the source body; point them into the copy's body instead.
  */
 static int av1_fbc_rebase(struct av1_backend *backend, void *prefix,
 			  const struct s7d_av1_slot_memory *source,
@@ -518,7 +523,9 @@ static int av1_fbc_rebase(struct av1_backend *backend, void *prefix,
 	u32 used = s7d_amfbc_header_used(layout->coded_width, layout->coded_height);
 	u64 body = source->body.address, body_end = body + source->body.bytes;
 	u64 first = source->header.address;
-	u64 last = (u64)source->chroma.address + source->chroma.bytes;
+	/* The source buffer: header, body and, unless AM08F/AM10F, NV12. */
+	u64 last = source->chroma.bytes ?
+		(u64)source->chroma.address + source->chroma.bytes : body_end;
 	__le32 *header = prefix;
 	u32 i, word, stray = 0;
 	u64 address;
@@ -547,11 +554,17 @@ static int av1_fbc_rebase(struct av1_backend *backend, void *prefix,
 /*
  * Fallback: the picture must be shown again while the client still holds its
  * buffer (show-existing of a frame already given out), so copy it into a free
- * one; an AM08C/AM10C copy takes the whole buffer and gets its header rebased.
+ * one; an AM08C/AM10C copy takes the whole buffer and gets its header rebased,
+ * an AM08F/AM10F one its header and body (its two planes), rebased the same.
  */
 static int av1_publish_copy(struct av1_backend *backend, u32 source)
 {
-	const size_t bytes[2] = { backend->layout.size[0], backend->layout.size[1] };
+	const struct s7d_av1_slot_memory *memory = &backend->slot_memory[source];
+	const bool fbc_only = backend->fbc && !memory->luma.bytes;
+	const size_t bytes[2] = {
+		fbc_only ? memory->header.bytes : backend->layout.size[0],
+		fbc_only ? memory->body.bytes : backend->layout.size[1],
+	};
 	struct s7d_codec_surface *surface, *from = backend->capture[source].surface;
 	u64 from_token = backend->bind[source].token;
 	u32 index;
@@ -563,14 +576,14 @@ static int av1_publish_copy(struct av1_backend *backend, u32 source)
 	if (ret)
 		return ret;
 	surface = backend->capture[index].surface;
-	if (!backend->fbc) {
+	if (!backend->fbc || fbc_only)
 		ret = s7d_codec_surface_copy(surface, token, from, from_token, bytes,
 					     av1_copy_cancelled, backend);
-	} else {
+	else
 		ret = s7d_codec_surface_copy_all(surface, token, from, from_token, bytes,
 						 av1_copy_cancelled, backend);
-		if (!ret)
-			ret = s7d_codec_surface_prefix_cpu(surface, token, &prefix);
+	if (!ret && backend->fbc) {
+		ret = s7d_codec_surface_prefix_cpu(surface, token, &prefix);
 		if (!ret)
 			ret = av1_fbc_rebase(backend, prefix, &backend->slot_memory[source],
 					     &backend->slot_memory[index]);
@@ -921,7 +934,8 @@ static int av1_nv12_prepare(struct av1_backend *backend,
 /*
  * The CAPTURE buffers become the DPB's picture memory. AM08C/AM10C ones take
  * it at the offsets the format exports: FBC header first, its body after it,
- * the NV12 double write behind both. Anything else fails CAPTURE setup.
+ * the NV12 double write behind both; AM08F/AM10F ones have no NV12, so the
+ * picture is written compressed only. Anything else fails CAPTURE setup.
  */
 static int av1_capture_prepare(struct av1_backend *backend,
 			       const struct s7d_v4l2_capture_buffer *buffers,
@@ -959,17 +973,23 @@ static int av1_capture_prepare(struct av1_backend *backend,
 	    s7d_amfbc_header_used(layout->coded_width, layout->coded_height) >
 	    region[0].header_bytes)
 		return -ERANGE;
-	for (i = 0; i < count; i++)
+	for (i = 0; i < count; i++) {
 		backend->slot_memory[i] = (struct s7d_av1_slot_memory) {
 			.cookie = i + 1,
 			.header = { .address = region[i].header,
 				    .bytes = region[i].header_bytes },
 			.body = { .address = region[i].body, .bytes = region[i].body_bytes },
-			.luma = { .address = region[i].nv12,
-				  .bytes = region[i].nv12_luma_bytes },
-			.chroma = { .address = region[i].nv12 + region[i].nv12_luma_bytes,
-				    .bytes = region[i].nv12_luma_bytes / 2 },
 		};
+		if (s7d_amfbc_fbc_only(&region[i]))
+			continue;
+		backend->slot_memory[i].luma = (struct s7d_av1_region) {
+			.address = region[i].nv12, .bytes = region[i].nv12_luma_bytes,
+		};
+		backend->slot_memory[i].chroma = (struct s7d_av1_region) {
+			.address = region[i].nv12 + region[i].nv12_luma_bytes,
+			.bytes = region[i].nv12_luma_bytes / 2,
+		};
+	}
 	backend->bound = true;
 	backend->fbc = true;
 	return 0;
