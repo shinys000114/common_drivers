@@ -40,6 +40,18 @@
 struct devfreq_simple_ondemand_data data;
 #endif
 
+#if IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
+/*
+ * The default 90% threshold holds the clock at the lowest step that keeps the
+ * GPU just under it, so frames composited once per vblank miss it. Ramp up
+ * the way the upstream Panthor and Panfrost drivers do.
+ */
+static struct devfreq_simple_ondemand_data kbase_c5_ondemand_data = {
+	.upthreshold = 45,
+	.downdifferential = 5,
+};
+#endif
+
 /**
  * get_voltage() - Get the voltage value corresponding to the nominal frequency
  *                 used by devfreq.
@@ -723,6 +735,9 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
 
 #if defined(CONFIG_AMLOGIC_MODIFY) && !IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
 	kbdev->devfreq = devfreq_add_device(kbdev->dev, dp, "simple_ondemand", &data);
+#elif IS_ENABLED(CONFIG_AMLOGIC_C5_GPU_KBASE)
+	kbdev->devfreq = devfreq_add_device(kbdev->dev, dp, "simple_ondemand",
+					    &kbase_c5_ondemand_data);
 #else
 	kbdev->devfreq = devfreq_add_device(kbdev->dev, dp, "simple_ondemand", NULL);
 #endif
