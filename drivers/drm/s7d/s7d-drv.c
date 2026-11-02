@@ -368,8 +368,9 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	drm->mode_config.helper_private = &s7d_mode_config_helper_funcs;
 	drm->mode_config.min_width = 1;
 	drm->mode_config.min_height = 1;
-	drm->mode_config.max_width = S7D_DISPLAY_MAX_WIDTH;
-	drm->mode_config.max_height = S7D_DISPLAY_MAX_HEIGHT;
+	/* Framebuffers hold decoded video up to 4096x2304; modes stay within s7d_caps. */
+	drm->mode_config.max_width = S7D_VIDEO_MAX_WIDTH;
+	drm->mode_config.max_height = S7D_VIDEO_MAX_HEIGHT;
 	drm->mode_config.cursor_width = 256;
 	drm->mode_config.cursor_height = 256;
 	drm->mode_config.normalize_zpos = true;

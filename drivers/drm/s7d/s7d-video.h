@@ -9,8 +9,9 @@
 struct drm_framebuffer;
 struct drm_rect;
 
+/* Decoded frames: the decoders' 4096x2304; the scaler input stays within 4096x2160. */
 #define S7D_VIDEO_MAX_WIDTH 4096
-#define S7D_VIDEO_MAX_HEIGHT 2160
+#define S7D_VIDEO_MAX_HEIGHT 2304
 #define S7D_VIDEO_REFLECT_X BIT(0)
 #define S7D_VIDEO_REFLECT_Y BIT(1)
 
