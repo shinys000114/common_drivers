@@ -117,13 +117,14 @@ static int check_layout(const struct s7d_video_state *layout,
  * becomes AFBC_ENABLE (dec_enable is bit 8, dos_uncomp_mode bit 19).
  */
 static int build_fbc(const struct s7d_video_state *layout, const struct drm_rect *dst,
-		     struct s7d_video_pipeline_state *next,
+		     unsigned int hold_lines, struct s7d_video_pipeline_state *next,
 		     struct s7d_video_pipeline_state *out)
 {
 	const struct s7d_video_fbc *fbc = &layout->fbc;
 	u32 width = (layout->scope_x[1] & 0xffff) - (layout->scope_x[1] >> 16) + 1;
 	u32 height = (layout->scope_y[1] & 0xffff) - (layout->scope_y[1] >> 16) + 1;
-	u32 mode = (3 << 24) | (8 << 16) | (2 << 14) | BIT(29) |
+	/* The decoder's own hold lines, AFBC_MODE[21:16], as the MIF's. */
+	u32 mode = (3 << 24) | (hold_lines << 16) | (2 << 14) | BIT(29) |
 		(fbc->ten_bit ? 0x2a00 : 0) | (fbc->mem_saving ? BIT(28) : 0);
 
 	if (!dst || dst->x1 < 0 || dst->y1 < 0 || dst->x2 > 8192 || dst->y2 > 8192 ||
@@ -223,7 +224,7 @@ static int s7d_video_build_pipeline_common(const struct s7d_video_state *layout,
 		return 0;
 	}
 	if (layout->fbc.enabled)
-		return vd2 ? -EINVAL : build_fbc(layout, dst, &next, out);
+		return vd2 ? -EINVAL : build_fbc(layout, dst, hold_lines, &next, out);
 	if (check_layout(layout, dst, &width, &height))
 		return -EINVAL;
 	deep = layout->format == DRM_FORMAT_XVYU2101010;
