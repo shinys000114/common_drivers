@@ -143,3 +143,24 @@ int s7d_video_build_state(struct drm_framebuffer *fb, const struct drm_rect *src
 	*state = next;
 	return 0;
 }
+
+/*
+ * Fetch every other source line: double the line strides and halve the
+ * vertical scopes, so a reduction by 2 or more reads about one source line
+ * per output line instead of two. 4:2:0 only.
+ */
+int s7d_video_skip_lines(struct s7d_video_state *state)
+{
+	u32 y1 = state->scope_y[0] & 0x1fff;
+	u32 y2 = (state->scope_y[0] >> 16) + 1;
+
+	if ((state->format != DRM_FORMAT_NV12 && state->format != DRM_FORMAT_NV21) ||
+	    state->fbc.enabled || (y1 | y2) & 3 ||
+	    state->stride[0] * 2 > 0x1fff || state->stride[1] * 2 > 0x1fff)
+		return -EINVAL;
+	state->stride[0] *= 2;
+	state->stride[1] *= 2;
+	state->scope_y[0] = ((y2 / 2 - 1) << 16) | (y1 / 2);
+	state->scope_y[1] = ((y2 / 4 - 1) << 16) | (y1 / 4);
+	return 0;
+}
