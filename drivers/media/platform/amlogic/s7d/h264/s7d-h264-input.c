@@ -1423,7 +1423,7 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 	static const u8 aud_masks[8] = { 4, 5, 7, 0, 0, 4, 5, 7 };
 	bool has_next, seen_vcl = false, all_same_type = false;
 	bool seen_nal = false, mixed_types = false, seen_aud = false;
-	bool seen_filler = false;
+	bool seen_filler = false, late_aud = false;
 	int ret;
 
 	if (IS_ERR_OR_NULL(parser) || !data || !info || !preflight)
@@ -1516,7 +1516,7 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 						     payload_end - prefix.header);
 			break;
 		case 9:
-			if (seen_nal) {
+			if (seen_aud || late_aud) {
 				ret = -EBADMSG;
 				break;
 			}
@@ -1525,7 +1525,13 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 				aud_mask = aud_masks[v];
 				ret = au_trailing_bits(&bits);
 			}
-			if (!ret) {
+			/*
+			 * h264parse puts codec_data SPS/PPS ahead of the first
+			 * AUD. A late AUD is carried like those NALs.
+			 */
+			if (!ret && seen_nal) {
+				late_aud = true;
+			} else if (!ret) {
 				draft->aud_end = has_next ? nonzero_end : raw_end;
 				seen_aud = true;
 			}
