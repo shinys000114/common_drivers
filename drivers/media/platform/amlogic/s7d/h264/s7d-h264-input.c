@@ -313,7 +313,8 @@ static int au_rbsp(const u8 *data, u32 bytes, u8 *rbsp, u32 *rbsp_bytes)
 		v = data[i];
 		if (zeros == 2) {
 			if (v == 3) {
-				if (i + 1 == bytes || data[i + 1] > 3)
+				/* It may end the NAL, after trailing cabac_zero_words. */
+				if (i + 1 < bytes && data[i + 1] > 3)
 					return -EBADMSG;
 				zeros = 0;
 				continue;

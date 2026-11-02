@@ -446,7 +446,7 @@ static int hevc_parse_sps(const u8 *nal, size_t bytes,
 		return -ENOMEM;
 	for (i = 2; i < bytes; i++) {
 		if (zeros >= 2 && nal[i] <= 3) {
-			if (nal[i] != 3 || i + 1 == bytes || nal[i + 1] > 3) {
+			if (nal[i] != 3 || (i + 1 < bytes && nal[i + 1] > 3)) {
 				ret = -EBADMSG;
 				goto out;
 			}

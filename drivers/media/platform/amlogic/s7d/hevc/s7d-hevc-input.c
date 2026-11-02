@@ -143,7 +143,8 @@ static int hevc_rbsp(const u8 *nal, size_t bytes, u8 **out, size_t *written)
 		return -ENOMEM;
 	for (i = 2; i < bytes; i++) {
 		if (zeros >= 2 && nal[i] <= 3) {
-			if (nal[i] != 3 || i + 1 == bytes || nal[i + 1] > 3) {
+			/* 00 00 03 may end the NAL: it guards trailing cabac_zero_words. */
+			if (nal[i] != 3 || (i + 1 < bytes && nal[i + 1] > 3)) {
 				kvfree(rbsp);
 				return -EBADMSG;
 			}
