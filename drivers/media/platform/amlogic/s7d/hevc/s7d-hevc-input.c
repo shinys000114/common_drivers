@@ -844,6 +844,11 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 		}
 		type = (nal[0] >> 1) & 63;
 		ret = hevc_rbsp(nal, end - start, &rbsp, &bits.bytes);
+		/* A damaged SEI is skipped, as below, even when it cannot be unescaped. */
+		if (ret == -EBADMSG && (type == 39 || type == 40)) {
+			ret = 0;
+			continue;
+		}
 		if (ret)
 			goto failed;
 		bits.data = rbsp;
