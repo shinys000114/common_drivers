@@ -88,7 +88,7 @@ static int check_layout(const struct s7d_video_state *layout,
 	      layout->scope_y[0] | layout->scope_y[1]) & ~0x1fff1fffU) ||
 	    dst->x1 < 0 || dst->y1 < 0 || dst->x2 > 8192 || dst->y2 > 8192 ||
 	    dst->x2 <= dst->x1 || dst->y2 <= dst->y1 ||
-	    ((dst->x1 | dst->y1 | dst->x2 | dst->y2) & 1))
+	    ((drm_rect_width(dst) | drm_rect_height(dst)) & 1))
 		return -EINVAL;
 	x_start = layout->scope_x[0] & 0x1fff;
 	x_end = layout->scope_x[0] >> 16;
@@ -129,7 +129,7 @@ static int build_fbc(const struct s7d_video_state *layout, const struct drm_rect
 
 	if (!dst || dst->x1 < 0 || dst->y1 < 0 || dst->x2 > 8192 || dst->y2 > 8192 ||
 	    dst->x2 <= dst->x1 || dst->y2 <= dst->y1 ||
-	    ((dst->x1 | dst->y1 | dst->x2 | dst->y2 | width | height) & 1) ||
+	    ((drm_rect_width(dst) | drm_rect_height(dst) | width | height) & 1) ||
 	    !fbc->width || !fbc->height || fbc->width > S7D_VIDEO_MAX_WIDTH ||
 	    fbc->height > S7D_VIDEO_MAX_HEIGHT || layout->reflection ||
 	    s7d_video_scaler_build(width, height, drm_rect_width(dst),
