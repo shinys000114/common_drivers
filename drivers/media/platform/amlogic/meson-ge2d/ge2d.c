@@ -809,6 +809,9 @@ static int ge2d_buf_prepare(struct vb2_buffer *vb)
 
 	vbuf->field = V4L2_FIELD_NONE;
 
+	/* The engine reads or writes a whole frame of the current format. */
+	if (vb2_plane_size(vb, 0) < f->pix_fmt.sizeimage)
+		return -EINVAL;
 	vb2_set_plane_payload(vb, 0, f->pix_fmt.sizeimage);
 
 	return 0;
@@ -1222,8 +1225,12 @@ static int vidioc_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f
 	frm->crop.width = frm->pix_fmt.width;
 	frm->crop.height = frm->pix_fmt.height;
 
-	/* Propagate settings to capture; a later capture S_FMT may scale. */
-	ge2d_reset_cap(ctx);
+	/*
+	 * Propagate settings to capture; a later capture S_FMT may scale. Not
+	 * once capture buffers exist: they are sized for its current format.
+	 */
+	if (!vb2_is_busy(v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE)))
+		ge2d_reset_cap(ctx);
 
 	return 0;
 }
