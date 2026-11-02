@@ -335,6 +335,7 @@ int panthor_gpu_soft_reset(struct panthor_device *ptdev)
 	}
 
 	ptdev->gpu->pending_reqs = 0;
+	panthor_device_soc_restore(ptdev);
 	return 0;
 }
 

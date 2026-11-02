@@ -4,6 +4,7 @@
 /* Copyright 2023 Collabora ltd. */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/mm.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -39,6 +40,47 @@ static int panthor_gpu_coherency_init(struct panthor_device *ptdev)
 
 	drm_err(&ptdev->base, "Coherency not supported by the device");
 	return -ENOTSUPP;
+}
+
+/* Amlogic S7D power override, as in the vendor GPU bring-up. */
+#define S7D_PWR_KEY			0x50
+#define S7D_PWR_KEY_VALUE		0x2968a819
+#define S7D_PWR_OVERRIDE1		0x58
+#define S7D_PWR_OVERRIDE1_VALUE		0x00200fff
+
+/**
+ * panthor_device_soc_restore() - Restore SoC GPU settings lost on a reset
+ * @ptdev: Device.
+ */
+void panthor_device_soc_restore(struct panthor_device *ptdev)
+{
+	if (!ptdev->soc_data || !ptdev->soc_data->s7d_pwr_override)
+		return;
+
+	if (gpu_read(ptdev, S7D_PWR_OVERRIDE1) == S7D_PWR_OVERRIDE1_VALUE)
+		return;
+
+	gpu_write(ptdev, S7D_PWR_KEY, S7D_PWR_KEY_VALUE);
+	gpu_write(ptdev, S7D_PWR_OVERRIDE1, S7D_PWR_OVERRIDE1_VALUE);
+}
+
+static int panthor_soc_init(struct panthor_device *ptdev)
+{
+	int ret;
+
+	if (ptdev->resets) {
+		ret = reset_control_assert(ptdev->resets);
+		if (ret)
+			return ret;
+		udelay(10);
+		ret = reset_control_deassert(ptdev->resets);
+		if (ret)
+			return ret;
+		udelay(10);
+	}
+
+	panthor_device_soc_restore(ptdev);
+	return 0;
 }
 
 static int panthor_clk_init(struct panthor_device *ptdev)
@@ -222,6 +264,11 @@ int panthor_device_init(struct panthor_device *ptdev)
 	if (ret)
 		return ret;
 
+	ptdev->resets = devm_reset_control_array_get_optional_exclusive(ptdev->base.dev);
+	if (IS_ERR(ptdev->resets))
+		return dev_err_probe(ptdev->base.dev, PTR_ERR(ptdev->resets),
+				     "get resets failed");
+
 	ret = panthor_devfreq_init(ptdev);
 	if (ret)
 		return ret;
@@ -247,6 +294,10 @@ int panthor_device_init(struct panthor_device *ptdev)
 		if (ret)
 			return ret;
 	}
+
+	ret = panthor_soc_init(ptdev);
+	if (ret)
+		goto err_rpm_put;
 
 	ret = panthor_hw_init(ptdev);
 	if (ret)
@@ -449,6 +500,7 @@ static int panthor_device_resume_hw_components(struct panthor_device *ptdev)
 {
 	int ret;
 
+	panthor_device_soc_restore(ptdev);
 	panthor_gpu_resume(ptdev);
 	panthor_mmu_resume(ptdev);
 
