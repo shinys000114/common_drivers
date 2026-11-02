@@ -3,6 +3,7 @@
 /* Copyright 2023 Collabora ltd. */
 
 #include <linux/cleanup.h>
+#include <linux/cma.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
@@ -91,6 +92,70 @@ should_map_wc(struct panthor_gem_object *bo, struct panthor_vm *exclusive_vm)
 	return true;
 }
 
+/*
+ * Back a new shareable BO with contiguous pages, so that a display controller
+ * that only takes contiguous buffers can scan it out after a dma-buf import.
+ * The shmem helpers see the pages as already allocated and hold one use count
+ * for them until panthor_gem_free_contig() gives them back to the CMA area.
+ */
+static void panthor_gem_alloc_contig(struct panthor_gem_object *bo)
+{
+	struct drm_gem_shmem_object *shmem = &bo->base;
+	struct panthor_device *ptdev = container_of(shmem->base.dev, struct panthor_device, base);
+	size_t npages = shmem->base.size >> PAGE_SHIFT;
+	struct page **pages;
+	struct page *contig;
+	size_t i;
+
+	if (!ptdev->scanout_cma)
+		return;
+
+	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
+	if (!pages)
+		return;
+
+	contig = cma_alloc(ptdev->scanout_cma, npages,
+			   min_t(unsigned int, get_order(shmem->base.size), CONFIG_CMA_ALIGNMENT),
+			   true);
+	if (!contig) {
+		kvfree(pages);
+		return;
+	}
+
+	memset(page_address(contig), 0, shmem->base.size);
+	for (i = 0; i < npages; i++)
+		pages[i] = contig + i;
+
+	dma_resv_lock(shmem->base.resv, NULL);
+	shmem->pages = pages;
+	shmem->pages_use_count = 1;
+	dma_resv_unlock(shmem->base.resv);
+	bo->contig_pages = contig;
+}
+
+static void panthor_gem_free_contig(struct panthor_gem_object *bo)
+{
+	struct drm_gem_shmem_object *shmem = &bo->base;
+	struct panthor_device *ptdev = container_of(shmem->base.dev, struct panthor_device, base);
+
+	dma_resv_lock(shmem->base.resv, NULL);
+	/* Our use count, plus the one the sgt holds. */
+	drm_WARN_ON(shmem->base.dev, shmem->vmap_use_count ||
+		    shmem->pages_use_count != 1 + !!shmem->sgt);
+	if (shmem->sgt) {
+		dma_unmap_sgtable(shmem->base.dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
+		sg_free_table(shmem->sgt);
+		kfree(shmem->sgt);
+		shmem->sgt = NULL;
+	}
+	kvfree(shmem->pages);
+	shmem->pages = NULL;
+	shmem->pages_use_count = 0;
+	dma_resv_unlock(shmem->base.resv);
+
+	cma_release(ptdev->scanout_cma, bo->contig_pages, shmem->base.size >> PAGE_SHIFT);
+}
+
 static void panthor_gem_free_object(struct drm_gem_object *obj)
 {
 	struct panthor_gem_object *bo = to_panthor_bo(obj);
@@ -108,6 +173,8 @@ static void panthor_gem_free_object(struct drm_gem_object *obj)
 	mutex_destroy(&bo->gpuva_list_lock);
 
 	drm_gem_free_mmap_offset(&bo->base.base);
+	if (bo->contig_pages)
+		panthor_gem_free_contig(bo);
 	drm_gem_shmem_free(&bo->base);
 	drm_gem_object_put(vm_root_gem);
 }
@@ -428,6 +495,8 @@ panthor_gem_create_with_handle(struct drm_file *file,
 		bo->exclusive_vm_root_gem = panthor_vm_root_gem(exclusive_vm);
 		drm_gem_object_get(bo->exclusive_vm_root_gem);
 		bo->base.base.resv = bo->exclusive_vm_root_gem->resv;
+	} else {
+		panthor_gem_alloc_contig(bo);
 	}
 
 	panthor_gem_debugfs_set_usage_flags(bo, 0);
@@ -435,11 +504,13 @@ panthor_gem_create_with_handle(struct drm_file *file,
 	/* If this is a write-combine mapping, we query the sgt to force a CPU
 	 * cache flush (dma_map_sgtable() is called when the sgt is created).
 	 * This ensures the zero-ing is visible to any uncached mapping created
-	 * by vmap/mmap.
+	 * by vmap/mmap. Contiguous pages are zeroed through the cached linear
+	 * map, so they need the same flush before the GPU or a display reads
+	 * them.
 	 * FIXME: Ideally this should be done when pages are allocated, not at
 	 * BO creation time.
 	 */
-	if (shmem->map_wc) {
+	if (shmem->map_wc || bo->contig_pages) {
 		struct sg_table *sgt;
 
 		sgt = drm_gem_shmem_get_pages_sgt(shmem);

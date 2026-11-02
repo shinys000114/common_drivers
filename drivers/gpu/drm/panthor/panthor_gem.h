@@ -91,6 +91,12 @@ struct panthor_gem_object {
 	u32 flags;
 
 	/**
+	 * @contig_pages: First page of the physically contiguous backing
+	 * allocated from &panthor_device.scanout_cma, NULL for shmem pages.
+	 */
+	struct page *contig_pages;
+
+	/**
 	 * @label: BO tagging fields. The label can be assigned within the
 	 * driver itself or through a specific IOCTL.
 	 */

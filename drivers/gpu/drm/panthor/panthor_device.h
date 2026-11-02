@@ -22,6 +22,7 @@
 
 struct panthor_csf;
 struct panthor_csf_ctx;
+struct cma;
 struct panthor_device;
 struct reset_control;
 
@@ -136,6 +137,12 @@ struct panthor_device {
 
 	/** @resets: GPU resets, pulsed once at probe. Optional. */
 	struct reset_control *resets;
+
+	/**
+	 * @scanout_cma: Contiguous area backing shareable BOs, so that display
+	 * controllers without an IOMMU can scan them out. NULL if none.
+	 */
+	struct cma *scanout_cma;
 
 	/** @coherent: True if the CPU/GPU are memory coherent. */
 	bool coherent;

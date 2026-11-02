@@ -6,6 +6,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/mm.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -88,6 +89,31 @@ static int panthor_soc_init(struct panthor_device *ptdev)
 	}
 
 	panthor_device_soc_restore(ptdev);
+	return 0;
+}
+
+static void panthor_scanout_cma_release(void *data)
+{
+	of_reserved_mem_device_release(data);
+}
+
+static int panthor_scanout_cma_init(struct panthor_device *ptdev)
+{
+	struct device *dev = ptdev->base.dev;
+	int ret;
+
+	if (of_property_match_string(dev->of_node, "memory-region-names", "scanout") < 0)
+		return 0;
+
+	ret = of_reserved_mem_device_init_by_name(dev, dev->of_node, "scanout");
+	if (ret)
+		return dev_err_probe(dev, ret, "scanout memory region");
+
+	ret = devm_add_action_or_reset(dev, panthor_scanout_cma_release, dev);
+	if (ret)
+		return ret;
+
+	ptdev->scanout_cma = dev->cma_area;
 	return 0;
 }
 
@@ -278,6 +304,10 @@ int panthor_device_init(struct panthor_device *ptdev)
 				     "get resets failed");
 
 	ret = panthor_devfreq_init(ptdev);
+	if (ret)
+		return ret;
+
+	ret = panthor_scanout_cma_init(ptdev);
 	if (ret)
 		return ret;
 
