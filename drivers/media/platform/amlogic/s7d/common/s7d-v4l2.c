@@ -416,14 +416,16 @@ bool s7d_v4l2_codec_valid(const struct s7d_v4l2_codec *codec)
 		return false;
 	if (codec->engine == S7D_CODEC_ENGINE_VDEC)
 		return codec->output_format == V4L2_PIX_FMT_H264;
-	return codec->engine == S7D_CODEC_ENGINE_HEVC &&
-		(codec->output_format == V4L2_PIX_FMT_HEVC ||
-		 codec->output_format == V4L2_PIX_FMT_VP9 ||
-		 codec->output_format == V4L2_PIX_FMT_AV1) && !codec->nv21 &&
+	if (codec->engine != S7D_CODEC_ENGINE_HEVC || codec->nv21)
+		return false;
+	/* HEVC decodes up to UHD with a 4K-sized access unit. */
+	if (codec->output_format == V4L2_PIX_FMT_HEVC)
+		return codec->max_input_size <= SZ_8M;
+	/* AV1 decodes up to UHD within 2 MiB access units, VP9 up to 1080p. */
+	return (codec->output_format == V4L2_PIX_FMT_VP9 ||
+		codec->output_format == V4L2_PIX_FMT_AV1) &&
 		(!codec->fbc || codec->output_format == V4L2_PIX_FMT_AV1) &&
-		(codec->max_width <= 1920 ||
-		 codec->output_format == V4L2_PIX_FMT_AV1) &&
-		(codec->max_height <= 1080 ||
+		((codec->max_width <= 1920 && codec->max_height <= 1080) ||
 		 codec->output_format == V4L2_PIX_FMT_AV1) &&
 		codec->max_input_size <= SZ_2M;
 }

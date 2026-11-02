@@ -14,8 +14,10 @@ struct s7d_codec_firmware_job;
 
 enum s7d_codec_firmware {
 	S7D_CODEC_FIRMWARE_H264_MH264,
-	/* Non-MMU HEVC; the initial backend selects Main8/DW 0x10. */
+	/* Non-MMU HEVC (hevc): 8-bit, linear double write 0x10 only. */
 	S7D_CODEC_FIRMWARE_HEVC,
+	/* MMU HEVC (hevc_mmu_swap): compressed references, Main and Main10. */
+	S7D_CODEC_FIRMWARE_HEVC_MMU,
 	S7D_CODEC_FIRMWARE_VP9,
 	S7D_CODEC_FIRMWARE_JPEG_ENC,
 	S7D_CODEC_FIRMWARE_AV1_MMU,

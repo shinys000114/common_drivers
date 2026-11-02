@@ -239,13 +239,15 @@ static int s7d_hevc_host_check(const struct s7d_hevc_sps *host)
 	    !host->max_dec_pic_buffering || host->max_dec_pic_buffering > 16 ||
 	    host->num_reorder_pics >= host->max_dec_pic_buffering)
 		return -EINVAL;
-	if (host->profile_idc != 1 || host->max_sub_layers != 1 ||
+	if ((host->profile_idc != 1 && host->profile_idc != 2) ||
+	    host->max_sub_layers != 1 ||
 	    host->chroma_format_idc != 1 || host->separate_colour_plane ||
-	    host->bit_depth_luma != 8 || host->bit_depth_chroma != 8 ||
+	    (host->bit_depth_luma != 8 && host->bit_depth_luma != 10) ||
+	    host->bit_depth_chroma != host->bit_depth_luma ||
 	    host->interlaced_source || host->field_seq ||
 	    host->coded_width < 64 || host->coded_height < 64 ||
-	    host->coded_width > 1920 || host->coded_height > 1088 ||
-	    host->coded_height - crop_y * 2 > 1080)
+	    host->coded_width > S7D_HEVC_MAX_WIDTH ||
+	    host->coded_height > S7D_HEVC_MAX_HEIGHT)
 		return -EOPNOTSUPP;
 	if ((host->coded_width | host->coded_height) &
 	    ((1U << host->log2_min_cb_size) - 1))
@@ -277,7 +279,9 @@ int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
 	if (word[RPM_FIRST_SLICE] != 1 || word[RPM_DEPENDENT_SLICE] ||
 	    word[RPM_SLICE_ADDRESS] || word[RPM_TEMPORAL_ID_PLUS1] != 1 ||
 	    word[RPM_TILES] || word[RPM_TILE_COLUMNS_MINUS1] || word[RPM_TILE_ROWS_MINUS1] ||
-	    (word[RPM_BIT_DEPTH] & 0xff) || (word[RPM_PROFILE_ETC] & BIT(2)) ||
+	    (word[RPM_BIT_DEPTH] & 0xff) != (((host->bit_depth_chroma - 8) << 4) |
+					     (host->bit_depth_luma - 8)) ||
+	    (word[RPM_PROFILE_ETC] & BIT(2)) ||
 	    ((word[RPM_SEI_FRAME_FIELD] & BIT(8)) &&
 	     (word[RPM_SEI_FRAME_FIELD] & GENMASK(6, 3))))
 		return -EOPNOTSUPP;

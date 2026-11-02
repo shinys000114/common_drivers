@@ -123,7 +123,8 @@ static bool hevc_layout_changed(const struct s7d_codec_layout *a,
 	return a->coded_width != b->coded_width || a->coded_height != b->coded_height ||
 	       a->visible_left != b->visible_left || a->visible_top != b->visible_top ||
 	       a->visible_width != b->visible_width || a->visible_height != b->visible_height ||
-	       a->min_capture_buffers != b->min_capture_buffers;
+	       a->min_capture_buffers != b->min_capture_buffers ||
+	       a->bit_depth != b->bit_depth;
 }
 
 static int hevc_metadata(struct hevc_backend *backend)
@@ -176,7 +177,7 @@ static int hevc_metadata(struct hevc_backend *backend)
 		}
 		prefix = s7d_hevc_input_prefix_bytes(prepared);
 		if (!prefix || check_add_overflow(prefix, view->bytes, &total) ||
-		    total > S7D_HEVC_INPUT_MAX_BYTES) {
+		    total > s7d_hevc_context_input_capacity(&view->sequence->sps)) {
 			ret = -E2BIG;
 			goto failed;
 		}
@@ -511,7 +512,9 @@ static int hevc_capture_start(void *priv, const struct s7d_codec_layout *layout,
 			      const struct s7d_v4l2_capture_buffer *buffers, unsigned int count)
 {
 	struct hevc_backend *backend = priv;
+	struct s7d_amfbc_buffer fbc[S7D_HEVC_MAX_CAPTURE_BUFFERS];
 	struct s7d_codec_layout checked;
+	bool zero_copy;
 	int ret = 0;
 
 	mutex_lock(&backend->lock);
@@ -530,6 +533,9 @@ static int hevc_capture_start(void *priv, const struct s7d_codec_layout *layout,
 		goto out;
 	}
 	ret = s7d_v4l2_validate_capture_pool(&checked, generation, buffers, count);
+	/* AM08C/AM10C buffers must all carry the format's FBC prefix. */
+	if (!ret)
+		ret = s7d_v4l2_fbc_capture_pool(&checked, buffers, count, fbc, &zero_copy);
 	if (ret)
 		goto out;
 	memcpy(backend->capture, buffers, sizeof(*buffers) * count);
@@ -1015,11 +1021,13 @@ s7d_hevc_v4l2_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 		.codec = {
 			.engine = S7D_CODEC_ENGINE_HEVC,
 			.output_format = V4L2_PIX_FMT_HEVC,
-			.max_width = 1920, .max_height = 1080,
+			.max_width = S7D_HEVC_MAX_WIDTH, .max_height = S7D_HEVC_MAX_HEIGHT,
 			.max_input_size = S7D_HEVC_INPUT_MAX_BYTES,
 			.staging_headroom = S7D_HEVC_PARAMETER_BYTES,
 			.max_capture_buffers = S7D_HEVC_MAX_CAPTURE_BUFFERS,
 			.default_layout = s7d_v4l2_default_nv12_layout,
+			/* CAPTURE buffers are the DPB already: no extra minimum. */
+			.fbc = true,
 		},
 		.ops = &hevc_ops, .ready = hevc_factory_ready,
 		.create = hevc_factory_create, .destroy = hevc_factory_destroy,

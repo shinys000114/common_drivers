@@ -183,7 +183,9 @@ static int hevc_vps_parse(struct hevc_bits *b, struct hevc_vps *vps)
 	constraint = hevc_get(b, 32);
 	constraint |= hevc_get(b, 12);
 	hevc_get(b, 8);
-	if ((profile != 1 && (profile || !(compatibility & BIT(30)))) ||
+	/* Main or Main10, as the SPS. */
+	if ((profile != 1 && profile != 2 &&
+	     (profile || !(compatibility & (BIT(30) | BIT(29))))) ||
 	    interlaced || constraint)
 		return b->error ?: -EOPNOTSUPP;
 	hevc_get(b, 1);

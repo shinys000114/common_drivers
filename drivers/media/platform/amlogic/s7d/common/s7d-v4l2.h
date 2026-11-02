@@ -18,7 +18,7 @@
 #endif
 
 /*
- * Driver-private CAPTURE formats of the AV1 decoder: each frame in Amlogic FBC
+ * Driver-private CAPTURE formats of the AV1 and HEVC decoders: each frame in Amlogic FBC
  * (scatter layout) followed by its linear 8-bit NV12 copy, in a single plane.
  * AM08C carries an 8-bit stream (mem-saving body), AM10C a 10-bit one (full
  * body); a stream is only offered the one of its own depth. w and h are the
@@ -102,7 +102,7 @@ struct s7d_v4l2_codec {
 	int (*default_layout)(u32 width, u32 height, u32 fourcc,
 			      struct s7d_codec_layout *layout);
 	bool nv21;
-	/* CAPTURE may also offer V4L2_PIX_FMT_AM08C/AM10C (AV1 only). */
+	/* CAPTURE may also offer V4L2_PIX_FMT_AM08C/AM10C (AV1 and HEVC). */
 	bool fbc;
 	/*
 	 * AM08C/AM10C CAPTURE minimum, when the decoder keeps its references in

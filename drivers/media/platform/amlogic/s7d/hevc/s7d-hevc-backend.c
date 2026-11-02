@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/regmap.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 
@@ -140,6 +141,10 @@ struct s7d_hevc_decoder {
 	u32 decode_count;
 	u8 start_decoding_flag;
 	u8 rps_set_id;
+	/* MMU firmware with FBC references (Main10, or an FBC CAPTURE format). */
+	bool compressed;
+	/* AM08C/AM10C: FBC bytes in front of each CAPTURE buffer's NV12, else 0. */
+	u32 fbc_prefix;
 	struct s7d_hevc_engine *irq_engine;
 	u64 irq_binding;
 	int release_error;
@@ -376,6 +381,8 @@ static int hevc_emit(struct s7d_hevc_decoder *decoder, bool drain,
 			.timestamp_meta = out.metadata.timestamp_meta,
 			.sequence = decoder->output_sequence, .flags = out.flags,
 			.bytesused = { decoder->layout.size[0], decoder->layout.size[1] },
+			/* AM08C/AM10C report the whole buffer: FBC, then NV12. */
+			.prefix_bytesused = decoder->fbc_prefix,
 		};
 		if (hevc_core_blocked(decoder))
 			return hevc_core_result(decoder, -ESHUTDOWN);
@@ -397,6 +404,7 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 {
 	struct s7d_hevc_picture_buffers buffers = {
 		.count = decoder->captures, .surface = decoder->surface, .mv = decoder->mv,
+		.compressed = decoder->compressed,
 	};
 	u8 raw[S7D_HEVC_RPM_BYTES];
 	unsigned long flags;
@@ -510,6 +518,12 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 	ret = regmap_read(decoder->map, HEVC_STATUS, &status);
 	if (!ret && status != S7D_HEVC_SLICE_HEADER_DONE)
 		ret = -ESTALE;
+	/* The SAO MMU writes this picture's body through the frame map. */
+	if (!ret && decoder->compressed)
+		ret = s7d_hevc_context_map_body(job->context, job->lease_epoch,
+			decoder->surface[slot].body,
+			DIV_ROUND_UP(s7d_hevc_fbc_body_bytes(decoder->sps.coded_width,
+				decoder->sps.coded_height, decoder->sps.bit_depth_luma), SZ_4K));
 	if (!ret)
 		ret = s7d_hevc_picture_configure(decoder->map,
 			s7d_hevc_context_workspace(job->context), &job->rpm,
@@ -766,6 +780,12 @@ static const struct s7d_codec_resource_ops hevc_resource_ops = {
 	.release = hevc_release,
 };
 
+/* The vendor's choice: MMU firmware whenever references are compressed. */
+static enum s7d_codec_firmware hevc_firmware(const struct s7d_hevc_decoder *decoder)
+{
+	return decoder->compressed ? S7D_CODEC_FIRMWARE_HEVC_MMU : S7D_CODEC_FIRMWARE_HEVC;
+}
+
 static int hevc_preload(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *job)
 {
 	struct s7d_codec_firmware_job *preload;
@@ -782,7 +802,7 @@ static int hevc_preload(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *j
 	job->firmware_epoch = decoder->firmware_epoch;
 	ret = s7d_codec_firmware_prepare_for_engine(decoder->firmware, job->session,
 			job->firmware_epoch, S7D_CODEC_ENGINE_HEVC,
-			S7D_CODEC_FIRMWARE_HEVC, &preload);
+			hevc_firmware(decoder), &preload);
 	if (ret || !preload)
 		return ret ? ret : hevc_job_check_stop(decoder, job);
 	spin_lock_irqsave(&decoder->irq_lock, flags);
@@ -830,11 +850,11 @@ static int hevc_protocol(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *
 	};
 	int ret;
 
-	ret = s7d_hevc_workspace_program(decoder->map, workspace);
+	ret = s7d_hevc_workspace_program(decoder->map, workspace, decoder->compressed);
 	if (!ret)
 		ret = s7d_codec_dos_hevc_init(decoder->dos);
 	if (!ret)
-		ret = s7d_hevc_protocol_configure(decoder->map);
+		ret = s7d_hevc_protocol_configure(decoder->map, decoder->compressed);
 	if (!ret)
 		ret = regmap_multi_reg_write(decoder->map, regs, ARRAY_SIZE(regs));
 	return ret;
@@ -906,6 +926,7 @@ static int hevc_validate_capture(const struct s7d_codec_layout *layout,
 	    count > S7D_HEVC_MAX_CAPTURE_BUFFERS)
 		return -EINVAL;
 	for (i = 0; i < count; i++) {
+		surface[i] = (struct s7d_hevc_surface) { };
 		if (!capture[i].surface || capture[i].generation != generation ||
 		    capture[i].surface_id >= S7D_CODEC_MAX_CAPTURE_BUFFERS)
 			return -EINVAL;
@@ -934,9 +955,12 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 			 u64 generation, u64 parameter_epoch,
 			 const struct s7d_v4l2_capture_buffer *capture, u32 count)
 {
+	struct s7d_amfbc_buffer fbc[S7D_HEVC_MAX_CAPTURE_BUFFERS];
+	struct s7d_hevc_dma_region header, body;
 	struct s7d_codec_layout checked;
 	unsigned long flags;
-	u32 i;
+	u32 i, fbc_header = 0, fbc_bytes = 0;
+	bool compressed, zero_copy = false;
 	int ret;
 
 	if (!decoder || !session || !sps || !layout || !parameter_epoch)
@@ -952,6 +976,9 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 		ret = -EINVAL;
 	if (!ret)
 		ret = hevc_validate_capture(layout, capture, generation, count, decoder->surface);
+	/* AM08C/AM10C: each picture's FBC lives in its CAPTURE buffer (zero copy). */
+	if (!ret)
+		ret = s7d_v4l2_fbc_capture_pool(layout, capture, count, fbc, &zero_copy);
 	if (ret)
 		goto out;
 	decoder->dpb = kzalloc(sizeof(*decoder->dpb), GFP_KERNEL);
@@ -962,8 +989,20 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 	ret = s7d_hevc_dpb_init(decoder->dpb, sps, generation, parameter_epoch, count);
 	if (ret)
 		goto free_dpb;
+	/*
+	 * Only the MMU firmware decodes Main10; its references are FBC, the NV12
+	 * double write stays 8-bit. Internal FBC memory takes the AM08C/AM10C
+	 * layout, one allocation per slot.
+	 */
+	compressed = layout->bit_depth == 10 || zero_copy;
+	if (compressed && !zero_copy) {
+		fbc_header = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
+		fbc_bytes = fbc_header + s7d_amfbc_body_size(layout->coded_width,
+				layout->storage_height, layout->bit_depth);
+	}
 	decoder->context = s7d_hevc_context_create_stream(session, sps,
-			S7D_HEVC_INPUT_MAX_BYTES, count, decoder->epoch);
+			s7d_hevc_context_input_capacity(sps), count, fbc_header, fbc_bytes,
+			decoder->epoch);
 	if (IS_ERR(decoder->context)) {
 		ret = PTR_ERR(decoder->context);
 		decoder->context = NULL;
@@ -978,11 +1017,30 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 	for (i = 0; i < count; i++) {
 		ret = s7d_hevc_context_mv_slot(decoder->context, decoder->epoch,
 					      i, &decoder->mv[i]);
+		if (!ret && compressed && !zero_copy)
+			ret = s7d_hevc_context_fbc_slot(decoder->context, decoder->epoch,
+							i, &header, &body);
 		if (ret) {
 			decoder->failure = ret;
 			goto out;
 		}
+		if (zero_copy) {
+			header = (struct s7d_hevc_dma_region) {
+				.address = fbc[i].header, .bytes = fbc[i].header_bytes,
+			};
+			body = (struct s7d_hevc_dma_region) {
+				.address = fbc[i].body, .bytes = fbc[i].body_bytes,
+			};
+		}
+		if (compressed) {
+			decoder->surface[i].header = header.address;
+			decoder->surface[i].header_bytes = header.bytes;
+			decoder->surface[i].body = body.address;
+			decoder->surface[i].body_bytes = body.bytes;
+		}
 	}
+	decoder->compressed = compressed;
+	decoder->fbc_prefix = zero_copy ? fbc[0].header_bytes + fbc[0].body_bytes : 0;
 	ret = s7d_hevc_engine_bind(decoder->irq_engine, session, decoder->epoch,
 				   &hevc_irq_ops, decoder, &decoder->irq_binding);
 	if (ret) {
@@ -1229,11 +1287,13 @@ static void hevc_report_failure(struct s7d_hevc_decoder *decoder,
 	s7d_hevc_context_report_dma(job->context, decoder->dev);
 	for (i = 0; i < decoder->captures; i++)
 		dev_err(decoder->dev,
-			"HEVC capture %u id=%llu generation=%llu Y=%#x+%#x UV=%#x+%#x MV=%#x+%#x\n",
+			"HEVC capture %u id=%llu generation=%llu Y=%#x+%#x UV=%#x+%#x MV=%#x+%#x FBC=%#x+%#x,%#x+%#x\n",
 			i, decoder->capture[i].surface_id, decoder->capture[i].generation,
 			decoder->surface[i].address[0], decoder->surface[i].bytes[0],
 			decoder->surface[i].address[1], decoder->surface[i].bytes[1],
-			decoder->mv[i].address, decoder->mv[i].bytes);
+			decoder->mv[i].address, decoder->mv[i].bytes,
+			decoder->surface[i].header, decoder->surface[i].header_bytes,
+			decoder->surface[i].body, decoder->surface[i].body_bytes);
 }
 
 int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
@@ -1347,7 +1407,7 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	if (!ret) {
 		stage = "firmware-load";
 		ret = s7d_codec_firmware_load(decoder->dev, S7D_CODEC_ENGINE_HEVC,
-					      S7D_CODEC_FIRMWARE_HEVC);
+					      hevc_firmware(decoder));
 	}
 	if (ret) {
 		s7d_codec_firmware_invalidate(decoder->firmware);
@@ -1568,6 +1628,8 @@ int s7d_hevc_decoder_stream_close(struct s7d_hevc_decoder *decoder,
 	decoder->decode_count = 0;
 	decoder->start_decoding_flag = 0;
 	decoder->rps_set_id = 0;
+	decoder->compressed = false;
+	decoder->fbc_prefix = 0;
 	memset(decoder->write_token, 0, sizeof(decoder->write_token));
 	ret = 0;
 out:

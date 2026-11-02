@@ -17,6 +17,7 @@
 
 /* S7D v1 DOS word addresses; s7 compatibility does not remap these registers. */
 #define HREG(word)			((word) * 4U)
+#define HEVC_ASSIST_MMU_MAP_ADDR		HREG(0x3009)
 #define HEVC_SCRATCH(n)			HREG(0x30c0 + (n))
 #define HEVC_CABAC_CONTROL		HREG(0x3110)
 #define HEVC_PARSER_CMD_WRITE		HREG(0x3112)
@@ -54,6 +55,7 @@
 #define HEVCD_MPP_ANC_CANVAS_ACCESS	HREG(0x34c0)
 #define HEVCD_MPP_ANC_CANVAS_DATA		HREG(0x34c1)
 #define HEVCD_MPP_DECOMP_CTL1		HREG(0x34c2)
+#define HEVCD_MPP_DECOMP_CTL2		HREG(0x34c3)
 #define HEVCD_MCRCC_CTL1			HREG(0x34f0)
 #define HEVCD_MCRCC_CTL2			HREG(0x34f1)
 #define HEVCD_MCRCC_CTL3			HREG(0x34f2)
@@ -77,6 +79,15 @@
 #define HEVC_SAO_Y_WPTR			HREG(0x360f)
 #define HEVC_SAO_C_WPTR			HREG(0x3610)
 #define HEVC_SAO_CTRL5			HREG(0x3623)
+#define HEVC_CM_BODY_START_ADDR		HREG(0x3626)
+#define HEVC_CM_BODY_LENGTH		HREG(0x3627)
+#define HEVC_CM_HEADER_START_ADDR		HREG(0x3628)
+#define HEVC_CM_HEADER_LENGTH		HREG(0x3629)
+#define HEVC_CM_HEADER_OFFSET		HREG(0x362b)
+#define HEVC_SAO_CTRL9			HREG(0x362d)
+#define HEVC_SAO_MMU_VH0_ADDR		HREG(0x363a)
+#define HEVC_SAO_MMU_VH1_ADDR		HREG(0x363b)
+#define HEVC_SAO_CTRL26			HREG(0x3677)
 
 enum picture_rpm_word {
 	RPM_COL_FROM_L0 = 0x1d,
@@ -90,6 +101,24 @@ enum picture_rpm_word {
 	RPM_PPS_CB_QP = 0x3f,
 	RPM_PPS_CR_QP = 0x40,
 };
+
+u32 s7d_hevc_fbc_body_bytes(u32 width, u32 height, u32 bit_depth)
+{
+	/* 8-bit bodies use the vendor's mem-saving block, as enable_mem_saving. */
+	return DIV_ROUND_UP(width, 64) * DIV_ROUND_UP(height, 32) *
+	       (bit_depth == 10 ? 4096 : 3200);
+}
+
+u32 s7d_hevc_fbc_header_bytes(u32 width, u32 height)
+{
+	return DIV_ROUND_UP(width, 128) * DIV_ROUND_UP(height, 64) * 32;
+}
+
+/* Scatter header the SAO writes at CM_HEADER_START_ADDR: 32 bytes per 32x32. */
+static u32 hevc_fbc_scatter_bytes(u32 width, u32 height)
+{
+	return DIV_ROUND_UP(width, 32) * DIV_ROUND_UP(height, 32) * 32;
+}
 
 /* Return the first write error and never continue programming after it. */
 static int hevc_write_many(struct regmap *map, const struct reg_sequence *seq,
@@ -123,11 +152,13 @@ static int hevc_workspace_check(const struct s7d_hevc_workspace *ws, u32 mv_byte
 		&ws->scalelut, &ws->dblk_para, &ws->dblk_data,
 		&ws->dblk_data2, &ws->mpred_above, &ws->rpm, &ws->lmem,
 		&ws->swap1, &ws->swap2, &ws->aux, &ws->mv,
+		&ws->mmu_vbh, &ws->mmu_map,
 	};
 	const u32 minimum[] = {
 		0x8000, 0x800, 0x800, 0x800, 0x2000, 0x8000,
 		0x40100, 0x140800, 0x100800, 0x8000, 0x100, 0xc00,
 		0x800, 0x800, 0x6000, mv_bytes,
+		0xa000, S7D_HEVC_MMU_MAP_BYTES,
 	};
 	u32 i, j;
 	int ret;
@@ -152,7 +183,8 @@ static int hevc_workspace_check(const struct s7d_hevc_workspace *ws, u32 mv_byte
 }
 
 int s7d_hevc_workspace_program(struct regmap *map,
-			       const struct s7d_hevc_workspace *ws)
+			       const struct s7d_hevc_workspace *ws,
+			       bool compressed)
 {
 	int ret;
 
@@ -178,11 +210,15 @@ int s7d_hevc_workspace_program(struct regmap *map,
 			{ HEVC_SCRATCH(15), ws->lmem.address },
 		};
 
-		return hevc_write_many(map, seq, ARRAY_SIZE(seq));
+		ret = hevc_write_many(map, seq, ARRAY_SIZE(seq));
 	}
+	/* As vendor hevc_config_work_space_hw with mmu_enable. */
+	if (!ret && compressed)
+		ret = regmap_write(map, HEVC_ASSIST_MMU_MAP_ADDR, ws->mmu_map.address);
+	return ret;
 }
 
-int s7d_hevc_protocol_configure(struct regmap *map)
+int s7d_hevc_protocol_configure(struct regmap *map, bool compressed)
 {
 	static const u16 parser_cmd[] = {
 		0x0401, 0x8401, 0x0800, 0x0402, 0x9002, 0x1423,
@@ -199,6 +235,7 @@ int s7d_hevc_protocol_configure(struct regmap *map)
 		{ HEVC_PARSER_CMD_SKIP_2, 0x001b1910 },
 		{ HEVCD_IPP_TOP_CNTL, 1 },
 		{ HEVCD_IPP_TOP_CNTL, 2 },
+		/* NV21 reference read mode, double write 0x10 only (last). */
 		{ HEVCD_MPP_DECOMP_CTL1, BIT(31) },
 	};
 	u32 i;
@@ -223,19 +260,21 @@ int s7d_hevc_protocol_configure(struct regmap *map)
 		if (ret)
 			return ret;
 	}
-	return hevc_write_many(map, seq, ARRAY_SIZE(seq));
+	return hevc_write_many(map, seq, ARRAY_SIZE(seq) - compressed);
 }
 
-static u32 hevc_canvas(u32 slot)
+/* Linear: Y and UV canvases per slot; compressed: one canvas, the FBC header. */
+static u32 hevc_canvas(u32 slot, bool compressed)
 {
-	u32 y = slot * 2;
-	u32 uv = y + 1;
+	u32 y = compressed ? slot : slot * 2;
+	u32 uv = compressed ? slot : y + 1;
 
 	return (uv << 16) | (uv << 8) | y;
 }
 
 static int hevc_mc_program(struct regmap *map,
-			   const struct s7d_hevc_picture_plan *refs)
+			   const struct s7d_hevc_picture_plan *refs,
+			   bool compressed)
 {
 	u32 list, i;
 	int ret;
@@ -249,7 +288,7 @@ static int hevc_mc_program(struct regmap *map,
 			return ret;
 		for (i = 0; i < refs->list_count[list]; i++) {
 			ret = regmap_write(map, HEVCD_MPP_ANC_CANVAS_DATA,
-					   hevc_canvas(refs->list[list][i].slot));
+					   hevc_canvas(refs->list[list][i].slot, compressed));
 			if (ret)
 				return ret;
 		}
@@ -257,7 +296,10 @@ static int hevc_mc_program(struct regmap *map,
 	return 0;
 }
 
-static int hevc_mcrcc_canvas(struct regmap *map, u32 slot, u32 *canvas)
+/* Next canvas of @list; an entry past the list reads back as the bank holds it. */
+static int hevc_mcrcc_canvas(struct regmap *map,
+			     const struct s7d_hevc_picture_plan *refs, u32 list,
+			     u32 index, bool compressed, u32 *canvas)
 {
 	u32 value;
 	int ret;
@@ -266,14 +308,21 @@ static int hevc_mcrcc_canvas(struct regmap *map, u32 slot, u32 *canvas)
 	if (ret)
 		return ret;
 	value &= 0xffff;
-	if (value != (hevc_canvas(slot) & 0xffff))
+	if (index < refs->list_count[list] &&
+	    value != (hevc_canvas(refs->list[list][index].slot, compressed) & 0xffff))
 		return -EIO;
 	*canvas = value | (value << 16);
 	return 0;
 }
 
+/*
+ * Vendor config_mcrcc_axi_hw: with double write 0x10 the list lengths pick the
+ * second cache canvas; in MMU mode it counts L0 as 0 and L1 as 0x7fff, so the
+ * second canvas is always the next entry read.
+ */
 static int hevc_mcrcc_program(struct regmap *map,
-			      const struct s7d_hevc_picture_plan *refs)
+			      const struct s7d_hevc_picture_plan *refs,
+			      bool compressed)
 {
 	u32 first, second;
 	int ret;
@@ -287,7 +336,7 @@ static int hevc_mcrcc_program(struct regmap *map,
 			   refs->slice_type == 0 ? 0 : BIT(1));
 	if (ret)
 		return ret;
-	ret = hevc_mcrcc_canvas(map, refs->list[0][0].slot, &first);
+	ret = hevc_mcrcc_canvas(map, refs, 0, 0, compressed, &first);
 	if (ret)
 		return ret;
 	ret = regmap_write(map, HEVCD_MCRCC_CTL2, first);
@@ -298,18 +347,18 @@ static int hevc_mcrcc_program(struct regmap *map,
 				   (16 << 8) | BIT(1));
 		if (ret)
 			return ret;
-		ret = hevc_mcrcc_canvas(map, refs->list[1][0].slot, &second);
+		ret = hevc_mcrcc_canvas(map, refs, 1, 0, compressed, &second);
 		if (ret)
 			return ret;
-		if (first == second && refs->list_count[1] > 1) {
-			ret = hevc_mcrcc_canvas(map, refs->list[1][1].slot, &second);
+		if (first == second && (compressed || refs->list_count[1] > 1)) {
+			ret = hevc_mcrcc_canvas(map, refs, 1, 1, compressed, &second);
 			if (ret)
 				return ret;
 		}
-	} else if (refs->list_count[0] == 1) {
+	} else if (!compressed && refs->list_count[0] == 1) {
 		second = first;
 	} else {
-		ret = hevc_mcrcc_canvas(map, refs->list[0][1].slot, &second);
+		ret = hevc_mcrcc_canvas(map, refs, 0, 1, compressed, &second);
 		if (ret)
 			return ret;
 	}
@@ -335,6 +384,9 @@ static int hevc_picture_program(struct regmap *map,
 	bool col_valid = refs->collocated_valid;
 	const struct s7d_hevc_dma_region *read_mv = col_valid ?
 		&buffers->mv[refs->collocated.slot] : write_mv;
+	bool compressed = buffers->compressed;
+	u32 body_bytes = s7d_hevc_fbc_body_bytes(geometry->coded_width,
+		geometry->coded_height, host->bit_depth_luma);
 	u32 slice_type = refs->slice_type;
 	u32 col_from_l0 = slice->collocated_from_l0;
 	u32 l0_count = refs->list_count[0];
@@ -388,10 +440,14 @@ static int hevc_picture_program(struct regmap *map,
 	if (ret)
 		return ret;
 	for (i = 0; i < buffers->count; i++) {
+		/* MMU mode: one entry per picture, its FBC header (init_pic_list_hw). */
 		ret = regmap_write(map, HEVCD_MPP_ANC2AXI_TBL_DATA,
-				   buffers->surface[i].address[0] >> 5);
+				   (compressed ? buffers->surface[i].header :
+				    buffers->surface[i].address[0]) >> 5);
 		if (ret)
 			return ret;
+		if (compressed)
+			continue;
 		ret = regmap_write(map, HEVCD_MPP_ANC2AXI_TBL_DATA,
 				   buffers->surface[i].address[1] >> 5);
 		if (ret)
@@ -408,7 +464,29 @@ static int hevc_picture_program(struct regmap *map,
 		if (ret)
 			return ret;
 	}
-	ret = hevc_mc_program(map, refs);
+	if (compressed) {
+		/* Vendor init_decode_head_hw, MMU: scatter body addressed by its header. */
+		const struct reg_sequence seq[] = {
+			{ HEVCD_MPP_DECOMP_CTL1, BIT(4) },
+			{ HEVCD_MPP_DECOMP_CTL2, 0 },
+			{ HEVC_CM_BODY_LENGTH, body_bytes },
+			{ HEVC_CM_HEADER_OFFSET, body_bytes },
+			{ HEVC_CM_HEADER_LENGTH,
+			  s7d_hevc_fbc_header_bytes(geometry->coded_width,
+						    geometry->coded_height) },
+			{ HEVC_SAO_MMU_VH0_ADDR, ws->mmu_vbh.address },
+			{ HEVC_SAO_MMU_VH1_ADDR, ws->mmu_vbh.address + ws->mmu_vbh.bytes / 2 },
+		};
+
+		ret = hevc_write_many(map, seq, ARRAY_SIZE(seq));
+		if (!ret)
+			ret = regmap_update_bits(map, HEVC_SAO_CTRL9, BIT(0), BIT(0));
+		if (!ret)
+			ret = regmap_update_bits(map, HEVC_SAO_CTRL5, BIT(10), BIT(10));
+		if (ret)
+			return ret;
+	}
+	ret = hevc_mc_program(map, refs, compressed);
 	if (ret)
 		return ret;
 	{
@@ -423,7 +501,7 @@ static int hevc_picture_program(struct regmap *map,
 	}
 	if (ret)
 		return ret;
-	ret = hevc_mcrcc_program(map, refs);
+	ret = hevc_mcrcc_program(map, refs, compressed);
 	if (ret)
 		return ret;
 	{
@@ -492,9 +570,28 @@ static int hevc_picture_program(struct regmap *map,
 	}
 	if (ret)
 		return ret;
-	ret = regmap_update_bits(map, HEVC_SAO_CTRL5, GENMASK(23, 16), 0);
+	if (compressed) {
+		/* Full-size double write; 8-bit bodies in mem-saving layout. */
+		ret = regmap_write(map, HEVC_SAO_CTRL26, 0);
+		if (!ret)
+			ret = regmap_update_bits(map, HEVC_SAO_CTRL5,
+				GENMASK(23, 16) | BIT(9),
+				host->bit_depth_luma == 8 ? BIT(9) : 0);
+	} else {
+		ret = regmap_update_bits(map, HEVC_SAO_CTRL5, GENMASK(23, 16), 0);
+	}
 	if (ret)
 		return ret;
+	if (compressed) {
+		const struct reg_sequence seq[] = {
+			{ HEVC_CM_BODY_START_ADDR, 0 },
+			{ HEVC_CM_HEADER_START_ADDR, surface->header },
+		};
+
+		ret = hevc_write_many(map, seq, ARRAY_SIZE(seq));
+		if (ret)
+			return ret;
+	}
 	{
 		const struct reg_sequence seq[] = {
 			{ HEVC_SAO_Y_START_ADDR, surface->address[0] },
@@ -503,7 +600,8 @@ static int hevc_picture_program(struct regmap *map,
 			{ HEVC_SAO_C_LENGTH, layout->size[1] },
 			{ HEVC_SAO_Y_WPTR, surface->address[0] },
 			{ HEVC_SAO_C_WPTR, surface->address[1] },
-			{ HEVC_DBLK_CFGB, 0xfe00 |
+			/* [8] compressed write, [9] double write. */
+			{ HEVC_DBLK_CFGB, (compressed ? 0xff00 : 0xfe00) |
 				(geometry->coded_width >= 1280 ? BIT(4) : 0) },
 			{ HEVC_DBLK_CFG2, pic_size },
 			{ HEVC_DBLK_CFG1, dblk1 },
@@ -514,8 +612,12 @@ static int hevc_picture_program(struct regmap *map,
 	}
 	if (ret)
 		return ret;
-	/* Linear, little-endian NV12, 64-byte lines, compressed output disabled. */
-	ret = regmap_update_bits(map, HEVC_SAO_CTRL1, 0xfff3, 0x8ff1);
+	/*
+	 * Linear, little-endian NV12, 64-byte lines; [0] disables the compressed
+	 * output, which MMU mode writes alongside the double write.
+	 */
+	ret = regmap_update_bits(map, HEVC_SAO_CTRL1, 0xfff3,
+				 compressed ? 0x8ff0 : 0x8ff1);
 	if (ret)
 		return ret;
 	ret = regmap_update_bits(map, HEVCD_IPP_AXIIF_CONFIG,
@@ -534,8 +636,22 @@ static bool hevc_overlaps(u32 address, u32 bytes, u32 other, u32 other_bytes)
 	       (u64)other < (u64)address + bytes;
 }
 
+/* A surface's regions: NV12 Y and UV, then FBC header and body if compressed. */
+static u32 hevc_surface_regions(const struct s7d_hevc_surface *surface,
+				bool compressed, struct s7d_hevc_dma_region region[4])
+{
+	region[0] = (struct s7d_hevc_dma_region) { surface->address[0], surface->bytes[0] };
+	region[1] = (struct s7d_hevc_dma_region) { surface->address[1], surface->bytes[1] };
+	if (!compressed)
+		return 2;
+	region[2] = (struct s7d_hevc_dma_region) { surface->header, surface->header_bytes };
+	region[3] = (struct s7d_hevc_dma_region) { surface->body, surface->body_bytes };
+	return 4;
+}
+
 static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 			      const struct s7d_codec_layout *layout,
+			      const struct s7d_hevc_sps *host,
 			      const struct s7d_hevc_geometry *geometry,
 			      const struct s7d_hevc_picture_buffers *buffers)
 {
@@ -543,18 +659,25 @@ static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 		&ws->ipp, &ws->short_term_rps, &ws->vps, &ws->sps, &ws->pps,
 		&ws->scalelut, &ws->dblk_para, &ws->dblk_data, &ws->dblk_data2,
 		&ws->mpred_above, &ws->rpm, &ws->lmem, &ws->swap1, &ws->swap2,
-		&ws->aux, &ws->mv,
+		&ws->aux, &ws->mv, &ws->mmu_vbh, &ws->mmu_map,
 	};
+	struct s7d_hevc_dma_region mine[4], theirs[4];
 	u32 unit = geometry->ctb_size == 64 ? 0x200 :
 		   geometry->ctb_size == 32 ? 0x80 : 0x20;
 	u32 used = geometry->ctb_count * unit;
 	u32 stride = ALIGN(used, 0x10000);
 	u32 count = buffers->count;
-	u32 i, j, plane, other;
+	u32 header = hevc_fbc_scatter_bytes(geometry->coded_width, geometry->coded_height);
+	u32 body = ALIGN(s7d_hevc_fbc_body_bytes(geometry->coded_width,
+				geometry->coded_height, host->bit_depth_luma), 4096);
+	u32 i, j, part, other, parts, other_parts;
 	int ret;
 
 	if (count < layout->min_capture_buffers ||
 	    count > S7D_HEVC_MAX_CAPTURE_BUFFERS)
+		return -EINVAL;
+	/* The linear path reads 8-bit references only. */
+	if (!buffers->compressed && host->bit_depth_luma != 8)
 		return -EINVAL;
 	ret = hevc_workspace_check(ws, count * stride);
 	if (ret)
@@ -563,6 +686,7 @@ static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 	    ws->mv.bytes != count * stride)
 		return -ESTALE;
 	for (i = 0; i < count; i++) {
+		const struct s7d_hevc_surface *surface = &buffers->surface[i];
 		const struct s7d_hevc_dma_region *mv = &buffers->mv[i];
 
 		if ((u64)mv->address != (u64)ws->mv.address + i * stride ||
@@ -570,28 +694,35 @@ static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 			return -ESTALE;
 		if ((u64)mv->address + mv->bytes > U32_MAX)
 			return -ERANGE;
-		for (plane = 0; plane < 2; plane++) {
-			const struct s7d_hevc_surface *surface = &buffers->surface[i];
-			u32 address = surface->address[plane];
-			u32 bytes = surface->bytes[plane];
+		/* Header and body 4 KiB aligned: ANC2AXI and the MMU map pages. */
+		if (buffers->compressed &&
+		    (!IS_ALIGNED(surface->header, 4096) || surface->header_bytes < header ||
+		     !IS_ALIGNED(surface->body, 4096) || surface->body_bytes < body))
+			return -EINVAL;
+		parts = hevc_surface_regions(surface, buffers->compressed, mine);
+		for (part = 0; part < parts; part++) {
+			const struct s7d_hevc_dma_region *a = &mine[part];
 
-			if (!address || !IS_ALIGNED(address, 64) ||
-			    bytes < layout->size[plane] ||
-			    (u64)address + bytes > (1ULL << 32))
+			if (!a->address || (part < 2 && (!IS_ALIGNED(a->address, 64) ||
+							 a->bytes < layout->size[part])) ||
+			    (u64)a->address + a->bytes > (1ULL << 32))
 				return -EINVAL;
 			for (j = 0; j < ARRAY_SIZE(region); j++)
-				if (hevc_overlaps(address, bytes, region[j]->address,
+				if (hevc_overlaps(a->address, a->bytes, region[j]->address,
 						  region[j]->bytes))
 					return -EINVAL;
-			for (j = 0; j <= i; j++)
-				for (other = 0; other < 2; other++) {
-					if (j == i && other >= plane)
+			for (j = 0; j <= i; j++) {
+				other_parts = hevc_surface_regions(&buffers->surface[j],
+								   buffers->compressed, theirs);
+				for (other = 0; other < other_parts; other++) {
+					if (j == i && other >= part)
 						continue;
-					if (hevc_overlaps(address, bytes,
-						buffers->surface[j].address[other],
-						buffers->surface[j].bytes[other]))
+					if (hevc_overlaps(a->address, a->bytes,
+							  theirs[other].address,
+							  theirs[other].bytes))
 						return -EINVAL;
 				}
+			}
 		}
 	}
 	return 0;
@@ -699,7 +830,7 @@ int s7d_hevc_picture_configure(struct regmap *map,
 	    rpm->word[RPM_FIVE_MINUS_MERGE] > 4 ||
 	    rpm->word[RPM_MISC_FLAGS] & ~GENMASK(10, 0))
 		return -EPROTO;
-	ret = hevc_buffers_check(ws, layout, &geometry, buffers);
+	ret = hevc_buffers_check(ws, layout, host, &geometry, buffers);
 	if (ret)
 		return ret;
 	ret = hevc_references_check(&checked, plan, buffers->count);

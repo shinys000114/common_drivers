@@ -81,8 +81,11 @@ static void hevc_profile(struct hevc_bits *b, u32 *profile, bool *interlaced)
 	hevc_skip(b, 1);
 	*profile = hevc_get(b, 5);
 	compatibility = hevc_get(b, 32);
+	/* A Main stream also claims Main10 (bit 29); Main wins. */
 	if (!*profile && (compatibility & BIT(30)))
 		*profile = 1;
+	else if (!*profile && (compatibility & BIT(29)))
+		*profile = 2;
 	hevc_skip(b, 1);
 	*interlaced = hevc_get(b, 1);
 	hevc_skip(b, 46);
@@ -512,6 +515,12 @@ static int hevc_dpb_limit(const struct s7d_hevc_sps *sps, u32 *limit)
 	case 153:
 		max_luma = 8912896;
 		break;
+	/* 4096x2304 exceeds every level up to 5.2; level 6 is the first to hold it. */
+	case 180:
+	case 183:
+	case 186:
+		max_luma = 35651584;
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -543,14 +552,19 @@ int s7d_hevc_build_layout(const struct s7d_hevc_sps *sps,
 
 	if (!sps || !layout)
 		return -EINVAL;
-	if (sps->profile_idc != 1 || sps->chroma_format_idc != 1 ||
-	    sps->separate_colour_plane || sps->bit_depth_luma != 8 ||
-	    sps->bit_depth_chroma != 8 || sps->interlaced_source || sps->field_seq)
+	/* Main and Main10; both components at the same depth, 8 or 10 bits. */
+	if ((sps->profile_idc != 1 && sps->profile_idc != 2) ||
+	    sps->chroma_format_idc != 1 || sps->separate_colour_plane ||
+	    (sps->bit_depth_luma != 8 && sps->bit_depth_luma != 10) ||
+	    sps->bit_depth_chroma != sps->bit_depth_luma ||
+	    (sps->profile_idc == 1 && sps->bit_depth_luma != 8) ||
+	    sps->interlaced_source || sps->field_seq)
 		return -EOPNOTSUPP;
 	if (format != S7D_CODEC_CAPTURE_NV12M && format != S7D_CODEC_CAPTURE_NV21M)
 		return -EOPNOTSUPP;
 	if (sps->coded_width < 64 || sps->coded_height < 64 ||
-	    sps->coded_width > 1920 || sps->coded_height > 1088)
+	    sps->coded_width > S7D_HEVC_MAX_WIDTH ||
+	    sps->coded_height > S7D_HEVC_MAX_HEIGHT)
 		return -ERANGE;
 	if (!sps->max_sub_layers || sps->max_sub_layers > HEVC_MAX_SUB_LAYERS ||
 	    sps->log2_min_cb_size < 3 || sps->log2_min_cb_size > 6 ||
@@ -578,7 +592,8 @@ int s7d_hevc_build_layout(const struct s7d_hevc_sps *sps,
 		return -EINVAL;
 	next.visible_width = next.coded_width - horizontal;
 	next.visible_height = next.coded_height - vertical;
-	if (next.visible_width > 1920 || next.visible_height > 1080)
+	if (next.visible_width > S7D_HEVC_MAX_WIDTH ||
+	    next.visible_height > S7D_HEVC_MAX_HEIGHT)
 		return -ERANGE;
 	next.pitch[0] = ALIGN(next.coded_width, S7D_CODEC_STORAGE_ALIGNMENT);
 	next.pitch[1] = next.pitch[0];
@@ -591,6 +606,8 @@ int s7d_hevc_build_layout(const struct s7d_hevc_sps *sps,
 	    check_add_overflow(next.size[0], uv_size, &next.total_size))
 		return -EOVERFLOW;
 	next.size[1] = uv_size;
+	/* The NV12 output stays 8-bit; the depth selects the FBC CAPTURE format. */
+	next.bit_depth = sps->bit_depth_luma;
 	next.dpb_slots = sps->max_dec_pic_buffering;
 	next.current_slots = 2;
 	next.extra_surfaces = extra_surfaces;

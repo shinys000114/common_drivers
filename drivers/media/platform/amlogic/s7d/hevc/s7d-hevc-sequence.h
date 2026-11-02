@@ -11,6 +11,12 @@
 #define S7D_HEVC_SPS_MAX_BYTES (64U * 1024U)
 #define S7D_HEVC_ST_RPS_MAX 64U
 #define S7D_HEVC_ST_RPS_ENTRIES 16U
+/* The S7D HEVC core decodes up to 4096x2304 (4K60). */
+#define S7D_HEVC_MAX_WIDTH 4096U
+#define S7D_HEVC_MAX_HEIGHT 2304U
+/* Up to 1920x1088 the 1080p input ring suffices; larger pictures take the 4K one. */
+#define S7D_HEVC_HD_WIDTH 1920U
+#define S7D_HEVC_HD_HEIGHT 1088U
 
 struct s7d_hevc_st_rps {
 	u32 count;
@@ -59,7 +65,7 @@ struct s7d_hevc_sequence {
 /* Heap-backed caller output; retains bounded RPS and slice-header flags. */
 int s7d_hevc_parse_sequence(const u8 *nal, size_t bytes,
 			    struct s7d_hevc_sequence *sequence);
-/* Linear, full-size DW0x10 storage; conformance offsets remain SPS units. */
+/* Linear, full-size NV12 storage; conformance offsets remain SPS units. */
 int s7d_hevc_build_layout(const struct s7d_hevc_sps *sps,
 			  enum s7d_codec_capture_format format,
 			  u32 extra_surfaces, struct s7d_codec_layout *layout);

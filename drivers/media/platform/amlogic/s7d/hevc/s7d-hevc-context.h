@@ -6,7 +6,9 @@
 
 #include <linux/types.h>
 
-#define S7D_HEVC_INPUT_MAX_BYTES (2U * 1024U * 1024U)
+/* One access unit: 2 MiB up to 1080p, 6 MiB (the vendor's 4K stream buffer) above. */
+#define S7D_HEVC_INPUT_HD_BYTES (2U * 1024U * 1024U)
+#define S7D_HEVC_INPUT_MAX_BYTES (6U * 1024U * 1024U)
 
 struct device;
 struct regmap;
@@ -35,6 +37,9 @@ struct s7d_hevc_workspace {
 	struct s7d_hevc_dma_region dblk_para;
 	struct s7d_hevc_dma_region dblk_data;
 	struct s7d_hevc_dma_region dblk_data2;
+	/* SAO MMU line buffers and frame map; compressed references only. */
+	struct s7d_hevc_dma_region mmu_vbh;
+	struct s7d_hevc_dma_region mmu_map;
 	struct s7d_hevc_dma_region mpred_above;
 	struct s7d_hevc_dma_region rpm;
 	struct s7d_hevc_dma_region lmem;
@@ -63,12 +68,31 @@ struct s7d_hevc_input_plan {
 	u64 token;
 };
 
-/* Persistent stream; slot count is the registered CAPTURE pool size. */
+/* Largest access unit, parameter-set prefix included, for this sequence. */
+u32 s7d_hevc_context_input_capacity(const struct s7d_hevc_sps *sps);
+
+/* Frame map entries (4 KiB body pages) the SAO MMU may walk, as the vendor's 8K map. */
+#define S7D_HEVC_MMU_MAP_BYTES (0x4800U * 4U)
+
+/*
+ * Persistent stream; slot count is the registered CAPTURE pool size. A
+ * nonzero fbc_bytes allocates that much compressed reference memory for every
+ * slot (FBC header, then body at fbc_header_bytes, 4 KiB aligned).
+ */
 struct s7d_hevc_context *
 s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 			       const struct s7d_hevc_sps *sps,
 			       size_t input_capacity, u32 slot_count,
+			       u32 fbc_header_bytes, u32 fbc_bytes,
 			       u64 lease_epoch);
+/* The slot's internal FBC header and body; -ENOENT without internal FBC. */
+int s7d_hevc_context_fbc_slot(const struct s7d_hevc_context *context,
+			      u64 lease_epoch, u32 slot,
+			      struct s7d_hevc_dma_region *header,
+			      struct s7d_hevc_dma_region *body);
+/* Executor, firmware paused: map the current picture's contiguous body 1:1. */
+int s7d_hevc_context_map_body(struct s7d_hevc_context *context,
+			      u64 lease_epoch, u32 body_address, u32 pages);
 /* All calls are serialized by the executor; join DPB/IRQ/work before destroy. */
 int s7d_hevc_context_destroy_stream(struct s7d_hevc_context *context,
 				  u64 lease_epoch);

@@ -8,7 +8,8 @@
 
 #define S7D_HEVC_RPS_ENTRIES 16U
 #define S7D_HEVC_PARAMETER_BYTES (64U * 1024U)
-#define S7D_HEVC_AU_MAX_BYTES (2U * 1024U * 1024U)
+/* The largest input buffer, S7D_HEVC_INPUT_MAX_BYTES; the context checks the stream size. */
+#define S7D_HEVC_AU_MAX_BYTES (6U * 1024U * 1024U)
 
 struct s7d_hevc_rps_entry {
 	s32 delta_poc;

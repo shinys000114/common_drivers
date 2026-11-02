@@ -15,22 +15,38 @@ struct s7d_hevc_dma_region;
 struct s7d_hevc_picture_plan;
 struct s7d_hevc_slice_info;
 
+/*
+ * A picture's memory: the NV12 output (address/bytes, Y then UV) and, when
+ * the stream decodes with compressed references, its Amlogic FBC header and
+ * contiguous body (zero otherwise).
+ */
 struct s7d_hevc_surface {
 	u32 address[2];
 	u32 bytes[2];
+	u32 header;
+	u32 header_bytes;
+	u32 body;
+	u32 body_bytes;
 };
 
 struct s7d_hevc_picture_buffers {
 	u32 count;
 	const struct s7d_hevc_surface *surface;
 	const struct s7d_hevc_dma_region *mv;
+	/* MMU firmware: FBC references, NV12 by double write; else linear DW 0x10. */
+	bool compressed;
 };
+
+/* Bytes the hardware writes per picture in FBC (vendor compute_losless_comp_*). */
+u32 s7d_hevc_fbc_body_bytes(u32 width, u32 height, u32 bit_depth);
+u32 s7d_hevc_fbc_header_bytes(u32 width, u32 height);
 
 /* Fresh held DOS lease, CPU stopped, buffers pinned; before owner IQIT init. */
 int s7d_hevc_workspace_program(struct regmap *map,
-			       const struct s7d_hevc_workspace *workspace);
+			       const struct s7d_hevc_workspace *workspace,
+			       bool compressed);
 /* Owner has initialized IQIT; CPU stopped, efficiency1 firmware selected. */
-int s7d_hevc_protocol_configure(struct regmap *map);
+int s7d_hevc_protocol_configure(struct regmap *map, bool compressed);
 
 /* Same paused lease; all registered mappings and plan references remain live. */
 int s7d_hevc_picture_configure(struct regmap *map,

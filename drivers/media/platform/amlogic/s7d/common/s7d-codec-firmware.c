@@ -17,6 +17,8 @@
 #define S7D_TEE_FW_H264_MH264	15
 #define S7D_TEE_CORE_VDEC		0
 #define S7D_TEE_FW_HEVC		16
+/* VIDEO_DEC_HEVC_MMU_SWAP, '265S'; S7D archives carry no plain hevc_mmu. */
+#define S7D_TEE_FW_HEVC_MMU_SWAP	0x32363553
 #define S7D_TEE_FW_VP9_MMU		19
 #define S7D_TEE_CORE_HEVC		2
 #define S7D_TEE_FW_JPEG_ENC	21
@@ -200,16 +202,19 @@ void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job)
 	module_put(module);
 }
 
-static int firmware_load_hevc(struct device *dev)
+static int firmware_load_hevc(struct device *dev, bool mmu)
 {
 	int ret;
 
 	if (!tee_enabled())
 		return -EOPNOTSUPP;
 
-	ret = tee_load_video_fw_swap(S7D_TEE_FW_HEVC, S7D_TEE_CORE_HEVC, true);
+	/* As the vendor: both HEVC images are swap builds on S7D. */
+	ret = tee_load_video_fw_swap(mmu ? S7D_TEE_FW_HEVC_MMU_SWAP : S7D_TEE_FW_HEVC,
+				     S7D_TEE_CORE_HEVC, true);
 	if (ret != TEEC_SUCCESS) {
-		dev_err(dev, "HEVC firmware load failed, TEE status %#x\n", (u32)ret);
+		dev_err(dev, "HEVC%s firmware load failed, TEE status %#x\n",
+			mmu ? " MMU" : "", (u32)ret);
 		return -EIO;
 	}
 
@@ -291,7 +296,9 @@ int s7d_codec_firmware_load(struct device *dev, enum s7d_codec_engine engine,
 	if (!dev)
 		return -EINVAL;
 	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_HEVC)
-		return firmware_load_hevc(dev);
+		return firmware_load_hevc(dev, false);
+	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_HEVC_MMU)
+		return firmware_load_hevc(dev, true);
 	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_VP9)
 		return firmware_load_vp9(dev);
 	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_AV1_MMU)
@@ -329,6 +336,7 @@ int s7d_codec_firmware_prepare_for_engine(struct s7d_codec_firmware_owner *owner
 	       firmware == S7D_CODEC_FIRMWARE_H264_MH264) ||
 	      (engine == S7D_CODEC_ENGINE_HEVC &&
 	       (firmware == S7D_CODEC_FIRMWARE_HEVC ||
+		firmware == S7D_CODEC_FIRMWARE_HEVC_MMU ||
 		firmware == S7D_CODEC_FIRMWARE_VP9 ||
 		firmware == S7D_CODEC_FIRMWARE_AV1_MMU)) ||
 	      (engine == S7D_CODEC_ENGINE_HCODEC &&

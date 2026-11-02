@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "../common/s7d-codec-layout.h"
 #include "../common/s7d-codec-session.h"
 #include "s7d-hevc-context.h"
 #include "s7d-hevc-rpm.h"
@@ -28,6 +29,8 @@ struct s7d_hevc_context {
 	struct s7d_hevc_workspace workspace;
 	struct s7d_hevc_sps host;
 	struct s7d_hevc_input_plan input;
+	struct s7d_codec_dma *fbc[S7D_HEVC_MAX_CAPTURE_BUFFERS];
+	u32 fbc_header_bytes;
 	u8 *cpu;
 	u32 base;
 	u32 input_offset;
@@ -55,7 +58,7 @@ static void hevc_region(u32 *offset, u32 bytes, u32 alignment,
 	*offset += bytes;
 }
 
-/* Fixed spec[5] capacities/order; MMU regions remain reserved and unused. */
+/* Fixed spec[5] capacities/order; the MMU regions serve compressed references. */
 static u32 hevc_workspace_layout(struct s7d_hevc_workspace *w, u32 mv_bytes)
 {
 	struct s7d_hevc_dma_region reserved;
@@ -75,8 +78,9 @@ static u32 hevc_workspace_layout(struct s7d_hevc_workspace *w, u32 mv_bytes)
 	hevc_region(&offset, 0x40100, SZ_4K, &w->dblk_para);
 	hevc_region(&offset, 0x140800, SZ_4K, &w->dblk_data);
 	hevc_region(&offset, 0x100800, SZ_4K, &w->dblk_data2);
-	hevc_region(&offset, 0xa000, SZ_4K, &reserved);
-	hevc_region(&offset, 0x14000, SZ_4K, &reserved);
+	/* VBH_BUF_SIZE_8K, then the frame map in the following 0x14000 bytes. */
+	hevc_region(&offset, 0xa000, SZ_4K, &w->mmu_vbh);
+	hevc_region(&offset, 0x14000, SZ_4K, &w->mmu_map);
 	hevc_region(&offset, 0x8000, SZ_4K, &w->mpred_above);
 	/* Preserve unused workspace RPM/LMEM slots before real coherent buffers. */
 	hevc_region(&offset, 0x100, SZ_4K, &reserved);
@@ -106,6 +110,8 @@ static void hevc_workspace_relocate(struct s7d_hevc_workspace *w, u32 base)
 	w->dblk_para.address += base;
 	w->dblk_data.address += base;
 	w->dblk_data2.address += base;
+	w->mmu_vbh.address += base;
+	w->mmu_map.address += base;
 	w->mpred_above.address += base;
 	w->rpm.address += base;
 	w->lmem.address += base;
@@ -137,8 +143,8 @@ static int hevc_context_ranges(const struct s7d_hevc_context *ctx, u32 total)
 		&w->ipp, &w->sao_abv, &w->sao_vb, &w->short_term_rps,
 		&w->vps, &w->sps, &w->pps, &w->sao_up, &w->swap1,
 		&w->swap2, &w->scalelut, &w->dblk_para, &w->dblk_data,
-		&w->dblk_data2, &w->mpred_above, &w->rpm, &w->lmem,
-		&w->aux, &w->mv,
+		&w->dblk_data2, &w->mmu_vbh, &w->mmu_map, &w->mpred_above,
+		&w->rpm, &w->lmem, &w->aux, &w->mv,
 	};
 	u64 input = (u64)ctx->base + ctx->input_offset;
 	u64 end = (u64)ctx->base + total;
@@ -169,16 +175,24 @@ static int hevc_context_ranges(const struct s7d_hevc_context *ctx, u32 total)
 	return 0;
 }
 
+u32 s7d_hevc_context_input_capacity(const struct s7d_hevc_sps *sps)
+{
+	return sps->coded_width <= S7D_HEVC_HD_WIDTH &&
+	       sps->coded_height <= S7D_HEVC_HD_HEIGHT ?
+	       S7D_HEVC_INPUT_HD_BYTES : S7D_HEVC_INPUT_MAX_BYTES;
+}
+
 struct s7d_hevc_context *
 s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 		    const struct s7d_hevc_sps *sps, size_t input_capacity,
-		    u32 slot_count, u64 lease_epoch)
+		    u32 slot_count, u32 fbc_header_bytes, u32 fbc_bytes,
+		    u64 lease_epoch)
 {
 	struct s7d_codec_layout layout;
 	struct s7d_hevc_context *ctx;
 	dma_addr_t dma;
 	u64 base, last;
-	u32 total, mv_bytes, allocation;
+	u32 total, mv_bytes, allocation, i;
 	int ret;
 
 	if (IS_ERR_OR_NULL(session) || !sps || !input_capacity)
@@ -192,7 +206,9 @@ s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 	    sps->log2_ctb_size > 6)
 		return ERR_PTR(-EOPNOTSUPP);
 	if (!lease_epoch || slot_count < layout.min_capture_buffers ||
-	    slot_count > S7D_HEVC_MAX_CAPTURE_BUFFERS)
+	    slot_count > S7D_HEVC_MAX_CAPTURE_BUFFERS ||
+	    (fbc_bytes && (!fbc_header_bytes || !IS_ALIGNED(fbc_header_bytes, SZ_4K) ||
+			   !IS_ALIGNED(fbc_bytes, SZ_4K) || fbc_header_bytes >= fbc_bytes)))
 		return ERR_PTR(-EINVAL);
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -238,6 +254,21 @@ s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 	ret = hevc_context_ranges(ctx, total);
 	if (ret)
 		goto release;
+	/* One allocation per slot: a 4K Main10 reference alone is ~19 MiB. */
+	for (i = 0; fbc_bytes && i < slot_count; i++) {
+		ctx->fbc[i] = s7d_codec_dma_alloc(session, fbc_bytes);
+		if (IS_ERR(ctx->fbc[i])) {
+			ret = PTR_ERR(ctx->fbc[i]);
+			ctx->fbc[i] = NULL;
+			goto release;
+		}
+		dma = s7d_codec_dma_addr(ctx->fbc[i]);
+		if (!IS_ALIGNED(dma, SZ_4K) || (u64)dma + fbc_bytes > U32_MAX) {
+			ret = -ERANGE;
+			goto release;
+		}
+	}
+	ctx->fbc_header_bytes = fbc_bytes ? fbc_header_bytes : 0;
 	memset(ctx->cpu, 0, total);
 	dma_wmb();
 	return ctx;
@@ -287,6 +318,55 @@ int s7d_hevc_context_mv_slot(const struct s7d_hevc_context *context,
 	next.bytes = context->mv_used_bytes;
 	*region = next;
 	return 0;
+}
+
+int s7d_hevc_context_fbc_slot(const struct s7d_hevc_context *context,
+			      u64 lease_epoch, u32 slot,
+			      struct s7d_hevc_dma_region *header,
+			      struct s7d_hevc_dma_region *body)
+{
+	u32 address, bytes;
+
+	if (IS_ERR_OR_NULL(context) || !header || !body)
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch)
+		return -ESTALE;
+	if (slot >= context->slot_count)
+		return -ERANGE;
+	if (!context->fbc[slot])
+		return -ENOENT;
+	address = s7d_codec_dma_addr(context->fbc[slot]);
+	bytes = s7d_codec_dma_size(context->fbc[slot]);
+	*header = (struct s7d_hevc_dma_region) {
+		.address = address, .bytes = context->fbc_header_bytes,
+	};
+	*body = (struct s7d_hevc_dma_region) {
+		.address = address + context->fbc_header_bytes,
+		.bytes = bytes - context->fbc_header_bytes,
+	};
+	return 0;
+}
+
+int s7d_hevc_context_map_body(struct s7d_hevc_context *context,
+			      u64 lease_epoch, u32 body_address, u32 pages)
+{
+	const struct s7d_hevc_dma_region *map;
+	int ret;
+
+	if (IS_ERR_OR_NULL(context))
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch)
+		return -ESTALE;
+	if (!context->begun || !context->programmed)
+		return -EBUSY;
+	map = &context->workspace.mmu_map;
+	if (map->bytes < S7D_HEVC_MMU_MAP_BYTES)
+		return -ERANGE;
+	ret = s7d_amfbc_mmu_map_contiguous(body_address, pages,
+		context->cpu + (map->address - context->base), S7D_HEVC_MMU_MAP_BYTES);
+	if (!ret)
+		dma_wmb();
+	return ret;
 }
 
 int s7d_hevc_context_mark_idle(struct s7d_hevc_context *context,
