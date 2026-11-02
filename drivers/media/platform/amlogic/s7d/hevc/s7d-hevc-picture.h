@@ -18,7 +18,7 @@ struct s7d_hevc_slice_info;
 /*
  * A picture's memory: the NV12 output (address/bytes, Y then UV) and, when
  * the stream decodes with compressed references, its Amlogic FBC header and
- * contiguous body (zero otherwise).
+ * contiguous body (zero otherwise, or when the body is scattered).
  */
 struct s7d_hevc_surface {
 	u32 address[2];
@@ -37,6 +37,11 @@ struct s7d_hevc_picture_buffers {
 	bool compressed;
 	/* Compressed only: no NV12 double write, surface address/bytes zero (AM08F/AM10F). */
 	bool fbc_only;
+	/*
+	 * Compressed only: each body is scattered system pages the SAO MMU
+	 * writes through the frame map (surface body/body_bytes zero).
+	 */
+	bool scattered;
 };
 
 /* Bytes the hardware writes per picture in FBC (vendor compute_losless_comp_*). */

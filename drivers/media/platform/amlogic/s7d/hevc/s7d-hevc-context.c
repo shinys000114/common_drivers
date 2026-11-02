@@ -6,6 +6,7 @@
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/regmap.h>
 #include <linux/sizes.h>
@@ -185,8 +186,7 @@ u32 s7d_hevc_context_input_capacity(const struct s7d_hevc_sps *sps)
 struct s7d_hevc_context *
 s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 		    const struct s7d_hevc_sps *sps, size_t input_capacity,
-		    u32 slot_count, u32 fbc_header_bytes, u32 fbc_bytes,
-		    u64 lease_epoch)
+		    u32 slot_count, u32 fbc_header_bytes, u64 lease_epoch)
 {
 	struct s7d_codec_layout layout;
 	struct s7d_hevc_context *ctx;
@@ -207,8 +207,7 @@ s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 		return ERR_PTR(-EOPNOTSUPP);
 	if (!lease_epoch || slot_count < layout.min_capture_buffers ||
 	    slot_count > S7D_HEVC_MAX_CAPTURE_BUFFERS ||
-	    (fbc_bytes && (!fbc_header_bytes || !IS_ALIGNED(fbc_header_bytes, SZ_4K) ||
-			   !IS_ALIGNED(fbc_bytes, SZ_4K) || fbc_header_bytes >= fbc_bytes)))
+	    !IS_ALIGNED(fbc_header_bytes, SZ_4K))
 		return ERR_PTR(-EINVAL);
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -254,21 +253,21 @@ s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 	ret = hevc_context_ranges(ctx, total);
 	if (ret)
 		goto release;
-	/* One allocation per slot: a 4K Main10 reference alone is ~19 MiB. */
-	for (i = 0; fbc_bytes && i < slot_count; i++) {
-		ctx->fbc[i] = s7d_codec_dma_alloc(session, fbc_bytes);
+	/* One header per slot; the bodies are scattered system pages. */
+	for (i = 0; fbc_header_bytes && i < slot_count; i++) {
+		ctx->fbc[i] = s7d_codec_dma_alloc(session, fbc_header_bytes);
 		if (IS_ERR(ctx->fbc[i])) {
 			ret = PTR_ERR(ctx->fbc[i]);
 			ctx->fbc[i] = NULL;
 			goto release;
 		}
 		dma = s7d_codec_dma_addr(ctx->fbc[i]);
-		if (!IS_ALIGNED(dma, SZ_4K) || (u64)dma + fbc_bytes > U32_MAX) {
+		if (!IS_ALIGNED(dma, SZ_4K) || (u64)dma + fbc_header_bytes > U32_MAX) {
 			ret = -ERANGE;
 			goto release;
 		}
 	}
-	ctx->fbc_header_bytes = fbc_bytes ? fbc_header_bytes : 0;
+	ctx->fbc_header_bytes = fbc_header_bytes;
 	memset(ctx->cpu, 0, total);
 	dma_wmb();
 	return ctx;
@@ -322,12 +321,9 @@ int s7d_hevc_context_mv_slot(const struct s7d_hevc_context *context,
 
 int s7d_hevc_context_fbc_slot(const struct s7d_hevc_context *context,
 			      u64 lease_epoch, u32 slot,
-			      struct s7d_hevc_dma_region *header,
-			      struct s7d_hevc_dma_region *body)
+			      struct s7d_hevc_dma_region *header)
 {
-	u32 address, bytes;
-
-	if (IS_ERR_OR_NULL(context) || !header || !body)
+	if (IS_ERR_OR_NULL(context) || !header)
 		return -EINVAL;
 	if (context->lease_epoch != lease_epoch)
 		return -ESTALE;
@@ -335,14 +331,9 @@ int s7d_hevc_context_fbc_slot(const struct s7d_hevc_context *context,
 		return -ERANGE;
 	if (!context->fbc[slot])
 		return -ENOENT;
-	address = s7d_codec_dma_addr(context->fbc[slot]);
-	bytes = s7d_codec_dma_size(context->fbc[slot]);
 	*header = (struct s7d_hevc_dma_region) {
-		.address = address, .bytes = context->fbc_header_bytes,
-	};
-	*body = (struct s7d_hevc_dma_region) {
-		.address = address + context->fbc_header_bytes,
-		.bytes = bytes - context->fbc_header_bytes,
+		.address = s7d_codec_dma_addr(context->fbc[slot]),
+		.bytes = context->fbc_header_bytes,
 	};
 	return 0;
 }
@@ -363,6 +354,36 @@ int s7d_hevc_context_map_body(struct s7d_hevc_context *context,
 	if (map->bytes < S7D_HEVC_MMU_MAP_BYTES)
 		return -ERANGE;
 	ret = s7d_amfbc_mmu_map_contiguous(body_address, pages,
+		context->cpu + (map->address - context->base), S7D_HEVC_MMU_MAP_BYTES);
+	if (!ret)
+		dma_wmb();
+	return ret;
+}
+
+int s7d_hevc_context_map_pages(struct s7d_hevc_context *context, u64 lease_epoch,
+			       const dma_addr_t *pages, u32 count, u32 units)
+{
+	const struct s7d_hevc_dma_region *map;
+	u64 first, last;
+	u32 i;
+	int ret;
+
+	if (IS_ERR_OR_NULL(context) || !pages || !units)
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch)
+		return -ESTALE;
+	if (!context->begun || !context->programmed)
+		return -EBUSY;
+	map = &context->workspace.mmu_map;
+	if (map->bytes < S7D_HEVC_MMU_MAP_BYTES)
+		return -ERANGE;
+	/* System pages never alias the stream's own coherent memory. */
+	first = s7d_codec_dma_addr(context->memory);
+	last = first + s7d_codec_dma_size(context->memory);
+	for (i = 0; i < count; i++)
+		if ((u64)pages[i] < last && first < (u64)pages[i] + PAGE_SIZE)
+			return -EINVAL;
+	ret = s7d_amfbc_mmu_map_pages(pages, count, units,
 		context->cpu + (map->address - context->base), S7D_HEVC_MMU_MAP_BYTES);
 	if (!ret)
 		dma_wmb();

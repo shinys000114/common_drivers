@@ -7,6 +7,7 @@
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/regmap.h>
@@ -16,6 +17,7 @@
 
 #include "../common/s7d-codec-dos.h"
 #include "../common/s7d-codec-firmware.h"
+#include "../common/s7d-codec-memory.h"
 #include "s7d-hevc-backend.h"
 #include "../common/s7d-hevc-engine.h"
 #include "s7d-hevc-context.h"
@@ -45,6 +47,7 @@
 #define HEVC_LCU_START HEVC_REG(0x3124)
 #define HEVC_CPU_INTERRUPT HEVC_REG(0x3305)
 #define HEVC_LMEM_DMA_CONTROL HEVC_REG(0x3350)
+#define HEVC_SAO_MMU_STATUS HEVC_REG(0x3639)
 #define HEVC_PSCALE_CONTROL HEVC_REG(0x3911)
 #define HEVC_TIMEOUT_MS 2000U
 
@@ -54,6 +57,8 @@ struct s7d_hevc_irq_snapshot {
 	u32 shift_status;
 	u32 shift_bytes;
 	u32 decode_info;
+	/* Scattered bodies: 4 KiB pages the SAO MMU took, HEVC_SAO_MMU_STATUS[31:16]. */
+	u32 mmu_pages;
 	int error;
 };
 
@@ -88,6 +93,8 @@ struct s7d_hevc_job {
 	u32 opaque_swap;
 	u32 headers;
 	u32 current_slot;
+	/* 4 KiB body pages the picture took through the MMU, from its end IRQ. */
+	u32 body_pages;
 	int status;
 	int irq_error;
 	bool snapshot_valid;
@@ -149,6 +156,16 @@ struct s7d_hevc_decoder {
 	bool fbc_only;
 	/* What each DQBUF reports beyond fbc_prefix: NV12, or FBC header and body. */
 	size_t frame_bytes[2];
+	/*
+	 * NV12 CAPTURE with compressed references: each slot's FBC body in
+	 * scattered system pages (header in the context), and the pages no slot
+	 * holds, kept mapped for the next picture (at most one body's worth).
+	 */
+	bool scattered;
+	u32 body_units;
+	u32 body_pages;
+	struct s7d_codec_pages body[S7D_HEVC_MAX_CAPTURE_BUFFERS];
+	struct s7d_codec_pages spare;
 	struct s7d_hevc_engine *irq_engine;
 	u64 irq_binding;
 	int release_error;
@@ -268,6 +285,11 @@ static irqreturn_t hevc_irq(void *data, const struct s7d_hevc_irq_cookie *cookie
 		ret = regmap_read(decoder->map, HEVC_SHIFT_BYTES, &snapshot.shift_bytes);
 	if (!ret)
 		ret = regmap_read(decoder->map, HEVC_DECODE_INFO, &snapshot.decode_info);
+	/* What the vendor frees the tail by (vh265.c, HEVC_SAO_MMU_STATUS >> 16). */
+	if (!ret && decoder->scattered) {
+		ret = regmap_read(decoder->map, HEVC_SAO_MMU_STATUS, &snapshot.mmu_pages);
+		snapshot.mmu_pages >>= 16;
+	}
 	if (!ret)
 		ret = regmap_read(decoder->map, HEVC_STATUS, &status);
 	if (!ret)
@@ -318,6 +340,51 @@ static int hevc_core_result(struct s7d_hevc_decoder *decoder, int error)
 	if (error == -ESHUTDOWN && decoder->job)
 		decoder->job->core_shutdown = true;
 	return error;
+}
+
+/*
+ * Halted, or the firmware paused before the current picture: the bodies of
+ * slots the DPB no longer pins go back to the spare pages.
+ */
+static void hevc_release_bodies(struct s7d_hevc_decoder *decoder, u32 keep)
+{
+	u32 slot;
+
+	if (!decoder->scattered)
+		return;
+	for (slot = 0; slot < decoder->captures; slot++)
+		if (slot != keep && !(decoder->pin_mask & BIT(slot)))
+			s7d_codec_pages_trim(&decoder->body[slot], &decoder->spare, 0);
+}
+
+/* Halted: the decoded picture keeps the body pages it used, its tail goes back. */
+static void hevc_trim_body(struct s7d_hevc_decoder *decoder, u32 slot, u32 used)
+{
+	const u32 per_page = PAGE_SIZE / SZ_4K;
+
+	if (!used || used > decoder->body_units) {
+		dev_warn_ratelimited(decoder->dev,
+				     "HEVC FBC: %u of %u body pages reported used, keeping all\n",
+				     used, decoder->body_units);
+		return;
+	}
+	s7d_codec_pages_trim(&decoder->body[slot], &decoder->spare,
+			     DIV_ROUND_UP(used, per_page));
+}
+
+/* Header pause, current pinned: the whole body a picture may take, mapped. */
+static int hevc_map_scattered(struct s7d_hevc_decoder *decoder,
+			      struct s7d_hevc_job *job, u32 slot)
+{
+	struct s7d_codec_pages *body = &decoder->body[slot];
+	int ret;
+
+	hevc_release_bodies(decoder, slot);
+	ret = s7d_codec_pages_fill(body, &decoder->spare, decoder->body_pages);
+	if (!ret)
+		ret = s7d_hevc_context_map_pages(job->context, job->lease_epoch,
+						 body->dma, body->count, decoder->body_units);
+	return ret;
 }
 
 static int hevc_apply_releases(struct s7d_hevc_decoder *decoder,
@@ -409,6 +476,7 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 	struct s7d_hevc_picture_buffers buffers = {
 		.count = decoder->captures, .surface = decoder->surface, .mv = decoder->mv,
 		.compressed = decoder->compressed, .fbc_only = decoder->fbc_only,
+		.scattered = decoder->scattered,
 	};
 	u8 raw[S7D_HEVC_RPM_BYTES];
 	unsigned long flags;
@@ -523,7 +591,9 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 	if (!ret && status != S7D_HEVC_SLICE_HEADER_DONE)
 		ret = -ESTALE;
 	/* The SAO MMU writes this picture's body through the frame map. */
-	if (!ret && decoder->compressed)
+	if (!ret && decoder->scattered)
+		ret = hevc_map_scattered(decoder, job, slot);
+	else if (!ret && decoder->compressed)
 		ret = s7d_hevc_context_map_body(job->context, job->lease_epoch,
 			decoder->surface[slot].body,
 			DIV_ROUND_UP(s7d_hevc_fbc_body_bytes(decoder->sps.coded_width,
@@ -617,6 +687,7 @@ static irqreturn_t hevc_irq_thread(void *data, const struct s7d_hevc_irq_cookie 
 	if (ret)
 		goto failed;
 	job->picture_complete = true;
+	job->body_pages = snapshot.mmu_pages;
 	hevc_finish(job, 0, false);
 	goto out;
 failed:
@@ -963,12 +1034,12 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 			 const struct s7d_v4l2_capture_buffer *capture, u32 count)
 {
 	struct s7d_amfbc_buffer fbc[S7D_HEVC_MAX_CAPTURE_BUFFERS];
-	struct s7d_hevc_dma_region header, body;
+	struct s7d_hevc_dma_region header = { }, body = { };
 	struct s7d_codec_layout checked;
 	struct s7d_codec_frame sizes = { };
 	unsigned long flags;
-	u32 i, fbc_header = 0, fbc_bytes = 0;
-	bool compressed, zero_copy = false;
+	u32 i, fbc_header = 0, units = 0;
+	bool compressed, scattered, zero_copy = false;
 	int ret;
 
 	if (!decoder || !session || !sps || !layout || !parameter_epoch)
@@ -999,17 +1070,19 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 		goto free_dpb;
 	/*
 	 * Only the MMU firmware decodes Main10; its references are FBC, the NV12
-	 * double write stays 8-bit. Internal FBC memory takes the AM08C/AM10C
-	 * layout, one allocation per slot.
+	 * double write stays 8-bit. As the vendor does (vh265.c H265_alloc_mmu,
+	 * decoder_mmu_box_alloc_idx), the internal FBC body is scattered system
+	 * pages per slot; the header, as for AM08C/AM10C, is codec memory.
 	 */
 	compressed = layout->bit_depth == 10 || zero_copy;
-	if (compressed && !zero_copy) {
+	scattered = compressed && !zero_copy;
+	if (scattered) {
 		fbc_header = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
-		fbc_bytes = fbc_header + s7d_amfbc_body_size(layout->coded_width,
-				layout->storage_height, layout->bit_depth);
+		units = DIV_ROUND_UP(s7d_hevc_fbc_body_bytes(sps->coded_width,
+				sps->coded_height, sps->bit_depth_luma), SZ_4K);
 	}
 	decoder->context = s7d_hevc_context_create_stream(session, sps,
-			s7d_hevc_context_input_capacity(sps), count, fbc_header, fbc_bytes,
+			s7d_hevc_context_input_capacity(sps), count, fbc_header,
 			decoder->epoch);
 	if (IS_ERR(decoder->context)) {
 		ret = PTR_ERR(decoder->context);
@@ -1022,12 +1095,24 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 	decoder->generation = generation;
 	decoder->captures = count;
 	memcpy(decoder->capture, capture, sizeof(*capture) * count);
+	/* Bookkeeping only; pages come with each picture, stream_close frees them. */
+	for (i = 0; scattered && i < count; i++) {
+		ret = s7d_codec_pages_init(&decoder->body[i], decoder->dev,
+					   DIV_ROUND_UP(units, PAGE_SIZE / SZ_4K));
+		if (!ret && !i)
+			ret = s7d_codec_pages_init(&decoder->spare, decoder->dev,
+						   DIV_ROUND_UP(units, PAGE_SIZE / SZ_4K));
+		if (ret) {
+			decoder->failure = ret;
+			goto out;
+		}
+	}
 	for (i = 0; i < count; i++) {
 		ret = s7d_hevc_context_mv_slot(decoder->context, decoder->epoch,
 					      i, &decoder->mv[i]);
-		if (!ret && compressed && !zero_copy)
+		if (!ret && scattered)
 			ret = s7d_hevc_context_fbc_slot(decoder->context, decoder->epoch,
-							i, &header, &body);
+							i, &header);
 		if (ret) {
 			decoder->failure = ret;
 			goto out;
@@ -1048,6 +1133,9 @@ int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
 		}
 	}
 	decoder->compressed = compressed;
+	decoder->scattered = scattered;
+	decoder->body_units = units;
+	decoder->body_pages = DIV_ROUND_UP(units, PAGE_SIZE / SZ_4K);
 	decoder->fbc_only = zero_copy && s7d_amfbc_fbc_only(&fbc[0]);
 	sizes.bytesused[0] = layout->size[0];
 	sizes.bytesused[1] = layout->size[1];
@@ -1463,6 +1551,9 @@ stop:
 		job->result.cancelled = false;
 		goto retained;
 	}
+	/* Halted: the SAO MMU writes no more (vh265.c recycle_mmu_buf_tail). */
+	if (decoder->scattered && job->picture_complete && job->current_slot < decoder->captures)
+		hevc_trim_body(decoder, job->current_slot, job->body_pages);
 	if (!ret)
 		ret = hevc_job_check_stop(decoder, job);
 	if (hevc_job_stopping(decoder, job) && !ret) {
@@ -1516,6 +1607,7 @@ stop:
 			decoder->rps_set_id = (job->snapshot.decode_info >> 8) & 0xff;
 		}
 	}
+	hevc_release_bodies(decoder, S7D_HEVC_NO_SLOT);
 	*result = job->result;
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->job = NULL;
@@ -1557,6 +1649,7 @@ int s7d_hevc_decoder_drain(struct s7d_hevc_decoder *decoder,
 		*cancelled = true;
 	if (!ret)
 		ret = hevc_emit(decoder, true, false, published);
+	hevc_release_bodies(decoder, S7D_HEVC_NO_SLOT);
 	if (ret && !*cancelled)
 		decoder->failure = ret;
 out:
@@ -1588,6 +1681,7 @@ int s7d_hevc_decoder_finish_sequence(struct s7d_hevc_decoder *decoder,
 		ret = s7d_hevc_dpb_finish_sequence(decoder->dpb, discard, true, &actions);
 	if (!ret)
 		ret = hevc_apply_releases(decoder, &actions);
+	hevc_release_bodies(decoder, S7D_HEVC_NO_SLOT);
 	if (ret && ret != -ECANCELED)
 		decoder->failure = ret;
 out:
@@ -1599,6 +1693,7 @@ int s7d_hevc_decoder_stream_close(struct s7d_hevc_decoder *decoder,
 				 struct s7d_codec_session *session)
 {
 	unsigned long flags;
+	u32 i;
 	int ret;
 
 	if (!decoder || !session)
@@ -1627,6 +1722,13 @@ int s7d_hevc_decoder_stream_close(struct s7d_hevc_decoder *decoder,
 		goto out;
 	decoder->context = NULL;
 	decoder->context_initialized = false;
+	/* Halted and unbound: no slot's body is read or written any more. */
+	for (i = 0; i < S7D_HEVC_MAX_CAPTURE_BUFFERS; i++)
+		s7d_codec_pages_destroy(&decoder->body[i]);
+	s7d_codec_pages_destroy(&decoder->spare);
+	decoder->scattered = false;
+	decoder->body_units = 0;
+	decoder->body_pages = 0;
 	kfree(decoder->dpb);
 	decoder->dpb = NULL;
 	spin_lock_irqsave(&decoder->irq_lock, flags);

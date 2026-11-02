@@ -76,23 +76,27 @@ u32 s7d_hevc_context_input_capacity(const struct s7d_hevc_sps *sps);
 
 /*
  * Persistent stream; slot count is the registered CAPTURE pool size. A
- * nonzero fbc_bytes allocates that much compressed reference memory for every
- * slot (FBC header, then body at fbc_header_bytes, 4 KiB aligned).
+ * nonzero fbc_header_bytes (4 KiB aligned) allocates an internal FBC header
+ * for every slot; the caller keeps the bodies in scattered system pages.
  */
 struct s7d_hevc_context *
 s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 			       const struct s7d_hevc_sps *sps,
 			       size_t input_capacity, u32 slot_count,
-			       u32 fbc_header_bytes, u32 fbc_bytes,
-			       u64 lease_epoch);
-/* The slot's internal FBC header and body; -ENOENT without internal FBC. */
+			       u32 fbc_header_bytes, u64 lease_epoch);
+/* The slot's internal FBC header; -ENOENT without internal FBC. */
 int s7d_hevc_context_fbc_slot(const struct s7d_hevc_context *context,
 			      u64 lease_epoch, u32 slot,
-			      struct s7d_hevc_dma_region *header,
-			      struct s7d_hevc_dma_region *body);
+			      struct s7d_hevc_dma_region *header);
 /* Executor, firmware paused: map the current picture's contiguous body 1:1. */
 int s7d_hevc_context_map_body(struct s7d_hevc_context *context,
 			      u64 lease_epoch, u32 body_address, u32 pages);
+/*
+ * As map_body, for a body scattered over @count PAGE_SIZE pages (device
+ * addresses below 4 GiB): map its first @units 4 KiB pages.
+ */
+int s7d_hevc_context_map_pages(struct s7d_hevc_context *context, u64 lease_epoch,
+			       const dma_addr_t *pages, u32 count, u32 units);
 /* All calls are serialized by the executor; join DPB/IRQ/work before destroy. */
 int s7d_hevc_context_destroy_stream(struct s7d_hevc_context *context,
 				  u64 lease_epoch);

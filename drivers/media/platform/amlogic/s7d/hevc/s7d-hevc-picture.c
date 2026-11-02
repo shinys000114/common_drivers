@@ -648,8 +648,8 @@ static bool hevc_overlaps(u32 address, u32 bytes, u32 other, u32 other_bytes)
 }
 
 /*
- * A surface's regions: NV12 Y and UV unless fbc_only, then FBC header and
- * body if compressed.
+ * A surface's regions: NV12 Y and UV unless fbc_only, then FBC header and,
+ * unless scattered, body if compressed.
  */
 static u32 hevc_surface_regions(const struct s7d_hevc_surface *surface,
 				const struct s7d_hevc_picture_buffers *buffers,
@@ -666,7 +666,8 @@ static u32 hevc_surface_regions(const struct s7d_hevc_surface *surface,
 	if (!buffers->compressed)
 		return parts;
 	region[parts++] = (struct s7d_hevc_dma_region) { surface->header, surface->header_bytes };
-	region[parts++] = (struct s7d_hevc_dma_region) { surface->body, surface->body_bytes };
+	if (!buffers->scattered)
+		region[parts++] = (struct s7d_hevc_dma_region) { surface->body, surface->body_bytes };
 	return parts;
 }
 
@@ -700,7 +701,8 @@ static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 		return -EINVAL;
 	/* The linear path reads 8-bit references only; no NV12 means compressed. */
 	if ((!buffers->compressed && host->bit_depth_luma != 8) ||
-	    (buffers->fbc_only && !buffers->compressed))
+	    (buffers->fbc_only && !buffers->compressed) ||
+	    (buffers->scattered && (!buffers->compressed || buffers->fbc_only)))
 		return -EINVAL;
 	ret = hevc_workspace_check(ws, count * stride);
 	if (ret)
@@ -720,7 +722,8 @@ static int hevc_buffers_check(const struct s7d_hevc_workspace *ws,
 		/* Header and body 4 KiB aligned: ANC2AXI and the MMU map pages. */
 		if (buffers->compressed &&
 		    (!IS_ALIGNED(surface->header, 4096) || surface->header_bytes < header ||
-		     !IS_ALIGNED(surface->body, 4096) || surface->body_bytes < body))
+		     (buffers->scattered ? surface->body || surface->body_bytes :
+		      !IS_ALIGNED(surface->body, 4096) || surface->body_bytes < body)))
 			return -EINVAL;
 		parts = hevc_surface_regions(surface, buffers, mine);
 		for (part = 0; part < parts; part++) {
