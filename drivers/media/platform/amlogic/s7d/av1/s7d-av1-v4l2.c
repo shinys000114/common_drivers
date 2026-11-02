@@ -213,8 +213,13 @@ static int av1_metadata(struct av1_backend *backend)
 	 * itself. Its first byte has the OBU forbidden bit set; its config OBUs
 	 * follow a four-byte header.
 	 */
-	if (backend->input.bytes > 4 && data[0] == 0x81)
+	if (backend->input.bytes >= 4 && data[0] == 0x81)
 		offset = start = 4;
+	/* A record without config OBUs: the sequence comes with the first TU. */
+	if (offset && offset == backend->input.bytes) {
+		memset(&backend->tu, 0, sizeof(backend->tu));
+		return 1;
+	}
 	while (offset < backend->input.bytes) {
 		ret = s7d_av1_obu_next(data, backend->input.bytes, offset, &obu);
 		if (ret)
@@ -671,9 +676,16 @@ static void av1_work(struct work_struct *work)
 		if (backend->input_pending && !backend->preflight) {
 			token = backend->input.token;
 			ret = av1_metadata(backend);
-			if (ret)
+			if (ret < 0)
 				goto failed;
 			backend->preflight = true;
+			if (ret) {
+				/* Nothing to take: complete it, initialization goes on. */
+				if (token == backend->initial_token)
+					backend->initial_complete = true;
+				mutex_unlock(&backend->lock);
+				continue;
+			}
 			mutex_unlock(&backend->lock);
 			cancelled = false;
 			ret = backend->sequence_notified ? 0 :
