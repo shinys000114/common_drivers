@@ -218,9 +218,11 @@ int s7d_video_scaler_build(u32 src_width, u32 src_height,
 		next.pre_scale.mask |= GENMASK(19, 8);
 		next.pre_scale.value = (4 << 16) | (2 << 12) | (4 << 8) |
 			(pre_h_rate << 4) | pre_v_rate;
-		next.setup[17].value &= ~BIT(2);
-		if (pre_width != dst_width || pre_height != dst_height)
-			next.setup[17].value |= BIT(2);
+		/*
+		 * Keep the SAFA in the path behind the pre-scaler even when it
+		 * leaves the output size: bypassing it there stalls the VPP at UHD.
+		 */
+		next.setup[17].value |= BIT(2);
 		next.setup[20] = (struct s7d_video_scaler_reg)SET(0x5105,
 			GENMASK(25, 16) | GENMASK(9, 0), 0);
 		next.setup[21] = (struct s7d_video_scaler_reg)SET(0x5106,
@@ -258,8 +260,27 @@ int s7d_video_scaler_build(u32 src_width, u32 src_height,
 	return 0;
 }
 
+/*
+ * Whether a reduction keeps up. The fetch and pre-scaler take one source
+ * pixel per core cycle, so the source pixels read per output line (its width
+ * times the source lines per output line) must fit the core cycles of an
+ * output line, with the 5% margin of scaler_clock_load(). At UHD60 that held
+ * for 3840 x 1.2 lines and stalled the VPP at 3840 x 1.33; at FHD60 it held
+ * for 3840 x 2 and stalled at 3840 x 3 (writeback capture timeouts). Larger
+ * reductions get here with line skipping (see s7d_video_skip_lines()).
+ */
+static bool s7d_video_scaler_reduction_fits(const struct s7d_video_scaler_state *state,
+					    u32 htotal, unsigned long pixel_rate,
+					    unsigned long core_rate)
+{
+	u64 need = (u64)state->src_width * state->src_height * pixel_rate * 105;
+	u64 have = (u64)htotal * state->dst_height * core_rate * 100;
+
+	return htotal && need <= have;
+}
+
 int s7d_video_scaler_check_mode(const struct s7d_video_scaler_state *state,
-			      u32 width, u32 height, unsigned long pixel_rate,
+			      u32 width, u32 height, u32 htotal, unsigned long pixel_rate,
 			      unsigned long core_rate)
 {
 	if (!state)
@@ -273,11 +294,10 @@ int s7d_video_scaler_check_mode(const struct s7d_video_scaler_state *state,
 	/*
 	 * Enlargement reads at most one source pixel per output pixel, so the
 	 * SAFA keeps up at one pixel per core cycle, as the vendor models it up
-	 * to UHD. A reduction reads more lines than it writes: keep it to FHD.
+	 * to UHD. A reduction reads more lines than it writes.
 	 */
 	if ((state->src_width > state->dst_width || state->src_height > state->dst_height) &&
-	    (width > 1920 || height > 1080 || pixel_rate > 148500000 ||
-	     core_rate / 2 < pixel_rate))
+	    !s7d_video_scaler_reduction_fits(state, htotal, pixel_rate, core_rate))
 		return -ERANGE;
 	return 0;
 }

@@ -169,6 +169,18 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 			return -EINVAL;
 		ret = s7d_video_build_state(base->fb, &base->src, plane->dma_mask,
 					    &state->video);
+		/*
+		 * The fetch reads about one source pixel per core cycle, so a
+		 * line's worth of time holds a little over one UHD source line or
+		 * a few FHD ones: a reduction by 2 or more above FHD, or by 3 or
+		 * more at FHD, fetches every other line.
+		 */
+		if (!ret && crtc_state &&
+		    !(crtc_state->adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE) &&
+		    drm_rect_height(&base->src) >> 16 >=
+		    (crtc_state->adjusted_mode.hdisplay > 1920 ? 2 : 3) *
+		    drm_rect_height(&base->dst))
+			ret = s7d_video_skip_lines(&state->video);
 		/* An FBC body is at most the uncompressed 4:2:0 frame. */
 		if (!ret && state->video.fbc.enabled)
 			state->compressed_size = (u32)state->video.fbc.width *

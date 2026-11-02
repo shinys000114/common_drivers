@@ -728,7 +728,7 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 		return ret;
 	ret = s7d_video_scaler_check_mode(&state->video.scaler,
 		state->base.adjusted_mode.hdisplay, state->base.adjusted_mode.vdisplay,
-		state->pixel_rate, core_rate);
+		state->base.adjusted_mode.htotal, state->pixel_rate, core_rate);
 	if (ret)
 		return ret;
 	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler,
@@ -1798,7 +1798,8 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 		return ret;
 	ret = s7d_video_scaler_check_mode(&state->video.scaler,
 		state->base.adjusted_mode.hdisplay, state->base.adjusted_mode.vdisplay,
-		state->pixel_rate, clk_get_rate(v->clocks[0].clk));
+		state->base.adjusted_mode.htotal, state->pixel_rate,
+		clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
 	ret = s7d_video_osd_scaler_check_mode(&state->video.scaler,
