@@ -129,31 +129,44 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height, bool interlace,
 			   const struct s7d_osd_layer layers[2],
 			   struct s7d_osd_pipeline_state *state)
 {
-	struct s7d_osd_state secondary = {
+	static const struct s7d_osd_state idle = {
 		.block_config = 0x8504, .stride = 4, .alpha_config = 0x7fc0,
 	};
-	const struct s7d_osd_state *primary;
+	struct s7d_osd_state secondary = idle;
+	const struct s7d_osd_state *primary = &idle;
 	struct s7d_osd_scaler_state scalers[2] = {0};
 	u32 h_scope, v_scope, secondary_h = 0x1fff1fff, secondary_v = 0x043a0439;
 	u32 primary_mif_h, primary_mif_v, secondary_mif_h = 0, secondary_mif_v = 0;
 	u32 size, blend = 0x807f4413 | BIT(25), alpha, secondary_ctrl = 0x00100004;
+	u32 primary_ctrl = 0x00100004;
 
 	if (!layers || !state)
 		return -EINVAL;
 	if (revision != S7D_OSD_REV_B)
 		return -EOPNOTSUPP;
 	if (!width || !height || width > 4096 || height > 4096 ||
-	    !layers[0].enabled ||
 	    check_layer(&layers[0], width, height, false, interlace, &scalers[0]) ||
 	    check_layer(&layers[1], width, height, true, interlace, &scalers[1]))
 		return -EINVAL;
-	primary = &layers[0].layout;
-	h_scope = ((layers[0].dst.x2 - 1) << 16) | layers[0].dst.x1;
-	v_scope = ((layers[0].dst.y2 - 1) << 16) | layers[0].dst.y1;
-	primary_mif_h = scalers[0].enabled ?
-		(((primary->scope_x >> 16) - (primary->scope_x & 0x1fff)) << 16) : h_scope;
-	primary_mif_v = scalers[0].enabled ?
-		(((primary->scope_y >> 16) - (primary->scope_y & 0x1fff)) << 16) : v_scope;
+	if (layers[0].enabled) {
+		primary = &layers[0].layout;
+		h_scope = ((layers[0].dst.x2 - 1) << 16) | layers[0].dst.x1;
+		v_scope = ((layers[0].dst.y2 - 1) << 16) | layers[0].dst.y1;
+		primary_mif_h = scalers[0].enabled ?
+			(((primary->scope_x >> 16) - (primary->scope_x & 0x1fff)) << 16) :
+			h_scope;
+		primary_mif_v = scalers[0].enabled ?
+			(((primary->scope_y >> 16) - (primary->scope_y & 0x1fff)) << 16) :
+			v_scope;
+		primary_ctrl |= BIT(0);
+	} else {
+		/* As vendor set_blend_din(): an idle OSD leaves its blend input off. */
+		h_scope = 0x1fff1fff;
+		v_scope = 0x0439043a;
+		primary_mif_h = 0;
+		primary_mif_v = 0;
+		blend &= ~BIT(20);
+	}
 	size = (height << 16) | width;
 	alpha = (layers[0].alpha << 20) | (256 << 11);
 	if (layers[1].enabled) {
@@ -216,7 +229,7 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height, bool interlace,
 			REG(OSD_BLEND_CTRL1, 0x31031),
 			REG(OSD_BLEND_CTRL, blend),
 			REG(OSD2_CTRL_STAT, secondary_ctrl),
-			REG(OSD1_CTRL_STAT, 0x00100005),
+			REG(OSD1_CTRL_STAT, primary_ctrl),
 		},
 		.update = {
 			REG(OSD1_BLK0_CFG_W0, primary->block_config),
@@ -244,6 +257,7 @@ int s7d_osd_build_pipeline(u8 revision, u32 width, u32 height, bool interlace,
 			REG(OSD1_BLK0_CFG_W4, primary_mif_v),
 			REG(OSD_BLEND_DIN0_H, h_scope),
 			REG(OSD_BLEND_DIN0_V, v_scope),
+			REG(OSD1_CTRL_STAT, primary_ctrl),
 		},
 	};
 	return 0;

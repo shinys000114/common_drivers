@@ -202,13 +202,15 @@ static bool display_write_valid(u32 reg, u32 value)
 	case 0x1a2d:
 	case 0x1a4d:
 		return value == 0x7fc0 || value == 0x7fc1 || value == BIT(2);
+	case 0x1a10:
 	case 0x1a30:
 		return value == 0x00100004 || value == 0x00100005;
 	case 0x39ba:
 		return !(value & ~GENMASK(28, 11)) &&
 		       (value >> 20) <= 256 && ((value >> 11) & 0x1ff) <= 256;
 	case 0x39b0:
-		value |= BIT(17) | BIT(19);
+		/* OSD1's blend input (bit 20) follows its enable. */
+		value |= BIT(17) | BIT(19) | BIT(20);
 		return value == (0x807f4413 | BIT(25)) ||
 		       value == (0x80ff2413 | BIT(25));
 	case 0x1d1a:
