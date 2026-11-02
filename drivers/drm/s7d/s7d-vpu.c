@@ -46,6 +46,7 @@
 #define VD1_GEN			0x4800
 #define AFBC_ENABLE		0x4840
 #define AFBC_ENABLE_RESET	0x00241602
+#define AFBC_MODE		0x4841
 #define VD1_PATH_AFBC		(BIT(22) | BIT(12) | BIT(10))
 #define VD2_GEN			0x4880
 #define VD2_PATH		0x1a0b
@@ -2198,8 +2199,8 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 	const struct s7d_flip_latch *latch_ptr = NULL;
 	struct s7d_flip_latch latch;
 	unsigned long flags;
-	u32 before, after, fifo, fifo2, vd1, vd2, arbiter;
-	u8 video_mask;
+	u32 before, after, fifo, fifo2, vd1, vd2, vd1_hold, arbiter;
+	u8 video_mask, changed;
 	bool afbc_error;
 	int ret;
 
@@ -2223,13 +2224,23 @@ static void s7d_vpu_frame_irq(struct s7d_vpu *v, bool vblank,
 		     (arbiter & ASYNC_IDLE);
 	video_mask = (vd1 & BIT(0) ? BIT(0) : 0) |
 		(vd2 & BIT(0) ? BIT(1) : 0);
-	/* The FBC decoder fetches VD1 while the MIF stays off. */
-	if (v->vd1_fbc && (vpu_read(v, AFBC_ENABLE) & BIT(8)))
+	vd1_hold = vd1;
+	/* The FBC decoder fetches VD1 while the MIF stays off, by its own hold. */
+	if (v->vd1_fbc && (vpu_read(v, AFBC_ENABLE) & BIT(8))) {
 		video_mask |= BIT(0);
-	/* Unchanged video inputs keep their buffers across the OSD flip. */
+		vd1_hold = BIT(29) | BIT(0) |
+			(((vpu_read(v, AFBC_MODE) >> 16) & 0x3f) << 19);
+	}
+	/*
+	 * Unchanged video inputs keep their buffers across the OSD flip. A
+	 * changed one completes in this field only if it still holds when the
+	 * window closes, as the vendor puts the displaced frame one vsync
+	 * after its RDMA unless that ran late (over_field).
+	 */
+	changed = video_mask & ~v->static_video_mask;
 	frame.early = frame.idle &&
-		(!video_mask || video_mask == v->static_video_mask) &&
-		s7d_vpu_afbc_window(before, after, 0, 0, v->flip_start, v->flip_end);
+		s7d_vpu_afbc_window(before, after, changed & BIT(0) ? vd1_hold : 0,
+				    changed & BIT(1) ? vd2 : 0, v->flip_start, v->flip_end);
 	if (v->gfcd_enabled) {
 		/* A changed scaled GFCD input needs a later idle field. */
 		frame.early = frame.early &&

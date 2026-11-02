@@ -687,7 +687,11 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		return -EINVAL;
 	if (s7d_encp_build_state(&base->adjusted_mode, &state->encp) != MODE_OK)
 		return -EINVAL;
-	if ((video || video2) && state->buffers.afbc.plan.surface_mask)
+	/*
+	 * Video holds through the flip window, so an address the window writes
+	 * is fetched in that field and a video flip completes in one frame.
+	 */
+	if ((video || video2) && state->encp.flip_end)
 		video_hold = state->encp.fifo_hold_lines;
 	ret = s7d_video_build_pipeline(video ? &video->video : NULL,
 				       video ? &video_dst : NULL, video_hold,
