@@ -25,8 +25,11 @@
 struct s7d_codec_memory {
 	struct device *dev;
 	void *cpu;
+	struct page *page;
 	dma_addr_t dma;
 	unsigned long bytes;
+	/* Set once user space maps the frame cacheable; then each handover syncs. */
+	bool user_cached;
 	refcount_t refs;
 	struct dma_resv resv;
 	struct vb2_vmarea_handler handler;
@@ -50,6 +53,7 @@ static void *s7d_memory_alloc(struct vb2_buffer *vb, struct device *dev,
 {
 	struct vb2_queue *q = vb->vb2_queue;
 	struct s7d_codec_memory *mem;
+	struct sg_table sgt;
 	int ret = -ENOMEM;
 
 	if (!dev || !bytes || !PAGE_ALIGNED(bytes))
@@ -73,6 +77,12 @@ static void *s7d_memory_alloc(struct vb2_buffer *vb, struct device *dev,
 		ret = -ERANGE;
 		goto free_dma;
 	}
+	/* The coherent buffer is physically contiguous; user space maps its pages. */
+	ret = dma_get_sgtable(dev, &sgt, mem->cpu, mem->dma, bytes);
+	if (ret)
+		goto free_dma;
+	mem->page = sg_page(sgt.sgl);
+	sg_free_table(&sgt);
 	dma_resv_init(&mem->resv);
 	refcount_set(&mem->refs, 1);
 	mem->handler.refcount = &mem->refs;
@@ -104,13 +114,28 @@ static unsigned int s7d_memory_num_users(void *priv)
 	return refcount_read(&mem->refs);
 }
 
+/*
+ * The device and the driver use the uncached coherent mapping. User space gets
+ * a cacheable one, as CPU readers of decoded frames (FFmpeg, converters) are
+ * many times slower on uncached memory; the frame is synced at each handover
+ * once such a mapping exists.
+ */
 static int s7d_memory_mmap(void *priv, struct vm_area_struct *vma)
 {
 	struct s7d_codec_memory *mem = priv;
+	unsigned long pages = PAGE_ALIGN(mem->bytes) >> PAGE_SHIFT;
+	unsigned long size = vma->vm_end - vma->vm_start;
 	int ret;
 
-	ret = dma_mmap_coherent(mem->dev, vma, mem->cpu, mem->dma,
-				mem->bytes);
+	if (vma->vm_pgoff >= pages || size >> PAGE_SHIFT > pages - vma->vm_pgoff)
+		return -EINVAL;
+	if (!READ_ONCE(mem->user_cached)) {
+		/* Drop lines the CPU may hold from before the first cacheable map. */
+		dma_sync_single_for_cpu(mem->dev, mem->dma, mem->bytes, DMA_FROM_DEVICE);
+		WRITE_ONCE(mem->user_cached, true);
+	}
+	ret = remap_pfn_range(vma, vma->vm_start, page_to_pfn(mem->page) + vma->vm_pgoff,
+			      size, vma->vm_page_prot);
 	if (ret)
 		return ret;
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
@@ -176,9 +201,49 @@ static void s7d_memory_release(struct dma_buf *dbuf)
 	s7d_memory_put(dbuf->priv);
 }
 
+/* Before the CPU reads a frame the device wrote. */
+static void s7d_memory_sync_for_cpu(struct s7d_codec_memory *mem)
+{
+	if (READ_ONCE(mem->user_cached))
+		dma_sync_single_for_cpu(mem->dev, mem->dma, mem->bytes, DMA_BIDIRECTIONAL);
+}
+
+/* Before the device or an importer uses a frame the CPU may have written. */
+static void s7d_memory_sync_for_device(struct s7d_codec_memory *mem)
+{
+	if (READ_ONCE(mem->user_cached))
+		dma_sync_single_for_device(mem->dev, mem->dma, mem->bytes, DMA_BIDIRECTIONAL);
+}
+
+static int s7d_memory_begin_cpu_access(struct dma_buf *dbuf,
+				       enum dma_data_direction direction)
+{
+	s7d_memory_sync_for_cpu(dbuf->priv);
+	return 0;
+}
+
+static int s7d_memory_end_cpu_access(struct dma_buf *dbuf,
+				     enum dma_data_direction direction)
+{
+	s7d_memory_sync_for_device(dbuf->priv);
+	return 0;
+}
+
+static void s7d_memory_prepare(void *priv)
+{
+	s7d_memory_sync_for_device(priv);
+}
+
+static void s7d_memory_finish(void *priv)
+{
+	s7d_memory_sync_for_cpu(priv);
+}
+
 static const struct dma_buf_ops s7d_memory_dmabuf_ops = {
 	.map_dma_buf = s7d_memory_map,
 	.unmap_dma_buf = s7d_memory_unmap,
+	.begin_cpu_access = s7d_memory_begin_cpu_access,
+	.end_cpu_access = s7d_memory_end_cpu_access,
 	.vmap = s7d_memory_vmap,
 	.mmap = s7d_memory_dmabuf_mmap,
 	.release = s7d_memory_release,
@@ -380,6 +445,8 @@ const struct vb2_mem_ops s7d_codec_memory_memops = {
 	.alloc = s7d_memory_alloc,
 	.put = s7d_memory_put,
 	.get_dmabuf = s7d_memory_get_dmabuf,
+	.prepare = s7d_memory_prepare,
+	.finish = s7d_memory_finish,
 	.vaddr = s7d_memory_vaddr,
 	.num_users = s7d_memory_num_users,
 	.mmap = s7d_memory_mmap,
