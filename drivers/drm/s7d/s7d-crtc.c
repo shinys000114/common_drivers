@@ -690,8 +690,9 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	/*
 	 * Video holds through the flip window, so an address the window writes
 	 * is fetched in that field and a video flip completes in one frame.
+	 * Disabled inputs keep the same hold, so enabling one changes no setup.
 	 */
-	if ((video || video2) && state->encp.flip_end)
+	if (state->encp.flip_end)
 		video_hold = state->encp.fifo_hold_lines;
 	ret = s7d_video_build_pipeline(video ? &video->video : NULL,
 				       video ? &video_dst : NULL, video_hold,
