@@ -307,6 +307,27 @@ static int hevc_find_reference(const struct s7d_hevc_dpb *dpb, s32 poc)
 	return found;
 }
 
+/* The decoded reference whose POC is nearest @poc, to stand in for a missing one. */
+static int hevc_nearest_reference(const struct s7d_hevc_dpb *dpb, s32 poc)
+{
+	u64 best = U64_MAX, distance;
+	int found = -ENOENT;
+	u32 i;
+
+	for (i = 0; i < dpb->slot_count; i++) {
+		const struct s7d_hevc_dpb_picture *pic = &dpb->picture[i];
+
+		if (!pic->valid || !pic->decoded || !pic->reference)
+			continue;
+		distance = abs((s64)pic->poc - poc);
+		if (distance < best) {
+			best = distance;
+			found = i;
+		}
+	}
+	return found;
+}
+
 static int hevc_reference_plan(const struct s7d_hevc_dpb *dpb,
 			       const struct s7d_hevc_slice_info *slice,
 			       struct s7d_hevc_picture_plan *plan)
@@ -326,6 +347,20 @@ static int hevc_reference_plan(const struct s7d_hevc_dpb *dpb,
 		if (plan->clear_dpb)
 			continue;
 		slot = hevc_find_reference(dpb, poc);
+		/* A picture only kept for later may be missing (8.3.2). */
+		if (slot == -ENOENT && !rps->used)
+			continue;
+		/*
+		 * One the current picture uses is missing in a cut or damaged
+		 * stream: decode with the nearest reference and flag the frame.
+		 */
+		if (slot == -ENOENT) {
+			slot = hevc_nearest_reference(dpb, poc);
+			if (slot < 0)
+				return slot;
+			poc = dpb->picture[slot].poc;
+			plan->concealed = true;
+		}
 		if (slot < 0)
 			return slot;
 		plan->retain_mask |= BIT(slot);
@@ -508,6 +543,7 @@ int s7d_hevc_dpb_begin(struct s7d_hevc_dpb *dpb,
 	pic->write_token = write_token;
 	pic->slice_type = plan->slice_type;
 	pic->poc = plan->poc;
+	pic->concealed = plan->concealed;
 	pic->valid = true;
 	dpb->active_plan = *plan;
 	dpb->active_write_token = write_token;
@@ -677,6 +713,8 @@ int s7d_hevc_dpb_peek_output(const struct s7d_hevc_dpb *dpb, bool drain,
 	next.metadata = dpb->picture[slot].metadata;
 	next.flags = dpb->picture[slot].slice_type == 2 ? S7D_CODEC_FRAME_KEY :
 		dpb->picture[slot].slice_type == 1 ? S7D_CODEC_FRAME_P : S7D_CODEC_FRAME_B;
+	if (dpb->picture[slot].concealed)
+		next.flags |= S7D_CODEC_FRAME_ERROR;
 	*out = next;
 	return 0;
 }

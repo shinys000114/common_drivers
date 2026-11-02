@@ -60,6 +60,8 @@ struct s7d_hevc_picture_plan {
 	bool collocated_valid;
 	bool low_delay;
 	bool clear_dpb;
+	/* A missing reference was replaced by the nearest one. */
+	bool concealed;
 };
 
 struct s7d_hevc_dpb_actions {
@@ -82,6 +84,7 @@ struct s7d_hevc_dpb_picture {
 	bool reference;
 	bool output_needed;
 	bool published;
+	bool concealed;
 };
 
 struct s7d_hevc_dpb {
