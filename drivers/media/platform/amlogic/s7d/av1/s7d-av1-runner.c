@@ -37,6 +37,8 @@ struct av1_header_job {
 	u64 firmware_epoch;
 	u64 timestamp_ns;
 	u32 sequence_bytes;
+	/* 4 KiB body pages the picture took through the MMU, from its end IRQ. */
+	u32 body_pages;
 	int status;
 	bool decode;
 	bool reference_run;
@@ -108,6 +110,8 @@ static int runner_configure_picture(struct s7d_av1_runner *runner,
 	struct s7d_av1_picture_input input;
 	struct s7d_av1_reference_layout layout;
 	enum s7d_av1_execution_event event;
+	const dma_addr_t *pages;
+	u32 count;
 	int ret;
 
 	if (!header->frame.show_existing &&
@@ -141,10 +145,18 @@ static int runner_configure_picture(struct s7d_av1_runner *runner,
 	};
 	ret = s7d_av1_reference_layout(header->frame.width, header->frame.height,
 		sequence->bit_depth, sequence->use_128x128_superblock ? 128 : 64, &layout);
-	if (!ret)
+	if (!ret && job->picture.backing[job->picture.plan.current_picture.id.slot].scattered) {
+		ret = s7d_av1_references_body_pages(runner->references, job->epoch, job->token,
+						    &pages, &count);
+		if (!ret)
+			ret = s7d_av1_dma_context_map_pages(runner->context, pages, count,
+							    layout.body_pages, job->epoch,
+							    job->token);
+	} else if (!ret) {
 		ret = s7d_av1_dma_context_map_body(runner->context,
 			&job->picture.backing[job->picture.plan.current_picture.id.slot].body,
 			layout.body_pages, job->epoch, job->token);
+	}
 	if (!ret)
 		ret = s7d_av1_dma_context_mmu_region(runner->context, job->epoch,
 						   &input.mmu_map);
@@ -237,6 +249,8 @@ static irqreturn_t av1_thread(void *priv, const struct s7d_hevc_irq_cookie *cook
 			goto finished;
 		}
 		job->picture_done = true;
+		/* What the vendor frees the tail by (vav1.c, HEVC_SAO_MMU_STATUS >> 16). */
+		job->body_pages = snapshot.mmu_pages;
 		goto picture_end;
 	}
 	if (event == S7D_AV1_EVENT_INPUT || event == S7D_AV1_EVENT_EOS) {
@@ -607,7 +621,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 		runner->context_ready = true;
 	}
 	if (job->decode && !runner->references) {
-		runner->references = s7d_av1_references_create(session,
+		runner->references = s7d_av1_references_create(runner->dev, session,
 			s7d_av1_dma_context_workspace(runner->context),
 			&job->result.sequence, lease_epoch, 0, true, target->fbc);
 		if (IS_ERR(runner->references)) {
@@ -704,7 +718,7 @@ stop:
 		if (!ret && (!job->picture_done || !job->execution.input_consumed))
 			ret = -EBADMSG;
 		finish = s7d_av1_references_finish(runner->references, lease_epoch,
-			input_token, 0, true, !ret && job->picture_done);
+			input_token, 0, true, !ret && job->picture_done, job->body_pages);
 		if (finish)
 			halted = finish;
 		if (!ret && !halted) {

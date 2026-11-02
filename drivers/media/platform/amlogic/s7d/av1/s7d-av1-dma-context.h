@@ -63,6 +63,10 @@ int s7d_av1_dma_context_program_input(struct s7d_av1_dma_context *context,
 int s7d_av1_dma_context_map_body(struct s7d_av1_dma_context *context,
 				const struct s7d_av1_region *body, u32 pages,
 				u64 lease_epoch, u64 token);
+/* As map_body, for a body scattered over PAGE_SIZE pages: map its first @units 4 KiB. */
+int s7d_av1_dma_context_map_pages(struct s7d_av1_dma_context *context,
+				 const dma_addr_t *pages, u32 count, u32 units,
+				 u64 lease_epoch, u64 token);
 /* Caller proves the firmware is paused and cannot write RPM during snapshot. */
 int s7d_av1_dma_context_snapshot_rpm(struct s7d_av1_dma_context *context,
 				    u64 lease_epoch, u64 token, bool efficiency,

@@ -72,6 +72,12 @@ struct s7d_codec_layout {
  * contiguous body one to one; the rest of the map is cleared.
  */
 int s7d_amfbc_mmu_map_contiguous(u32 body_address, u32 pages, u8 *map, size_t bytes);
+/*
+ * Map a body scattered over @count device addresses of PAGE_SIZE pages, below
+ * 4 GiB: its first @units 4 KiB pages, in order; the rest of the map is cleared.
+ */
+int s7d_amfbc_mmu_map_pages(const dma_addr_t *pages, u32 count, u32 units, u8 *map,
+			    size_t bytes);
 
 int s7d_codec_resolve_colour(const struct s7d_codec_colour *colour,
 			    u32 width, u32 height,

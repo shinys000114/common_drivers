@@ -91,7 +91,9 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 		if (!slot->id.backing_cookie)
 			continue;
 		if (slot->id.slot != i ||
-		    !region_valid(&slot->body, SZ_4K, layout.body_allocation) ||
+		    /* A scattered body is mapped page by page for its own picture. */
+		    (slot->scattered ? slot->body.address || slot->body.bytes :
+		     !region_valid(&slot->body, SZ_4K, layout.body_allocation)) ||
 		    !region_valid(&slot->header, 32, header_bytes) ||
 		    !region_valid(&slot->mv, SZ_64K, layout.mv_allocation) ||
 		    !region_valid(&slot->luma, 64, luma_bytes) ||

@@ -6,12 +6,14 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
+#include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/regmap.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "../common/s7d-codec-layout.h"
 #include "../common/s7d-codec-session.h"
 #include "s7d-av1-dma-context.h"
 
@@ -285,6 +287,33 @@ int s7d_av1_dma_context_map_body(struct s7d_av1_dma_context *context,
 	if ((u64)body->address < last && first < (u64)body->address + body->bytes)
 		return -EINVAL;
 	ret = s7d_av1_mmu_map_contiguous(body, pages,
+		context->cpu + context->sizes.mmu_map_offset, S7D_AV1_MMU_MAP_BYTES);
+	if (ret)
+		return ret;
+	dma_wmb();
+	return 0;
+}
+
+int s7d_av1_dma_context_map_pages(struct s7d_av1_dma_context *context,
+				 const dma_addr_t *pages, u32 count, u32 units,
+				 u64 lease_epoch, u64 token)
+{
+	u64 first, last;
+	u32 i;
+	int ret;
+
+	if (IS_ERR_OR_NULL(context) || !pages || !units || units > S7D_AV1_MMU_MAX_PAGES)
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch || context->input.token != token)
+		return -ESTALE;
+	if (!context->begun || !context->programmed)
+		return -EBUSY;
+	first = s7d_codec_dma_addr(context->memory);
+	last = first + s7d_codec_dma_size(context->memory);
+	for (i = 0; i < count; i++)
+		if ((u64)pages[i] < last && first < (u64)pages[i] + PAGE_SIZE)
+			return -EINVAL;
+	ret = s7d_amfbc_mmu_map_pages(pages, count, units,
 		context->cpu + context->sizes.mmu_map_offset, S7D_AV1_MMU_MAP_BYTES);
 	if (ret)
 		return ret;

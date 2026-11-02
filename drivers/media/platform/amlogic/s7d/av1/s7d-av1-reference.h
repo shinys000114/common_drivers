@@ -8,6 +8,7 @@
 
 #define S7D_AV1_PARSER_REFERENCE_WORDS 12U
 
+struct device;
 struct s7d_codec_session;
 struct s7d_codec_dma;
 struct s7d_av1_references;
@@ -23,6 +24,12 @@ struct s7d_av1_reference_backing {
 	struct s7d_av1_region cdf;
 	struct s7d_av1_region segment_map;
 	u32 pitch;
+	/*
+	 * The body is the slot's own scattered pages (body region zero), which
+	 * the hardware writes through the MMU frame map; its scatter header holds
+	 * their addresses for the reference reads.
+	 */
+	bool scattered;
 };
 
 struct s7d_av1_reference_state {
@@ -52,8 +59,9 @@ struct s7d_av1_reference_picture {
 /*
  * The caller memory (a CAPTURE buffer) a decoded picture is written to: its
  * NV12 double write, and with AM08C/AM10C (fbc) its FBC header and body too.
- * Otherwise the slot keeps the FBC header and body itself; the MV always stays
- * with the slot.
+ * Otherwise the slot keeps the FBC header (coherent) and body (scattered
+ * system pages, only those the picture used once it is decoded) itself; the
+ * MV always stays with the slot.
  */
 struct s7d_av1_slot_memory {
 	/* Nonzero caller handle, reported back once the DPB lets go of the slot. */
@@ -78,7 +86,7 @@ struct s7d_av1_reference_output {
  * their MV, otherwise also the FBC header and body.
  */
 struct s7d_av1_references *
-s7d_av1_references_create(struct s7d_codec_session *session,
+s7d_av1_references_create(struct device *dev, struct s7d_codec_session *session,
 			  const struct s7d_av1_workspace *workspace,
 			  const struct s7d_av1_sequence *sequence,
 			  u64 lease_epoch, int halt_status, bool joined, bool fbc);
@@ -97,13 +105,25 @@ int s7d_av1_references_prepare(struct s7d_av1_references *references,
 			       const struct s7d_av1_header *header,
 			       const struct s7d_av1_dpb_metadata *metadata,
 			       struct s7d_av1_reference_picture *picture);
+/*
+ * The current picture's scattered body pages (PAGE_SIZE each, device
+ * addresses) to map before its MMIO; -ENOENT when the body is not scattered.
+ */
+int s7d_av1_references_body_pages(const struct s7d_av1_references *references,
+				  u64 lease_epoch, u64 input_token,
+				  const dma_addr_t **pages, u32 *count);
 /* Only after all picture MMIO and the actual feature snapshot succeeded. */
 int s7d_av1_references_configured(struct s7d_av1_references *references,
 				  u64 lease_epoch, u64 input_token);
-/* completed requires matching picture IRQ or validated show-existing. */
+/*
+ * completed requires matching picture IRQ or validated show-existing.
+ * @used_pages: the 4 KiB body pages the decoded picture took through the MMU
+ * (HEVC_SAO_MMU_STATUS[31:16] at picture end), 0 if unknown; a scattered body
+ * keeps only those, and slots the DPB dropped give theirs back.
+ */
 int s7d_av1_references_finish(struct s7d_av1_references *references,
 			      u64 lease_epoch, u64 input_token,
-			      int halt_status, bool joined, bool completed);
+			      int halt_status, bool joined, bool completed, u32 used_pages);
 int s7d_av1_references_output(struct s7d_av1_references *references,
 			      struct s7d_av1_reference_output *output);
 /* The copy/publication and every CPU reader have finished. */

@@ -384,3 +384,109 @@ const struct vb2_mem_ops s7d_codec_memory_memops = {
 	.num_users = s7d_memory_num_users,
 	.mmap = s7d_memory_mmap,
 };
+
+int s7d_codec_pages_init(struct s7d_codec_pages *set, struct device *dev, u32 capacity)
+{
+	if (!set || !dev || !capacity)
+		return -EINVAL;
+	if (set->page)
+		return set->dev == dev && set->capacity == capacity ? 0 : -EINVAL;
+	set->page = kvcalloc(capacity, sizeof(*set->page), GFP_KERNEL);
+	set->dma = kvcalloc(capacity, sizeof(*set->dma), GFP_KERNEL);
+	if (!set->page || !set->dma) {
+		kvfree(set->page);
+		kvfree(set->dma);
+		set->page = NULL;
+		set->dma = NULL;
+		return -ENOMEM;
+	}
+	set->dev = dev;
+	set->capacity = capacity;
+	set->count = 0;
+	return 0;
+}
+
+static void s7d_pages_release(struct device *dev, struct page *page, dma_addr_t dma)
+{
+	/* Nothing to give back to the CPU: it never reads these pages. */
+	dma_unmap_page_attrs(dev, dma, PAGE_SIZE, DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+	__free_page(page);
+}
+
+static int s7d_pages_new(struct device *dev, struct page **out, dma_addr_t *dma)
+{
+	struct page *page;
+
+	/* Not movable, so never from CMA; DMA32 for the 32-bit page numbers. */
+	page = alloc_page(GFP_KERNEL | __GFP_DMA32 | __GFP_NOWARN);
+	if (!page)
+		return -ENOMEM;
+	/*
+	 * A full sync, once: a page fresh from the allocator may hold dirty
+	 * lines that would otherwise be written back over the hardware's data.
+	 */
+	*dma = dma_map_page_attrs(dev, page, 0, PAGE_SIZE, DMA_BIDIRECTIONAL, 0);
+	if (dma_mapping_error(dev, *dma)) {
+		__free_page(page);
+		return -ENOMEM;
+	}
+	if (!IS_ALIGNED(*dma, PAGE_SIZE) || (u64)*dma + PAGE_SIZE > (1ULL << 32)) {
+		s7d_pages_release(dev, page, *dma);
+		return -ERANGE;
+	}
+	*out = page;
+	return 0;
+}
+
+int s7d_codec_pages_fill(struct s7d_codec_pages *set, struct s7d_codec_pages *pool,
+			 u32 count)
+{
+	int ret;
+
+	if (!set || !set->page || count > set->capacity ||
+	    (pool && (!pool->page || pool->dev != set->dev)))
+		return -EINVAL;
+	while (set->count < count) {
+		if (pool && pool->count) {
+			pool->count--;
+			set->page[set->count] = pool->page[pool->count];
+			set->dma[set->count] = pool->dma[pool->count];
+		} else {
+			ret = s7d_pages_new(set->dev, &set->page[set->count],
+					    &set->dma[set->count]);
+			if (ret)
+				return ret;
+		}
+		set->count++;
+	}
+	return 0;
+}
+
+void s7d_codec_pages_trim(struct s7d_codec_pages *set, struct s7d_codec_pages *pool,
+			  u32 count)
+{
+	if (!set || !set->page)
+		return;
+	if (pool && (!pool->page || pool->dev != set->dev))
+		pool = NULL;
+	while (set->count > count) {
+		set->count--;
+		if (pool && pool->count < pool->capacity) {
+			pool->page[pool->count] = set->page[set->count];
+			pool->dma[pool->count] = set->dma[set->count];
+			pool->count++;
+		} else {
+			s7d_pages_release(set->dev, set->page[set->count], set->dma[set->count]);
+		}
+	}
+}
+
+void s7d_codec_pages_destroy(struct s7d_codec_pages *set)
+{
+	if (!set)
+		return;
+	s7d_codec_pages_trim(set, NULL, 0);
+	kvfree(set->page);
+	kvfree(set->dma);
+	memset(set, 0, sizeof(*set));
+}

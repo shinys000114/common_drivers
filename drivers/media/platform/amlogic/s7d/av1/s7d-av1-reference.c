@@ -2,15 +2,18 @@
 /* Copyright (C) 2017 Amlogic, Inc. All rights reserved. */
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 
+#include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
+#include <linux/mm.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "../common/s7d-codec-memory.h"
 #include "../common/s7d-codec-session.h"
 #include "s7d-av1-reference.h"
 
@@ -22,9 +25,12 @@ struct reference_layout {
 	u32 mv_offset;
 	u32 used_bytes;
 	u32 allocation_bytes;
+	/* Scattered body: PAGE_SIZE pages for a worst-case picture. */
+	u32 body_pages;
 };
 
 struct s7d_av1_references {
+	struct device *dev;
 	struct s7d_codec_session *session;
 	struct s7d_av1_workspace workspace;
 	struct reference_layout layout;
@@ -35,6 +41,12 @@ struct s7d_av1_references {
 	struct s7d_codec_dma *memory[S7D_AV1_DPB_MAX_SLOTS];
 	/* What the hardware may see this picture, and slot memory cookies. */
 	struct s7d_av1_reference_backing view[S7D_AV1_DPB_MAX_SLOTS];
+	/*
+	 * Without fbc: each slot's scattered body, and the pages no slot holds,
+	 * kept mapped for the next picture (at most one picture's worth).
+	 */
+	struct s7d_codec_pages body[S7D_AV1_DPB_MAX_SLOTS];
+	struct s7d_codec_pages spare;
 	u64 binding[S7D_AV1_DPB_MAX_SLOTS];
 	u64 lease_epoch;
 	u64 input_token;
@@ -70,11 +82,13 @@ static int reference_layout(const struct s7d_av1_sequence *sequence, bool fbc,
 		&next.compressed);
 	if (ret)
 		return ret;
-	/* NV12 always comes with each picture, with fbc its header and body too. */
+	/*
+	 * NV12 always comes with each picture, with fbc its header and body too.
+	 * Otherwise the slot holds the header here and its body in scattered pages.
+	 */
 	if (!fbc) {
-		next.header_offset = next.compressed.body_allocation;
-		next.mv_offset = ALIGN(next.header_offset + next.compressed.header_capacity,
-				       SZ_64K);
+		next.mv_offset = ALIGN(next.compressed.header_capacity, SZ_64K);
+		next.body_pages = DIV_ROUND_UP(next.compressed.body_pages, PAGE_SIZE / SZ_4K);
 	}
 	next.used_bytes = next.mv_offset + next.compressed.mv_allocation;
 	next.allocation_bytes = next.used_bytes + SZ_64K - 1;
@@ -83,7 +97,7 @@ static int reference_layout(const struct s7d_av1_sequence *sequence, bool fbc,
 }
 
 struct s7d_av1_references *
-s7d_av1_references_create(struct s7d_codec_session *session,
+s7d_av1_references_create(struct device *dev, struct s7d_codec_session *session,
 			  const struct s7d_av1_workspace *workspace,
 			  const struct s7d_av1_sequence *sequence,
 			  u64 lease_epoch, int halt_status, bool joined, bool fbc)
@@ -93,7 +107,7 @@ s7d_av1_references_create(struct s7d_codec_session *session,
 	struct reference_layout layout;
 	int ret = stopped(halt_status, joined);
 
-	if (ret || IS_ERR_OR_NULL(session) || !lease_epoch)
+	if (ret || !dev || IS_ERR_OR_NULL(session) || !lease_epoch)
 		return ERR_PTR(ret ?: -EINVAL);
 	ret = s7d_av1_admit_sequence(sequence);
 	if (ret)
@@ -122,10 +136,13 @@ s7d_av1_references_create(struct s7d_codec_session *session,
 	seq.delta_frame_id_bits = sequence->frame_id_numbers_present ?
 		sequence->delta_frame_id_bits : 0;
 	ret = s7d_av1_dpb_init(&references->dpb, &seq, lease_epoch, S7D_AV1_DPB_MAX_SLOTS);
+	if (!ret && !fbc)
+		ret = s7d_codec_pages_init(&references->spare, dev, layout.body_pages);
 	if (ret) {
 		kfree(references);
 		return ERR_PTR(ret);
 	}
+	references->dev = dev;
 	s7d_codec_session_get(session);
 	references->session = session;
 	references->workspace = *workspace;
@@ -250,6 +267,12 @@ static int allocate_slot(struct s7d_av1_references *references, u32 slot)
 		return 0;
 	if (references->memory[slot])
 		return -EIO;
+	if (!references->fbc) {
+		ret = s7d_codec_pages_init(&references->body[slot], references->dev,
+					   layout->body_pages);
+		if (ret)
+			return ret;
+	}
 	memory = s7d_codec_dma_alloc(references->session, layout->allocation_bytes);
 	if (IS_ERR(memory))
 		return PTR_ERR(memory);
@@ -265,10 +288,9 @@ static int allocate_slot(struct s7d_av1_references *references, u32 slot)
 	next.mv.address = base + layout->mv_offset;
 	next.mv.bytes = layout->compressed.mv_allocation;
 	if (!references->fbc) {
-		next.body.address = base;
-		next.body.bytes = layout->compressed.body_allocation;
 		next.header.address = base + layout->header_offset;
 		next.header.bytes = layout->compressed.header_capacity;
+		next.scattered = true;
 	}
 	next.cdf.address = ws->part[S7D_AV1_CDF].address + slot * AV1_CDF_BANK_BYTES;
 	next.cdf.bytes = AV1_CDF_BANK_BYTES;
@@ -281,6 +303,23 @@ static int allocate_slot(struct s7d_av1_references *references, u32 slot)
 	if (ret)
 		return ret;
 	references->backing[slot] = next;
+	return 0;
+}
+
+/* Idle: the bodies of slots the DPB no longer owns go back to the spare pages. */
+static int release_bodies(struct s7d_av1_references *references, u32 keep)
+{
+	u32 owned, slot;
+	int ret;
+
+	if (references->fbc)
+		return 0;
+	ret = s7d_av1_dpb_owned_mask(&references->dpb, &owned);
+	if (ret)
+		return ret;
+	for (slot = 0; slot < S7D_AV1_DPB_MAX_SLOTS; slot++)
+		if (slot != keep && !(owned & BIT(slot)))
+			s7d_codec_pages_trim(&references->body[slot], &references->spare, 0);
 	return 0;
 }
 
@@ -314,7 +353,13 @@ int s7d_av1_references_run_begin(struct s7d_av1_references *references,
 		if (ret)
 			return ret;
 	}
-	ret = allocate_slot(references, slot);
+	ret = release_bodies(references, slot);
+	if (!ret)
+		ret = allocate_slot(references, slot);
+	/* The whole body a picture may take, until the hardware says what it used. */
+	if (!ret && !references->fbc)
+		ret = s7d_codec_pages_fill(&references->body[slot], &references->spare,
+					   references->layout.body_pages);
 	if (ret)
 		return ret;
 	if (memory)
@@ -438,6 +483,31 @@ int s7d_av1_references_prepare(struct s7d_av1_references *references,
 	return 0;
 }
 
+int s7d_av1_references_body_pages(const struct s7d_av1_references *references,
+				  u64 lease_epoch, u64 input_token,
+				  const dma_addr_t **pages, u32 *count)
+{
+	const struct s7d_codec_pages *body;
+	u32 slot;
+
+	if (IS_ERR_OR_NULL(references) || !pages || !count)
+		return -EINVAL;
+	if (references->lease_epoch != lease_epoch || references->input_token != input_token)
+		return -ESTALE;
+	if (!references->running || !references->prepared || references->configured ||
+	    !references->dpb.pending.decode)
+		return -EBUSY;
+	slot = references->reserved_slot;
+	if (references->fbc || slot >= S7D_AV1_DPB_MAX_SLOTS)
+		return -ENOENT;
+	body = &references->body[slot];
+	if (body->count < references->layout.body_pages)
+		return -ENOSPC;
+	*pages = body->dma;
+	*count = body->count;
+	return 0;
+}
+
 int s7d_av1_references_configured(struct s7d_av1_references *references,
 				  u64 lease_epoch, u64 input_token)
 {
@@ -451,11 +521,27 @@ int s7d_av1_references_configured(struct s7d_av1_references *references,
 	return 0;
 }
 
+/* The decoded picture keeps the body pages it used, its tail goes back. */
+static void trim_body(struct s7d_av1_references *references, u32 slot, u32 used_pages)
+{
+	const u32 per_page = PAGE_SIZE / SZ_4K;
+	struct s7d_codec_pages *body = &references->body[slot];
+
+	if (!used_pages || used_pages > body->count * per_page) {
+		dev_warn_ratelimited(references->dev,
+				     "AV1 FBC: %u of %u body pages reported used, keeping all\n",
+				     used_pages, body->count * per_page);
+		return;
+	}
+	s7d_codec_pages_trim(body, &references->spare, DIV_ROUND_UP(used_pages, per_page));
+}
+
 int s7d_av1_references_finish(struct s7d_av1_references *references,
 			      u64 lease_epoch, u64 input_token,
-			      int halt_status, bool joined, bool completed)
+			      int halt_status, bool joined, bool completed, u32 used_pages)
 {
-	u32 slot;
+	bool decoded = false;
+	u32 slot = S7D_AV1_DPB_NO_SLOT;
 	int ret;
 
 	if (IS_ERR_OR_NULL(references))
@@ -472,6 +558,9 @@ int s7d_av1_references_finish(struct s7d_av1_references *references,
 		return -EINVAL;
 	if (references->prepared) {
 		slot = references->dpb.pending.current_picture.id.slot;
+		/* The picture decoded into its slot's scattered body. */
+		decoded = completed && references->dpb.pending.decode &&
+			references->backing[slot].scattered;
 		if (completed)
 			ret = s7d_av1_dpb_complete(&references->dpb, references->dpb.pending.serial,
 				input_token, true, true);
@@ -483,6 +572,12 @@ int s7d_av1_references_finish(struct s7d_av1_references *references,
 		if (completed)
 			references->state[slot] = references->pending_state;
 	}
+	/* Fully stopped: what the hardware no longer writes or reads can go. */
+	if (decoded)
+		trim_body(references, slot, used_pages);
+	ret = release_bodies(references, S7D_AV1_DPB_NO_SLOT);
+	if (ret)
+		return ret;
 	references->prepared = false;
 	references->configured = false;
 	references->running = false;
@@ -590,7 +685,7 @@ int s7d_av1_references_parser_words(const struct s7d_av1_references *references,
 int s7d_av1_references_destroy(struct s7d_av1_references *references,
 			       u64 lease_epoch, int halt_status, bool joined)
 {
-	u32 unbound;
+	u32 unbound, i;
 	int ret;
 
 	if (IS_ERR_OR_NULL(references))
@@ -605,6 +700,9 @@ int s7d_av1_references_destroy(struct s7d_av1_references *references,
 	ret = s7d_av1_dpb_release(&references->dpb, true, &unbound);
 	if (ret)
 		return ret;
+	for (i = 0; i < S7D_AV1_DPB_MAX_SLOTS; i++)
+		s7d_codec_pages_destroy(&references->body[i]);
+	s7d_codec_pages_destroy(&references->spare);
 	s7d_codec_session_put(references->session);
 	kfree(references);
 	return 0;

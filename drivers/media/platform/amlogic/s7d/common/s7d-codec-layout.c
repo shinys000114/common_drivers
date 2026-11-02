@@ -3,6 +3,7 @@
 
 #include <linux/align.h>
 #include <linux/errno.h>
+#include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
@@ -152,5 +153,27 @@ int s7d_amfbc_mmu_map_contiguous(u32 body_address, u32 pages, u8 *map, size_t by
 	for (i = 0; i < pages; i++)
 		put_unaligned_le32((body_address >> 12) + i, map + i * sizeof(u32));
 	memset(map + pages * sizeof(u32), 0, bytes - pages * sizeof(u32));
+	return 0;
+}
+
+int s7d_amfbc_mmu_map_pages(const dma_addr_t *pages, u32 count, u32 units, u8 *map,
+			    size_t bytes)
+{
+	const u32 per_page = PAGE_SIZE / SZ_4K;
+	u64 address;
+	u32 i;
+
+	if (!pages || !map || !units || units > bytes / sizeof(u32) ||
+	    (u64)count * per_page < units)
+		return -EINVAL;
+	for (i = 0; i < units; i++) {
+		if (!pages[i / per_page] || !IS_ALIGNED(pages[i / per_page], PAGE_SIZE))
+			return -EINVAL;
+		address = (u64)pages[i / per_page] + (u64)(i % per_page) * SZ_4K;
+		if (address + SZ_4K > (1ULL << 32))
+			return -EINVAL;
+		put_unaligned_le32(address >> 12, map + i * sizeof(u32));
+	}
+	memset(map + units * sizeof(u32), 0, bytes - units * sizeof(u32));
 	return 0;
 }
