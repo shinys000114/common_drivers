@@ -7,7 +7,7 @@
 #include <linux/regmap.h>
 #include <linux/string.h>
 
-#include "../common/s7d-codec-layout.h"
+#include "s7d-codec-layout.h"
 #include "s7d-hevc-context.h"
 #include "s7d-hevc-dpb.h"
 #include "s7d-hevc-input.h"

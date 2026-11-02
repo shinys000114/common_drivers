@@ -15,11 +15,11 @@
 #include <linux/spinlock.h>
 #include <linux/unaligned.h>
 
-#include "../common/s7d-codec-dos.h"
-#include "../common/s7d-codec-firmware.h"
-#include "../common/s7d-codec-memory.h"
-#include "../common/s7d-hevc-engine.h"
-#include "../common/s7d-v4l2.h"
+#include "s7d-codec-dos.h"
+#include "s7d-codec-firmware.h"
+#include "s7d-codec-memory.h"
+#include "s7d-hevc-engine.h"
+#include "s7d-v4l2.h"
 #include "s7d-vp9-backend.h"
 #include "s7d-vp9-dma-context.h"
 #include "s7d-vp9-input.h"

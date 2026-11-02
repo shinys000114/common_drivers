@@ -13,8 +13,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-#include "../common/s7d-codec-memory.h"
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-memory.h"
+#include "s7d-codec-session.h"
 #include "s7d-av1-reference.h"
 
 #define AV1_CDF_BANK_BYTES 0x8000U

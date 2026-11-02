@@ -15,15 +15,15 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 
-#include "../common/s7d-codec-dos.h"
-#include "../common/s7d-codec-firmware.h"
-#include "../common/s7d-codec-memory.h"
+#include "s7d-codec-dos.h"
+#include "s7d-codec-firmware.h"
+#include "s7d-codec-memory.h"
 #include "s7d-hevc-backend.h"
-#include "../common/s7d-hevc-engine.h"
+#include "s7d-hevc-engine.h"
 #include "s7d-hevc-context.h"
 #include "s7d-hevc-dpb.h"
 #include "s7d-hevc-input.h"
-#include "../common/s7d-v4l2.h"
+#include "s7d-v4l2.h"
 #include "s7d-hevc-picture.h"
 #include "s7d-hevc-rpm.h"
 #include "s7d-hevc-sequence.h"

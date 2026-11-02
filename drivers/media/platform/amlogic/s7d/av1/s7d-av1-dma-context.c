@@ -13,8 +13,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-#include "../common/s7d-codec-layout.h"
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-layout.h"
+#include "s7d-codec-session.h"
 #include "s7d-av1-dma-context.h"
 
 #define AV1_INPUT_PADDING SZ_16K

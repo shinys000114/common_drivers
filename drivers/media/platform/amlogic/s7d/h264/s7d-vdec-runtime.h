@@ -4,7 +4,7 @@
 #ifndef S7D_VDEC_RUNTIME_H
 #define S7D_VDEC_RUNTIME_H
 
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-session.h"
 
 struct device;
 struct module;

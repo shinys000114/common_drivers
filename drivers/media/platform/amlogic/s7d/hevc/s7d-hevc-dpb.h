@@ -4,7 +4,7 @@
 #ifndef S7D_HEVC_DPB_H
 #define S7D_HEVC_DPB_H
 
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-session.h"
 #include "s7d-hevc-input.h"
 
 #define S7D_HEVC_DPB_SLOTS 24U

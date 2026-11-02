@@ -5,7 +5,7 @@
 #define S7D_H264_CONTEXT_H
 
 #include <linux/types.h>
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-session.h"
 #include "s7d-h264-layout.h"
 
 struct regmap;

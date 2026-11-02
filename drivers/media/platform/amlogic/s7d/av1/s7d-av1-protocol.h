@@ -4,7 +4,7 @@
 #ifndef S7D_AV1_PROTOCOL_H
 #define S7D_AV1_PROTOCOL_H
 
-#include "../common/s7d-hevc-engine.h"
+#include "s7d-hevc-engine.h"
 #include "s7d-av1-dma-context.h"
 #include "s7d-av1-rpm.h"
 

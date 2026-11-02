@@ -4,7 +4,7 @@
 #ifndef S7D_HEVC_SEQUENCE_H
 #define S7D_HEVC_SEQUENCE_H
 
-#include "../common/s7d-codec-layout.h"
+#include "s7d-codec-layout.h"
 
 #define S7D_HEVC_DOUBLE_WRITE_MODE 0x10U
 #define S7D_HEVC_MAX_CAPTURE_BUFFERS 24U

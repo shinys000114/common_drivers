@@ -9,7 +9,7 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
-#include "../common/s7d-codec-layout.h"
+#include "s7d-codec-layout.h"
 #include "s7d-av1-workspace.h"
 
 static const u32 av1_workspace_size[2][S7D_AV1_WORKSPACE_PARTS] = {

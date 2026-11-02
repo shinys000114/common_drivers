@@ -19,7 +19,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-vmalloc.h>
 
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-session.h"
 #include "s7d-jpeg-backend.h"
 #include "s7d-jpeg-v4l2.h"
 

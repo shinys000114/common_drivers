@@ -13,9 +13,9 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 
-#include "../common/s7d-codec-dos.h"
-#include "../common/s7d-codec-firmware.h"
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-dos.h"
+#include "s7d-codec-firmware.h"
+#include "s7d-codec-session.h"
 #include "s7d-av1-picture.h"
 #include "s7d-av1-runner.h"
 

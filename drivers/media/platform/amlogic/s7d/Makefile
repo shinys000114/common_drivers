@@ -3,6 +3,9 @@
 
 obj-$(CONFIG_VIDEO_AMLOGIC_S7D) += s7d-vdec.o
 
+# Each codec directory includes the shared headers by name.
+ccflags-y += -I$(src)/common
+
 s7d-vdec-y := \
 	s7d-vdec-platform.o \
 	h264/s7d-h264-backend.o \

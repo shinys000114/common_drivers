@@ -6,7 +6,7 @@
 
 #include <linux/types.h>
 
-#include "../common/s7d-codec-layout.h"
+#include "s7d-codec-layout.h"
 #include "s7d-vp9-prefix.h"
 
 #define S7D_VP9_RPM_BYTES	0x800U

@@ -15,9 +15,9 @@
 #include <linux/spinlock.h>
 #include <linux/videodev2.h>
 
-#include "../common/s7d-codec-dos.h"
-#include "../common/s7d-codec-firmware.h"
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-dos.h"
+#include "s7d-codec-firmware.h"
+#include "s7d-codec-session.h"
 #include "s7d-jpeg-backend.h"
 #include "s7d-jpeg-bitstream.h"
 #include "s7d-jpeg-protocol.h"

@@ -4,7 +4,7 @@
 #ifndef S7D_VP9_INPUT_H
 #define S7D_VP9_INPUT_H
 
-#include "../common/s7d-codec-layout.h"
+#include "s7d-codec-layout.h"
 #include "s7d-vp9-header-prefix.h"
 
 #define S7D_VP9_MAX_WIDTH 4096U

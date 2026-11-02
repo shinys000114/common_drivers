@@ -15,16 +15,17 @@
 #include <linux/string.h>
 #include <linux/suspend.h>
 
+#include "s7d-codec-dos.h"
+#include "s7d-codec-firmware.h"
+#include "s7d-hevc-engine.h"
+#include "s7d-v4l2-device.h"
+
 #include "av1/s7d-av1-v4l2.h"
-#include "common/s7d-codec-dos.h"
-#include "common/s7d-codec-firmware.h"
 #include "h264/s7d-h264-backend.h"
 #include "hevc/s7d-hevc-v4l2.h"
-#include "common/s7d-hevc-engine.h"
 #include "jpeg/s7d-jpeg-backend.h"
 #include "jpeg/s7d-jpeg-v4l2.h"
 #include "vp9/s7d-vp9-v4l2.h"
-#include "common/s7d-v4l2-device.h"
 
 struct s7d_vdec {
 	struct list_head failed_node;

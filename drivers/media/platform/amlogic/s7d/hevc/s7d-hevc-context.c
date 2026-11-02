@@ -13,8 +13,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-#include "../common/s7d-codec-layout.h"
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-layout.h"
+#include "s7d-codec-session.h"
 #include "s7d-hevc-context.h"
 #include "s7d-hevc-rpm.h"
 #include "s7d-hevc-sequence.h"

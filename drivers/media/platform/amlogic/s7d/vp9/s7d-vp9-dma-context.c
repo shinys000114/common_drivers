@@ -12,8 +12,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-#include "../common/s7d-codec-layout.h"
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-layout.h"
+#include "s7d-codec-session.h"
 #include "s7d-vp9-dma-context.h"
 #include "s7d-vp9-input.h"
 

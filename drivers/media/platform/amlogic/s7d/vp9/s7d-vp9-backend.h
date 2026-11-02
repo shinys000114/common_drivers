@@ -3,7 +3,7 @@
 #ifndef S7D_VP9_BACKEND_H
 #define S7D_VP9_BACKEND_H
 
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-session.h"
 #include "s7d-vp9-dpb.h"
 
 struct device;

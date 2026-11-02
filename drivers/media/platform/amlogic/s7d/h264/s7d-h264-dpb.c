@@ -6,7 +6,7 @@
 #include <linux/minmax.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include "../common/s7d-codec-types.h"
+#include "s7d-codec-types.h"
 #include "s7d-h264-dpb.h"
 
 #define H264_MAX_REFERENCES 16U

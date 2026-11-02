@@ -4,7 +4,7 @@
 #ifndef S7D_H264_LAYOUT_H
 #define S7D_H264_LAYOUT_H
 
-#include "../common/s7d-codec-layout.h"
+#include "s7d-codec-layout.h"
 
 struct s7d_h264_sps {
 	u32 mb_width;

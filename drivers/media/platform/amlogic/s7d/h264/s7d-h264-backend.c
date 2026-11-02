@@ -14,7 +14,7 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 
-#include "../common/s7d-codec-dos.h"
+#include "s7d-codec-dos.h"
 #include "s7d-h264-backend.h"
 #include "s7d-h264-capture.h"
 #include "s7d-h264-context.h"
@@ -23,7 +23,7 @@
 #include "s7d-h264-mailbox.h"
 #include "s7d-h264-picture-hw.h"
 #include "s7d-h264-picture-snapshot.h"
-#include "../common/s7d-v4l2-device.h"
+#include "s7d-v4l2-device.h"
 #include "s7d-vdec-runtime.h"
 
 #define DOS_REG(word)		((word) * 4U)

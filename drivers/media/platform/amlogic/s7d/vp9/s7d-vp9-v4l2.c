@@ -15,8 +15,8 @@
 #include "s7d-vp9-input.h"
 #include "s7d-vp9-prefix.h"
 #include "s7d-vp9-v4l2.h"
-#include "../common/s7d-codec-dos.h"
-#include "../common/s7d-v4l2-device.h"
+#include "s7d-codec-dos.h"
+#include "s7d-v4l2-device.h"
 
 struct vp9_backend {
 	struct s7d_vp9_v4l2 *adapter;

@@ -12,8 +12,8 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 
-#include "../common/s7d-codec-dos.h"
-#include "../common/s7d-codec-firmware.h"
+#include "s7d-codec-dos.h"
+#include "s7d-codec-firmware.h"
 #include "s7d-h264-dpb.h"
 #include "s7d-h264-input.h"
 #include "s7d-vdec-runtime.h"

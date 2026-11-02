@@ -16,8 +16,8 @@
 #include "s7d-hevc-input.h"
 #include "s7d-hevc-sequence.h"
 #include "s7d-hevc-v4l2.h"
-#include "../common/s7d-codec-dos.h"
-#include "../common/s7d-v4l2-device.h"
+#include "s7d-codec-dos.h"
+#include "s7d-v4l2-device.h"
 
 struct hevc_backend {
 	struct s7d_hevc_v4l2 *adapter;

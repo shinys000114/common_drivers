@@ -5,7 +5,7 @@
 #define S7D_H264_DPB_H
 
 #include <linux/types.h>
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-session.h"
 #include "s7d-h264-layout.h"
 
 #define S7D_H264_REF_LIST_SIZE 32U

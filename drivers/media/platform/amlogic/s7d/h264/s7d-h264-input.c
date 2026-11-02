@@ -13,10 +13,10 @@
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 
-#include "../common/s7d-codec-dos.h"
-#include "../common/s7d-codec-session.h"
+#include "s7d-codec-dos.h"
+#include "s7d-codec-session.h"
 #include "s7d-vdec-runtime.h"
-#include "../common/s7d-v4l2.h"
+#include "s7d-v4l2.h"
 #include "s7d-h264-input.h"
 #include "s7d-h264-dpb.h"
 #include "s7d-h264-protocol.h"
