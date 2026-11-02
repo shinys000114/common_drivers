@@ -39,6 +39,16 @@
 		opp-400000000 {
 			opp-hz = /bits/ 64 <400000000>;
 		};
+		/* fclk_div4, fclk_div3 and GP1 PLL, as the vendor table. */
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+		};
+		opp-666666666 {
+			opp-hz = /bits/ 64 <666666666>;
+		};
+		opp-852000000 {
+			opp-hz = /bits/ 64 <852000000>;
+		};
 	};
 
 	c5_gpu: gpu@fd000000 {
@@ -63,7 +73,7 @@
 &soc_thermal {
 	cooling-maps {
 		cooling_map {
-			cooling-device = <&CPU0 0 8>, <&c5_gpu 0 1>;
+			cooling-device = <&CPU0 0 8>, <&c5_gpu 0 3>;
 		};
 	};
 };
