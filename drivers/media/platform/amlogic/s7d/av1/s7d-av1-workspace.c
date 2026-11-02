@@ -9,6 +9,7 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
+#include "../common/s7d-codec-layout.h"
 #include "s7d-av1-workspace.h"
 
 static const u32 av1_workspace_size[2][S7D_AV1_WORKSPACE_PARTS] = {
@@ -180,14 +181,9 @@ int s7d_av1_reference_layout(u32 width, u32 height, u32 bit_depth,
 int s7d_av1_mmu_map_contiguous(const struct s7d_av1_region *body,
 			       u32 pages, u8 *map, size_t bytes)
 {
-	u32 i;
-
 	if (!body || !map || !pages || pages > S7D_AV1_MMU_MAX_PAGES ||
 	    bytes != S7D_AV1_MMU_MAP_BYTES ||
 	    av1_region_validate(body, pages * SZ_4K))
 		return -EINVAL;
-	for (i = 0; i < pages; i++)
-		put_unaligned_le32((body->address >> 12) + i, map + i * 4);
-	memset(map + pages * 4, 0, bytes - pages * 4);
-	return 0;
+	return s7d_amfbc_mmu_map_contiguous(body->address, pages, map, bytes);
 }

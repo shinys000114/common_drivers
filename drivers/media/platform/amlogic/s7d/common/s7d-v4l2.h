@@ -135,6 +135,28 @@ int s7d_v4l2_validate_capture_pool(const struct s7d_codec_layout *layout,
 				   const struct s7d_v4l2_capture_buffer *buffers,
 				   unsigned int count);
 
+/* Where an AM08C/AM10C CAPTURE buffer holds a picture, as the format documents. */
+struct s7d_amfbc_buffer {
+	u32 header;
+	u32 header_bytes;
+	u32 body;
+	u32 body_bytes;
+	/* NV12 luma; chroma follows at nv12 + nv12_luma_bytes. */
+	u32 nv12;
+	u32 nv12_luma_bytes;
+};
+
+/*
+ * A pool the decoder writes straight into: every buffer must carry the FBC
+ * prefix of @layout's AM08C/AM10C format (header, body 4 KiB aligned, NV12
+ * right behind), all below 4 GiB. *fbc reads false, with no regions filled,
+ * when no buffer has a prefix; a mixed pool is -EINVAL.
+ */
+int s7d_v4l2_fbc_capture_pool(const struct s7d_codec_layout *layout,
+			      const struct s7d_v4l2_capture_buffer *buffers,
+			      unsigned int count, struct s7d_amfbc_buffer *regions,
+			      bool *fbc);
+
 struct s7d_v4l2_drain {
 	u64 epoch;
 	u64 last_input_token;

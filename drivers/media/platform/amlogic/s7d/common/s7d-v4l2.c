@@ -343,6 +343,56 @@ int s7d_v4l2_validate_capture_pool(const struct s7d_codec_layout *layout,
 	return 0;
 }
 
+int s7d_v4l2_fbc_capture_pool(const struct s7d_codec_layout *layout,
+			      const struct s7d_v4l2_capture_buffer *buffers,
+			      unsigned int count, struct s7d_amfbc_buffer *regions,
+			      bool *fbc)
+{
+	u32 depth = layout->bit_depth == 10 ? 10 : 8;
+	u32 header = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
+	u32 body = s7d_amfbc_body_size(layout->coded_width, layout->storage_height, depth);
+	u32 luma = layout->pitch[0] * layout->storage_height;
+	dma_addr_t base, plane[2];
+	size_t prefix, bytes;
+	unsigned int i, prefixed = 0;
+	int ret;
+
+	*fbc = false;
+	for (i = 0; i < count; i++) {
+		ret = s7d_codec_surface_prefix(buffers[i].surface, &base, &prefix);
+		if (ret)
+			return ret;
+		prefixed += !!prefix;
+	}
+	if (!prefixed)
+		return 0;
+	if (prefixed != count)
+		return -EINVAL;
+	if ((u64)layout->pitch[0] * layout->storage_height != layout->size[0])
+		return -ERANGE;
+	for (i = 0; i < count; i++) {
+		ret = s7d_codec_surface_prefix(buffers[i].surface, &base, &prefix);
+		if (!ret)
+			ret = s7d_codec_surface_dma(buffers[i].surface, 0, &plane[0], &bytes);
+		if (!ret)
+			ret = s7d_codec_surface_dma(buffers[i].surface, 1, &plane[1], &bytes);
+		if (ret)
+			return ret;
+		/* Body at 4 KiB for the MMU, NV12 64-aligned, all below 4 GiB. */
+		if (prefix != (size_t)header + body || !IS_ALIGNED(base, SZ_4K) ||
+		    plane[0] != base + prefix || plane[1] != plane[0] + luma ||
+		    (u64)plane[1] + luma / 2 > (1ULL << 32))
+			return -ERANGE;
+		regions[i] = (struct s7d_amfbc_buffer) {
+			.header = base, .header_bytes = header,
+			.body = base + header, .body_bytes = body,
+			.nv12 = plane[0], .nv12_luma_bytes = luma,
+		};
+	}
+	*fbc = true;
+	return 0;
+}
+
 static u32 s7d_capture_limit(const struct s7d_v4l2_codec *codec)
 {
 	return codec->max_capture_buffers ?: S7D_CODEC_MAX_CAPTURE_BUFFERS;

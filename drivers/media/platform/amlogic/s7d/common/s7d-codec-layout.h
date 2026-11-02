@@ -56,6 +56,13 @@ struct s7d_codec_layout {
 	struct s7d_codec_colourimetry colourimetry;
 };
 
+/*
+ * Amlogic FBC written through the HEVC core's SAO MMU: a frame map of one
+ * little-endian u32 page number per 4 KiB body page. Map a physically
+ * contiguous body one to one; the rest of the map is cleared.
+ */
+int s7d_amfbc_mmu_map_contiguous(u32 body_address, u32 pages, u8 *map, size_t bytes);
+
 int s7d_codec_resolve_colour(const struct s7d_codec_colour *colour,
 			    u32 width, u32 height,
 			    struct s7d_codec_colourimetry *colourimetry);

@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 
+#include <linux/align.h>
 #include <linux/errno.h>
 #include <linux/overflow.h>
+#include <linux/sizes.h>
+#include <linux/string.h>
+#include <linux/unaligned.h>
 #include <linux/videodev2.h>
 
 #include "s7d-codec-layout.h"
@@ -134,5 +138,19 @@ int s7d_codec_validate_layout(const struct s7d_codec_layout *layout)
 	    layout->min_capture_buffers != minimum ||
 	    minimum > S7D_CODEC_MAX_CAPTURE_BUFFERS)
 		return -ERANGE;
+	return 0;
+}
+
+int s7d_amfbc_mmu_map_contiguous(u32 body_address, u32 pages, u8 *map, size_t bytes)
+{
+	u32 i;
+
+	if (!map || !pages || !body_address || !IS_ALIGNED(body_address, SZ_4K) ||
+	    pages > bytes / sizeof(u32) ||
+	    (u64)body_address + (u64)pages * SZ_4K > (1ULL << 32))
+		return -EINVAL;
+	for (i = 0; i < pages; i++)
+		put_unaligned_le32((body_address >> 12) + i, map + i * sizeof(u32));
+	memset(map + pages * sizeof(u32), 0, bytes - pages * sizeof(u32));
 	return 0;
 }

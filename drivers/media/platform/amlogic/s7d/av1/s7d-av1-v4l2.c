@@ -904,26 +904,20 @@ static int av1_zero_copy_prepare(struct av1_backend *backend,
 {
 	const struct s7d_codec_layout *layout = &backend->layout;
 	u32 depth = layout->bit_depth == 10 ? 10 : 8;
-	u32 header = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
-	u32 body = s7d_amfbc_body_size(layout->coded_width, layout->storage_height, depth);
-	u32 luma = layout->pitch[0] * layout->storage_height;
+	struct s7d_amfbc_buffer region[ARRAY_SIZE(backend->capture)];
 	struct s7d_av1_reference_layout fbc;
-	dma_addr_t base, plane[2];
-	size_t prefix, bytes;
-	unsigned int i, prefixed = 0;
+	unsigned int i;
+	bool prefixed;
 	int ret;
 
 	lockdep_assert_held(&backend->lock);
 	backend->zero_copy = false;
-	for (i = 0; i < count; i++) {
-		ret = s7d_codec_surface_prefix(buffers[i].surface, &base, &prefix);
-		if (ret)
-			return ret;
-		prefixed += !!prefix;
-	}
-	if (!prefixed)
-		return 0;
-	if (prefixed != count || count < AV1_FBC_CAPTURE_MINIMUM)
+	if (count > ARRAY_SIZE(region))
+		return -EINVAL;
+	ret = s7d_v4l2_fbc_capture_pool(layout, buffers, count, region, &prefixed);
+	if (ret || !prefixed)
+		return ret;
+	if (count < AV1_FBC_CAPTURE_MINIMUM)
 		return -EINVAL;
 	/* What the hardware writes for a picture of this size must fit the format. */
 	ret = s7d_av1_reference_layout(layout->coded_width, layout->coded_height, depth,
@@ -931,32 +925,22 @@ static int av1_zero_copy_prepare(struct av1_backend *backend,
 				       &fbc);
 	if (ret)
 		return ret;
-	if (fbc.body_allocation > body ||
-	    s7d_amfbc_header_used(layout->coded_width, layout->coded_height) > header ||
-	    (u64)layout->pitch[0] * layout->storage_height != layout->size[0])
+	if (fbc.body_allocation > region[0].body_bytes ||
+	    s7d_amfbc_header_used(layout->coded_width, layout->coded_height) >
+	    region[0].header_bytes)
 		return -ERANGE;
-	for (i = 0; i < count; i++) {
-		ret = s7d_codec_surface_prefix(buffers[i].surface, &base, &prefix);
-		if (!ret)
-			ret = s7d_codec_surface_dma(buffers[i].surface, 0, &plane[0], &bytes);
-		if (!ret)
-			ret = s7d_codec_surface_dma(buffers[i].surface, 1, &plane[1], &bytes);
-		if (ret)
-			return ret;
-		/* Body at 4 KiB for the MMU, NV12 64-aligned, all below 4 GiB. */
-		if (prefix != (size_t)header + body || !IS_ALIGNED(base, SZ_4K) ||
-		    plane[0] != base + prefix || plane[1] != plane[0] + luma ||
-		    (u64)plane[1] + luma / 2 > (1ULL << 32))
-			return -ERANGE;
+	for (i = 0; i < count; i++)
 		backend->slot_memory[i] = (struct s7d_av1_slot_memory) {
 			.cookie = i + 1,
-			.header = { .address = base, .bytes = header },
-			.body = { .address = base + header, .bytes = body },
-			.linear = { .address = plane[0], .bytes = luma + luma / 2 },
-			.y_bytes = luma,
-			.uv_bytes = luma / 2,
+			.header = { .address = region[i].header,
+				    .bytes = region[i].header_bytes },
+			.body = { .address = region[i].body, .bytes = region[i].body_bytes },
+			.linear = { .address = region[i].nv12,
+				    .bytes = region[i].nv12_luma_bytes +
+					     region[i].nv12_luma_bytes / 2 },
+			.y_bytes = region[i].nv12_luma_bytes,
+			.uv_bytes = region[i].nv12_luma_bytes / 2,
 		};
-	}
 	backend->zero_copy = true;
 	return 0;
 }
