@@ -1633,6 +1633,7 @@ static int panthor_probe(struct platform_device *pdev)
 		return PTR_ERR(ptdev);
 
 	platform_set_drvdata(pdev, ptdev);
+	ptdev->soc_data = of_device_get_match_data(&pdev->dev);
 
 	return panthor_device_init(ptdev);
 }
@@ -1682,7 +1683,13 @@ static struct attribute *panthor_attrs[] = {
 
 ATTRIBUTE_GROUPS(panthor);
 
+static const struct panthor_soc_data panthor_s7d_data = {
+	.s7d_pwr_override = true,
+	.stacks_follow_core = true,
+};
+
 static const struct of_device_id dt_match[] = {
+	{ .compatible = "amlogic,s7d-mali", .data = &panthor_s7d_data },
 	{ .compatible = "rockchip,rk3588-mali" },
 	{ .compatible = "arm,mali-valhall-csf" },
 	{}

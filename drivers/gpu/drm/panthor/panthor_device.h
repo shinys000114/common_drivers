@@ -23,6 +23,24 @@
 struct panthor_csf;
 struct panthor_csf_ctx;
 struct panthor_device;
+struct reset_control;
+
+/**
+ * struct panthor_soc_data - SoC integration details
+ */
+struct panthor_soc_data {
+	/**
+	 * @s7d_pwr_override: Amlogic S7D power override, set again whenever
+	 * the GPU loses it.
+	 */
+	bool s7d_pwr_override;
+
+	/**
+	 * @stacks_follow_core: The OPP table holds core rates only; run the
+	 * stacks clock at the same rate.
+	 */
+	bool stacks_follow_core;
+};
 struct panthor_gpu;
 struct panthor_group_pool;
 struct panthor_heap_pool;
@@ -112,6 +130,12 @@ struct panthor_device {
 		/** @coregroup: Core group clock. This clock is optional. */
 		struct clk *coregroup;
 	} clks;
+
+	/** @soc_data: SoC integration details, NULL if none. */
+	const struct panthor_soc_data *soc_data;
+
+	/** @resets: GPU resets, pulsed once at probe. Optional. */
+	struct reset_control *resets;
 
 	/** @coherent: True if the CPU/GPU are memory coherent. */
 	bool coherent;
@@ -261,6 +285,7 @@ struct panthor_file {
 };
 
 int panthor_device_init(struct panthor_device *ptdev);
+void panthor_device_soc_restore(struct panthor_device *ptdev);
 void panthor_device_unplug(struct panthor_device *ptdev);
 
 /**
