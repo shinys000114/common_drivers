@@ -35,6 +35,17 @@ MODULE_PARM_DESC(afbc_policy,
 		 "AFBC primary decoder: -1 Kconfig default, 0 Mali AFBCD, 1 GFCD within its envelope");
 
 /*
+ * Switching the primary between a compressed and a linear or YUV framebuffer
+ * restarts the AFBC decoder, which takes a modeset, so a compositor cannot
+ * move between composition and direct scanout of a client or video buffer.
+ * Clearing this keeps the primary linear (and YUV on VD1); the OSD2 overlay
+ * still takes AFBC.
+ */
+static bool primary_afbc = true;
+module_param(primary_afbc, bool, 0444);
+MODULE_PARM_DESC(primary_afbc, "Offer AFBC/AFRC modifiers on the primary plane (default: true)");
+
+/*
  * GFCD decodes only what Mali AFBCD cannot read, XBGR8888 AFBC and AFRC,
  * unless the GFCD primary policy also takes ABGR8888 inside its FHD/148.5 MHz
  * envelope. With no fallback, the GFCD checks reject the first two outside it.
@@ -432,7 +443,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		zpos = 0;
 		plane_formats = primary_formats;
 		format_count = ARRAY_SIZE(primary_formats);
-		if (afbc_supported) {
+		if (afbc_supported && primary_afbc) {
 			funcs = &s7d_rgb_plane_funcs;
 			plane_modifiers = IS_ENABLED(CONFIG_DRM_S7D_GFCD) ?
 				gfcd_modifiers : rgb_modifiers;
