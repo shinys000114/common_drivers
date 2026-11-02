@@ -91,7 +91,7 @@ int s7d_postblend_build_state(u32 width, u32 height,
 	if (!state || !resources || !zpos || !video_alpha || !width || !height ||
 	    (opaque & ~resources->inputs) ||
 	    width > S7D_DISPLAY_MAX_WIDTH || height > S7D_DISPLAY_MAX_HEIGHT ||
-	    !(resources->inputs & BIT(S7D_INPUT_OSD1)) ||
+	    !(resources->inputs & (BIT(S7D_INPUT_OSD1) | BIT(S7D_INPUT_VD1))) ||
 	    !!video_dst != !!(resources->inputs & BIT(S7D_INPUT_VD1)) ||
 	    !!video2_dst != !!(resources->inputs & BIT(S7D_INPUT_VD2)))
 		return -EINVAL;

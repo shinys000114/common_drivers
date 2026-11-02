@@ -91,7 +91,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	struct s7d_plane_state *state = to_s7d_plane_state(base);
 	int min_scale = DRM_PLANE_NO_SCALING;
 	int max_scale = DRM_PLANE_NO_SCALING;
-	bool can_scale, scaled, gfcd_primary;
+	bool can_scale, scaled, gfcd_primary, video;
 	int ret;
 
 	state->osd_valid = false;
@@ -112,7 +112,10 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	    (base->fb->width > 256 || base->fb->height > 256))
 		return -EINVAL;
 
-	can_scale = base->fb &&
+	/* OSD cannot read YUV, so the CRTC scans a YUV primary out on VD1. */
+	video = plane->slot == S7D_PLANE_VIDEO || plane->slot == S7D_PLANE_VIDEO2 ||
+		(plane->slot == S7D_PLANE_PRIMARY && base->fb && base->fb->format->is_yuv);
+	can_scale = base->fb && !video &&
 		(base->fb->modifier == DRM_FORMAT_MOD_LINEAR ||
 		 base->fb->modifier == S7D_AFBC_MODIFIER ||
 		 s7d_fb_afrc_metadata(base->fb)) &&
@@ -124,12 +127,12 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	if (can_scale) {
 		min_scale /= S7D_OSD_SCALER_MAX_UPSCALE;
 		max_scale *= S7D_OSD_SCALER_MAX_DOWNSCALE;
-	} else if (plane->slot == S7D_PLANE_VIDEO) {
-		min_scale /= S7D_VIDEO_SCALER_MAX_UPSCALE;
-		max_scale *= S7D_VIDEO_SCALER_MAX_DOWNSCALE;
 	} else if (plane->slot == S7D_PLANE_VIDEO2) {
 		min_scale /= S7D_VIDEO2_SCALER_MAX_UPSCALE;
 		max_scale = max_scale * S7D_VIDEO2_SCALER_MAX_DOWNSCALE - 1;
+	} else if (video) {
+		min_scale /= S7D_VIDEO_SCALER_MAX_UPSCALE;
+		max_scale *= S7D_VIDEO_SCALER_MAX_DOWNSCALE;
 	}
 	scaled = base->src_w != ((u64)base->crtc_w << 16) ||
 		base->src_h != ((u64)base->crtc_h << 16);
@@ -139,7 +142,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 						 true, true);
 	if (ret || !base->visible)
 		return ret;
-	if (scaled && plane->slot != S7D_PLANE_VIDEO && plane->slot != S7D_PLANE_VIDEO2 &&
+	if (scaled && !video &&
 	    (base->src.x1 != base->src_x || base->src.y1 != base->src_y ||
 	     drm_rect_width(&base->src) != base->src_w ||
 	     drm_rect_height(&base->src) != base->src_h ||
@@ -147,7 +150,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	     drm_rect_width(&base->dst) != base->crtc_w ||
 	     drm_rect_height(&base->dst) != base->crtc_h))
 		return -EINVAL;
-	if (plane->slot == S7D_PLANE_VIDEO || plane->slot == S7D_PLANE_VIDEO2) {
+	if (video) {
 		if (plane->slot == S7D_PLANE_VIDEO2 &&
 		    (base->fb->width > 2048 || base->fb->height > 1080))
 			return -EINVAL;
@@ -375,6 +378,16 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		DRM_FORMAT_RGB565, DRM_FORMAT_RGB888, DRM_FORMAT_BGR888,
 		DRM_FORMAT_ABGR2101010, DRM_FORMAT_XBGR2101010,
 	};
+	/* NV12/NV21 primary framebuffers scan out on VD1. */
+	static const u32 primary_formats[] = {
+		DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888,
+		DRM_FORMAT_RGBX8888, DRM_FORMAT_BGRX8888,
+		DRM_FORMAT_ARGB8888, DRM_FORMAT_ABGR8888,
+		DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
+		DRM_FORMAT_RGB565, DRM_FORMAT_RGB888, DRM_FORMAT_BGR888,
+		DRM_FORMAT_ABGR2101010, DRM_FORMAT_XBGR2101010,
+		DRM_FORMAT_NV12, DRM_FORMAT_NV21,
+	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	static const u64 rgb_modifiers[] = {
 		DRM_FORMAT_MOD_LINEAR, S7D_AFBC_MODIFIER, DRM_FORMAT_MOD_INVALID,
@@ -414,6 +427,8 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		type = DRM_PLANE_TYPE_PRIMARY;
 		name = "S7D OSD1";
 		zpos = 0;
+		plane_formats = primary_formats;
+		format_count = ARRAY_SIZE(primary_formats);
 		if (afbc_supported) {
 			funcs = &s7d_rgb_plane_funcs;
 			plane_modifiers = IS_ENABLED(CONFIG_DRM_S7D_GFCD) ?
@@ -472,7 +487,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		DRM_MODE_ROTATE_0 | DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y);
 	if (ret)
 		return ERR_PTR(ret);
-	if (slot == S7D_PLANE_VIDEO || slot == S7D_PLANE_VIDEO2) {
+	if (slot == S7D_PLANE_VIDEO || slot == S7D_PLANE_VIDEO2 || slot == S7D_PLANE_PRIMARY) {
 		ret = drm_plane_create_color_properties(&plane->base,
 			BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709) |
 			BIT(DRM_COLOR_YCBCR_BT2020),
@@ -480,6 +495,8 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 			DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE);
 		if (ret)
 			return ERR_PTR(ret);
+	}
+	if (slot == S7D_PLANE_VIDEO || slot == S7D_PLANE_VIDEO2) {
 		drm_plane_helper_add(&plane->base, &s7d_plane_helper_funcs);
 		return &plane->base;
 	}

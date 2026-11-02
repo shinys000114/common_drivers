@@ -550,6 +550,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		const struct drm_plane_helper_funcs *funcs = plane->helper_private;
 		struct drm_plane_state *ps, *old_ps;
 		struct s7d_plane_state *checked;
+		enum s7d_display_input input;
 		enum s7d_plane_slot slot;
 
 		if (!s7d_plane_is_native(plane))
@@ -571,20 +572,23 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		if (ps->crtc != crtc || !ps->fb)
 			return -EINVAL;
 		slot = s7d_plane_slot(plane);
-		ret = s7d_display_claim(&state->resources, inputs[slot],
+		/* OSD cannot read YUV, so a YUV primary framebuffer scans out on VD1. */
+		input = slot == S7D_PLANE_PRIMARY && checked->video_valid ?
+			S7D_INPUT_VD1 : inputs[slot];
+		ret = s7d_display_claim(&state->resources, input,
 			checked->gfcd_valid ? S7D_FETCH_GFCD :
 			checked->afbc_valid ? S7D_FETCH_AFBC : S7D_FETCH_LINEAR);
 		if (ret)
 			return ret;
-		zpos[inputs[slot]] = ps->normalized_zpos;
-		bandwidth[inputs[slot]] = (struct s7d_bandwidth_input) {
+		zpos[input] = ps->normalized_zpos;
+		bandwidth[input] = (struct s7d_bandwidth_input) {
 			.fb = ps->fb, .src = ps->src, .dst = ps->dst,
 			.compressed_size = checked->compressed_size,
 		};
 		if (checked->video_valid ? ps->alpha == DRM_BLEND_ALPHA_OPAQUE :
 		    checked->layer.alpha == 256 &&
 		    !(checked->layer.layout.alpha_config & BIT(2)))
-			opaque |= BIT(inputs[slot]);
+			opaque |= BIT(input);
 		if (slot == S7D_PLANE_PRIMARY)
 			primary_changed = !old_ps || old_ps->fb != ps->fb ||
 				old_ps->src_x != ps->src_x || old_ps->src_y != ps->src_y ||
@@ -606,9 +610,11 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 			video2_dst = ps->dst;
 			encoding2 = ps->color_encoding;
 			range2 = ps->color_range;
-		} else if (slot == S7D_PLANE_VIDEO) {
+		} else if (input == S7D_INPUT_VD1) {
 			if (!checked->video_valid)
 				return -EINVAL;
+			if (slot == S7D_PLANE_PRIMARY)
+				state->buffers.fb[S7D_PLANE_VIDEO] = ps->fb;
 			video = checked;
 			video_alpha[0] = ps->alpha;
 			video_dst = ps->dst;
