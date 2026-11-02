@@ -16,7 +16,9 @@
 #include <drm/drm_device.h>
 #include <drm/drm_mm.h>
 #include <drm/gpu_scheduler.h>
-#include <drm/panthor_drm.h>
+#include "panthor_drm.h"
+
+#include "panthor_compat.h"
 
 struct panthor_csf;
 struct panthor_csf_ctx;

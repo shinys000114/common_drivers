@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0 or MIT
 
-config DRM_PANTHOR
-	tristate "Panthor (DRM support for ARM Mali CSF-based GPUs)"
+config DRM_S7D_PANTHOR
+	tristate "Panthor for the S7D Mali-G310 (Linux 6.18 backport)"
 	depends on DRM
 	depends on ARM || ARM64 || COMPILE_TEST
+	depends on !DRM_PANTHOR && MALI_MIDGARD = n
 	depends on !GENERIC_ATOMIC64  # for IOMMU_IO_PGTABLE_LPAE
 	depends on MMU
 	select DEVFREQ_GOV_SIMPLE_ONDEMAND
@@ -15,7 +16,9 @@ config DRM_PANTHOR
 	select IOMMU_SUPPORT
 	select PM_DEVFREQ
 	help
-	  DRM driver for ARM Mali CSF-based GPUs.
+	  DRM driver for ARM Mali CSF-based GPUs, forked from Linux 6.18 for
+	  the S7D Mali-G310. It replaces the vendor kbase driver, so only one
+	  of the two can be built.
 
 	  This driver is for Mali (or Immortalis) Valhall Gxxx GPUs.
 

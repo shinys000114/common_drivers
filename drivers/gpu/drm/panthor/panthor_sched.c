@@ -6,7 +6,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/gpu_scheduler.h>
-#include <drm/panthor_drm.h>
+#include "panthor_drm.h"
 
 #include <linux/build_bug.h>
 #include <linux/cleanup.h>
@@ -856,7 +856,7 @@ panthor_queue_put_syncwait_obj(struct panthor_queue *queue)
 	if (queue->syncwait.kmap) {
 		struct iosys_map map = IOSYS_MAP_INIT_VADDR(queue->syncwait.kmap);
 
-		drm_gem_vunmap(queue->syncwait.obj, &map);
+		drm_gem_vunmap_unlocked(queue->syncwait.obj, &map);
 		queue->syncwait.kmap = NULL;
 	}
 
@@ -882,7 +882,7 @@ panthor_queue_get_syncwait_obj(struct panthor_group *group, struct panthor_queue
 		goto err_put_syncwait_obj;
 
 	queue->syncwait.obj = &bo->base.base;
-	ret = drm_gem_vmap(queue->syncwait.obj, &map);
+	ret = drm_gem_vmap_unlocked(queue->syncwait.obj, &map);
 	if (drm_WARN_ON(&ptdev->base, ret))
 		goto err_put_syncwait_obj;
 
@@ -2671,7 +2671,7 @@ static void queue_start(struct panthor_queue *queue)
 	list_for_each_entry(job, &queue->scheduler.pending_list, base.list)
 		job->base.s_fence->parent = dma_fence_get(job->done_fence);
 
-	drm_sched_start(&queue->scheduler, 0);
+	drm_sched_start(&queue->scheduler);
 }
 
 static void panthor_group_stop(struct panthor_group *group)
@@ -3382,22 +3382,6 @@ static struct panthor_queue *
 group_create_queue(struct panthor_group *group,
 		   const struct drm_panthor_queue_create *args)
 {
-	const struct drm_sched_init_args sched_args = {
-		.ops = &panthor_queue_sched_ops,
-		.submit_wq = group->ptdev->scheduler->wq,
-		.num_rqs = 1,
-		/*
-		 * The credit limit argument tells us the total number of
-		 * instructions across all CS slots in the ringbuffer, with
-		 * some jobs requiring twice as many as others, depending on
-		 * their profiling status.
-		 */
-		.credit_limit = args->ringbuf_size / sizeof(u64),
-		.timeout = msecs_to_jiffies(JOB_TIMEOUT_MS),
-		.timeout_wq = group->ptdev->reset.wq,
-		.name = "panthor-queue",
-		.dev = group->ptdev->base.dev,
-	};
 	struct drm_gpu_scheduler *drm_sched;
 	struct panthor_queue *queue;
 	int ret;
@@ -3470,7 +3454,19 @@ group_create_queue(struct panthor_group *group,
 	if (ret)
 		goto err_free_queue;
 
-	ret = drm_sched_init(&queue->scheduler, &sched_args);
+	/*
+	 * The credit limit argument tells us the total number of
+	 * instructions across all CS slots in the ringbuffer, with
+	 * some jobs requiring twice as many as others, depending on
+	 * their profiling status.
+	 */
+	ret = drm_sched_init(&queue->scheduler, &panthor_queue_sched_ops,
+			     group->ptdev->scheduler->wq, 1,
+			     args->ringbuf_size / sizeof(u64),
+			     0, msecs_to_jiffies(JOB_TIMEOUT_MS),
+			     group->ptdev->reset.wq,
+			     NULL, "panthor-queue",
+			     group->ptdev->base.dev);
 	if (ret)
 		goto err_free_queue;
 
@@ -3915,7 +3911,7 @@ panthor_job_create(struct panthor_file *pfile,
 
 	ret = drm_sched_job_init(&job->base,
 				 &job->group->queues[job->queue_idx]->entity,
-				 credits, job->group, drm_client_id);
+				 credits, job->group);
 	if (ret)
 		goto err_put_job;
 

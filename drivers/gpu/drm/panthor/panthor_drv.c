@@ -23,7 +23,7 @@
 #include <drm/drm_syncobj.h>
 #include <drm/drm_utils.h>
 #include <drm/gpu_scheduler.h>
-#include <drm/panthor_drm.h>
+#include "panthor_drm.h"
 
 #include "panthor_device.h"
 #include "panthor_fw.h"

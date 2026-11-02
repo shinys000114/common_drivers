@@ -8,7 +8,7 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 
-#include <drm/panthor_drm.h>
+#include "panthor_drm.h"
 
 #include "panthor_device.h"
 #include "panthor_fw.h"
@@ -72,6 +72,7 @@ static void panthor_gem_free_object(struct drm_gem_object *obj)
 	kfree_const(bo->label.str);
 
 	mutex_destroy(&bo->label.lock);
+	mutex_destroy(&bo->gpuva_list_lock);
 
 	drm_gem_free_mmap_offset(&bo->base.base);
 	drm_gem_shmem_free(&bo->base);
@@ -238,6 +239,8 @@ struct drm_gem_object *panthor_gem_create_object(struct drm_device *ddev, size_t
 	obj->base.base.funcs = &panthor_gem_funcs;
 	obj->base.map_wc = !ptdev->coherent;
 	mutex_init(&obj->label.lock);
+	mutex_init(&obj->gpuva_list_lock);
+	drm_gem_gpuva_set_lock(&obj->base.base, &obj->gpuva_list_lock);
 
 	panthor_gem_debugfs_bo_init(obj);
 

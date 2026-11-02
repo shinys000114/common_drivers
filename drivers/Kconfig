@@ -74,5 +74,6 @@ source "$(COMMON_DRIVERS_DIR)/drivers/aml_trusted_keys/Kconfig"
 source "$(COMMON_DRIVERS_DIR)/scripts/Kconfig"
 source "$(COMMON_DRIVERS_DIR)/drivers/base/arm/Kconfig"
 source "$(COMMON_DRIVERS_DIR)/drivers/gpu/arm/Kconfig"
+source "$(COMMON_DRIVERS_DIR)/drivers/gpu/drm/panthor/Kconfig"
 source "$(COMMON_DRIVERS_DIR)/drivers/hwtracing/coresight/mali/Kconfig"
 endmenu

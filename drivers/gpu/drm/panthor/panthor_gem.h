@@ -79,6 +79,14 @@ struct panthor_gem_object {
 	 */
 	struct drm_gem_object *exclusive_vm_root_gem;
 
+	/**
+	 * @gpuva_list_lock: Custom GPUVA lock.
+	 *
+	 * Linux 6.12 has no gpuva.lock in drm_gem_object; this protects
+	 * the GEM's GPUVA list instead.
+	 */
+	struct mutex gpuva_list_lock;
+
 	/** @flags: Combination of drm_panthor_bo_flags flags. */
 	u32 flags;
 
@@ -168,7 +176,7 @@ panthor_kernel_bo_vmap(struct panthor_kernel_bo *bo)
 	if (bo->kmap)
 		return 0;
 
-	ret = drm_gem_vmap(bo->obj, &map);
+	ret = drm_gem_vmap_unlocked(bo->obj, &map);
 	if (ret)
 		return ret;
 
@@ -182,7 +190,7 @@ panthor_kernel_bo_vunmap(struct panthor_kernel_bo *bo)
 	if (bo->kmap) {
 		struct iosys_map map = IOSYS_MAP_INIT_VADDR(bo->kmap);
 
-		drm_gem_vunmap(bo->obj, &map);
+		drm_gem_vunmap_unlocked(bo->obj, &map);
 		bo->kmap = NULL;
 	}
 }
