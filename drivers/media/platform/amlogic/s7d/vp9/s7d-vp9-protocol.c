@@ -48,7 +48,7 @@ static bool protocol_overlap(const struct s7d_vp9_region *a,
 
 /*
  * A surface's memory: NV12 Y and UV (none if fbc_only), then its FBC header
- * and body, if any.
+ * and, unless scattered, body, if any.
  */
 static u32 protocol_regions(const struct s7d_vp9_hw_surface *s, bool compressed,
 			    struct s7d_vp9_region region[4])
@@ -61,7 +61,8 @@ static u32 protocol_regions(const struct s7d_vp9_hw_surface *s, bool compressed,
 	}
 	if (compressed && s->header.bytes) {
 		region[parts++] = s->header;
-		region[parts++] = s->body;
+		if (!s->scattered)
+			region[parts++] = s->body;
 	}
 	return parts;
 }

@@ -95,7 +95,7 @@ static bool overlaps_workspace(const struct s7d_vp9_workspace *ws,
 
 /*
  * A surface's memory: NV12 Y and UV (none if fbc_only), then its FBC header
- * and body, if any.
+ * and, unless scattered, body, if any.
  */
 static u32 surface_regions(const struct s7d_vp9_hw_surface *s, bool compressed,
 			   struct s7d_vp9_region region[4])
@@ -108,7 +108,8 @@ static u32 surface_regions(const struct s7d_vp9_hw_surface *s, bool compressed,
 	}
 	if (compressed && s->header.bytes) {
 		region[parts++] = s->header;
-		region[parts++] = s->body;
+		if (!s->scattered)
+			region[parts++] = s->body;
 	}
 	return parts;
 }
@@ -283,10 +284,14 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 		/* Without NV12 a surface is its own FBC, written compressed only. */
 		if (s->fbc_only && (!f->compressed || !s->header.bytes))
 			return -EINVAL;
+		if (s->scattered && (!f->compressed || s->fbc_only ||
+				     s->body.address || s->body.bytes))
+			return -EINVAL;
 		/* Header and body 4 KiB aligned: ANC2AXI and the MMU map pages. */
 		if (f->compressed && s->header.bytes &&
 		    (!IS_ALIGNED(s->header.address, 4096) || s->header.bytes < scatter ||
-		     !IS_ALIGNED(s->body.address, 4096) || s->body.bytes < body))
+		     (!s->scattered &&
+		      (!IS_ALIGNED(s->body.address, 4096) || s->body.bytes < body))))
 			return -EINVAL;
 		parts = surface_regions(s, f->compressed, mine);
 		nv12 = s->fbc_only ? 0 : 2;

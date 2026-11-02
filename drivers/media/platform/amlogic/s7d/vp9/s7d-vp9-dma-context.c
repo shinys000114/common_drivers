@@ -5,12 +5,14 @@
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/regmap.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "../common/s7d-codec-layout.h"
 #include "../common/s7d-codec-session.h"
 #include "s7d-vp9-dma-context.h"
 #include "s7d-vp9-input.h"
@@ -114,8 +116,7 @@ static int vp9_dma_layout(const struct s7d_vp9_dma_context *ctx,
 struct s7d_vp9_dma_context *
 s7d_vp9_dma_context_create_stream(struct s7d_codec_session *session,
 				u32 width, u32 height, size_t input_capacity,
-				u32 fbc_count, u32 fbc_header_bytes, u32 fbc_bytes,
-				u64 lease_epoch)
+				u32 fbc_count, u32 fbc_header_bytes, u64 lease_epoch)
 {
 	struct s7d_vp9_region rpm, lmem;
 	struct s7d_vp9_dma_context *ctx;
@@ -126,8 +127,7 @@ s7d_vp9_dma_context_create_stream(struct s7d_codec_session *session,
 	int ret;
 
 	if (IS_ERR_OR_NULL(session) || !lease_epoch || fbc_count > S7D_VP9_FBC_SLOTS ||
-	    (fbc_count && (!fbc_header_bytes || !IS_ALIGNED(fbc_header_bytes, SZ_4K) ||
-			   !IS_ALIGNED(fbc_bytes, SZ_4K) || fbc_header_bytes >= fbc_bytes)))
+	    (fbc_count && (!fbc_header_bytes || !IS_ALIGNED(fbc_header_bytes, SZ_4K))))
 		return ERR_PTR(-EINVAL);
 	ret = s7d_vp9_dma_sizes(width, height, input_capacity, &sizes);
 	if (ret)
@@ -166,16 +166,16 @@ s7d_vp9_dma_context_create_stream(struct s7d_codec_session *session,
 	ctx->workspace.mmu_vbh.bytes = S7D_VP9_MMU_VBH_BYTES;
 	ctx->workspace.mmu_map.address = base + sizes.map_offset;
 	ctx->workspace.mmu_map.bytes = S7D_VP9_MMU_MAP_BYTES;
-	/* One allocation each: a 4K 10-bit picture alone is ~17 MiB. */
+	/* One header each; the bodies are scattered system pages. */
 	for (i = 0; i < fbc_count; i++) {
-		ctx->fbc[i] = s7d_codec_dma_alloc(session, fbc_bytes);
+		ctx->fbc[i] = s7d_codec_dma_alloc(session, fbc_header_bytes);
 		if (IS_ERR(ctx->fbc[i])) {
 			ret = PTR_ERR(ctx->fbc[i]);
 			ctx->fbc[i] = NULL;
 			goto release;
 		}
 		fbc_dma = s7d_codec_dma_addr(ctx->fbc[i]);
-		if (!IS_ALIGNED(fbc_dma, SZ_4K) || (u64)fbc_dma + fbc_bytes > U32_MAX) {
+		if (!IS_ALIGNED(fbc_dma, SZ_4K) || (u64)fbc_dma + fbc_header_bytes > U32_MAX) {
 			ret = -ERANGE;
 			goto release;
 		}
@@ -249,25 +249,17 @@ int s7d_vp9_dma_context_mv_slot(const struct s7d_vp9_dma_context *context,
 
 int s7d_vp9_dma_context_fbc_slot(const struct s7d_vp9_dma_context *context,
 				 u64 lease_epoch, u32 index,
-				 struct s7d_vp9_region *header,
-				 struct s7d_vp9_region *body)
+				 struct s7d_vp9_region *header)
 {
-	u32 address, bytes;
-
-	if (IS_ERR_OR_NULL(context) || !header || !body)
+	if (IS_ERR_OR_NULL(context) || !header)
 		return -EINVAL;
 	if (context->lease_epoch != lease_epoch)
 		return -ESTALE;
 	if (index >= context->fbc_count)
 		return -ENOENT;
-	address = s7d_codec_dma_addr(context->fbc[index]);
-	bytes = s7d_codec_dma_size(context->fbc[index]);
 	*header = (struct s7d_vp9_region) {
-		.address = address, .bytes = context->fbc_header_bytes,
-	};
-	*body = (struct s7d_vp9_region) {
-		.address = address + context->fbc_header_bytes,
-		.bytes = bytes - context->fbc_header_bytes,
+		.address = s7d_codec_dma_addr(context->fbc[index]),
+		.bytes = context->fbc_header_bytes,
 	};
 	return 0;
 }
@@ -287,6 +279,34 @@ int s7d_vp9_dma_context_map_body(struct s7d_vp9_dma_context *context,
 	ret = s7d_amfbc_mmu_map_contiguous(body_address, pages,
 					   context->cpu + context->sizes.map_offset,
 					   S7D_VP9_MMU_MAP_BYTES);
+	if (!ret)
+		dma_wmb();
+	return ret;
+}
+
+int s7d_vp9_dma_context_map_pages(struct s7d_vp9_dma_context *context,
+				  u64 lease_epoch, u64 token,
+				  const dma_addr_t *pages, u32 count, u32 units)
+{
+	u64 first, last;
+	u32 i;
+	int ret;
+
+	if (IS_ERR_OR_NULL(context) || !pages || !units)
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch || context->input.token != token)
+		return -ESTALE;
+	if (!context->begun || !context->programmed)
+		return -EBUSY;
+	/* System pages never alias the stream's own coherent memory. */
+	first = s7d_codec_dma_addr(context->memory);
+	last = first + s7d_codec_dma_size(context->memory);
+	for (i = 0; i < count; i++)
+		if ((u64)pages[i] < last && first < (u64)pages[i] + PAGE_SIZE)
+			return -EINVAL;
+	ret = s7d_amfbc_mmu_map_pages(pages, count, units,
+				      context->cpu + context->sizes.map_offset,
+				      S7D_VP9_MMU_MAP_BYTES);
 	if (!ret)
 		dma_wmb();
 	return ret;

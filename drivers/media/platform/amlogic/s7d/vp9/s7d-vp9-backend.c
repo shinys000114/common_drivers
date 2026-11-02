@@ -6,6 +6,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/regmap.h>
@@ -16,6 +17,7 @@
 
 #include "../common/s7d-codec-dos.h"
 #include "../common/s7d-codec-firmware.h"
+#include "../common/s7d-codec-memory.h"
 #include "../common/s7d-hevc-engine.h"
 #include "../common/s7d-v4l2.h"
 #include "s7d-vp9-backend.h"
@@ -31,6 +33,7 @@
 #define VP9_COUNT VP9_REG(0x30d6)
 #define VP9_SIZE VP9_REG(0x30d7)
 #define VP9_SHIFT_BYTES VP9_REG(0x310d)
+#define VP9_SAO_MMU_STATUS VP9_REG(0x3639)
 #define VP9_HEADER_DONE 0xf0U
 #define VP9_PICTURE_DONE 0x0aU
 #define VP9_ACTION_DONE 0xffU
@@ -41,6 +44,8 @@ struct vp9_snapshot {
 	u32 status;
 	u32 shift_bytes;
 	u32 adapt;
+	/* Scattered bodies: 4 KiB pages the SAO MMU took, HEVC_SAO_MMU_STATUS[31:16]. */
+	u32 mmu_pages;
 	int error;
 };
 
@@ -60,6 +65,8 @@ struct vp9_job {
 	u64 timestamp_ns;
 	struct s7d_codec_timestamp_metadata timestamp_meta;
 	u32 current_slot;
+	/* 4 KiB body pages the picture took through the MMU, from its end IRQ. */
+	u32 body_pages;
 	int status;
 	bool rpm_valid;
 	bool staged;
@@ -128,6 +135,16 @@ struct s7d_vp9_decoder {
 	bool zero_copy;
 	/* AM08F/AM10F: compressed output only, no NV12 double write. */
 	bool fbc_only;
+	/*
+	 * NV12 CAPTURE, compressed: each internal FBC buffer's body in scattered
+	 * system pages (its header in the context), and the pages no buffer
+	 * holds, kept mapped for the next picture (at most one body's worth).
+	 */
+	bool scattered;
+	u32 body_units;
+	u32 body_pages;
+	struct s7d_codec_pages body[S7D_VP9_FBC_SLOTS];
+	struct s7d_codec_pages spare;
 	bool firmware_loaded;
 	bool context_ready;
 	bool irq_accept;
@@ -179,6 +196,11 @@ static irqreturn_t vp9_irq(void *priv, const struct s7d_hevc_irq_cookie *cookie)
 		ret = regmap_read(decoder->map, VP9_SHIFT_BYTES, &snapshot.shift_bytes);
 	if (!ret)
 		ret = regmap_read(decoder->map, VP9_ADAPT_PROB, &snapshot.adapt);
+	/* What the vendor frees the tail by (vvp9.c, HEVC_SAO_MMU_STATUS >> 16). */
+	if (!ret && decoder->scattered && snapshot.status == VP9_PICTURE_DONE) {
+		ret = regmap_read(decoder->map, VP9_SAO_MMU_STATUS, &snapshot.mmu_pages);
+		snapshot.mmu_pages >>= 16;
+	}
 	if (!ret)
 		ret = regmap_read(decoder->map, VP9_STATUS, &fresh);
 	if (!ret && fresh != snapshot.status)
@@ -236,20 +258,43 @@ static int vp9_acquire_surface(struct s7d_vp9_decoder *decoder, struct vp9_job *
 	}
 }
 
-/* A slot leaves the DPB: drop its pin record and any internal FBC it borrowed. */
+/*
+ * Halted, a slot leaves the DPB: drop its pin record and any internal FBC it
+ * borrowed, whose scattered body goes back to the spare pages.
+ */
 static void vp9_unpin(struct s7d_vp9_decoder *decoder, u32 slot)
 {
 	decoder->pin_mask &= ~BIT(slot);
 	if (!decoder->compressed || decoder->zero_copy)
 		return;
+	if (decoder->scattered && decoder->fbc_index[slot] != VP9_NO_FBC)
+		s7d_codec_pages_trim(&decoder->body[decoder->fbc_index[slot]],
+				     &decoder->spare, 0);
 	decoder->fbc_index[slot] = VP9_NO_FBC;
 	decoder->surface[slot].header = (struct s7d_vp9_region) { };
 	decoder->surface[slot].body = (struct s7d_vp9_region) { };
 }
 
+/* Halted: the decoded picture keeps the body pages it used, its tail goes back. */
+static void vp9_trim_body(struct s7d_vp9_decoder *decoder, u32 index, u32 used)
+{
+	const u32 per_page = PAGE_SIZE / SZ_4K;
+
+	if (!used || used > decoder->body_units) {
+		dev_warn_ratelimited(decoder->dev,
+				     "VP9 FBC: %u of %u body pages reported used, keeping all\n",
+				     used, decoder->body_units);
+		return;
+	}
+	s7d_codec_pages_trim(&decoder->body[index], &decoder->spare,
+			     DIV_ROUND_UP(used, per_page));
+}
+
 /*
  * NV12 CAPTURE with compressed references: lend the picture being decoded a
  * free internal FBC buffer. At most eight DPB slots hold one, so one is free.
+ * Its body takes the whole size a picture may need, until the hardware says
+ * what it used (vvp9.c vp9_alloc_mmu, decoder_mmu_box_alloc_idx).
  */
 static int vp9_lend_fbc(struct s7d_vp9_decoder *decoder, u32 slot)
 {
@@ -267,10 +312,13 @@ static int vp9_lend_fbc(struct s7d_vp9_decoder *decoder, u32 slot)
 	if (index >= decoder->fbc_count)
 		return -ENOSPC;
 	ret = s7d_vp9_dma_context_fbc_slot(decoder->context, decoder->epoch, index,
-					   &surface->header, &surface->body);
-	if (!ret)
-		decoder->fbc_index[slot] = index;
-	return ret;
+					   &surface->header);
+	if (ret)
+		return ret;
+	/* Lent from here on: vp9_unpin gives back what a failed fill took. */
+	decoder->fbc_index[slot] = index;
+	return s7d_codec_pages_fill(&decoder->body[index], &decoder->spare,
+				    decoder->body_pages);
 }
 
 /* Header pause, current pinned: give it FBC memory and map its body for the SAO MMU. */
@@ -283,6 +331,16 @@ static int vp9_map_current(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 
 	if (!decoder->zero_copy)
 		ret = vp9_lend_fbc(decoder, job->current_slot);
+	if (!ret && decoder->scattered) {
+		const struct s7d_codec_pages *body =
+			&decoder->body[decoder->fbc_index[job->current_slot]];
+
+		if (DIV_ROUND_UP(bytes, SZ_4K) > decoder->body_units)
+			return -ERANGE;
+		return s7d_vp9_dma_context_map_pages(decoder->context, job->epoch, job->token,
+						     body->dma, body->count,
+						     DIV_ROUND_UP(bytes, SZ_4K));
+	}
 	if (!ret && surface->body.bytes < bytes)
 		ret = -ERANGE;
 	if (!ret)
@@ -411,10 +469,12 @@ static irqreturn_t vp9_irq_thread(void *priv, const struct s7d_hevc_irq_cookie *
 			goto out;
 	} else if (!ret && snapshot.status == VP9_PICTURE_DONE) {
 		if (!job->header_armed || !job->planned || !snapshot.shift_bytes ||
-		    snapshot.shift_bytes > job->input.max_shift_bytes)
+		    snapshot.shift_bytes > job->input.max_shift_bytes) {
 			ret = -EPROTO;
-		else
+		} else {
 			job->picture_complete = true;
+			job->body_pages = snapshot.mmu_pages;
+		}
 	} else if (!ret) {
 		ret = -EBADMSG;
 	}
@@ -567,10 +627,10 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 			 const struct s7d_v4l2_capture_buffer *capture, u32 count)
 {
 	struct s7d_amfbc_buffer fbc[S7D_VP9_MAX_PHYSICAL];
-	u32 i, j, fbc_count = 0, fbc_header = 0, fbc_bytes = 0;
+	u32 i, j, fbc_count = 0, fbc_header = 0, units = 0;
 	struct s7d_vp9_region region[2] = { };
 	struct s7d_codec_frame sizes = { };
-	bool compressed, zero_copy = false, fbc_only;
+	bool compressed, scattered, zero_copy = false, fbc_only;
 	unsigned long flags;
 	int ret;
 
@@ -599,19 +659,21 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 	/*
 	 * Only the MMU mode decodes 10-bit: its references are FBC and the NV12
 	 * double write stays 8-bit (S7D has no P010). For NV12 CAPTURE the FBC
-	 * buffers are internal and lent to the live pictures only.
+	 * buffers are internal and lent to the live pictures only; as the
+	 * vendor's internal_comp_buf, their bodies are scattered system pages.
 	 */
 	compressed = layout->bit_depth == 10 || zero_copy;
-	if (compressed && !zero_copy) {
+	scattered = compressed && !zero_copy;
+	if (scattered) {
 		fbc_header = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
-		fbc_bytes = fbc_header + s7d_amfbc_body_size(layout->coded_width,
-				layout->storage_height, layout->bit_depth);
+		units = DIV_ROUND_UP(s7d_vp9_fbc_body_bytes(layout->coded_width,
+				layout->coded_height, layout->bit_depth), SZ_4K);
 		fbc_count = min(count, S7D_VP9_FBC_SLOTS);
 	}
 	decoder->context = s7d_vp9_dma_context_create_stream(session, layout->coded_width,
 		layout->coded_height,
 		s7d_vp9_input_capacity(layout->coded_width, layout->coded_height),
-		fbc_count, fbc_header, fbc_bytes, decoder->epoch);
+		fbc_count, fbc_header, decoder->epoch);
 	if (IS_ERR(decoder->context)) {
 		ret = PTR_ERR(decoder->context);
 		decoder->context = NULL;
@@ -620,6 +682,16 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 	decoder->session = session;
 	decoder->layout = *layout;
 	decoder->generation = generation;
+	/* Bookkeeping only; pages come with each picture, stream_close frees them. */
+	for (i = 0; i < fbc_count; i++) {
+		ret = s7d_codec_pages_init(&decoder->body[i], decoder->dev,
+					   DIV_ROUND_UP(units, PAGE_SIZE / SZ_4K));
+		if (!ret && !i)
+			ret = s7d_codec_pages_init(&decoder->spare, decoder->dev,
+						   DIV_ROUND_UP(units, PAGE_SIZE / SZ_4K));
+		if (ret)
+			goto failed;
+	}
 	for (i = 0; i < count; i++) {
 		if (!capture[i].surface || capture[i].generation != generation) {
 			ret = -EINVAL;
@@ -640,6 +712,7 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 		decoder->surface[i] = (struct s7d_vp9_hw_surface) {
 			.plane = { region[0], region[1] }, .width = layout->coded_width,
 			.height = layout->coded_height, .valid = true, .fbc_only = fbc_only,
+			.scattered = scattered,
 		};
 		if (zero_copy) {
 			decoder->surface[i].header = (struct s7d_vp9_region) {
@@ -664,6 +737,9 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 	decoder->compressed = compressed;
 	decoder->zero_copy = zero_copy;
 	decoder->fbc_only = fbc_only;
+	decoder->scattered = scattered;
+	decoder->body_units = units;
+	decoder->body_pages = DIV_ROUND_UP(units, PAGE_SIZE / SZ_4K);
 	decoder->fbc_count = fbc_count;
 	sizes.bytesused[0] = layout->size[0];
 	sizes.bytesused[1] = layout->size[1];
@@ -1192,6 +1268,11 @@ stop:
 		ret = ret ?: halted;
 		goto retained;
 	}
+	/* Halted: the SAO MMU writes no more (vvp9.c recycle_mmu_buf_tail). */
+	if (decoder->scattered && job->picture_complete &&
+	    job->current_slot < decoder->captures &&
+	    decoder->fbc_index[job->current_slot] != VP9_NO_FBC)
+		vp9_trim_body(decoder, decoder->fbc_index[job->current_slot], job->body_pages);
 	if (!ret)
 		ret = vp9_stop_check(decoder);
 	if (!ret && !job->header.show_existing &&
@@ -1281,6 +1362,7 @@ int s7d_vp9_decoder_stream_close(struct s7d_vp9_decoder *decoder,
 				 struct s7d_codec_session *session)
 {
 	unsigned long flags;
+	u32 i;
 	int ret;
 
 	if (!decoder || !session)
@@ -1307,6 +1389,13 @@ int s7d_vp9_decoder_stream_close(struct s7d_vp9_decoder *decoder,
 		goto out;
 	decoder->context = NULL;
 	decoder->context_ready = false;
+	/* Halted and unbound: no buffer's body is read or written any more. */
+	for (i = 0; i < S7D_VP9_FBC_SLOTS; i++)
+		s7d_codec_pages_destroy(&decoder->body[i]);
+	s7d_codec_pages_destroy(&decoder->spare);
+	decoder->scattered = false;
+	decoder->body_units = 0;
+	decoder->body_pages = 0;
 	decoder->session = NULL;
 	decoder->generation = 0;
 	decoder->pin_mask = 0;

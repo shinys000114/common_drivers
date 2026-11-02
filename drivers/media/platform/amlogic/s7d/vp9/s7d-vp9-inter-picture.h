@@ -29,6 +29,11 @@ struct s7d_vp9_hw_surface {
 	 * the picture is written compressed only; needs the compressed mode.
 	 */
 	bool fbc_only;
+	/*
+	 * Compressed, NV12 CAPTURE: the body is scattered system pages the SAO
+	 * MMU writes through the frame map, so body stays zero.
+	 */
+	bool scattered;
 };
 
 struct s7d_vp9_picture_frame {

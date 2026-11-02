@@ -13,7 +13,8 @@
 #define S7D_VP9_MMU_MAP_BYTES (0x1200U * 4U)
 /*
  * Internal FBC buffers for NV12 CAPTURE with compressed references: one per
- * live picture, the eight reference slots and the picture being decoded.
+ * live picture, the eight reference slots and the picture being decoded. The
+ * context holds their headers; the owner keeps the bodies in system pages.
  */
 #define S7D_VP9_FBC_SLOTS 9U
 
@@ -51,14 +52,13 @@ int s7d_vp9_dma_sizes(u32 width, u32 height, size_t input_capacity,
 		      struct s7d_vp9_dma_sizes *sizes);
 /*
  * Owner serializes calls and joins executor, IRQ and DPB users before destroy.
- * A nonzero fbc_count allocates that many internal FBC buffers of fbc_bytes
- * (header, then body at fbc_header_bytes, 4 KiB aligned).
+ * A nonzero fbc_count allocates that many internal FBC headers of
+ * fbc_header_bytes (4 KiB aligned).
  */
 struct s7d_vp9_dma_context *
 s7d_vp9_dma_context_create_stream(struct s7d_codec_session *session,
 				u32 width, u32 height, size_t input_capacity,
-				u32 fbc_count, u32 fbc_header_bytes, u32 fbc_bytes,
-				u64 lease_epoch);
+				u32 fbc_count, u32 fbc_header_bytes, u64 lease_epoch);
 int s7d_vp9_dma_context_destroy_stream(struct s7d_vp9_dma_context *context,
 				     u64 lease_epoch);
 const struct s7d_vp9_workspace *
@@ -66,15 +66,21 @@ s7d_vp9_dma_context_workspace(const struct s7d_vp9_dma_context *context);
 int s7d_vp9_dma_context_mv_slot(const struct s7d_vp9_dma_context *context,
 			      u64 lease_epoch, u32 bank,
 			      struct s7d_vp9_region *region);
-/* Internal FBC buffer @index: header and body; -ENOENT without them. */
+/* Internal FBC buffer @index: its header; -ENOENT without them. */
 int s7d_vp9_dma_context_fbc_slot(const struct s7d_vp9_dma_context *context,
 				 u64 lease_epoch, u32 index,
-				 struct s7d_vp9_region *header,
-				 struct s7d_vp9_region *body);
+				 struct s7d_vp9_region *header);
 /* Firmware header pause: map the current picture's contiguous body 1:1. */
 int s7d_vp9_dma_context_map_body(struct s7d_vp9_dma_context *context,
 				 u64 lease_epoch, u64 token, u32 body_address,
 				 u32 pages);
+/*
+ * As map_body, for a body scattered over @count PAGE_SIZE pages (device
+ * addresses below 4 GiB): map its first @units 4 KiB pages.
+ */
+int s7d_vp9_dma_context_map_pages(struct s7d_vp9_dma_context *context,
+				  u64 lease_epoch, u64 token,
+				  const dma_addr_t *pages, u32 count, u32 units);
 /* Caller holds a live CAPTURE pin from this session and generation. */
 int s7d_vp9_dma_context_bind_surface(const struct s7d_vp9_dma_context *context,
 				   u64 lease_epoch,
