@@ -8,7 +8,7 @@
 #include <drm/drm_gpuvm.h>
 #include <drm/drm_managed.h>
 #include <drm/gpu_scheduler.h>
-#include <drm/panthor_drm.h>
+#include "panthor_drm.h"
 
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
@@ -860,7 +860,7 @@ static void panthor_vm_stop(struct panthor_vm *vm)
 
 static void panthor_vm_start(struct panthor_vm *vm)
 {
-	drm_sched_start(&vm->sched, 0);
+	drm_sched_start(&vm->sched);
 }
 
 /**
@@ -1102,9 +1102,9 @@ static void panthor_vm_bo_put(struct drm_gpuvm_bo *vm_bo)
 	 * GEM vm_bo list.
 	 */
 	dma_resv_lock(drm_gpuvm_resv(vm), NULL);
-	mutex_lock(&bo->base.base.gpuva.lock);
+	mutex_lock(&bo->gpuva_list_lock);
 	unpin = drm_gpuvm_bo_put(vm_bo);
-	mutex_unlock(&bo->base.base.gpuva.lock);
+	mutex_unlock(&bo->gpuva_list_lock);
 	dma_resv_unlock(drm_gpuvm_resv(vm));
 
 	/* If the vm_bo object was destroyed, release the pin reference that
@@ -1295,9 +1295,9 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	 * calling this function.
 	 */
 	dma_resv_lock(panthor_vm_resv(vm), NULL);
-	mutex_lock(&bo->base.base.gpuva.lock);
+	mutex_lock(&bo->gpuva_list_lock);
 	op_ctx->map.vm_bo = drm_gpuvm_bo_obtain_prealloc(preallocated_vm_bo);
-	mutex_unlock(&bo->base.base.gpuva.lock);
+	mutex_unlock(&bo->gpuva_list_lock);
 	dma_resv_unlock(panthor_vm_resv(vm));
 
 	/* If the a vm_bo for this <VM,BO> combination exists, it already
@@ -2053,10 +2053,10 @@ static void panthor_vma_link(struct panthor_vm *vm,
 {
 	struct panthor_gem_object *bo = to_panthor_bo(vma->base.gem.obj);
 
-	mutex_lock(&bo->base.base.gpuva.lock);
+	mutex_lock(&bo->gpuva_list_lock);
 	drm_gpuva_link(&vma->base, vm_bo);
 	drm_WARN_ON(&vm->ptdev->base, drm_gpuvm_bo_put(vm_bo));
-	mutex_unlock(&bo->base.base.gpuva.lock);
+	mutex_unlock(&bo->gpuva_list_lock);
 }
 
 static void panthor_vma_unlink(struct panthor_vm *vm,
@@ -2065,9 +2065,9 @@ static void panthor_vma_unlink(struct panthor_vm *vm,
 	struct panthor_gem_object *bo = to_panthor_bo(vma->base.gem.obj);
 	struct drm_gpuvm_bo *vm_bo = drm_gpuvm_bo_get(vma->base.vm_bo);
 
-	mutex_lock(&bo->base.base.gpuva.lock);
+	mutex_lock(&bo->gpuva_list_lock);
 	drm_gpuva_unlink(&vma->base);
-	mutex_unlock(&bo->base.base.gpuva.lock);
+	mutex_unlock(&bo->gpuva_list_lock);
 
 	/* drm_gpuva_unlink() release the vm_bo, but we manually retained it
 	 * when entering this function, so we can implement deferred VMA
@@ -2221,22 +2221,15 @@ panthor_vm_exec_op(struct panthor_vm *vm, struct panthor_vm_op_ctx *op,
 	mutex_lock(&vm->op_lock);
 	vm->op_ctx = op;
 	switch (op_type) {
-	case DRM_PANTHOR_VM_BIND_OP_TYPE_MAP: {
-		const struct drm_gpuvm_map_req map_req = {
-			.map.va.addr = op->va.addr,
-			.map.va.range = op->va.range,
-			.map.gem.obj = op->map.vm_bo->obj,
-			.map.gem.offset = op->map.bo_offset,
-		};
-
+	case DRM_PANTHOR_VM_BIND_OP_TYPE_MAP:
 		if (vm->unusable) {
 			ret = -EINVAL;
 			break;
 		}
 
-		ret = drm_gpuvm_sm_map(&vm->base, vm, &map_req);
+		ret = drm_gpuvm_sm_map(&vm->base, vm, op->va.addr, op->va.range,
+				       op->map.vm_bo->obj, op->map.bo_offset);
 		break;
-	}
 
 	case DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP:
 		ret = drm_gpuvm_sm_unmap(&vm->base, vm, op->va.addr, op->va.range);
@@ -2348,16 +2341,6 @@ panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 	u64 full_va_range = 1ull << va_bits;
 	struct drm_gem_object *dummy_gem;
 	struct drm_gpu_scheduler *sched;
-	const struct drm_sched_init_args sched_args = {
-		.ops = &panthor_vm_bind_ops,
-		.submit_wq = ptdev->mmu->vm.wq,
-		.num_rqs = 1,
-		.credit_limit = 1,
-		/* Bind operations are synchronous for now, no timeout needed. */
-		.timeout = MAX_SCHEDULE_TIMEOUT,
-		.name = "panthor-vm-bind",
-		.dev = ptdev->base.dev,
-	};
 	struct io_pgtable_cfg pgtbl_cfg;
 	u64 mair, min_va, va_range;
 	struct panthor_vm *vm;
@@ -2417,7 +2400,11 @@ panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 		goto err_mm_takedown;
 	}
 
-	ret = drm_sched_init(&vm->sched, &sched_args);
+	/* Bind operations are synchronous for now, no timeout needed. */
+	ret = drm_sched_init(&vm->sched, &panthor_vm_bind_ops, ptdev->mmu->vm.wq,
+			     1, 1, 0,
+			     MAX_SCHEDULE_TIMEOUT, NULL, NULL,
+			     "panthor-vm-bind", ptdev->base.dev);
 	if (ret)
 		goto err_free_io_pgtable;
 
@@ -2441,9 +2428,8 @@ panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 	 * to be handled the same way user VMAs are.
 	 */
 	drm_gpuvm_init(&vm->base, for_mcu ? "panthor-MCU-VM" : "panthor-GPU-VM",
-		       DRM_GPUVM_RESV_PROTECTED | DRM_GPUVM_IMMEDIATE_MODE,
-		       &ptdev->base, dummy_gem, min_va, va_range, 0, 0,
-		       &panthor_gpuvm_ops);
+		       DRM_GPUVM_RESV_PROTECTED, &ptdev->base, dummy_gem,
+		       min_va, va_range, 0, 0, &panthor_gpuvm_ops);
 	drm_gem_object_put(dummy_gem);
 	return vm;
 
@@ -2566,7 +2552,7 @@ panthor_vm_bind_job_create(struct drm_file *file,
 	kref_init(&job->refcount);
 	job->vm = panthor_vm_get(vm);
 
-	ret = drm_sched_job_init(&job->base, &vm->entity, 1, vm, file->client_id);
+	ret = drm_sched_job_init(&job->base, &vm->entity, 1, vm);
 	if (ret)
 		goto err_put_job;
 

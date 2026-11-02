@@ -74,6 +74,7 @@ obj-$(CONFIG_AMLOGIC_SOC_TIMESTAMP)	+= timestamp/
 obj-$(CONFIG_AMLOGIC_SECKEY)		+= seckey/
 obj-$(CONFIG_AMLOGIC_USBCAM)		+= dvb_usbci/
 obj-$(CONFIG_MALI_MIDGARD)		+= gpu/arm/
+obj-$(CONFIG_DRM_S7D_PANTHOR)		+= gpu/drm/panthor/
 obj-$(CONFIG_MALI_BASE_MODULES)		+= base/arm/
 obj-$(CONFIG_MALI_CORESIGHT)		+= hwtracing/coresight/mali/
 
