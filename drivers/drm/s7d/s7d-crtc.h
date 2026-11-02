@@ -20,7 +20,8 @@
 
 #define S7D_CRTC_UPDATE_REG_COUNT (S7D_OSD_UPDATE_REG_COUNT + \
 	2 * (S7D_VIDEO_UPDATE_REG_COUNT + S7D_CSC_MATRIX_REG_COUNT + 1) + \
-	S7D_POSTBLEND_REG_COUNT + 2 + S7D_VPP_POST2_UPDATE_COUNT + S7D_GAMMA_UPDATE_COUNT)
+	S7D_POSTBLEND_REG_COUNT + 2 + S7D_VPP_POST2_UPDATE_COUNT + S7D_GAMMA_UPDATE_COUNT + \
+	S7D_VIDEO_SCALER_LIVE_COUNT)
 
 struct s7d_writeback;
 
@@ -39,6 +40,13 @@ struct s7d_crtc_state {
 	struct s7d_bandwidth_state bandwidth;
 	struct s7d_rdma_entry update[S7D_CRTC_UPDATE_REG_COUNT];
 	unsigned int update_count;
+	/*
+	 * update[scaler_live_first..] moves the running VD1 SAFA; submit merges
+	 * each value into the register's current bits outside scaler_live_mask.
+	 */
+	unsigned int scaler_live_first;
+	unsigned int scaler_live_count;
+	u32 scaler_live_mask[S7D_VIDEO_SCALER_LIVE_COUNT];
 	/* Borrowed from the checked atomic plane states until scanout takes refs. */
 	struct s7d_scanout_buffers buffers;
 	struct s7d_scanout_afbc previous_afbc;
@@ -59,6 +67,7 @@ struct s7d_crtc_state {
 	bool gfcd_unchanged;
 	bool afbc_decode_only;
 	bool afbc_replay_compatible;
+	bool video_scaler_live;
 };
 
 static inline struct s7d_crtc_state *

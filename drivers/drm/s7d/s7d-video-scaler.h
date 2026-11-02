@@ -24,6 +24,9 @@ struct s7d_video_scaler_reg {
 	u32 value;
 };
 
+/* SAFA registers rewritten at vblank when a running VD1 changes its scaling. */
+#define S7D_VIDEO_SCALER_LIVE_COUNT (S7D_VIDEO_SCALER_SETUP_COUNT + 5)
+
 struct s7d_video_scaler_state {
 	struct s7d_video_scaler_reg setup[S7D_VIDEO_SCALER_SETUP_COUNT];
 	struct s7d_video_scaler_reg control;
@@ -49,6 +52,13 @@ int s7d_video_osd_scaler_check_mode(const struct s7d_video_scaler_state *video,
 				    const struct s7d_osd_scaler_state *osd,
 				    u32 htotal, unsigned long pixel_rate,
 				    unsigned long core_rate);
+/*
+ * Masked writes, in order, that move a running SAFA to state (enabled or not)
+ * once the LUTs are loaded; 4:4:4 input is only prepared while stopped.
+ * Returns the count, or a negative error.
+ */
+int s7d_video_scaler_build_live(const struct s7d_video_scaler_state *state,
+				struct s7d_video_scaler_reg out[S7D_VIDEO_SCALER_LIVE_COUNT]);
 bool s7d_video_scaler_same_config(const struct s7d_video_scaler_state *a,
 				const struct s7d_video_scaler_state *b);
 int s7d_video_scaler_coefficient(u32 bank, u32 phase, u32 pair, u32 *out);

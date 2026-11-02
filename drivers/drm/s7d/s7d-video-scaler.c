@@ -350,6 +350,38 @@ int s7d_video_osd_scaler_check_mode(const struct s7d_video_scaler_state *video,
 	return max_t(u64, pixel_rate, required) > core_rate ? -ERANGE : 0;
 }
 
+int s7d_video_scaler_build_live(const struct s7d_video_scaler_state *state,
+				struct s7d_video_scaler_reg out[S7D_VIDEO_SCALER_LIVE_COUNT])
+{
+	unsigned int i, n = 0;
+
+	if (!state || !out || state->input444 ||
+	    state->setup_count > S7D_VIDEO_SCALER_SETUP_COUNT)
+		return -EINVAL;
+	if (!state->enabled) {
+		/* Back to the VPP setup defaults: SAFA off, preblend-to-VADJ1 bypass. */
+		out[n++] = (struct s7d_video_scaler_reg)SET(0x5000, BIT(0), 0);
+		out[n++] = (struct s7d_video_scaler_reg)SET(0x1d93, BIT(0), BIT(0));
+		return n;
+	}
+	/* The stopped preparation order, minus the LUTs. */
+	out[n++] = (struct s7d_video_scaler_reg)SET(0x1d93, BIT(0), 0);
+	out[n++] = (struct s7d_video_scaler_reg)SET(0x1da4, 0x1fff1fff,
+		(state->dst_width << 16) | state->dst_height);
+	out[n++] = state->pre_scale;
+	for (i = 0; i < state->setup_count; i++) {
+		out[n] = state->setup[i];
+		/* The size register is written whole, without a readback merge. */
+		if (out[n].reg == 0x1da6)
+			out[n].mask = U32_MAX;
+		n++;
+	}
+	out[n++] = (struct s7d_video_scaler_reg)SET(0x1d20, U32_MAX,
+		(state->src_height << 16) | state->src_width);
+	out[n++] = state->control;
+	return n;
+}
+
 bool s7d_video_scaler_same_config(const struct s7d_video_scaler_state *a,
 				const struct s7d_video_scaler_state *b)
 {

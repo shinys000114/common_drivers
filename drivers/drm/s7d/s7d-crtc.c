@@ -92,6 +92,8 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->gfcd_unchanged = false;
 	state->afbc_decode_only = false;
 	state->afbc_replay_compatible = false;
+	state->video_scaler_live = false;
+	state->scaler_live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	return &state->base;
 }
@@ -358,6 +360,23 @@ static int s7d_crtc_build_update(struct s7d_crtc_state *state,
 				.value = cpu_to_le32(csc->matrix[j].value),
 			};
 	}
+	if (state->video_scaler_live && old && old->valid && old->base.active &&
+	    !drm_atomic_crtc_needs_modeset(&state->base)) {
+		struct s7d_video_scaler_reg live[S7D_VIDEO_SCALER_LIVE_COUNT];
+		int n = s7d_video_scaler_build_live(&state->video.scaler, live);
+
+		if (n < 0 || state->video_unchanged || state->video_address_only)
+			return -EINVAL;
+		state->scaler_live_first = count;
+		state->scaler_live_count = n;
+		for (i = 0; i < (unsigned int)n; i++) {
+			state->scaler_live_mask[i] = live[i].mask;
+			state->update[count++] = (struct s7d_rdma_entry) {
+				.reg = cpu_to_le32(live[i].reg),
+				.value = cpu_to_le32(live[i].value & live[i].mask),
+			};
+		}
+	}
 	memcpy(state->update + count, state->postblend.regs, sizeof(state->postblend.regs));
 	count += S7D_POSTBLEND_REG_COUNT;
 	/* Select the blend sources before disabling fetch, or enabling a new input. */
@@ -439,7 +458,7 @@ static bool s7d_crtc_decode_only(const struct s7d_crtc_state *state,
 static bool s7d_crtc_replay_compatible(const struct s7d_crtc_state *state,
 				      const struct s7d_crtc_state *old)
 {
-	return state->input_captured &&
+	return state->input_captured && !state->scaler_live_count &&
 		state->base.active && state->base.enable && old && old->valid &&
 		old->base.active && !drm_atomic_crtc_needs_modeset(&state->base) &&
 		/* The replayed list carries CTM and GAMMA_LUT changes. */
@@ -525,6 +544,8 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->gfcd_unchanged = false;
 	state->afbc_decode_only = false;
 	state->afbc_replay_compatible = false;
+	state->video_scaler_live = false;
+	state->scaler_live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	state->buffers = (struct s7d_scanout_buffers) {0};
 	state->resources = (struct s7d_display_resources) {0};
@@ -705,12 +726,22 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 				       &state->video);
 	if (ret)
 		return ret;
-	if (old && old->active &&
-	    (!s7d_video_scaler_same_config(&to_s7d_crtc_state(old)->video.scaler,
-					   &state->video.scaler) ||
-	     memcmp(to_s7d_crtc_state(old)->video.setup, state->video.setup,
-		    sizeof(state->video.setup))))
-		base->mode_changed = true;
+	if (old && old->active) {
+		const struct s7d_crtc_state *before = to_s7d_crtc_state(old);
+
+		/* A MIF VD1 rescales at vblank; FBC and 4:4:4 input prepare while stopped. */
+		if (memcmp(before->video.setup, state->video.setup, sizeof(state->video.setup)))
+			base->mode_changed = true;
+		else if (!s7d_video_scaler_same_config(&before->video.scaler,
+						       &state->video.scaler)) {
+			if (before->video.scaler.input444 || state->video.scaler.input444 ||
+			    before->video.control.reg != state->video.control.reg ||
+			    s7d_video_enable_bit(&state->video.control) != BIT(0))
+				base->mode_changed = true;
+			else
+				state->video_scaler_live = true;
+		}
+	}
 	ret = s7d_video_build_vd2_pipeline(video2 ? &video2->video : NULL,
 		video2 ? &video2_dst : NULL, video_hold, &state->video2);
 	if (ret)
