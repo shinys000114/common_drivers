@@ -65,6 +65,9 @@
 		resets = <&reset RESET_MALI_CAPB3>, <&reset RESET_MALI>;
 		reset-names = "bus", "core";
 		operating-points-v2 = <&c5_gpu_opp>;
+		/* Shareable Panthor BOs, so the display can scan them out. */
+		memory-region = <&dmaheap_cma_reserved>;
+		memory-region-names = "scanout";
 		#cooling-cells = <2>;
 		status = "okay";
 	};
