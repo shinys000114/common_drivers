@@ -254,9 +254,13 @@ static bool display_write_valid(u32 reg, u32 value)
 		return value == ((2 << 12) | 0x100);
 	case 0x4880:
 	case 0x4800:
-		return value == 0x38400052 || value == 0x38400053 ||
-		       value == 0x38404050 || value == 0x38404051 ||
-		       value == 0x38418050 || value == 0x38418051;
+		/* Bits 24:19 hold the MIF through the ENCP flip window. */
+		if (!(value & GENMASK(24, 19)))
+			return false;
+		value &= ~GENMASK(24, 19);
+		return value == 0x38000052 || value == 0x38000053 ||
+		       value == 0x38004050 || value == 0x38004051 ||
+		       value == 0x38018050 || value == 0x38018051;
 	case 0x4899:
 	case 0x4819:
 		return !(value & ~GENMASK(5, 0)) && (value & 3) <= 2 &&
