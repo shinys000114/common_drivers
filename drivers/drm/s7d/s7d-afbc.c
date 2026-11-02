@@ -15,8 +15,18 @@
 #include "s7d-afbc.h"
 
 #define REG(r, v) { .reg = (r), .value = (v) }
-/* AFBC_EN is a software flag, not a decoder FORMAT_SPECIFIER field. */
-#define AFBC_FORMAT (BIT(18) | BIT(16) | BIT(9) | BIT(8) | 5)
+/*
+ * FORMAT_SPECIFIER (vendor meson_osd_afbc.h): bit 18 tiled header, bit 16
+ * 32x8 superblocks, bit 9 split, bit 8 YTR, bits 3:0 RGBA8888 packing.
+ * AFBC_EN is a software flag, not a decoder field.
+ */
+#define AFBC_FORMAT_UNTILED (BIT(16) | BIT(9) | BIT(8) | 5)
+#define AFBC_FORMAT (BIT(18) | AFBC_FORMAT_UNTILED)
+
+static u32 afbc_format(u64 modifier)
+{
+	return modifier == S7D_AFBC_MODIFIER ? AFBC_FORMAT : AFBC_FORMAT_UNTILED;
+}
 
 const struct s7d_afbc_surface *s7d_afbc_surface_get(u32 mask)
 {
@@ -40,25 +50,28 @@ const struct s7d_afbc_surface *s7d_afbc_surface_get(u32 mask)
 	return NULL;
 }
 
-static int afbc_layout(u32 width, u32 height, struct s7d_afbc_buffer *layout)
+/* As drm_gem_fb_afbc_init(): tiles of 8x8 superblocks, 4 KiB or 128 B header alignment. */
+static int afbc_layout(u32 width, u32 height, u64 modifier, struct s7d_afbc_buffer *layout)
 {
+	bool tiled = modifier == S7D_AFBC_MODIFIER;
 	u64 n_blocks, header_size, body_size, size;
 	u32 aligned_width, aligned_height, pitch;
 
 	if (!width || !height || width > S7D_AFBC_MAX_WIDTH ||
-	    height > S7D_AFBC_MAX_HEIGHT)
+	    height > S7D_AFBC_MAX_HEIGHT || !s7d_afbc_modifier(modifier))
 		return -EINVAL;
-	aligned_width = ALIGN(width, 256);
-	aligned_height = ALIGN(height, 64);
+	aligned_width = ALIGN(width, tiled ? 256 : 32);
+	aligned_height = ALIGN(height, tiled ? 64 : 8);
 	if (check_mul_overflow(aligned_width, 4U, &pitch) ||
 	    !IS_ALIGNED(pitch, 128) || (pitch >> 4) > 0xfff || pitch > 0xffff)
 		return -EINVAL;
 	n_blocks = (u64)aligned_width * aligned_height / 256;
-	header_size = ALIGN(n_blocks * 16, 4096);
+	header_size = ALIGN(n_blocks * 16, tiled ? 4096 : 128);
 	body_size = n_blocks * 1024;
 	if (check_add_overflow(header_size, body_size, &size) || size > U32_MAX)
 		return -ERANGE;
 	*layout = (struct s7d_afbc_buffer) {
+		.modifier = modifier,
 		.aligned_width = aligned_width,
 		.aligned_height = aligned_height,
 		.buffer_height = ALIGN(height, 8),
@@ -85,7 +98,7 @@ int s7d_afbc_check_state(const struct s7d_afbc_state *p)
 	x2 = p->osd.scope_x >> 16;
 	y2 = p->osd.scope_y >> 16;
 	if (x1 > x2 || y1 > y2 || x2 >= p->fb_width || y2 >= p->fb_height ||
-	    afbc_layout(p->fb_width, p->fb_height, &layout) ||
+	    afbc_layout(p->fb_width, p->fb_height, p->modifier, &layout) ||
 	    p->header_size != layout.header_size || p->body_size != layout.body_size ||
 	    p->afbc_size != layout.size || p->aligned_width != layout.aligned_width ||
 	    p->aligned_height != layout.aligned_height ||
@@ -96,7 +109,10 @@ int s7d_afbc_check_state(const struct s7d_afbc_state *p)
 	    p->last_byte_addr != p->body_addr + p->body_size - 1)
 		return -EINVAL;
 	unpack_mask = BIT(31) | GENMASK(15, 0);
-	unpack_value = BIT(31) | 0x1234;
+	unpack_value = BIT(31) | (p->unpack.value & GENMASK(15, 0));
+	if ((unpack_value & GENMASK(15, 0)) !=
+	    (p->modifier == S7D_AFBC_MODIFIER_UNTILED ? 0x3214 : 0x1234))
+		return -EINVAL;
 	if (p->osd.alpha_config == (BIT(2) | BIT(1))) {
 		unpack_mask |= BIT(28) | GENMASK(25, 24);
 		unpack_value |= BIT(28);
@@ -118,7 +134,7 @@ int s7d_afbc_check_state(const struct s7d_afbc_state *p)
 	    p->regs[1].value != upper_32_bits(p->header_addr))
 		return -EINVAL;
 	memcpy(settings, (u32[]) {
-		AFBC_FORMAT, layout.aligned_width, layout.buffer_height,
+		afbc_format(p->modifier), layout.aligned_width, layout.buffer_height,
 		x1, x2, y1, y2, s->alias, 0, layout.pitch,
 		(p->osd.block_config >> 28) & 3,
 	}, sizeof(settings));
@@ -160,15 +176,15 @@ int s7d_afbc_build_buffer(const struct drm_afbc_framebuffer *afbc_fb,
 		return -EINVAL;
 	fb = &afbc_fb->base;
 	if (!fb->format ||
-	    (fb->format->format != DRM_FORMAT_ABGR8888 &&
-	     fb->format->format != DRM_FORMAT_XBGR8888) ||
+	    (!s7d_afbc_format(fb->format->format, fb->modifier) &&
+	     (fb->modifier != S7D_AFBC_MODIFIER ||
+	      fb->format->format != DRM_FORMAT_XBGR8888)) ||
 	    fb->format->num_planes != 1 || !fb->obj[0] ||
-	    fb->modifier != S7D_AFBC_MODIFIER ||
 	    fb->flags != DRM_MODE_FB_MODIFIERS ||
 	    fb->offsets[0] || afbc_fb->offset != fb->offsets[0] ||
 	    afbc_fb->block_width != 32 || afbc_fb->block_height != 8)
 		return -EINVAL;
-	ret = afbc_layout(fb->width, fb->height, &layout);
+	ret = afbc_layout(fb->width, fb->height, fb->modifier, &layout);
 	if (ret)
 		return ret;
 	if (afbc_fb->aligned_width != layout.aligned_width ||
@@ -206,7 +222,7 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 	int ret;
 
 	if (!afbc_fb || !src || !out || surface > 1 || !afbc_fb->base.format ||
-	    afbc_fb->base.format->format != DRM_FORMAT_ABGR8888)
+	    !s7d_afbc_format(afbc_fb->base.format->format, afbc_fb->base.modifier))
 		return -EINVAL;
 	fb = &afbc_fb->base;
 	if (!fb->width || !fb->height || fb->width > S7D_AFBC_MAX_WIDTH ||
@@ -239,7 +255,7 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 		.regs = {
 			REG(s->bank, lower_32_bits(header_addr)),
 			REG(s->bank + 1, upper_32_bits(header_addr)),
-			REG(s->bank + 2, AFBC_FORMAT),
+			REG(s->bank + 2, afbc_format(layout.modifier)),
 			REG(s->bank + 3, layout.aligned_width),
 			REG(s->bank + 4, layout.buffer_height),
 			REG(s->bank + 5, x1),
@@ -259,8 +275,11 @@ int s7d_afbc_build_state(const struct drm_afbc_framebuffer *afbc_fb,
 		.unpack = {
 			.reg = s->unpack,
 			.mask = BIT(31) | GENMASK(15, 0),
-			.value = BIT(31) | 0x1234,
+			/* Component order as the vendor meson_plane: 0x3214 for ARGB/XRGB. */
+			.value = BIT(31) |
+				 (layout.modifier == S7D_AFBC_MODIFIER_UNTILED ? 0x3214 : 0x1234),
 		},
+		.modifier = layout.modifier,
 		.header_addr = header_addr,
 		.body_addr = header_addr + layout.header_size,
 		.last_byte_addr = layout.last_byte_addr,
