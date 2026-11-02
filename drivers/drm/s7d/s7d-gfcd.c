@@ -154,7 +154,8 @@ int s7d_gfcd_build_state(const struct drm_afbc_framebuffer *fb,
 	struct drm_rect full_source;
 	int ret;
 
-	if (!fb || !source || !state)
+	/* GFCD reads the tiled layout only. */
+	if (!fb || !source || !state || fb->base.modifier != S7D_AFBC_MODIFIER)
 		return -EINVAL;
 	ret = gfcd_build_state(&fb->base, source, premult, &candidate);
 	if (ret)

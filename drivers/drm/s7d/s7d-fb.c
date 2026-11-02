@@ -104,9 +104,9 @@ s7d_fb_create(struct drm_device *dev, struct drm_file *file,
 		return drm_gem_fb_create(dev, file, cmd);
 	if (s7d_afrc_cu(cmd->modifier[0]) >= 0)
 		return s7d_fb_create_afrc(dev, file, cmd);
-	if (cmd->modifier[0] != S7D_AFBC_MODIFIER ||
-	    (cmd->pixel_format != DRM_FORMAT_ABGR8888 &&
+	if ((!s7d_afbc_format(cmd->pixel_format, cmd->modifier[0]) &&
 	     (!IS_ENABLED(CONFIG_DRM_S7D_GFCD) ||
+	      cmd->modifier[0] != S7D_AFBC_MODIFIER ||
 	      cmd->pixel_format != DRM_FORMAT_XBGR8888)) ||
 	    cmd->flags != DRM_MODE_FB_MODIFIERS ||
 	    !cmd->width || !cmd->height || cmd->width > S7D_AFBC_MAX_WIDTH ||

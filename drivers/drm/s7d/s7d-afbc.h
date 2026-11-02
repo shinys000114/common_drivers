@@ -20,6 +20,25 @@ struct drm_rect;
 	AFBC_FORMAT_MOD_BLOCK_SIZE_32x8 | AFBC_FORMAT_MOD_YTR | \
 	AFBC_FORMAT_MOD_SPLIT | AFBC_FORMAT_MOD_SPARSE | \
 	AFBC_FORMAT_MOD_TILED | AFBC_FORMAT_MOD_SC)
+/* The untiled layout Mesa renders on Valhall. */
+#define S7D_AFBC_MODIFIER_UNTILED DRM_FORMAT_MOD_ARM_AFBC( \
+	AFBC_FORMAT_MOD_BLOCK_SIZE_32x8 | AFBC_FORMAT_MOD_YTR | \
+	AFBC_FORMAT_MOD_SPLIT | AFBC_FORMAT_MOD_SPARSE)
+
+static inline bool s7d_afbc_modifier(u64 modifier)
+{
+	return modifier == S7D_AFBC_MODIFIER || modifier == S7D_AFBC_MODIFIER_UNTILED;
+}
+
+/* Formats the Mali AFBCD path reads with @modifier. */
+static inline bool s7d_afbc_format(u32 format, u64 modifier)
+{
+	if (modifier == S7D_AFBC_MODIFIER)
+		return format == DRM_FORMAT_ABGR8888;
+	/* The formats Mesa renders to scanout buffers. */
+	return modifier == S7D_AFBC_MODIFIER_UNTILED &&
+		(format == DRM_FORMAT_ARGB8888 || format == DRM_FORMAT_XRGB8888);
+}
 
 struct s7d_afbc_reg_setting {
 	u32 reg;
@@ -44,6 +63,7 @@ struct s7d_afbc_surface {
 };
 
 struct s7d_afbc_buffer {
+	u64 modifier;
 	u64 header_addr;
 	u64 last_byte_addr;
 	u32 aligned_width;
@@ -61,6 +81,7 @@ struct s7d_afbc_state {
 	struct s7d_afbc_reg_value regs[S7D_AFBC_SURFACE_REG_COUNT];
 	struct s7d_afbc_reg_setting route;
 	struct s7d_afbc_reg_setting unpack;
+	u64 modifier;
 	u64 header_addr;
 	u64 body_addr;
 	u64 last_byte_addr;
@@ -88,7 +109,7 @@ struct s7d_afbc_plan {
 	for ((i) = 0; (i) < S7D_AFBC_MAX_SURFACES; (i)++) \
 		for_each_if((plan)->surface_mask & BIT(i))
 
-/* Full-source ABGR/XBGR8888 metadata; errors leave the output unchanged. */
+/* Full-source 8-bit RGB metadata; errors leave the output unchanged. */
 int s7d_afbc_build_buffer(const struct drm_afbc_framebuffer *afbc_fb,
 			  const struct drm_rect *source, u64 dma_mask,
 			  struct s7d_afbc_buffer *out);

@@ -43,9 +43,11 @@ static bool s7d_plane_gfcd(const struct s7d_plane *plane,
 			   const struct drm_plane_state *base,
 			   const struct drm_crtc_state *crtc_state)
 {
+	/* GFCD reads the tiled layout only. */
 	if (!IS_ENABLED(CONFIG_DRM_S7D_GFCD) ||
 	    plane->slot != S7D_PLANE_PRIMARY || !base->fb ||
-	    base->fb->modifier == DRM_FORMAT_MOD_LINEAR)
+	    base->fb->modifier == DRM_FORMAT_MOD_LINEAR ||
+	    base->fb->modifier == S7D_AFBC_MODIFIER_UNTILED)
 		return false;
 	if (base->fb->format->format == DRM_FORMAT_XBGR8888 ||
 	    s7d_fb_afrc_metadata(base->fb))
@@ -117,7 +119,7 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		(plane->slot == S7D_PLANE_PRIMARY && base->fb && base->fb->format->is_yuv);
 	can_scale = base->fb && !video &&
 		(base->fb->modifier == DRM_FORMAT_MOD_LINEAR ||
-		 base->fb->modifier == S7D_AFBC_MODIFIER ||
+		 s7d_afbc_modifier(base->fb->modifier) ||
 		 s7d_fb_afrc_metadata(base->fb)) &&
 		(plane->slot == S7D_PLANE_PRIMARY || plane->slot == S7D_PLANE_RGB);
 	/* Otherwise ABGR AFBC uses Mali AFBCD S0 on OSD1 or S1 on OSD2. */
@@ -197,7 +199,8 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 			ret = s7d_afbc_build_state(fb, &base->src, plane->dma_mask,
 					 plane->slot == S7D_PLANE_PRIMARY ? 0 : 1,
 					 &state->afbc);
-			if (!ret && premult)
+			/* X is an encoded fourth component, never pixel alpha. */
+			if (!ret && premult && base->fb->format->has_alpha)
 				ret = s7d_afbc_set_premult(&state->afbc);
 			if (!ret && reflection)
 				ret = s7d_afbc_set_reflection(&state->afbc, reflection);
@@ -259,9 +262,8 @@ static bool s7d_rgb_format_mod_supported(struct drm_plane *plane,
 		plane->type == DRM_PLANE_TYPE_PRIMARY;
 
 	return modifier == DRM_FORMAT_MOD_LINEAR ||
-		(modifier == S7D_AFBC_MODIFIER &&
-		 (format == DRM_FORMAT_ABGR8888 ||
-		  (gfcd && format == DRM_FORMAT_XBGR8888))) ||
+		s7d_afbc_format(format, modifier) ||
+		(gfcd && modifier == S7D_AFBC_MODIFIER && format == DRM_FORMAT_XBGR8888) ||
 		(gfcd && s7d_afrc_cu(modifier) >= 0 && format == DRM_FORMAT_RGBA8888);
 }
 
@@ -390,11 +392,12 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	static const u64 rgb_modifiers[] = {
-		DRM_FORMAT_MOD_LINEAR, S7D_AFBC_MODIFIER, DRM_FORMAT_MOD_INVALID,
+		DRM_FORMAT_MOD_LINEAR, S7D_AFBC_MODIFIER, S7D_AFBC_MODIFIER_UNTILED,
+		DRM_FORMAT_MOD_INVALID,
 	};
 	/* GFCD reads AFRC on the primary only. */
 	static const u64 gfcd_modifiers[] = {
-		DRM_FORMAT_MOD_LINEAR, S7D_AFBC_MODIFIER,
+		DRM_FORMAT_MOD_LINEAR, S7D_AFBC_MODIFIER, S7D_AFBC_MODIFIER_UNTILED,
 		S7D_AFRC_MODIFIER(16), S7D_AFRC_MODIFIER(24), S7D_AFRC_MODIFIER(32),
 		DRM_FORMAT_MOD_INVALID,
 	};
