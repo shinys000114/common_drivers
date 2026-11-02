@@ -1511,11 +1511,15 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 		stage = "firmware-load";
 		ret = s7d_codec_firmware_load(decoder->dev, S7D_CODEC_ENGINE_HEVC,
 					      hevc_firmware(decoder));
+		/*
+		 * The owner is shared by every codec; only a failed TEE load concerns
+		 * it, not a cancelled or superseded preload.
+		 */
+		if (ret)
+			s7d_codec_firmware_invalidate(decoder->firmware);
 	}
-	if (ret) {
-		s7d_codec_firmware_invalidate(decoder->firmware);
+	if (ret)
 		goto stop;
-	}
 	stage = "swap-token";
 	ret = regmap_read(decoder->map, HEVC_SWAP_TOKEN, &job->opaque_swap);
 
