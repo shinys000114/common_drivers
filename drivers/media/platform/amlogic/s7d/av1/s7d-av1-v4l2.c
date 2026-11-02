@@ -26,12 +26,13 @@
 #define AV1_MAX_HEIGHT		2304
 
 /*
- * AM08C/AM10C: the eight reference frames and the picture being decoded live
- * in CAPTURE buffers, plus one the client keeps on display, as for VP9.
+ * The eight reference frames and the picture being decoded live in CAPTURE
+ * buffers, plus one the client keeps on display, as for VP9.
  */
-#define AV1_FBC_CAPTURE_MINIMUM	(S7D_AV1_DPB_REFERENCES + 2)
+#define AV1_CAPTURE_CURRENT	2U
+#define AV1_CAPTURE_MINIMUM	(S7D_AV1_DPB_REFERENCES + AV1_CAPTURE_CURRENT)
 
-/* What the decoder does with a CAPTURE buffer in AM08C/AM10C (zero-copy) mode. */
+/* What the decoder does with a CAPTURE buffer. */
 enum av1_bind_state {
 	AV1_BIND_FREE,		/* not the decoder's: queued, or the client's */
 	AV1_BIND_PENDING,	/* acquired for the picture about to be decoded */
@@ -59,10 +60,10 @@ struct av1_backend {
 	struct s7d_v4l2_drain drain;
 	struct s7d_v4l2_capture_buffer capture[S7D_CODEC_MAX_CAPTURE_BUFFERS];
 	/*
-	 * AM08C/AM10C: each buffer is a DPB picture's memory, its header, body and
-	 * NV12 at the exported offsets (cookie = index + 1); a DPB-held buffer
-	 * keeps one surface DPB reference, so it is not written again even when
-	 * the client requeues it.
+	 * Each buffer is a DPB picture's memory (cookie = index + 1): the NV12
+	 * double write, with AM08C/AM10C also its FBC header and body at the
+	 * exported offsets. A DPB-held buffer keeps one surface DPB reference, so
+	 * it is not written again even when the client requeues it.
 	 */
 	struct av1_bind bind[S7D_CODEC_MAX_CAPTURE_BUFFERS];
 	struct s7d_av1_slot_memory slot_memory[S7D_CODEC_MAX_CAPTURE_BUFFERS];
@@ -79,7 +80,7 @@ struct av1_backend {
 	u64 picture_token;
 	u32 next_picture;
 	u32 captures;
-	/* Zero copy: index + 1 of the buffer acquired for the next picture. */
+	/* Index + 1 of the buffer acquired for the next picture. */
 	u32 pending;
 	u32 frame_sequence;
 	int failure;
@@ -96,7 +97,10 @@ struct av1_backend {
 	bool execution_attempted;
 	bool drain_pending;
 	bool drain_notified;
-	bool zero_copy;
+	/* The CAPTURE buffers are bound as DPB picture memory. */
+	bool bound;
+	/* AM08C/AM10C: they hold the FBC header and body too. */
+	bool fbc;
 };
 
 struct s7d_av1_v4l2 {
@@ -269,8 +273,17 @@ static int av1_metadata(struct av1_backend *backend)
 					V4L2_PIX_FMT_NV12M, &backend->layout);
 	if (ret)
 		return ret;
-	/* The CAPTURE NV12 copy stays 8-bit; the depth selects the FBC format. */
+	/* The CAPTURE NV12 double write stays 8-bit; the depth selects the FBC format. */
 	backend->layout.bit_depth = sequence.bit_depth;
+	/* Every format: the references and the decoded picture sit in CAPTURE buffers. */
+	backend->layout.dpb_limit = S7D_AV1_DPB_REFERENCES;
+	backend->layout.dpb_slots = S7D_AV1_DPB_REFERENCES;
+	backend->layout.current_slots = AV1_CAPTURE_CURRENT;
+	backend->layout.extra_surfaces = 0;
+	backend->layout.min_capture_buffers = AV1_CAPTURE_MINIMUM;
+	ret = s7d_codec_validate_layout(&backend->layout);
+	if (ret)
+		return ret;
 	colour.flags = S7D_CODEC_COLOUR_SIGNAL_PRESENT;
 	if (sequence.color_range)
 		colour.flags |= S7D_CODEC_COLOUR_FULL_RANGE;
@@ -368,7 +381,7 @@ static int av1_acquire_free(struct av1_backend *backend, u32 *index, u64 *token)
 	return -EAGAIN;
 }
 
-/* Zero copy: the next decoded picture goes straight into a free CAPTURE buffer. */
+/* The next decoded picture goes straight into a free CAPTURE buffer. */
 static int av1_acquire_target(struct av1_backend *backend)
 {
 	u32 index;
@@ -423,7 +436,7 @@ static int av1_unbind(struct av1_backend *backend)
 	u32 i, count;
 	int ret;
 
-	if (!backend->zero_copy)
+	if (!backend->bound)
 		return 0;
 	ret = s7d_av1_runner_unbind(backend->adapter->runner, cookie, &count);
 	for (i = 0; !ret && i < count; i++)
@@ -438,7 +451,7 @@ static int av1_decoded(struct av1_backend *backend)
 	struct av1_bind *bind;
 	int ret;
 
-	if (!backend->zero_copy)
+	if (!backend->bound)
 		return 0;
 	if (backend->pending && backend->result.picture_decoded) {
 		bind = &backend->bind[backend->pending - 1];
@@ -491,46 +504,6 @@ static int av1_deliver(struct av1_backend *backend, u32 index, u64 token)
 	return ret;
 }
 
-/* NV12/NV12M: copy the slot's NV12 double write into a free CAPTURE buffer. */
-static int av1_publish_nv12(struct av1_backend *backend)
-{
-	const struct s7d_av1_reference_output *output = &backend->result.output;
-	struct s7d_codec_dma_copy_plane plane[2];
-	struct s7d_codec_surface *surface;
-	u32 i, index;
-	u64 token;
-	int ret, cleanup;
-
-	ret = av1_acquire_free(backend, &index, &token);
-	if (ret)
-		return ret;
-	surface = backend->capture[index].surface;
-	for (i = 0; i < 2; i++)
-		plane[i] = (struct s7d_codec_dma_copy_plane) {
-			.memory = output->memory,
-			.offset = output->source_offset[i],
-			.source_pitch = output->pitch,
-			.destination_pitch = backend->layout.pitch[i],
-			.row_bytes = backend->layout.coded_width,
-			.rows = backend->layout.coded_height >> i,
-		};
-	ret = s7d_codec_surface_copy_dma(surface, token, backend->generation, plane,
-					av1_copy_cancelled, backend);
-	cleanup = s7d_codec_surface_written(surface, token);
-	if (!ret)
-		ret = cleanup;
-	if (!ret && av1_copy_cancelled(backend))
-		ret = -ECANCELED;
-	if (!ret)
-		ret = av1_deliver(backend, index, token);
-	if (ret) {
-		if (!cleanup)
-			s7d_codec_surface_discard(surface, token);
-		return ret;
-	}
-	return s7d_codec_surface_ref_put(surface);
-}
-
 /*
  * The header words of a copied AM08C/AM10C picture are physical addresses >> 2
  * into the source body; point them into the copy's body instead.
@@ -543,7 +516,7 @@ static int av1_fbc_rebase(struct av1_backend *backend, void *prefix,
 	u32 used = s7d_amfbc_header_used(layout->coded_width, layout->coded_height);
 	u64 body = source->body.address, body_end = body + source->body.bytes;
 	u64 first = source->header.address;
-	u64 last = (u64)source->linear.address + source->linear.bytes;
+	u64 last = (u64)source->chroma.address + source->chroma.bytes;
 	__le32 *header = prefix;
 	u32 i, word, stray = 0;
 	u64 address;
@@ -570,14 +543,15 @@ static int av1_fbc_rebase(struct av1_backend *backend, void *prefix,
 }
 
 /*
- * AM08C/AM10C fallback: the picture must be shown again while the client still
- * holds its buffer (show-existing of a frame already given out), so copy the
- * whole buffer into a free one and rebase the copy's header.
+ * Fallback: the picture must be shown again while the client still holds its
+ * buffer (show-existing of a frame already given out), so copy it into a free
+ * one; an AM08C/AM10C copy takes the whole buffer and gets its header rebased.
  */
 static int av1_publish_copy(struct av1_backend *backend, u32 source)
 {
 	const size_t bytes[2] = { backend->layout.size[0], backend->layout.size[1] };
-	struct s7d_codec_surface *surface;
+	struct s7d_codec_surface *surface, *from = backend->capture[source].surface;
+	u64 from_token = backend->bind[source].token;
 	u32 index;
 	u64 token;
 	void *prefix;
@@ -587,14 +561,18 @@ static int av1_publish_copy(struct av1_backend *backend, u32 source)
 	if (ret)
 		return ret;
 	surface = backend->capture[index].surface;
-	ret = s7d_codec_surface_copy_all(surface, token, backend->capture[source].surface,
-					 backend->bind[source].token, bytes,
-					 av1_copy_cancelled, backend);
-	if (!ret)
-		ret = s7d_codec_surface_prefix_cpu(surface, token, &prefix);
-	if (!ret)
-		ret = av1_fbc_rebase(backend, prefix, &backend->slot_memory[source],
-				     &backend->slot_memory[index]);
+	if (!backend->fbc) {
+		ret = s7d_codec_surface_copy(surface, token, from, from_token, bytes,
+					     av1_copy_cancelled, backend);
+	} else {
+		ret = s7d_codec_surface_copy_all(surface, token, from, from_token, bytes,
+						 av1_copy_cancelled, backend);
+		if (!ret)
+			ret = s7d_codec_surface_prefix_cpu(surface, token, &prefix);
+		if (!ret)
+			ret = av1_fbc_rebase(backend, prefix, &backend->slot_memory[source],
+					     &backend->slot_memory[index]);
+	}
 	cleanup = s7d_codec_surface_written(surface, token);
 	if (!ret)
 		ret = cleanup;
@@ -611,8 +589,8 @@ static int av1_publish_copy(struct av1_backend *backend, u32 source)
 }
 
 /*
- * AM08C/AM10C: the hardware wrote the picture into its CAPTURE buffer; give
- * that buffer out. A picture shown again (show-existing) goes out in place
+ * The hardware wrote the picture into its CAPTURE buffer; give that buffer
+ * out. A picture shown again (show-existing) goes out in place
  * when the client has requeued its buffer, and as a copy while it holds it.
  */
 static int av1_publish_bound(struct av1_backend *backend)
@@ -652,7 +630,7 @@ static int av1_publish(struct av1_backend *backend)
 	    output->output.picture.height != backend->layout.coded_height ||
 	    output->pitch != backend->layout.pitch[0])
 		return -EOPNOTSUPP;
-	ret = backend->zero_copy ? av1_publish_bound(backend) : av1_publish_nv12(backend);
+	ret = backend->bound ? av1_publish_bound(backend) : -EPROTO;
 	if (!ret)
 		ret = s7d_av1_runner_output_committed(backend->adapter->runner, output);
 	if (ret)
@@ -718,7 +696,7 @@ static void av1_work(struct work_struct *work)
 				u32 offset = backend->tu.picture[backend->next_picture].offset;
 				u32 bytes = backend->tu.picture[backend->next_picture].bytes;
 				struct s7d_av1_decode_target target = {
-					.external = backend->zero_copy,
+					.fbc = backend->fbc,
 				};
 				u64 picture_token;
 				const u8 *data;
@@ -729,8 +707,7 @@ static void av1_work(struct work_struct *work)
 				}
 				/* Any buffer the decoder takes means a full stop to give it back. */
 				backend->execution_attempted = true;
-				if (backend->zero_copy &&
-				    !backend->tu.picture[backend->next_picture].show_existing) {
+				if (!backend->tu.picture[backend->next_picture].show_existing) {
 					mutex_unlock(&backend->lock);
 					ret = av1_acquire_target(backend);
 					mutex_lock(&backend->lock);
@@ -906,13 +883,47 @@ static int av1_sync_initial(void *priv, u64 token)
 }
 
 /*
- * AM08C/AM10C buffers become the DPB's picture memory, at the offsets the
- * format exports: FBC header first, its body after it, the NV12 double write
- * behind both. Anything else fails CAPTURE setup.
+ * NV12/NV12M buffers take the NV12 double write of a DPB picture, at the
+ * planes they export, at the format's pitch.
  */
-static int av1_zero_copy_prepare(struct av1_backend *backend,
-				 const struct s7d_v4l2_capture_buffer *buffers,
-				 unsigned int count)
+static int av1_nv12_prepare(struct av1_backend *backend,
+			    const struct s7d_v4l2_capture_buffer *buffers, unsigned int count)
+{
+	const struct s7d_codec_layout *layout = &backend->layout;
+	u32 luma = layout->pitch[0] * layout->storage_height;
+	dma_addr_t plane[2];
+	size_t bytes[2];
+	unsigned int i, j;
+	int ret;
+
+	for (i = 0; i < count; i++) {
+		for (j = 0; j < 2; j++) {
+			ret = s7d_codec_surface_dma(buffers[i].surface, j, &plane[j], &bytes[j]);
+			if (ret)
+				return ret;
+		}
+		/* What the hardware writes: pitch * height rows of luma, half of it CbCr. */
+		if (bytes[0] < luma || bytes[1] < luma / 2 ||
+		    (u64)plane[0] + luma > (1ULL << 32) ||
+		    (u64)plane[1] + luma / 2 > (1ULL << 32))
+			return -ERANGE;
+		backend->slot_memory[i] = (struct s7d_av1_slot_memory) {
+			.cookie = i + 1,
+			.luma = { .address = plane[0], .bytes = luma },
+			.chroma = { .address = plane[1], .bytes = luma / 2 },
+		};
+	}
+	return 0;
+}
+
+/*
+ * The CAPTURE buffers become the DPB's picture memory. AM08C/AM10C ones take
+ * it at the offsets the format exports: FBC header first, its body after it,
+ * the NV12 double write behind both. Anything else fails CAPTURE setup.
+ */
+static int av1_capture_prepare(struct av1_backend *backend,
+			       const struct s7d_v4l2_capture_buffer *buffers,
+			       unsigned int count)
 {
 	const struct s7d_codec_layout *layout = &backend->layout;
 	u32 depth = layout->bit_depth == 10 ? 10 : 8;
@@ -923,14 +934,19 @@ static int av1_zero_copy_prepare(struct av1_backend *backend,
 	int ret;
 
 	lockdep_assert_held(&backend->lock);
-	backend->zero_copy = false;
-	if (count > ARRAY_SIZE(region))
+	backend->bound = false;
+	backend->fbc = false;
+	if (count > ARRAY_SIZE(region) || count < AV1_CAPTURE_MINIMUM)
 		return -EINVAL;
 	ret = s7d_v4l2_fbc_capture_pool(layout, buffers, count, region, &prefixed);
-	if (ret || !prefixed)
+	if (ret)
 		return ret;
-	if (count < AV1_FBC_CAPTURE_MINIMUM)
-		return -EINVAL;
+	if (!prefixed) {
+		ret = av1_nv12_prepare(backend, buffers, count);
+		if (!ret)
+			backend->bound = true;
+		return ret;
+	}
 	/* What the hardware writes for a picture of this size must fit the format. */
 	ret = s7d_av1_reference_layout(layout->coded_width, layout->coded_height, depth,
 				       backend->sequence.use_128x128_superblock ? 128 : 64,
@@ -947,13 +963,13 @@ static int av1_zero_copy_prepare(struct av1_backend *backend,
 			.header = { .address = region[i].header,
 				    .bytes = region[i].header_bytes },
 			.body = { .address = region[i].body, .bytes = region[i].body_bytes },
-			.linear = { .address = region[i].nv12,
-				    .bytes = region[i].nv12_luma_bytes +
-					     region[i].nv12_luma_bytes / 2 },
-			.y_bytes = region[i].nv12_luma_bytes,
-			.uv_bytes = region[i].nv12_luma_bytes / 2,
+			.luma = { .address = region[i].nv12,
+				  .bytes = region[i].nv12_luma_bytes },
+			.chroma = { .address = region[i].nv12 + region[i].nv12_luma_bytes,
+				    .bytes = region[i].nv12_luma_bytes / 2 },
 		};
-	backend->zero_copy = true;
+	backend->bound = true;
+	backend->fbc = true;
 	return 0;
 }
 
@@ -982,7 +998,7 @@ static int av1_capture_start(void *priv, const struct s7d_codec_layout *layout,
 		memset(backend->bind, 0, sizeof(backend->bind));
 		memset(backend->slot_memory, 0, sizeof(backend->slot_memory));
 		backend->pending = 0;
-		ret = av1_zero_copy_prepare(backend, buffers, count);
+		ret = av1_capture_prepare(backend, buffers, count);
 	}
 	if (!ret) {
 		memcpy(backend->capture, buffers, sizeof(*buffers) * count);
@@ -1029,7 +1045,8 @@ static int av1_capture_stop(void *priv, u64 generation)
 		memset(backend->slot_memory, 0, sizeof(backend->slot_memory));
 		backend->captures = 0;
 		backend->pending = 0;
-		backend->zero_copy = false;
+		backend->bound = false;
+		backend->fbc = false;
 		backend->generation = 0;
 	}
 	mutex_unlock(&backend->lock);
@@ -1183,7 +1200,8 @@ static int av1_reset(void *priv)
 		memset(backend->bind, 0, sizeof(backend->bind));
 		memset(backend->slot_memory, 0, sizeof(backend->slot_memory));
 		backend->pending = 0;
-		backend->zero_copy = false;
+		backend->bound = false;
+		backend->fbc = false;
 		backend->lease_epoch = 0;
 		backend->generation = 0;
 		backend->initial_token = 0;
@@ -1349,7 +1367,7 @@ s7d_av1_v4l2_create(struct device *dev, struct s7d_codec_dos *dos,
 			.min_input_size = AV1_INPUT_BYTES,
 			.default_layout = s7d_v4l2_default_nv12_layout,
 			.fbc = true,
-			.fbc_min_capture_buffers = AV1_FBC_CAPTURE_MINIMUM,
+			.fbc_min_capture_buffers = AV1_CAPTURE_MINIMUM,
 		},
 		.ops = &av1_ops, .ready = av1_factory_ready,
 		.create = av1_factory_create, .destroy = av1_factory_destroy,

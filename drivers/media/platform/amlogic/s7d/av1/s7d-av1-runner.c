@@ -508,7 +508,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 
 	if (!runner || !session || !lease_epoch || !input_token || !data || !bytes ||
 	    (!header_result && !decode_result) || (header_result && decode_result) ||
-	    !decode_result != !target || (target && target->memory && !target->external))
+	    !decode_result != !target)
 		return -EINVAL;
 	if (bytes > S7D_AV1_INPUT_MAX_BYTES)
 		return -E2BIG;
@@ -549,7 +549,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 		goto unlock;
 	}
 	if (job->decode && runner->references &&
-	    s7d_av1_references_external(runner->references) != target->external) {
+	    s7d_av1_references_fbc(runner->references) != target->fbc) {
 		ret = -EINVAL;
 		goto unlock;
 	}
@@ -609,7 +609,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 	if (job->decode && !runner->references) {
 		runner->references = s7d_av1_references_create(session,
 			s7d_av1_dma_context_workspace(runner->context),
-			&job->result.sequence, lease_epoch, 0, true, target->external);
+			&job->result.sequence, lease_epoch, 0, true, target->fbc);
 		if (IS_ERR(runner->references)) {
 			ret = PTR_ERR(runner->references);
 			runner->references = NULL;

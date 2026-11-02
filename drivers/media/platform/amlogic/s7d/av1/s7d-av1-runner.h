@@ -27,9 +27,9 @@ struct s7d_av1_header_result {
 
 /* Where a decoded picture goes; fixed for a session once the first picture ran. */
 struct s7d_av1_decode_target {
-	/* The DPB lives in caller memory (AM08C/AM10C CAPTURE), bound per picture. */
-	bool external;
-	/* External only: this picture's memory; NULL for a show-existing frame. */
+	/* The caller memory also holds the FBC header and body (AM08C/AM10C). */
+	bool fbc;
+	/* This picture's CAPTURE memory; NULL for a show-existing frame. */
 	const struct s7d_av1_slot_memory *memory;
 };
 
@@ -58,10 +58,10 @@ int s7d_av1_runner_decode(struct s7d_av1_runner *runner,
 			  u64 input_token, const u8 *data, size_t bytes,
 			  u64 timestamp_ns, const struct s7d_av1_decode_target *target,
 			  struct s7d_av1_decode_result *result);
-/* The linear shadow remains pinned until every output reader has finished. */
+/* The shown picture stays DPB-owned until it has been published. */
 int s7d_av1_runner_output_committed(struct s7d_av1_runner *runner,
 				    const struct s7d_av1_reference_output *output);
-/* External DPB: take back the memory of every slot the DPB no longer owns. */
+/* Take back the memory of every slot the DPB no longer owns. */
 int s7d_av1_runner_unbind(struct s7d_av1_runner *runner,
 			  u64 cookies[S7D_AV1_DPB_MAX_SLOTS], u32 *count);
 void s7d_av1_runner_request_stop(struct s7d_av1_runner *runner);

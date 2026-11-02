@@ -17,11 +17,11 @@ struct s7d_av1_reference_backing {
 	struct s7d_av1_region body;
 	struct s7d_av1_region header;
 	struct s7d_av1_region mv;
-	struct s7d_av1_region linear;
+	/* NV12 double write: luma, then interleaved CbCr, both at the pitch. */
+	struct s7d_av1_region luma;
+	struct s7d_av1_region chroma;
 	struct s7d_av1_region cdf;
 	struct s7d_av1_region segment_map;
-	u32 y_bytes;
-	u32 uv_bytes;
 	u32 pitch;
 };
 
@@ -50,48 +50,43 @@ struct s7d_av1_reference_picture {
 };
 
 /*
- * External mode: one caller buffer (an AM08C/AM10C CAPTURE buffer) holds a
- * picture's FBC header, body and NV12 double write; the slot keeps only its MV.
+ * The caller memory (a CAPTURE buffer) a decoded picture is written to: its
+ * NV12 double write, and with AM08C/AM10C (fbc) its FBC header and body too.
+ * Otherwise the slot keeps the FBC header and body itself; the MV always stays
+ * with the slot.
  */
 struct s7d_av1_slot_memory {
 	/* Nonzero caller handle, reported back once the DPB lets go of the slot. */
 	u64 cookie;
+	/* fbc only; zero otherwise. */
 	struct s7d_av1_region header;
 	struct s7d_av1_region body;
-	struct s7d_av1_region linear;
-	u32 y_bytes;
-	u32 uv_bytes;
+	struct s7d_av1_region luma;
+	struct s7d_av1_region chroma;
 };
 
 struct s7d_av1_reference_output {
 	struct s7d_av1_dpb_output output;
-	/* Internal mode: the slot's allocation holding the NV12 double write. */
-	struct s7d_codec_dma *memory;
-	size_t source_offset[2];
-	struct s7d_av1_region linear;
-	const u8 *y;
-	const u8 *uv;
 	u32 pitch;
-	u32 y_bytes;
-	u32 uv_bytes;
-	/* External mode: the cookie of the memory bound to the shown slot. */
+	/* The cookie of the memory bound to the shown slot. */
 	u64 cookie;
 };
 
 /*
  * Caller retains the workspace owner; halt/join precedes initial allocation.
- * External: slots allocate only their MV; each decoded picture brings its memory.
+ * Each decoded picture brings its memory; with fbc the slots allocate only
+ * their MV, otherwise also the FBC header and body.
  */
 struct s7d_av1_references *
 s7d_av1_references_create(struct s7d_codec_session *session,
 			  const struct s7d_av1_workspace *workspace,
 			  const struct s7d_av1_sequence *sequence,
-			  u64 lease_epoch, int halt_status, bool joined, bool external);
-bool s7d_av1_references_external(const struct s7d_av1_references *references);
+			  u64 lease_epoch, int halt_status, bool joined, bool fbc);
+bool s7d_av1_references_fbc(const struct s7d_av1_references *references);
 /*
  * Reserve/recycle before the run's first protocol/CPU MMIO, while fully idle.
- * External mode binds @memory (NULL for a show-existing frame) to the reserved
- * slot; unowned slots must have been unbound first. Internal mode takes NULL.
+ * Binds @memory (NULL for a show-existing frame) to the reserved slot; unowned
+ * slots must have been unbound first.
  */
 int s7d_av1_references_run_begin(struct s7d_av1_references *references,
 				 u64 lease_epoch, u64 input_token,
@@ -115,8 +110,8 @@ int s7d_av1_references_output(struct s7d_av1_references *references,
 int s7d_av1_references_output_committed(struct s7d_av1_references *references,
 					const struct s7d_av1_reference_output *output);
 /*
- * External mode, idle: drop the memory of every slot the DPB (references, a
- * pending output) no longer owns; returns their cookies. The hardware reads no
+ * Idle: drop the memory of every slot the DPB (references, a pending output)
+ * no longer owns; returns their cookies. The hardware reads no
  * unowned slot again, so the caller may reuse that memory at once.
  */
 int s7d_av1_references_unbind(struct s7d_av1_references *references,

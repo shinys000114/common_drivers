@@ -42,10 +42,14 @@ slot_region(const struct s7d_av1_reference_backing *backing, u32 index)
 		return &backing->header;
 	case 2:
 		return &backing->mv;
+	case 3:
+		return &backing->luma;
 	default:
-		return &backing->linear;
+		return &backing->chroma;
 	}
 }
+
+#define SLOT_REGIONS 5U
 
 static bool id_equal(const struct s7d_av1_picture_id *a,
 		     const struct s7d_av1_picture_id *b)
@@ -71,7 +75,7 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 	/*
 	 * Scatter header: 32 bytes per 32x32 block. Double write: NV12 at a
 	 * 64-aligned pitch over a 64-aligned height, as the vendor's CAPTURE
-	 * buffers; the internal slots reserve superblock-aligned planes.
+	 * buffers.
 	 */
 	header_bytes = DIV_ROUND_UP(input->sequence->max_frame_width, 32) *
 		DIV_ROUND_UP(input->sequence->max_frame_height, 32) * 32;
@@ -90,29 +94,28 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 		    !region_valid(&slot->body, SZ_4K, layout.body_allocation) ||
 		    !region_valid(&slot->header, 32, header_bytes) ||
 		    !region_valid(&slot->mv, SZ_64K, layout.mv_allocation) ||
-		    !region_valid(&slot->linear, 64, luma_bytes / 2 * 3) ||
-		    slot->y_bytes < luma_bytes || slot->uv_bytes < luma_bytes / 2 ||
-		    !IS_ALIGNED(slot->y_bytes, 64) ||
-		    (u64)slot->y_bytes + slot->uv_bytes > slot->linear.bytes ||
+		    !region_valid(&slot->luma, 64, luma_bytes) ||
+		    !region_valid(&slot->chroma, 64, luma_bytes / 2) ||
+		    !IS_ALIGNED(slot->luma.bytes, 64) ||
 		    slot->cdf.address != ws->part[S7D_AV1_CDF].address + i * CDF_BANK_BYTES ||
 		    slot->cdf.bytes != CDF_BANK_BYTES ||
 		    slot->segment_map.address != ws->part[S7D_AV1_SEGMENT_MAP].address +
 					 i * segment_bytes ||
 		    slot->segment_map.bytes != segment_bytes)
 			return -EINVAL;
-		for (a = 0; a < 4; a++) {
+		for (a = 0; a < SLOT_REGIONS; a++) {
 			const struct s7d_av1_region *region = slot_region(slot, a);
 
 			if (overlap(region, &ws->backing) || overlap(region, &ws->rpm) ||
 			    overlap(region, &ws->lmem) || overlap(region, &input->mmu_map))
 				return -EINVAL;
-			for (b = a + 1; b < 4; b++)
+			for (b = a + 1; b < SLOT_REGIONS; b++)
 				if (overlap(region, slot_region(slot, b)))
 					return -EINVAL;
 			for (j = 0; j < i; j++) {
 				if (!input->backing[j].id.backing_cookie)
 					continue;
-				for (b = 0; b < 4; b++)
+				for (b = 0; b < SLOT_REGIONS; b++)
 					if (overlap(region, slot_region(&input->backing[j], b)))
 						return -EINVAL;
 			}
@@ -351,10 +354,10 @@ int s7d_av1_picture_plan(const struct s7d_av1_picture_input *input,
 	next.lcu_total = DIV_ROUND_UP(dpb->current_picture.width, superblock) *
 		DIV_ROUND_UP(dpb->current_picture.height, superblock);
 	/* Plane lengths are those of the picture's own memory, not recomputed. */
-	next.y_bytes = picture->y_bytes;
-	next.uv_bytes = picture->uv_bytes;
-	next.y_address = picture->linear.address;
-	next.uv_address = picture->linear.address + picture->y_bytes;
+	next.y_bytes = picture->luma.bytes;
+	next.uv_bytes = picture->chroma.bytes;
+	next.y_address = picture->luma.address;
+	next.uv_address = picture->chroma.address;
 	next.header_address = picture->header.address;
 	next.current_mv = picture->mv.address;
 	next.cdf_write = picture->cdf.address;
