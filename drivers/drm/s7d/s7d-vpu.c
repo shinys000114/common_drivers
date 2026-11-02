@@ -591,6 +591,30 @@ static int s7d_vpu_afbc_cancel(void *data, u64 generation)
 		s7d_afbc_engine_cancel_stage(&v->afbc, generation) : 0;
 }
 
+/*
+ * Merge the live SAFA writes into the bits each register holds now. The output
+ * runs and only preparation or these lists write those registers.
+ */
+static const struct s7d_rdma_entry *
+s7d_vpu_merge_scaler_live(struct s7d_vpu *v, const struct s7d_crtc_state *state)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&v->frame_lock);
+	if (!state->scaler_live_count)
+		return state->update;
+	memcpy(v->live_update, state->update, state->update_count * sizeof(*state->update));
+	for (i = 0; i < state->scaler_live_count; i++) {
+		struct s7d_rdma_entry *e = &v->live_update[state->scaler_live_first + i];
+		u32 mask = state->scaler_live_mask[i];
+		u32 reg = le32_to_cpu(e->reg);
+
+		if (mask != U32_MAX)
+			e->value = cpu_to_le32((vpu_read(v, reg) & ~mask) | le32_to_cpu(e->value));
+	}
+	return v->live_update;
+}
+
 static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 {
 	struct s7d_vpu *v = data;
@@ -617,7 +641,8 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
-	ret = s7d_scanout_submit_staged(&v->scanout, &state->buffers, state->update,
+	ret = s7d_scanout_submit_staged(&v->scanout, &state->buffers,
+		s7d_vpu_merge_scaler_live(v, state),
 		state->update_count, state->video_unchanged, state->video_address_only,
 		state->afbc_unchanged,
 		transaction,
@@ -1270,10 +1295,41 @@ static int program_osd_scaler(struct s7d_vpu *v,
 	return s7d_osd_scaler_setup(v->regs, states, &v->failed_reg);
 }
 
+/*
+ * The SAFA LUTs do not depend on the ratio. Load them on every preparation so a
+ * running VD1 can start or change scaling at vblank.
+ */
+static int load_video_scaler_luts(struct s7d_vpu *v)
+{
+	u32 bank, phase, pair, word, component;
+	int ret;
+
+	/* Indirect auto-increment ports are write-only during stopped preparation. */
+	for (component = 0; component < 2; component++) {
+		u32 index = component ? S7D_VIDEO_SCALER_COEF_IDX_CHROMA :
+			S7D_VIDEO_SCALER_COEF_IDX_LUMA;
+		u32 data = component ? S7D_VIDEO_SCALER_COEF_DATA_CHROMA :
+			S7D_VIDEO_SCALER_COEF_DATA_LUMA;
+
+		for (bank = 0; bank < S7D_VIDEO_SCALER_COEF_BANKS; bank++) {
+			writel(bank << 7, v->regs + index * 4);
+			for (phase = 0; phase < S7D_VIDEO_SCALER_COEF_PHASES; phase++) {
+				for (pair = 0; pair < S7D_VIDEO_SCALER_COEF_PAIRS; pair++) {
+					ret = s7d_video_scaler_coefficient(bank, phase,
+								   pair, &word);
+					if (ret)
+						return ret;
+					writel(word, v->regs + data * 4);
+				}
+			}
+		}
+	}
+	return 0;
+}
+
 static int program_video_scaler(struct s7d_vpu *v,
 				const struct s7d_video_scaler_state *state)
 {
-	u32 bank, phase, pair, word, component;
 	unsigned int i;
 	int ret;
 
@@ -1323,26 +1379,6 @@ static int program_video_scaler(struct s7d_vpu *v,
 	writel(state->src_height, v->regs + 0x1d02 * 4);
 	writel((state->src_height << 16) | state->src_width,
 	       v->regs + 0x1d20 * 4);
-	/* Indirect auto-increment ports are write-only during stopped preparation. */
-	for (component = 0; component < 2; component++) {
-		u32 index = component ? S7D_VIDEO_SCALER_COEF_IDX_CHROMA :
-			S7D_VIDEO_SCALER_COEF_IDX_LUMA;
-		u32 data = component ? S7D_VIDEO_SCALER_COEF_DATA_CHROMA :
-			S7D_VIDEO_SCALER_COEF_DATA_LUMA;
-
-		for (bank = 0; bank < S7D_VIDEO_SCALER_COEF_BANKS; bank++) {
-			writel(bank << 7, v->regs + index * 4);
-			for (phase = 0; phase < S7D_VIDEO_SCALER_COEF_PHASES; phase++) {
-				for (pair = 0; pair < S7D_VIDEO_SCALER_COEF_PAIRS; pair++) {
-					ret = s7d_video_scaler_coefficient(bank, phase,
-								   pair, &word);
-					if (ret)
-						return ret;
-					writel(word, v->regs + data * 4);
-				}
-			}
-		}
-	}
 	return vpu_update(v, state->control.reg, state->control.mask, state->control.value);
 }
 
@@ -1461,6 +1497,9 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		if (ret)
 			return ret;
 	}
+	ret = load_video_scaler_luts(v);
+	if (ret)
+		return ret;
 	ret = program_video_scaler(v, &state->video.scaler);
 	if (ret)
 		return ret;

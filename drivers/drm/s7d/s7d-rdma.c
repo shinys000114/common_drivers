@@ -287,6 +287,24 @@ static bool display_write_valid(u32 reg, u32 value)
 	case 0x481e:
 		return (value >> 16) >= 2 && (value >> 16) <= 4096 &&
 		       !(value & BIT(16)) && (value & 0xffff) == (value >> 17);
+	/* VD1 SAFA geometry, merged with the running register values at submit. */
+	case 0x1d93:
+	case 0x5000:
+	case 0x5001:
+	case 0x5008:
+	case 0x500a:
+	case 0x5041:
+	case 0x5048:
+	case 0x5100 ... 0x5103:
+	case 0x5105 ... 0x5110:
+	case 0x5116:
+	case 0x511e:
+	case 0x5190:
+	case 0x5191:
+		return true;
+	case 0x1da4:
+	case 0x1da6:
+		return !(value & ~0x1fff1fffU);
 	case 0x1d01:
 		return value >= 2 && value <= 4096 && !(value & BIT(0));
 	case 0x1d02:
