@@ -66,6 +66,7 @@ struct s7d_vpu {
 	bool touched;
 	bool post2_touched;
 	bool gamma_touched;
+	bool osd1_enable;
 	bool osd2_enable;
 	bool afbc_available;
 	bool gfcd_available;

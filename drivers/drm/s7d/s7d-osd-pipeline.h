@@ -11,7 +11,7 @@
 
 #define S7D_OSD_REV_B 0x0b
 #define S7D_OSD_SETUP_REG_COUNT 42
-#define S7D_OSD_UPDATE_REG_COUNT 25
+#define S7D_OSD_UPDATE_REG_COUNT 26
 
 struct s7d_osd_layer {
 	struct s7d_osd_state layout;
