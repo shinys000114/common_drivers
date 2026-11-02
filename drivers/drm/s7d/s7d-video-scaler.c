@@ -221,8 +221,6 @@ int s7d_video_scaler_build(u32 src_width, u32 src_height,
 		next.setup[17].value &= ~BIT(2);
 		if (pre_width != dst_width || pre_height != dst_height)
 			next.setup[17].value |= BIT(2);
-		if (pre_width > 2048)
-			next.setup[17].value |= BIT(1);
 		next.setup[20] = (struct s7d_video_scaler_reg)SET(0x5105,
 			GENMASK(25, 16) | GENMASK(9, 0), 0);
 		next.setup[21] = (struct s7d_video_scaler_reg)SET(0x5106,
@@ -235,6 +233,9 @@ int s7d_video_scaler_build(u32 src_width, u32 src_height,
 			GENMASK(25, 16) | GENMASK(9, 0), 256);
 		next.setup_count = 25;
 	}
+	/* video_safa.c step 3: a SAFA input over 2048 takes the wide post-scaler line mux. */
+	if (pre_width > 2048)
+		next.setup[17].value |= BIT(1);
 	next.setup[18] = (struct s7d_video_scaler_reg)SET(0x5191, GENMASK(27, 0),
 		(pre_h_rate ? 0 : BIT(8)) | (pre_v_enabled ? 0 : BIT(10)));
 	next.setup[19] = (struct s7d_video_scaler_reg)SET(0x1da6, 0x1fff1fff,
