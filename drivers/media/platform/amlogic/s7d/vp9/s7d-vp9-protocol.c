@@ -9,6 +9,7 @@
 #include "s7d-vp9-protocol.h"
 
 #define HREG(word)			((word) * 4U)
+#define HEVC_ASSIST_MMU_MAP_ADDR		HREG(0x3009)
 #define HEVC_SCRATCH(n)			HREG(0x30c0 + (n))
 #define HEVC_SHIFT_CONTROL		HREG(0x3108)
 #define HEVC_PARSER_CMD_WRITE		HREG(0x3112)
@@ -32,7 +33,10 @@
 #define HEVC_DBLK_CFGE			HREG(0x350e)
 #define HEVC_CM_BODY_LENGTH		HREG(0x3627)
 #define HEVC_CM_HEADER_LENGTH		HREG(0x3629)
+#define HEVC_SAO_CTRL5			HREG(0x3623)
 #define HEVC_CM_HEADER_OFFSET		HREG(0x362b)
+#define HEVC_SAO_MMU_VH0_ADDR		HREG(0x363a)
+#define HEVC_SAO_MMU_VH1_ADDR		HREG(0x363b)
 #define HEVC_PSCALE_CONTROL		HREG(0x3911)
 
 static bool protocol_overlap(const struct s7d_vp9_region *a,
@@ -42,14 +46,30 @@ static bool protocol_overlap(const struct s7d_vp9_region *a,
 	       (u64)b->address < (u64)a->address + a->bytes;
 }
 
+/* A surface's memory: NV12 Y and UV, then its FBC header and body, if any. */
+static u32 protocol_regions(const struct s7d_vp9_hw_surface *s, bool compressed,
+			    struct s7d_vp9_region region[4])
+{
+	region[0] = s->plane[0];
+	region[1] = s->plane[1];
+	if (!compressed || !s->header.bytes)
+		return 2;
+	region[2] = s->header;
+	region[3] = s->body;
+	return 4;
+}
+
 static int protocol_validate(const struct s7d_vp9_protocol_frame *f)
 {
+	struct s7d_vp9_region mine[4], theirs[4];
 	const struct s7d_codec_layout *l;
-	u32 i, j, a, b, unused;
+	u32 i, j, a, b, unused, parts, other_parts;
 	int ret;
 
 	if (!f || !f->layout || !f->surface || !f->physical_count ||
-	    f->physical_count > S7D_VP9_MAX_PHYSICAL)
+	    f->physical_count > S7D_VP9_MAX_PHYSICAL ||
+	    (f->bit_depth != 8 && f->bit_depth != 10) ||
+	    (!f->compressed && f->bit_depth != 8))
 		return -EINVAL;
 	l = f->layout;
 	ret = s7d_vp9_workspace_validate(f->workspace);
@@ -61,6 +81,10 @@ static int protocol_validate(const struct s7d_vp9_protocol_frame *f)
 	ret = s7d_vp9_compressed_mv_size(l->coded_width, l->coded_height, &unused);
 	if (ret)
 		return ret;
+	if (f->compressed &&
+	    (!f->workspace->mmu_vbh.bytes || !f->workspace->mmu_map.bytes ||
+	     !IS_ALIGNED(f->workspace->mmu_map.address, 4096)))
+		return -EINVAL;
 	if (l->format != S7D_CODEC_CAPTURE_NV12M || l->visible_left || l->visible_top ||
 	    l->visible_width != l->coded_width || l->visible_height != l->coded_height ||
 	    l->pitch[0] != ALIGN(l->coded_width, 64) ||
@@ -74,22 +98,28 @@ static int protocol_validate(const struct s7d_vp9_protocol_frame *f)
 			continue;
 		if (s->width != l->coded_width || s->height != l->coded_height)
 			return -EOPNOTSUPP;
-		for (a = 0; a < 2; a++) {
-			const struct s7d_vp9_region *p = &s->plane[a];
+		parts = protocol_regions(s, f->compressed, mine);
+		for (a = 0; a < parts; a++) {
+			const struct s7d_vp9_region *p = &mine[a];
 
-			if (!p->address || !IS_ALIGNED(p->address, 32) || p->bytes < l->size[a] ||
+			if (!p->address || !IS_ALIGNED(p->address, a < 2 ? 32 : 4096) ||
+			    p->bytes < (a < 2 ? l->size[a] : 1) ||
 			    (u64)p->address + p->bytes > (1ULL << 32) ||
 			    protocol_overlap(p, &f->workspace->backing) ||
 			    protocol_overlap(p, &f->workspace->rpm) ||
-			    protocol_overlap(p, &f->workspace->lmem))
+			    protocol_overlap(p, &f->workspace->lmem) ||
+			    protocol_overlap(p, &f->workspace->mmu_vbh) ||
+			    protocol_overlap(p, &f->workspace->mmu_map))
 				return -EINVAL;
 			for (j = 0; j <= i; j++) {
 				if (!f->surface[j].valid)
 					continue;
-				for (b = 0; b < 2; b++) {
+				other_parts = protocol_regions(&f->surface[j], f->compressed,
+							       theirs);
+				for (b = 0; b < other_parts; b++) {
 					if (j == i && b >= a)
 						continue;
-					if (protocol_overlap(p, &f->surface[j].plane[b]))
+					if (protocol_overlap(p, &theirs[b]))
 						return -EINVAL;
 				}
 			}
@@ -132,10 +162,9 @@ int s7d_vp9_protocol_init(struct regmap *map, const struct s7d_vp9_protocol_fram
 	if (ret)
 		return ret;
 	ws = f->workspace;
-	body = DIV_ROUND_UP(f->layout->coded_width, 64) *
-		DIV_ROUND_UP(f->layout->coded_height, 32) * 3200;
-	header = DIV_ROUND_UP(f->layout->coded_width, 128) *
-		DIV_ROUND_UP(f->layout->coded_height, 64) * 32;
+	body = s7d_vp9_fbc_body_bytes(f->layout->coded_width, f->layout->coded_height,
+				      f->bit_depth);
+	header = s7d_vp9_fbc_header_bytes(f->layout->coded_width, f->layout->coded_height);
 	{
 		const struct reg_sequence seq[] = {
 			{ HEVC_SCRATCH(1), ws->rpm.address },
@@ -149,7 +178,8 @@ int s7d_vp9_protocol_init(struct regmap *map, const struct s7d_vp9_protocol_fram
 			{ HEVC_DBLK_CFG4, ws->part[S7D_VP9_DBLK_PARAMETERS].address },
 			{ HEVC_DBLK_CFG5, ws->part[S7D_VP9_DBLK_DATA].address },
 			{ HEVC_DBLK_CFG3, 0x808020 },
-			{ HEVCD_DECOMP_CTRL2, body >> 5 },
+			/* The body size only without the MMU (vp9_config_work_space_hw). */
+			{ HEVCD_DECOMP_CTRL2, f->compressed ? 0 : body >> 5 },
 			{ HEVC_CM_BODY_LENGTH, body },
 			{ HEVC_CM_HEADER_OFFSET, body },
 			{ HEVC_CM_HEADER_LENGTH, header },
@@ -157,6 +187,20 @@ int s7d_vp9_protocol_init(struct regmap *map, const struct s7d_vp9_protocol_fram
 		};
 
 		ret = protocol_writes(map, seq, ARRAY_SIZE(seq));
+		if (ret)
+			return ret;
+	}
+	if (f->compressed) {
+		/* Vendor vp9_config_work_space_hw with mmu_enable. */
+		const struct reg_sequence seq[] = {
+			{ HEVC_SAO_MMU_VH0_ADDR, ws->mmu_vbh.address },
+			{ HEVC_SAO_MMU_VH1_ADDR, ws->mmu_vbh.address + ws->mmu_vbh.bytes / 2 },
+			{ HEVC_ASSIST_MMU_MAP_ADDR, ws->mmu_map.address },
+		};
+
+		ret = protocol_writes(map, seq, ARRAY_SIZE(seq));
+		if (!ret)
+			ret = regmap_update_bits(map, HEVC_SAO_CTRL5, BIT(10), BIT(10));
 		if (ret)
 			return ret;
 	}
@@ -178,7 +222,10 @@ int s7d_vp9_protocol_init(struct regmap *map, const struct s7d_vp9_protocol_fram
 	for (i = 0; i < S7D_VP9_MAX_PHYSICAL * 2; i++) {
 		u32 value = 0;
 
-		if (i / 2 < f->physical_count && f->surface[i / 2].valid)
+		/* Compressed: one entry per picture, its FBC header (init_pic_list_hw). */
+		if (f->compressed && i < f->physical_count && f->surface[i].valid)
+			value = f->surface[i].header.address >> 5;
+		else if (!f->compressed && i / 2 < f->physical_count && f->surface[i / 2].valid)
 			value = f->surface[i / 2].plane[i % 2].address >> 5;
 		ret = regmap_write(map, HEVCD_ANC2AXI_DATA, value);
 		if (ret)
@@ -230,7 +277,8 @@ int s7d_vp9_protocol_init(struct regmap *map, const struct s7d_vp9_protocol_fram
 			{ HEVC_PARSER_CMD_SKIP0, 0x0000090b },
 			{ HEVC_PARSER_CMD_SKIP1, 0x1b14140f },
 			{ HEVC_PARSER_CMD_SKIP2, 0x001b1910 },
-			{ HEVCD_DECOMP_CTRL1, BIT(31) },
+			/* MMU: paged reference reads; else NV21 reference read mode. */
+			{ HEVCD_DECOMP_CTRL1, f->compressed ? BIT(4) : BIT(31) },
 		};
 
 		ret = protocol_writes(map, seq, ARRAY_SIZE(seq));
@@ -248,7 +296,8 @@ int s7d_vp9_protocol_init(struct regmap *map, const struct s7d_vp9_protocol_fram
 	}
 	{
 		const struct reg_sequence seq[] = {
-			{ HEVC_DBLK_CFGB, 0xfe01 },
+			/* [8] compressed write, [9] double write. */
+			{ HEVC_DBLK_CFGB, f->compressed ? 0xff01 : 0xfe01 },
 			{ HEVC_SCRATCH(14), 1 },
 			{ HEVC_PSCALE_CONTROL, 0 },
 			{ HEVC_SCRATCH(16), 0 },

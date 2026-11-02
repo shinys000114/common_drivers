@@ -235,8 +235,31 @@ static bool s7d_capture_fits(struct vb2_buffer *vb, const struct s7d_codec_layou
 	       vb2_plane_size(vb, 1) >= layout->size[1];
 }
 
+/* Colour the stream leaves to the container: the OUTPUT format's, if set. */
+static void s7d_capture_colour(const struct s7d_codec_colourimetry *colour,
+			       const struct v4l2_pix_format_mplane *output,
+			       struct v4l2_pix_format_mplane *format)
+{
+	format->colorspace = colour->colorspace;
+	format->ycbcr_enc = colour->ycbcr_enc;
+	format->quantization = colour->quantization;
+	format->xfer_func = colour->xfer_func;
+	if ((colour->from_output & S7D_CODEC_COLOUR_FROM_OUTPUT_SPACE) &&
+	    output->colorspace) {
+		format->colorspace = output->colorspace;
+		format->ycbcr_enc = output->ycbcr_enc ?:
+			V4L2_MAP_YCBCR_ENC_DEFAULT(output->colorspace);
+		format->xfer_func = output->xfer_func ?:
+			V4L2_MAP_XFER_FUNC_DEFAULT(output->colorspace);
+	} else if ((colour->from_output & S7D_CODEC_COLOUR_FROM_OUTPUT_XFER) &&
+		   output->xfer_func) {
+		format->xfer_func = output->xfer_func;
+	}
+}
+
 static void s7d_capture_format(const struct s7d_codec_layout *layout,
 			       enum s7d_capture_mode mode,
+			       const struct v4l2_pix_format_mplane *output,
 			       struct v4l2_pix_format_mplane *format)
 {
 	bool nv21 = layout->format == S7D_CODEC_CAPTURE_NV21M;
@@ -251,10 +274,7 @@ static void s7d_capture_format(const struct s7d_codec_layout *layout,
 	format->width = layout->coded_width;
 	format->height = layout->storage_height;
 	format->field = V4L2_FIELD_NONE;
-	format->colorspace = layout->colourimetry.colorspace;
-	format->ycbcr_enc = layout->colourimetry.ycbcr_enc;
-	format->quantization = layout->colourimetry.quantization;
-	format->xfer_func = layout->colourimetry.xfer_func;
+	s7d_capture_colour(&layout->colourimetry, output, format);
 	/* A luma plane padded past pitch * height can only be offered as NV12M. */
 	if (mode != S7D_CAPTURE_MPLANE && s7d_layout_contiguous(layout)) {
 		format->pixelformat = nv21 ? V4L2_PIX_FMT_NV21 : V4L2_PIX_FMT_NV12;
@@ -418,15 +438,12 @@ bool s7d_v4l2_codec_valid(const struct s7d_v4l2_codec *codec)
 		return codec->output_format == V4L2_PIX_FMT_H264;
 	if (codec->engine != S7D_CODEC_ENGINE_HEVC || codec->nv21)
 		return false;
-	/* HEVC decodes up to UHD with a 4K-sized access unit. */
-	if (codec->output_format == V4L2_PIX_FMT_HEVC)
+	/* HEVC and VP9 decode up to UHD with a 4K-sized access unit. */
+	if (codec->output_format == V4L2_PIX_FMT_HEVC ||
+	    codec->output_format == V4L2_PIX_FMT_VP9)
 		return codec->max_input_size <= SZ_8M;
-	/* AV1 decodes up to UHD within 2 MiB access units, VP9 up to 1080p. */
-	return (codec->output_format == V4L2_PIX_FMT_VP9 ||
-		codec->output_format == V4L2_PIX_FMT_AV1) &&
-		(!codec->fbc || codec->output_format == V4L2_PIX_FMT_AV1) &&
-		((codec->max_width <= 1920 && codec->max_height <= 1080) ||
-		 codec->output_format == V4L2_PIX_FMT_AV1) &&
+	/* AV1 decodes up to UHD within 2 MiB access units. */
+	return codec->output_format == V4L2_PIX_FMT_AV1 &&
 		codec->max_input_size <= SZ_2M;
 }
 
@@ -557,7 +574,7 @@ int s7d_v4l2_try_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format
 			return ret;
 	}
 	layout.format = nv21 ? S7D_CODEC_CAPTURE_NV21M : S7D_CODEC_CAPTURE_NV12M;
-	s7d_capture_format(&layout, s7d_fourcc_mode(&ctx->codec, fourcc), pix);
+	s7d_capture_format(&layout, s7d_fourcc_mode(&ctx->codec, fourcc), &ctx->output, pix);
 	if (!valid)
 		s7d_capture_follow_output(&ctx->output, pix);
 	return 0;
@@ -605,7 +622,7 @@ int s7d_v4l2_set_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format
 	if (s7d_output(format->type)) {
 		ctx->output = format->fmt.pix_mp;
 		ctx->layout = placeholder;
-		s7d_capture_format(&placeholder, ctx->capture_mode, &ctx->capture);
+		s7d_capture_format(&placeholder, ctx->capture_mode, &ctx->output, &ctx->capture);
 		s7d_capture_follow_output(&ctx->output, &ctx->capture);
 		ctx->sequence_valid = false;
 		ctx->capture_layout_retained = false;
@@ -896,7 +913,7 @@ static int s7d_reset(struct s7d_v4l2_context *ctx, bool capture_streaming)
 	ctx->prepared = false;
 	if (ctx->change_pending) {
 		ctx->layout.format = ctx->query_layout.format;
-		s7d_capture_format(&ctx->layout, ctx->capture_mode, &ctx->capture);
+		s7d_capture_format(&ctx->layout, ctx->capture_mode, &ctx->output, &ctx->capture);
 		ctx->output.width = ctx->layout.coded_width;
 		ctx->output.height = ctx->layout.coded_height;
 	}
@@ -1403,7 +1420,7 @@ int s7d_v4l2_reconfigure_result(struct s7d_v4l2_context *ctx,
 		ctx->change_draining = ctx->state == S7D_V4L2_DRAINING;
 		ctx->capture_stopping = true;
 		ctx->rebind_pending = false;
-		s7d_capture_format(&layout, ctx->capture_mode, &ctx->capture);
+		s7d_capture_format(&layout, ctx->capture_mode, &ctx->output, &ctx->capture);
 		ctx->output.width = layout.coded_width;
 		ctx->output.height = layout.coded_height;
 	}
@@ -1448,7 +1465,7 @@ int s7d_v4l2_sequence_result(struct s7d_v4l2_context *ctx,
 		return 0;
 	} else {
 		ctx->layout = layout;
-		s7d_capture_format(&layout, ctx->capture_mode, &ctx->capture);
+		s7d_capture_format(&layout, ctx->capture_mode, &ctx->output, &ctx->capture);
 		ctx->output.width = layout.coded_width;
 		ctx->output.height = layout.coded_height;
 		ctx->sequence_valid = true;
@@ -1612,7 +1629,7 @@ static int s7d_buf_prepare(struct vb2_buffer *vb)
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	format = vb->vb2_queue->is_output ? ctx->output : ctx->capture;
 	if (!vb->vb2_queue->is_output && ctx->change_pending && !ctx->change_capture_off)
-		s7d_capture_format(&ctx->layout, ctx->capture_mode, &format);
+		s7d_capture_format(&ctx->layout, ctx->capture_mode, &ctx->output, &format);
 	ret = ctx->retired ? -ESHUTDOWN : 0;
 	valid = ctx->sequence_valid;
 	detached = ctx->ops.clear_stream && !ctx->capture_ready;
@@ -2562,8 +2579,10 @@ static int s7d_context_controls(struct s7d_v4l2_context *ctx)
 		V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, 1, S7D_CODEC_MAX_CAPTURE_BUFFERS, 1, 1);
 	if (control)
 		control->flags |= V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE;
+	/* VP9 profiles 0 and 2 (8- and 10-bit 4:2:0). */
 	control = v4l2_ctrl_new_std_menu(&ctx->controls, NULL,
-		V4L2_CID_MPEG_VIDEO_VP9_PROFILE, 0, 0, 0);
+		V4L2_CID_MPEG_VIDEO_VP9_PROFILE, V4L2_MPEG_VIDEO_VP9_PROFILE_2,
+		BIT(V4L2_MPEG_VIDEO_VP9_PROFILE_1), V4L2_MPEG_VIDEO_VP9_PROFILE_0);
 	if (control)
 		control->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	control = v4l2_ctrl_new_std_menu(&ctx->controls, NULL,
@@ -2615,7 +2634,7 @@ s7d_v4l2_context_create(struct device *dev, struct video_device *video,
 	ret = s7d_placeholder(codec, 1920, 1080, V4L2_PIX_FMT_NV12M, &ctx->layout);
 	if (ret)
 		goto free;
-	s7d_capture_format(&ctx->layout, S7D_CAPTURE_MPLANE, &ctx->capture);
+	s7d_capture_format(&ctx->layout, S7D_CAPTURE_MPLANE, &ctx->output, &ctx->capture);
 	s7d_capture_follow_output(&ctx->output, &ctx->capture);
 	ret = s7d_context_controls(ctx);
 	if (ret)
@@ -2680,7 +2699,7 @@ int s7d_v4l2_context_rebind(struct s7d_v4l2_context *ctx, struct s7d_codec_core 
 	ctx->capture_layout_retained = false;
 	if (s7d_fbc_mode(ctx->capture_mode) && !codec->fbc)
 		ctx->capture_mode = S7D_CAPTURE_SINGLE;
-	s7d_capture_format(&layout, ctx->capture_mode, &ctx->capture);
+	s7d_capture_format(&layout, ctx->capture_mode, &ctx->output, &ctx->capture);
 	s7d_capture_follow_output(&ctx->output, &ctx->capture);
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
 unlock:

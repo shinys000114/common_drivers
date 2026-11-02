@@ -22,6 +22,9 @@
 struct s7d_vp9_dma_context {
 	struct s7d_codec_session *session;
 	struct s7d_codec_dma *memory;
+	struct s7d_codec_dma *fbc[S7D_VP9_FBC_SLOTS];
+	u32 fbc_count;
+	u32 fbc_header_bytes;
 	struct regmap *borrowed_map;
 	struct s7d_vp9_workspace workspace;
 	struct s7d_vp9_dma_sizes sizes;
@@ -47,8 +50,8 @@ int s7d_vp9_dma_sizes(u32 width, u32 height, size_t input_capacity,
 	struct s7d_vp9_dma_sizes next = { 0 };
 	u32 columns, rows, base_bytes, compressed_bytes, padded, mv_bytes;
 
-	if (!sizes || !input_capacity || width < 64 || width > 1920 ||
-	    height < 64 || height > 1080 || ((width | height) & 1))
+	if (!sizes || !input_capacity || width < 64 || width > S7D_VP9_MAX_WIDTH ||
+	    height < 64 || height > S7D_VP9_MAX_HEIGHT || ((width | height) & 1))
 		return -EINVAL;
 	if (input_capacity > S7D_VP9_INPUT_MAX_BYTES)
 		return -E2BIG;
@@ -64,7 +67,9 @@ int s7d_vp9_dma_sizes(u32 width, u32 height, size_t input_capacity,
 	next.mv_stride = round_down(padded, SZ_64K);
 	next.rpm_offset = S7D_VP9_WORKSPACE_BYTES;
 	next.lmem_offset = next.rpm_offset + ALIGN(S7D_VP9_RPM_BYTES, SZ_4K);
-	next.mv_offset = ALIGN(next.lmem_offset + S7D_VP9_LMEM_BYTES, SZ_64K);
+	next.vbh_offset = ALIGN(next.lmem_offset + S7D_VP9_LMEM_BYTES, SZ_4K);
+	next.map_offset = next.vbh_offset + S7D_VP9_MMU_VBH_BYTES;
+	next.mv_offset = ALIGN(next.map_offset + S7D_VP9_MMU_MAP_BYTES, SZ_64K);
 	if (check_mul_overflow(S7D_VP9_MV_BANKS, next.mv_stride, &mv_bytes) ||
 	    check_add_overflow(next.mv_offset, mv_bytes, &next.input_offset))
 		return -EOVERFLOW;
@@ -109,16 +114,20 @@ static int vp9_dma_layout(const struct s7d_vp9_dma_context *ctx,
 struct s7d_vp9_dma_context *
 s7d_vp9_dma_context_create_stream(struct s7d_codec_session *session,
 				u32 width, u32 height, size_t input_capacity,
+				u32 fbc_count, u32 fbc_header_bytes, u32 fbc_bytes,
 				u64 lease_epoch)
 {
 	struct s7d_vp9_region rpm, lmem;
 	struct s7d_vp9_dma_context *ctx;
 	struct s7d_vp9_dma_sizes sizes;
-	dma_addr_t dma;
+	dma_addr_t dma, fbc_dma;
 	u64 base, last;
+	u32 i;
 	int ret;
 
-	if (IS_ERR_OR_NULL(session) || !lease_epoch)
+	if (IS_ERR_OR_NULL(session) || !lease_epoch || fbc_count > S7D_VP9_FBC_SLOTS ||
+	    (fbc_count && (!fbc_header_bytes || !IS_ALIGNED(fbc_header_bytes, SZ_4K) ||
+			   !IS_ALIGNED(fbc_bytes, SZ_4K) || fbc_header_bytes >= fbc_bytes)))
 		return ERR_PTR(-EINVAL);
 	ret = s7d_vp9_dma_sizes(width, height, input_capacity, &sizes);
 	if (ret)
@@ -153,6 +162,26 @@ s7d_vp9_dma_context_create_stream(struct s7d_codec_session *session,
 		ret = -EINVAL;
 		goto release;
 	}
+	ctx->workspace.mmu_vbh.address = base + sizes.vbh_offset;
+	ctx->workspace.mmu_vbh.bytes = S7D_VP9_MMU_VBH_BYTES;
+	ctx->workspace.mmu_map.address = base + sizes.map_offset;
+	ctx->workspace.mmu_map.bytes = S7D_VP9_MMU_MAP_BYTES;
+	/* One allocation each: a 4K 10-bit picture alone is ~17 MiB. */
+	for (i = 0; i < fbc_count; i++) {
+		ctx->fbc[i] = s7d_codec_dma_alloc(session, fbc_bytes);
+		if (IS_ERR(ctx->fbc[i])) {
+			ret = PTR_ERR(ctx->fbc[i]);
+			ctx->fbc[i] = NULL;
+			goto release;
+		}
+		fbc_dma = s7d_codec_dma_addr(ctx->fbc[i]);
+		if (!IS_ALIGNED(fbc_dma, SZ_4K) || (u64)fbc_dma + fbc_bytes > U32_MAX) {
+			ret = -ERANGE;
+			goto release;
+		}
+	}
+	ctx->fbc_count = fbc_count;
+	ctx->fbc_header_bytes = fbc_header_bytes;
 	ctx->sizes = sizes;
 	ctx->base = base;
 	ctx->cpu = (u8 *)s7d_codec_dma_cpu(ctx->memory) + (base - dma);
@@ -216,6 +245,51 @@ int s7d_vp9_dma_context_mv_slot(const struct s7d_vp9_dma_context *context,
 	next.bytes = context->sizes.mv_stride;
 	*region = next;
 	return 0;
+}
+
+int s7d_vp9_dma_context_fbc_slot(const struct s7d_vp9_dma_context *context,
+				 u64 lease_epoch, u32 index,
+				 struct s7d_vp9_region *header,
+				 struct s7d_vp9_region *body)
+{
+	u32 address, bytes;
+
+	if (IS_ERR_OR_NULL(context) || !header || !body)
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch)
+		return -ESTALE;
+	if (index >= context->fbc_count)
+		return -ENOENT;
+	address = s7d_codec_dma_addr(context->fbc[index]);
+	bytes = s7d_codec_dma_size(context->fbc[index]);
+	*header = (struct s7d_vp9_region) {
+		.address = address, .bytes = context->fbc_header_bytes,
+	};
+	*body = (struct s7d_vp9_region) {
+		.address = address + context->fbc_header_bytes,
+		.bytes = bytes - context->fbc_header_bytes,
+	};
+	return 0;
+}
+
+int s7d_vp9_dma_context_map_body(struct s7d_vp9_dma_context *context,
+				 u64 lease_epoch, u64 token, u32 body_address,
+				 u32 pages)
+{
+	int ret;
+
+	if (IS_ERR_OR_NULL(context))
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch || context->input.token != token)
+		return -ESTALE;
+	if (!context->begun || !context->programmed)
+		return -EBUSY;
+	ret = s7d_amfbc_mmu_map_contiguous(body_address, pages,
+					   context->cpu + context->sizes.map_offset,
+					   S7D_VP9_MMU_MAP_BYTES);
+	if (!ret)
+		dma_wmb();
+	return ret;
 }
 
 int s7d_vp9_dma_context_bind_surface(const struct s7d_vp9_dma_context *context,

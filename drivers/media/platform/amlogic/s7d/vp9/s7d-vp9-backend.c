@@ -9,8 +9,10 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/regmap.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/unaligned.h>
 
 #include "../common/s7d-codec-dos.h"
 #include "../common/s7d-codec-firmware.h"
@@ -33,6 +35,7 @@
 #define VP9_PICTURE_DONE 0x0aU
 #define VP9_ACTION_DONE 0xffU
 #define VP9_TIMEOUT_MS 2000U
+#define VP9_NO_FBC 0xffU
 
 struct vp9_snapshot {
 	u32 status;
@@ -92,6 +95,8 @@ struct s7d_vp9_decoder {
 	struct s7d_v4l2_capture_buffer capture[S7D_VP9_MAX_PHYSICAL];
 	struct s7d_vp9_hw_surface surface[S7D_VP9_MAX_PHYSICAL];
 	struct s7d_vp9_region mv[2];
+	/* Internal FBC buffer lent to each pinned slot (NV12 CAPTURE, compressed). */
+	u8 fbc_index[S7D_VP9_MAX_PHYSICAL];
 	u64 queue_serial[S7D_VP9_MAX_PHYSICAL];
 	u64 content_token[S7D_VP9_MAX_PHYSICAL];
 	u64 epoch;
@@ -106,12 +111,19 @@ struct s7d_vp9_decoder {
 	u32 decode_count;
 	u32 output_sequence;
 	u32 mv_bank;
+	/* AM08C/AM10C: FBC bytes in front of each CAPTURE buffer's NV12, else 0. */
+	u32 fbc_prefix;
+	u32 fbc_count;
 	int failure;
 	int release_error;
 	bool previous_valid;
 	bool previous_keyframe;
 	bool previous_intra_only;
 	bool previous_show_frame;
+	/* FBC references through the SAO MMU (10-bit, or an FBC CAPTURE format). */
+	bool compressed;
+	/* Each picture's FBC lives in its AM08C/AM10C CAPTURE buffer. */
+	bool zero_copy;
 	bool firmware_loaded;
 	bool context_ready;
 	bool irq_accept;
@@ -220,6 +232,62 @@ static int vp9_acquire_surface(struct s7d_vp9_decoder *decoder, struct vp9_job *
 	}
 }
 
+/* A slot leaves the DPB: drop its pin record and any internal FBC it borrowed. */
+static void vp9_unpin(struct s7d_vp9_decoder *decoder, u32 slot)
+{
+	decoder->pin_mask &= ~BIT(slot);
+	if (!decoder->compressed || decoder->zero_copy)
+		return;
+	decoder->fbc_index[slot] = VP9_NO_FBC;
+	decoder->surface[slot].header = (struct s7d_vp9_region) { };
+	decoder->surface[slot].body = (struct s7d_vp9_region) { };
+}
+
+/*
+ * NV12 CAPTURE with compressed references: lend the picture being decoded a
+ * free internal FBC buffer. At most eight DPB slots hold one, so one is free.
+ */
+static int vp9_lend_fbc(struct s7d_vp9_decoder *decoder, u32 slot)
+{
+	struct s7d_vp9_hw_surface *surface = &decoder->surface[slot];
+	unsigned long used = 0;
+	u32 i, index;
+	int ret;
+
+	if (decoder->fbc_index[slot] != VP9_NO_FBC)
+		return -EPROTO;
+	for (i = 0; i < decoder->captures; i++)
+		if (decoder->fbc_index[i] != VP9_NO_FBC)
+			__set_bit(decoder->fbc_index[i], &used);
+	index = find_first_zero_bit(&used, decoder->fbc_count);
+	if (index >= decoder->fbc_count)
+		return -ENOSPC;
+	ret = s7d_vp9_dma_context_fbc_slot(decoder->context, decoder->epoch, index,
+					   &surface->header, &surface->body);
+	if (!ret)
+		decoder->fbc_index[slot] = index;
+	return ret;
+}
+
+/* Header pause, current pinned: give it FBC memory and map its body for the SAO MMU. */
+static int vp9_map_current(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
+{
+	const struct s7d_vp9_hw_surface *surface = &decoder->surface[job->current_slot];
+	u32 bytes = s7d_vp9_fbc_body_bytes(job->header.width, job->header.height,
+					   job->header.bit_depth);
+	int ret = 0;
+
+	if (!decoder->zero_copy)
+		ret = vp9_lend_fbc(decoder, job->current_slot);
+	if (!ret && surface->body.bytes < bytes)
+		ret = -ERANGE;
+	if (!ret)
+		ret = s7d_vp9_dma_context_map_body(decoder->context, job->epoch, job->token,
+						   surface->body.address,
+						   DIV_ROUND_UP(bytes, SZ_4K));
+	return ret;
+}
+
 static int vp9_acquire_current(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 {
 	int ret = vp9_acquire_surface(decoder, job);
@@ -249,7 +317,8 @@ static int vp9_header(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 	struct s7d_vp9_picture_frame frame = {
 		.workspace = s7d_vp9_dma_context_workspace(decoder->context),
 		.header = &job->header, .rpm = &job->rpm, .layout = &decoder->layout,
-		.surface = decoder->surface, .physical_count = decoder->captures,
+		.surface = decoder->surface, .compressed = decoder->compressed,
+		.physical_count = decoder->captures,
 		.coded_frames = 1, .current_mv = decoder->mv[decoder->mv_bank],
 		.previous_mv = decoder->mv[decoder->mv_bank ^ 1],
 		.previous_valid = decoder->previous_valid,
@@ -281,6 +350,8 @@ static int vp9_header(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 	}
 	if (!ret)
 		ret = vp9_acquire_current(decoder, job);
+	if (!ret && decoder->compressed)
+		ret = vp9_map_current(decoder, job);
 	if (ret)
 		return ret;
 	frame.current_physical = job->current_slot;
@@ -491,13 +562,19 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 			 const struct s7d_codec_layout *layout, u64 generation,
 			 const struct s7d_v4l2_capture_buffer *capture, u32 count)
 {
+	struct s7d_amfbc_buffer fbc[S7D_VP9_MAX_PHYSICAL];
+	u32 i, j, fbc_count = 0, fbc_header = 0, fbc_bytes = 0;
 	struct s7d_vp9_region region[2];
+	bool compressed, zero_copy = false;
 	unsigned long flags;
-	u32 i, j;
 	int ret;
 
-	if (!decoder || !session || !layout || !capture || !generation)
+	if (!decoder || !session || !layout || !capture || !generation ||
+	    !count || count > S7D_VP9_MAX_PHYSICAL)
 		return -EINVAL;
+	for (i = 0; i < count; i++)
+		if (!capture[i].surface)
+			return -EINVAL;
 	mutex_lock(&decoder->control);
 	if (decoder->closing || decoder->running || decoder->session || decoder->quarantined ||
 	    decoder->failure || !decoder->lease_active) {
@@ -505,12 +582,29 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 		goto out;
 	}
 	ret = s7d_codec_validate_layout(layout);
+	/* AM08C/AM10C: each picture's FBC lives in its CAPTURE buffer (zero copy). */
+	if (!ret)
+		ret = s7d_v4l2_fbc_capture_pool(layout, capture, count, fbc, &zero_copy);
 	if (!ret)
 		ret = s7d_vp9_dpb_init(&decoder->dpb, generation, count);
 	if (ret)
 		goto out;
+	/*
+	 * Only the MMU mode decodes 10-bit: its references are FBC and the NV12
+	 * double write stays 8-bit (S7D has no P010). For NV12 CAPTURE the FBC
+	 * buffers are internal and lent to the live pictures only.
+	 */
+	compressed = layout->bit_depth == 10 || zero_copy;
+	if (compressed && !zero_copy) {
+		fbc_header = s7d_amfbc_header_size(layout->coded_width, layout->storage_height);
+		fbc_bytes = fbc_header + s7d_amfbc_body_size(layout->coded_width,
+				layout->storage_height, layout->bit_depth);
+		fbc_count = min(count, S7D_VP9_FBC_SLOTS);
+	}
 	decoder->context = s7d_vp9_dma_context_create_stream(session, layout->coded_width,
-		layout->coded_height, S7D_VP9_INPUT_MAX_BYTES, decoder->epoch);
+		layout->coded_height,
+		s7d_vp9_input_capacity(layout->coded_width, layout->coded_height),
+		fbc_count, fbc_header, fbc_bytes, decoder->epoch);
 	if (IS_ERR(decoder->context)) {
 		ret = PTR_ERR(decoder->context);
 		decoder->context = NULL;
@@ -538,6 +632,15 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 			.plane = { region[0], region[1] }, .width = layout->coded_width,
 			.height = layout->coded_height, .valid = true,
 		};
+		if (zero_copy) {
+			decoder->surface[i].header = (struct s7d_vp9_region) {
+				.address = fbc[i].header, .bytes = fbc[i].header_bytes,
+			};
+			decoder->surface[i].body = (struct s7d_vp9_region) {
+				.address = fbc[i].body, .bytes = fbc[i].body_bytes,
+			};
+		}
+		decoder->fbc_index[i] = VP9_NO_FBC;
 	}
 	for (i = 0; i < 2; i++) {
 		ret = s7d_vp9_dma_context_mv_slot(decoder->context, decoder->epoch, i,
@@ -549,6 +652,10 @@ int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 				  &vp9_irq_ops, decoder, &decoder->binding);
 	if (ret)
 		goto failed;
+	decoder->compressed = compressed;
+	decoder->zero_copy = zero_copy;
+	decoder->fbc_count = fbc_count;
+	decoder->fbc_prefix = zero_copy ? fbc[0].header_bytes + fbc[0].body_bytes : 0;
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->captures = count;
 	memcpy(decoder->capture, capture, sizeof(*capture) * count);
@@ -716,6 +823,8 @@ static int vp9_frame_ready(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 		.flags = job->header.show_existing ? 0 :
 			 job->header.keyframe ? S7D_CODEC_FRAME_KEY : S7D_CODEC_FRAME_P,
 		.bytesused = { decoder->layout.size[0], decoder->layout.size[1] },
+		/* AM08C/AM10C report the whole buffer: FBC, then NV12. */
+		.prefix_bytesused = decoder->fbc_prefix,
 	};
 
 	return s7d_codec_session_frame_ready(job->session, &frame);
@@ -761,7 +870,7 @@ static int vp9_publish(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 			if (ret)
 				return ret;
 		}
-		decoder->pin_mask &= ~BIT(i);
+		vp9_unpin(decoder, i);
 		if (i == job->current_slot)
 			job->pinned = false;
 	}
@@ -795,7 +904,7 @@ static int vp9_discard(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 		job->pinned = false;
 		decoder->hidden_mask &= ~BIT(job->current_slot);
 		decoder->content_token[job->current_slot] = 0;
-		decoder->pin_mask &= ~BIT(job->current_slot);
+		vp9_unpin(decoder, job->current_slot);
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		decoder->queued_mask |= BIT(job->current_slot);
 		spin_unlock_irqrestore(&decoder->irq_lock, flags);
@@ -807,6 +916,56 @@ static int vp9_discard(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 static bool vp9_copy_cancelled(void *priv)
 {
 	return vp9_stop_check(priv) != 0;
+}
+
+/*
+ * AM08C/AM10C: copy the whole picture, FBC included, into the current slot.
+ * The header words are physical addresses >> 2 into the source body; point
+ * the copy's words into its own body.
+ */
+static int vp9_copy_fbc(struct s7d_vp9_decoder *decoder, struct vp9_job *job,
+			u32 source, u64 source_token)
+{
+	const size_t bytes[2] = { decoder->layout.size[0], decoder->layout.size[1] };
+	const struct s7d_vp9_hw_surface *from = &decoder->surface[source];
+	const struct s7d_vp9_hw_surface *to = &decoder->surface[job->current_slot];
+	u32 used = s7d_amfbc_header_used(decoder->layout.coded_width,
+					 decoder->layout.coded_height);
+	u64 body = from->body.address, body_end = body + from->body.bytes;
+	u64 first = from->header.address;
+	u64 last = (u64)from->plane[1].address + from->plane[1].bytes;
+	u32 i, word, stray = 0;
+	u64 address;
+	u8 *header;
+	int ret;
+
+	if (!used || used % 4 || used > from->header.bytes || used > to->header.bytes ||
+	    from->body.bytes > to->body.bytes)
+		return -ERANGE;
+	ret = s7d_codec_surface_copy_all(decoder->capture[job->current_slot].surface,
+		job->write_token, decoder->capture[source].surface, source_token, bytes,
+		vp9_copy_cancelled, decoder);
+	if (!ret)
+		ret = s7d_codec_surface_prefix_cpu(decoder->capture[job->current_slot].surface,
+						   job->write_token, (void **)&header);
+	if (ret)
+		return ret;
+	for (i = 0; i < used; i += 4) {
+		word = get_unaligned_le32(header + i);
+		address = (u64)word << 2;
+		if (address >= body && address < body_end)
+			put_unaligned_le32((address - body + to->body.address) >> 2, header + i);
+		else if (address >= first && address < last)
+			stray++;
+	}
+	if (stray) {
+		dev_warn_ratelimited(decoder->dev,
+				     "VP9 FBC: %u header words point outside the body\n", stray);
+		return -EIO;
+	}
+	/* Rebased header stores precede the publication that exports them. */
+	dma_wmb();
+	return 0;
 }
 
 static int vp9_present_existing(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
@@ -841,9 +1000,12 @@ static int vp9_present_existing(struct s7d_vp9_decoder *decoder, struct vp9_job 
 	}
 	if (ret)
 		return ret;
-	ret = s7d_codec_surface_copy(decoder->capture[job->current_slot].surface,
-		job->write_token, decoder->capture[source].surface, source_token,
-		bytes, vp9_copy_cancelled, decoder);
+	if (decoder->zero_copy)
+		ret = vp9_copy_fbc(decoder, job, source, source_token);
+	else
+		ret = s7d_codec_surface_copy(decoder->capture[job->current_slot].surface,
+			job->write_token, decoder->capture[source].surface, source_token,
+			bytes, vp9_copy_cancelled, decoder);
 	if (!ret)
 		ret = vp9_stop_check(decoder);
 	if (!ret)
@@ -861,7 +1023,7 @@ static int vp9_present_existing(struct s7d_vp9_decoder *decoder, struct vp9_job 
 	job->published = true;
 	ret = s7d_codec_surface_ref_put(decoder->capture[job->current_slot].surface);
 	if (!ret) {
-		decoder->pin_mask &= ~BIT(job->current_slot);
+		vp9_unpin(decoder, job->current_slot);
 		job->pinned = false;
 		decoder->output_sequence++;
 	}
@@ -971,6 +1133,8 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 		.workspace = s7d_vp9_dma_context_workspace(decoder->context),
 		.layout = &decoder->layout, .surface = decoder->surface,
 		.physical_count = decoder->captures, .decode_count = decoder->decode_count,
+		.compressed = decoder->compressed,
+		.bit_depth = decoder->layout.bit_depth == 10 ? 10 : 8,
 	};
 	mutex_lock(&decoder->protocol);
 	if (!ret) {
@@ -1127,6 +1291,12 @@ int s7d_vp9_decoder_stream_close(struct s7d_vp9_decoder *decoder,
 	decoder->previous_intra_only = false;
 	decoder->previous_show_frame = false;
 	decoder->hidden_mask = 0;
+	decoder->compressed = false;
+	decoder->zero_copy = false;
+	decoder->fbc_prefix = 0;
+	decoder->fbc_count = 0;
+	memset(decoder->fbc_index, VP9_NO_FBC, sizeof(decoder->fbc_index));
+	memset(decoder->surface, 0, sizeof(decoder->surface));
 	memset(decoder->content_token, 0, sizeof(decoder->content_token));
 	decoder->firmware_loaded = false;
 	memset(&decoder->dpb, 0, sizeof(decoder->dpb));

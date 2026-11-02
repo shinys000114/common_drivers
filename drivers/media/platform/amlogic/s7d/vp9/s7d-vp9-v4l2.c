@@ -330,7 +330,7 @@ static int vp9_submit(void *priv, const struct s7d_v4l2_input *input)
 	if (backend->closing || backend->failure || !backend->session) {
 		ret = backend->failure ? backend->failure : -ESHUTDOWN;
 	} else if (!input || !input->memory || !input->bytes ||
-		   input->bytes > S7D_VP9_INPUT_MAX_BYTES || !input->token) {
+		   input->bytes > S7D_VP9_OUTPUT_MAX_BYTES || !input->token) {
 		ret = -EINVAL;
 	} else if (backend->input_pending || backend->drain_pending ||
 		   input->token <= backend->last_submitted) {
@@ -372,7 +372,9 @@ static int vp9_capture_start(void *priv, const struct s7d_codec_layout *layout,
 			      const struct s7d_v4l2_capture_buffer *buffers, unsigned int count)
 {
 	struct vp9_backend *backend = priv;
+	struct s7d_amfbc_buffer fbc[S7D_VP9_MAX_PHYSICAL];
 	struct s7d_codec_layout checked;
+	bool zero_copy;
 	int ret = 0;
 
 	mutex_lock(&backend->lock);
@@ -392,6 +394,9 @@ static int vp9_capture_start(void *priv, const struct s7d_codec_layout *layout,
 		goto out;
 	}
 	ret = s7d_v4l2_validate_capture_pool(&checked, generation, buffers, count);
+	/* AM08C/AM10C buffers must all carry the format's FBC prefix. */
+	if (!ret)
+		ret = s7d_v4l2_fbc_capture_pool(&checked, buffers, count, fbc, &zero_copy);
 	if (ret)
 		goto out;
 	memcpy(backend->capture, buffers, sizeof(*buffers) * count);
@@ -745,11 +750,17 @@ s7d_vp9_v4l2_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 		.codec = {
 			.engine = S7D_CODEC_ENGINE_HEVC,
 			.output_format = V4L2_PIX_FMT_VP9,
-			.max_width = 1920, .max_height = 1080,
-			.max_input_size = S7D_VP9_INPUT_MAX_BYTES,
+			.max_width = S7D_VP9_MAX_WIDTH, .max_height = S7D_VP9_MAX_HEIGHT,
+			.max_input_size = S7D_VP9_OUTPUT_MAX_BYTES,
 			.staging_headroom = SZ_64K,
 			.default_layout = s7d_v4l2_default_nv12_layout,
 			.max_capture_buffers = S7D_VP9_MAX_PHYSICAL,
+			/*
+			 * AM08C/AM10C too; the CAPTURE buffers are the DPB in every
+			 * format, so the layout's minimum (8 references, the picture
+			 * being decoded and one held by the client) applies to both.
+			 */
+			.fbc = true,
 		},
 		.ops = &vp9_ops, .ready = vp9_factory_ready,
 		.create = vp9_factory_create, .destroy = vp9_factory_destroy,

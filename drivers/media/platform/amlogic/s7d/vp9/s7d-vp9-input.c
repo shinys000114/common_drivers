@@ -56,6 +56,16 @@ static int vp9_colour(const struct s7d_vp9_header_prefix *prefix,
 		next.matrix = 1;
 		next.flags |= S7D_CODEC_COLOUR_DESCRIPTION_PRESENT;
 		break;
+	case 5:
+		/*
+		 * BT.2020 non-constant luminance. VP9 codes no transfer function:
+		 * PQ or HLG is only known from the container.
+		 */
+		next.primaries = 9;
+		next.transfer = 14;
+		next.matrix = 9;
+		next.flags |= S7D_CODEC_COLOUR_DESCRIPTION_PRESENT;
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -73,11 +83,12 @@ static int vp9_layout(const struct s7d_vp9_header_prefix *prefix,
 		.visible_width = prefix->width, .visible_height = prefix->height,
 		.dpb_limit = 8, .dpb_slots = 8, .current_slots = 1,
 		.extra_surfaces = 1, .min_capture_buffers = S7D_VP9_CAPTURE_MINIMUM,
+		.bit_depth = prefix->bit_depth,
 	};
 	int ret;
 
-	if (prefix->width < 64 || prefix->width > 1920 ||
-	    prefix->height < 64 || prefix->height > 1080 ||
+	if (prefix->width < 64 || prefix->width > S7D_VP9_MAX_WIDTH ||
+	    prefix->height < 64 || prefix->height > S7D_VP9_MAX_HEIGHT ||
 	    ((prefix->width | prefix->height) & 1) ||
 	    prefix->width != prefix->render_width ||
 	    prefix->height != prefix->render_height)
@@ -92,6 +103,10 @@ static int vp9_layout(const struct s7d_vp9_header_prefix *prefix,
 		return -EOVERFLOW;
 	ret = s7d_codec_resolve_colour(colour, prefix->width, prefix->height,
 				     &next.colourimetry);
+	/* VP9 codes no transfer function, and an unknown colour space codes nothing. */
+	next.colourimetry.from_output = S7D_CODEC_COLOUR_FROM_OUTPUT_XFER;
+	if (!(colour->flags & S7D_CODEC_COLOUR_DESCRIPTION_PRESENT))
+		next.colourimetry.from_output |= S7D_CODEC_COLOUR_FROM_OUTPUT_SPACE;
 	if (!ret)
 		ret = s7d_codec_validate_layout(&next);
 	if (!ret)
@@ -103,10 +118,17 @@ static bool same_sequence(const struct s7d_codec_layout *a,
 			  const struct s7d_codec_layout *b)
 {
 	return a->coded_width == b->coded_width && a->coded_height == b->coded_height &&
+		a->bit_depth == b->bit_depth &&
 		a->colourimetry.colorspace == b->colourimetry.colorspace &&
 		a->colourimetry.xfer_func == b->colourimetry.xfer_func &&
 		a->colourimetry.ycbcr_enc == b->colourimetry.ycbcr_enc &&
 		a->colourimetry.quantization == b->colourimetry.quantization;
+}
+
+u32 s7d_vp9_input_capacity(u32 width, u32 height)
+{
+	return width <= 1920 && height <= 1088 ? S7D_VP9_INPUT_HD_BYTES :
+	       S7D_VP9_INPUT_MAX_BYTES;
 }
 
 struct s7d_vp9_input_bank *s7d_vp9_input_bank_create(void)
@@ -181,6 +203,8 @@ int s7d_vp9_input_prepare_frame(const struct s7d_vp9_input_bank *bank,
 	ret = vp9_layout(&view.prefix, &colour, &view.layout);
 	if (ret)
 		return ret;
+	if (view.bytes > s7d_vp9_input_capacity(view.prefix.width, view.prefix.height))
+		return -E2BIG;
 	if (bank->valid && !same_sequence(&bank->layout, &view.layout))
 		return -EOPNOTSUPP;
 	if (check_add_overflow(view.bytes, 16U, &view.decode_bytes))
@@ -237,9 +261,10 @@ int s7d_vp9_input_check_rpm(struct s7d_vp9_input *input, const struct s7d_vp9_rp
 		return -ESTALE;
 	input->rpm_checked = false;
 	prefix = &input->view.prefix;
-	if (rpm->word[0] || rpm->word[1] || rpm->word[3] != !prefix->keyframe ||
+	if (rpm->word[0] != prefix->profile || rpm->word[1] ||
+	    rpm->word[3] != !prefix->keyframe ||
 	    rpm->word[4] != prefix->show_frame || rpm->word[5] != prefix->error_resilient ||
-	    rpm->word[25] != 8 || rpm->word[7] > 1)
+	    rpm->word[25] != prefix->bit_depth || rpm->word[7] > 1)
 		return -EBADMSG;
 	width = rpm->word[10];
 	height = rpm->word[11];
@@ -301,7 +326,8 @@ int s7d_vp9_input_commit_metadata(struct s7d_vp9_input_bank *bank,
 		bank->reference[i] = (struct s7d_vp9_reference_metadata) {
 			.width = prefix->width, .height = prefix->height,
 			.render_width = prefix->render_width,
-			.render_height = prefix->render_height, .valid = true,
+			.render_height = prefix->render_height,
+			.bit_depth = prefix->bit_depth, .valid = true,
 		};
 	}
 	bank->colour = input->colour;

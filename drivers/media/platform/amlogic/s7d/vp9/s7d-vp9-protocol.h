@@ -12,10 +12,14 @@ struct s7d_vp9_protocol_frame {
 	const struct s7d_vp9_hw_surface *surface;
 	u32 physical_count;
 	u32 decode_count;
+	/* MMU mode: FBC references at bit_depth; else linear 8-bit (DW 0x10). */
+	bool compressed;
+	u32 bit_depth;
 };
 
 /*
  * Exclusive S7D VP9 lease, FW19/core2/no-swap and IQIT prepared; CPU/input off.
+ * FW19 (vp9_mmu) serves both the linear and the compressed (MMU) mode.
  * Persistent probability/count/segment/MV backings are initialized or restored
  * by the caller, never cleared here. Per-job init sets SCRATCH0 to idle (0) and
  * SCRATCH_M to decode_count. No run/resume, stream fetch, IRQ/mailbox, DOS reset,

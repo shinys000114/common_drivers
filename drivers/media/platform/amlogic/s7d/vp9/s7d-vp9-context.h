@@ -46,6 +46,9 @@ struct s7d_vp9_workspace {
 	struct s7d_vp9_region part[S7D_VP9_WORKSPACE_PARTS];
 	struct s7d_vp9_region rpm;
 	struct s7d_vp9_region lmem;
+	/* SAO MMU line buffers and frame map, outside the plan; compressed only. */
+	struct s7d_vp9_region mmu_vbh;
+	struct s7d_vp9_region mmu_map;
 	u32 used;
 };
 

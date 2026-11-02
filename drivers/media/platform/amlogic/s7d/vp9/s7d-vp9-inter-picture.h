@@ -12,9 +12,15 @@
 
 struct regmap;
 
-/* Valid means allocated with fixed geometry; decoded/pinned state is external. */
+/*
+ * Valid means allocated with fixed geometry; decoded/pinned state is external.
+ * plane[] is the NV12 output; with compressed references, header and body
+ * are the picture's Amlogic FBC (zero bytes while it has none).
+ */
 struct s7d_vp9_hw_surface {
 	struct s7d_vp9_region plane[2];
+	struct s7d_vp9_region header;
+	struct s7d_vp9_region body;
 	u32 width;
 	u32 height;
 	bool valid;
@@ -26,6 +32,8 @@ struct s7d_vp9_picture_frame {
 	const struct s7d_vp9_rpm *rpm;
 	const struct s7d_codec_layout *layout;
 	const struct s7d_vp9_hw_surface *surface;
+	/* FBC references through the SAO MMU, NV12 by double write; else linear 8-bit. */
+	bool compressed;
 	u32 physical_count;
 	u32 current_physical;
 	u32 logical_to_physical[S7D_VP9_REFERENCE_SLOTS];
@@ -50,6 +58,7 @@ struct s7d_vp9_hw_picture_plan {
 	u32 physical_count;
 	u32 current_y;
 	u32 current_uv;
+	u32 current_header;
 	u32 y_bytes;
 	u32 uv_bytes;
 	u32 mv_above;
@@ -59,9 +68,15 @@ struct s7d_vp9_hw_picture_plan {
 	u32 mv_bytes;
 	bool intra;
 	bool use_prev_frame_mvs;
+	bool compressed;
 };
 
 int s7d_vp9_compressed_mv_size(u32 width, u32 height, u32 *bytes);
+/* Bytes the hardware writes per picture in FBC (vendor compute_losless_comp_*). */
+u32 s7d_vp9_fbc_body_bytes(u32 width, u32 height, u32 bit_depth);
+u32 s7d_vp9_fbc_header_bytes(u32 width, u32 height);
+/* Scatter header the SAO writes at CM_HEADER_START_ADDR: 32 bytes per 32x32. */
+u32 s7d_vp9_fbc_scatter_bytes(u32 width, u32 height);
 /* Pure preflight: failure leaves plan unchanged. */
 int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *frame,
 			      struct s7d_vp9_hw_picture_plan *plan);

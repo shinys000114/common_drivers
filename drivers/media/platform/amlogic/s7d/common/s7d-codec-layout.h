@@ -26,11 +26,21 @@ struct s7d_codec_colour {
 	u8 flags;
 };
 
+/*
+ * What the stream does not code (VP9 has no transfer function, and may leave
+ * the colour space unknown): CAPTURE then reports the OUTPUT format's value,
+ * which the client takes from the container, when it gives one.
+ */
+#define S7D_CODEC_COLOUR_FROM_OUTPUT_XFER	BIT(0)
+#define S7D_CODEC_COLOUR_FROM_OUTPUT_SPACE	BIT(1)
+
 struct s7d_codec_colourimetry {
 	u32 colorspace;
 	u32 xfer_func;
 	u32 ycbcr_enc;
 	u32 quantization;
+	/* S7D_CODEC_COLOUR_FROM_OUTPUT_*; the values above are the fallback. */
+	u32 from_output;
 };
 
 struct s7d_codec_layout {

@@ -37,8 +37,22 @@ static int reference_valid(const struct s7d_vp9_reference_metadata *reference)
 	if (!reference->width || reference->width > 65536 ||
 	    !reference->height || reference->height > 65536 ||
 	    !reference->render_width || reference->render_width > 65536 ||
-	    !reference->render_height || reference->render_height > 65536)
+	    !reference->render_height || reference->render_height > 65536 ||
+	    (reference->bit_depth != 8 && reference->bit_depth != 10))
 		return -EINVAL;
+	return 0;
+}
+
+/* Profile 2 depth: 10-bit only, the hardware rejects 12-bit. */
+static int high_bit_depth(struct vp9_bits *bits, struct s7d_vp9_header_prefix *prefix)
+{
+	u32 twelve = read_bits(bits, 1);
+
+	if (bits->error)
+		return bits->error;
+	if (twelve)
+		return -EOPNOTSUPP;
+	prefix->bit_depth = 10;
 	return 0;
 }
 
@@ -70,19 +84,27 @@ static int intra_prefix(struct vp9_bits *bits,
 		return bits->error;
 	if (sync != 0x498342)
 		return -EBADMSG;
-	if (prefix->keyframe) {
+	prefix->bit_depth = 8;
+	/* color_config(): key frames, and intra-only frames above profile 0. */
+	if (prefix->keyframe || prefix->profile) {
+		if (prefix->profile) {
+			int ret = high_bit_depth(bits, prefix);
+
+			if (ret)
+				return ret;
+		}
 		prefix->color_space = read_bits(bits, 3);
 		prefix->full_range = read_bits(bits, 1);
 		if (bits->error)
 			return bits->error;
+		/* Reserved, or sRGB, which is 4:4:4 only (profiles 1 and 3). */
 		if (prefix->color_space >= 6)
 			return -EBADMSG;
 		prefix->color_config_present = true;
-		prefix->refresh_flags = 0xff;
 	} else {
 		prefix->color_space = 1;
-		prefix->refresh_flags = read_bits(bits, 8);
 	}
+	prefix->refresh_flags = prefix->keyframe ? 0xff : read_bits(bits, 8);
 	frame_size(bits, prefix);
 	render_size(bits, prefix);
 	return bits->error;
@@ -109,6 +131,11 @@ static int inter_prefix(struct vp9_bits *bits,
 		if (ret)
 			return ret;
 	}
+	/* The frame keeps the depth of its references, which must agree. */
+	prefix->bit_depth = references[prefix->reference_index[0]].bit_depth;
+	for (i = 1; i < S7D_VP9_FRAME_REFERENCES; i++)
+		if (references[prefix->reference_index[i]].bit_depth != prefix->bit_depth)
+			return -EBADMSG;
 	for (i = 0; i < S7D_VP9_FRAME_REFERENCES; i++) {
 		if (read_bits(bits, 1)) {
 			const struct s7d_vp9_reference_metadata *reference =
@@ -144,8 +171,10 @@ int s7d_vp9_parse_header_prefix(const u8 *data, size_t bytes,
 		return bits.error;
 	if (marker != 2)
 		return -EBADMSG;
-	if (profile)
+	/* 4:2:0 only: profiles 1 and 3 carry 4:4:4/4:2:2/4:4:0. */
+	if (profile != 0 && profile != 2)
 		return -EOPNOTSUPP;
+	next.profile = profile;
 	next.show_existing = read_bits(&bits, 1);
 	if (next.show_existing) {
 		const struct s7d_vp9_reference_metadata *reference;
@@ -163,6 +192,7 @@ int s7d_vp9_parse_header_prefix(const u8 *data, size_t bytes,
 		next.height = reference->height;
 		next.render_width = reference->render_width;
 		next.render_height = reference->render_height;
+		next.bit_depth = reference->bit_depth;
 		next.show_frame = true;
 		goto done;
 	}
@@ -185,6 +215,8 @@ int s7d_vp9_parse_header_prefix(const u8 *data, size_t bytes,
 		ret = inter_prefix(&bits, references, &next);
 	if (ret)
 		return ret;
+	if ((next.profile == 2) != (next.bit_depth == 10))
+		return -EBADMSG;
 done:
 	next.prefix_bits = bits.bit;
 	*prefix = next;

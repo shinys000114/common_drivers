@@ -8,6 +8,14 @@
 
 #define S7D_VP9_MV_BANKS 2U
 #define S7D_VP9_WORKSPACE_BYTES 0x1a2000U
+/* SAO MMU line buffers (vendor 8K spec) and the 4K frame map (0x1200 pages). */
+#define S7D_VP9_MMU_VBH_BYTES 0xa000U
+#define S7D_VP9_MMU_MAP_BYTES (0x1200U * 4U)
+/*
+ * Internal FBC buffers for NV12 CAPTURE with compressed references: one per
+ * live picture, the eight reference slots and the picture being decoded.
+ */
+#define S7D_VP9_FBC_SLOTS 9U
 
 struct regmap;
 struct s7d_codec_session;
@@ -18,6 +26,8 @@ struct s7d_vp9_dma_context;
 struct s7d_vp9_dma_sizes {
 	u32 rpm_offset;
 	u32 lmem_offset;
+	u32 vbh_offset;
+	u32 map_offset;
 	u32 mv_offset;
 	u32 mv_used_bytes;
 	u32 mv_stride;
@@ -39,10 +49,15 @@ struct s7d_vp9_input_plan {
 
 int s7d_vp9_dma_sizes(u32 width, u32 height, size_t input_capacity,
 		      struct s7d_vp9_dma_sizes *sizes);
-/* Owner serializes calls and joins executor, IRQ and DPB users before destroy. */
+/*
+ * Owner serializes calls and joins executor, IRQ and DPB users before destroy.
+ * A nonzero fbc_count allocates that many internal FBC buffers of fbc_bytes
+ * (header, then body at fbc_header_bytes, 4 KiB aligned).
+ */
 struct s7d_vp9_dma_context *
 s7d_vp9_dma_context_create_stream(struct s7d_codec_session *session,
 				u32 width, u32 height, size_t input_capacity,
+				u32 fbc_count, u32 fbc_header_bytes, u32 fbc_bytes,
 				u64 lease_epoch);
 int s7d_vp9_dma_context_destroy_stream(struct s7d_vp9_dma_context *context,
 				     u64 lease_epoch);
@@ -51,6 +66,15 @@ s7d_vp9_dma_context_workspace(const struct s7d_vp9_dma_context *context);
 int s7d_vp9_dma_context_mv_slot(const struct s7d_vp9_dma_context *context,
 			      u64 lease_epoch, u32 bank,
 			      struct s7d_vp9_region *region);
+/* Internal FBC buffer @index: header and body; -ENOENT without them. */
+int s7d_vp9_dma_context_fbc_slot(const struct s7d_vp9_dma_context *context,
+				 u64 lease_epoch, u32 index,
+				 struct s7d_vp9_region *header,
+				 struct s7d_vp9_region *body);
+/* Firmware header pause: map the current picture's contiguous body 1:1. */
+int s7d_vp9_dma_context_map_body(struct s7d_vp9_dma_context *context,
+				 u64 lease_epoch, u64 token, u32 body_address,
+				 u32 pages);
 /* Caller holds a live CAPTURE pin from this session and generation. */
 int s7d_vp9_dma_context_bind_surface(const struct s7d_vp9_dma_context *context,
 				   u64 lease_epoch,

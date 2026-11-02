@@ -7,7 +7,16 @@
 #include "../common/s7d-codec-layout.h"
 #include "s7d-vp9-header-prefix.h"
 
-#define S7D_VP9_INPUT_MAX_BYTES (2U * 1024U * 1024U)
+#define S7D_VP9_MAX_WIDTH 4096U
+#define S7D_VP9_MAX_HEIGHT 2304U
+/*
+ * One VP9 frame: 2 MiB up to 1920x1088, 8 MiB above (UHD key frames of
+ * 5.6 MiB occur in real streams). An OUTPUT buffer holds one packet, its
+ * superframe index included, so it is bounded by the largest frame capacity.
+ */
+#define S7D_VP9_INPUT_HD_BYTES (2U * 1024U * 1024U)
+#define S7D_VP9_INPUT_MAX_BYTES (8U * 1024U * 1024U)
+#define S7D_VP9_OUTPUT_MAX_BYTES S7D_VP9_INPUT_MAX_BYTES
 #define S7D_VP9_CAPTURE_MINIMUM 10U
 
 struct s7d_vp9_input_bank;
@@ -24,10 +33,12 @@ struct s7d_vp9_input_result {
 	struct s7d_codec_layout layout;
 };
 
+/* Largest frame the decoder takes for a picture of this size. */
+u32 s7d_vp9_input_capacity(u32 width, u32 height);
 /* Caller serializes the bank and keeps it alive until all inputs are released. */
 struct s7d_vp9_input_bank *s7d_vp9_input_bank_create(void);
 void s7d_vp9_input_bank_destroy(struct s7d_vp9_input_bank *bank);
-/* Profile 0 single frame; failed prepare changes neither bank nor out. */
+/* Profile 0/2 single frame; failed prepare changes neither bank nor out. */
 int s7d_vp9_input_prepare(const struct s7d_vp9_input_bank *bank,
 			 const u8 *data, size_t bytes, struct s7d_vp9_input **out);
 /* Exact subframe span from a validated packet; do not parse an index again. */

@@ -46,8 +46,27 @@
 #define HEVC_SAO_C_WPTR			HREG(0x3610)
 #define HEVC_SAO_CTRL5			HREG(0x3623)
 #define HEVC_CM_BODY_LENGTH		HREG(0x3627)
+#define HEVC_CM_HEADER_START_ADDR		HREG(0x3628)
 #define HEVC_CM_HEADER_LENGTH		HREG(0x3629)
 #define HEVC_CM_HEADER_OFFSET		HREG(0x362b)
+#define HEVC_SAO_CTRL26			HREG(0x3677)
+
+u32 s7d_vp9_fbc_body_bytes(u32 width, u32 height, u32 bit_depth)
+{
+	/* 8-bit bodies use the vendor's mem-saving block. */
+	return DIV_ROUND_UP(width, 64) * DIV_ROUND_UP(height, 32) *
+	       (bit_depth == 10 ? 4096 : 3200);
+}
+
+u32 s7d_vp9_fbc_header_bytes(u32 width, u32 height)
+{
+	return DIV_ROUND_UP(width, 128) * DIV_ROUND_UP(height, 64) * 32;
+}
+
+u32 s7d_vp9_fbc_scatter_bytes(u32 width, u32 height)
+{
+	return DIV_ROUND_UP(width, 32) * DIV_ROUND_UP(height, 32) * 32;
+}
 
 static bool overlaps(const struct s7d_vp9_region *a,
 		     const struct s7d_vp9_region *b)
@@ -70,14 +89,28 @@ static bool overlaps_workspace(const struct s7d_vp9_workspace *ws,
 			       const struct s7d_vp9_region *region)
 {
 	return overlaps(region, &ws->backing) || overlaps(region, &ws->rpm) ||
-	       overlaps(region, &ws->lmem);
+	       overlaps(region, &ws->lmem) || overlaps(region, &ws->mmu_vbh) ||
+	       overlaps(region, &ws->mmu_map);
+}
+
+/* A surface's memory: NV12 Y and UV, then its FBC header and body, if any. */
+static u32 surface_regions(const struct s7d_vp9_hw_surface *s, bool compressed,
+			   struct s7d_vp9_region region[4])
+{
+	region[0] = s->plane[0];
+	region[1] = s->plane[1];
+	if (!compressed || !s->header.bytes)
+		return 2;
+	region[2] = s->header;
+	region[3] = s->body;
+	return 4;
 }
 
 int s7d_vp9_compressed_mv_size(u32 width, u32 height, u32 *bytes)
 {
 	u32 x, y, size;
 
-	if (!bytes || width < 64 || width > 1920 || height < 64 || height > 1080 ||
+	if (!bytes || width < 64 || width > 4096 || height < 64 || height > 2304 ||
 	    ((width | height) & 1))
 		return -EOPNOTSUPP;
 	x = DIV_ROUND_UP(width, 64);
@@ -94,9 +127,9 @@ static int validate_rpm(const struct s7d_vp9_picture_frame *f)
 	u32 refs = 0, width = rpm->word[10], height = rpm->word[11], i;
 	bool from_reference = false;
 
-	if (rpm->word[0] || rpm->word[1] || rpm->word[3] != !h->keyframe ||
+	if (rpm->word[0] != h->profile || rpm->word[1] || rpm->word[3] != !h->keyframe ||
 	    rpm->word[4] != h->show_frame || rpm->word[5] != h->error_resilient ||
-	    rpm->word[25] != 8)
+	    rpm->word[25] != h->bit_depth)
 		return -EOPNOTSUPP;
 	if (rpm->word[7] > 1 || rpm->word[16] > 1 || rpm->word[23] > 63 ||
 	    rpm->word[24] > 7 || rpm->word[34] > 1 ||
@@ -194,9 +227,10 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 			      struct s7d_vp9_hw_picture_plan *plan)
 {
 	struct s7d_vp9_hw_picture_plan next = { };
+	struct s7d_vp9_region mine[4], theirs[4];
 	const struct s7d_vp9_header_prefix *h;
 	const struct s7d_codec_layout *l;
-	u32 i, j, a, b, end;
+	u32 i, j, a, b, end, parts, other_parts, scatter, body;
 	int ret;
 
 	if (!f || !plan || !f->header || !f->rpm || !f->layout || !f->surface)
@@ -204,8 +238,10 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 	h = f->header;
 	l = f->layout;
 	if (f->coded_frames != 1 || h->show_existing ||
+	    (!f->compressed && h->bit_depth != 8) ||
 	    h->render_width != h->width || h->render_height != h->height ||
-	    (h->keyframe && (h->refresh_flags != 0xff || h->color_space > 3)))
+	    (h->keyframe && (h->refresh_flags != 0xff || h->color_space == 4 ||
+			     h->color_space > 5)))
 		return -EOPNOTSUPP;
 	ret = s7d_vp9_compressed_mv_size(h->width, h->height, &next.mv_bytes);
 	if (ret)
@@ -225,6 +261,10 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 	    f->current_physical >= f->physical_count ||
 	    !f->surface[f->current_physical].valid)
 		return -EINVAL;
+	scatter = s7d_vp9_fbc_scatter_bytes(h->width, h->height);
+	body = ALIGN(s7d_vp9_fbc_body_bytes(h->width, h->height, h->bit_depth), 4096);
+	if (f->compressed && !f->surface[f->current_physical].header.bytes)
+		return -ENODATA;
 	for (i = 0; i < f->physical_count; i++) {
 		const struct s7d_vp9_hw_surface *s = &f->surface[i];
 
@@ -232,26 +272,39 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 			continue;
 		if (s->width != h->width || s->height != h->height)
 			return -EOPNOTSUPP;
-		for (a = 0; a < 2; a++) {
-			if (region_valid(&s->plane[a], l->size[a], 32) ||
-			    overlaps_workspace(f->workspace, &s->plane[a]) ||
-			    overlaps(&s->plane[a], &f->current_mv) ||
+		/* Header and body 4 KiB aligned: ANC2AXI and the MMU map pages. */
+		if (f->compressed && s->header.bytes &&
+		    (!IS_ALIGNED(s->header.address, 4096) || s->header.bytes < scatter ||
+		     !IS_ALIGNED(s->body.address, 4096) || s->body.bytes < body))
+			return -EINVAL;
+		parts = surface_regions(s, f->compressed, mine);
+		for (a = 0; a < parts; a++) {
+			if (region_valid(&mine[a], a < 2 ? l->size[a] : 1, a < 2 ? 32 : 4096) ||
+			    overlaps_workspace(f->workspace, &mine[a]) ||
+			    overlaps(&mine[a], &f->current_mv) ||
 			    (!h->keyframe && !h->intra_only &&
-			     overlaps(&s->plane[a], &f->previous_mv)))
+			     overlaps(&mine[a], &f->previous_mv)))
 				return -EINVAL;
 			for (j = 0; j <= i; j++) {
 				if (!f->surface[j].valid)
 					continue;
-				for (b = 0; b < 2; b++) {
+				other_parts = surface_regions(&f->surface[j], f->compressed,
+							      theirs);
+				for (b = 0; b < other_parts; b++) {
 					if (j == i && b >= a)
 						continue;
-					if (overlaps(&s->plane[a], &f->surface[j].plane[b]))
+					if (overlaps(&mine[a], &theirs[b]))
 						return -EINVAL;
 				}
 			}
 		}
-		next.anc2axi[i * 2] = s->plane[0].address >> 5;
-		next.anc2axi[i * 2 + 1] = s->plane[1].address >> 5;
+		/* Compressed: one entry per picture, its FBC header (init_pic_list_hw). */
+		if (f->compressed) {
+			next.anc2axi[i] = s->header.address >> 5;
+		} else {
+			next.anc2axi[i * 2] = s->plane[0].address >> 5;
+			next.anc2axi[i * 2 + 1] = s->plane[1].address >> 5;
+		}
 	}
 	for (i = 0; i < S7D_VP9_REFERENCE_SLOTS; i++) {
 		u32 slot = f->logical_to_physical[i];
@@ -280,29 +333,40 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 		next.previous_mv_end = end;
 		for (i = 0; i < S7D_VP9_FRAME_REFERENCES; i++) {
 			u32 slot = f->logical_to_physical[h->reference_index[i]];
-			u32 y = slot * 2, uv = y + 1;
+			/* Linear: Y and UV canvases per slot; compressed: one, its header. */
+			u32 y = f->compressed ? slot : slot * 2;
+			u32 uv = f->compressed ? slot : y + 1;
 
+			if (f->compressed && !f->surface[slot].header.bytes)
+				return -ENODATA;
 			next.reference_canvas[i] = (uv << 16) | (uv << 8) | y;
 			next.reference_info[i][0] = h->width;
 			next.reference_info[i][1] = h->height;
 			next.reference_info[i][2] = 1 << 14;
 			next.reference_info[i][3] = 1 << 14;
-			next.reference_info[i][4] = DIV_ROUND_UP(h->width, 64) *
-				DIV_ROUND_UP(h->height, 32) * 3200 / 32;
+			/* Vendor config_mc_buffer: the body size only without the MMU. */
+			next.reference_info[i][4] = f->compressed ? 0 :
+				s7d_vp9_fbc_body_bytes(h->width, h->height, 8) / 32;
 		}
 	}
 	next.picture.size = (h->height << 16) | h->width;
-	next.picture.body_bytes = DIV_ROUND_UP(h->width, 64) *
-		DIV_ROUND_UP(h->height, 32) * 3200;
-	next.picture.header_bytes = DIV_ROUND_UP(h->width, 128) *
-		DIV_ROUND_UP(h->height, 64) * 32;
-	next.picture.sao_ctrl1 = (2 << 14) | 0xff0 | 1;
+	next.picture.body_bytes = s7d_vp9_fbc_body_bytes(h->width, h->height, h->bit_depth);
+	next.picture.header_bytes = s7d_vp9_fbc_header_bytes(h->width, h->height);
+	/*
+	 * Linear, little-endian NV12, 64-byte lines; [0] disables the compressed
+	 * output, which the MMU mode writes alongside the double write.
+	 */
+	next.picture.sao_ctrl1 = (2 << 14) | 0xff0 | (f->compressed ? 0 : 1);
 	next.picture.ipp_axiif = (2 << 8) | 0xf;
-	next.picture.dblk_cfgb = 0xfe01 | (h->width >= 1280 ? BIT(4) : 0);
+	/* [8] compressed write, [9] double write. */
+	next.picture.dblk_cfgb = (f->compressed ? 0xff01 : 0xfe01) |
+		(h->width >= 1280 ? BIT(4) : 0);
 	filter_plan(f->rpm, &next.picture);
 	next.physical_count = f->physical_count;
 	next.current_y = f->surface[f->current_physical].plane[0].address;
 	next.current_uv = f->surface[f->current_physical].plane[1].address;
+	next.current_header = f->surface[f->current_physical].header.address;
+	next.compressed = f->compressed;
 	next.y_bytes = l->size[0];
 	next.uv_bytes = l->size[1];
 	next.mv_above = f->workspace->part[S7D_VP9_MPRED_ABOVE].address;
@@ -443,13 +507,19 @@ int s7d_vp9_inter_picture_configure(struct regmap *map,
 	ret = regmap_write(map, HEVC_PARSER_PICTURE_SIZE, p.picture.size);
 	if (ret)
 		return ret;
-	ret = regmap_update_bits(map, HEVC_SAO_CTRL5,
-				BIT(9) | BIT(10) | (0xff << 16), BIT(9));
+	/*
+	 * Vendor config_pic_size: [9] 8-bit mem-saving body; MMU mode [10]
+	 * takes the header from CM_HEADER_START_ADDR; [23:16] full-size DW.
+	 */
+	ret = regmap_update_bits(map, HEVC_SAO_CTRL5, BIT(9) | BIT(10) | (0xff << 16),
+				 !p.compressed ? BIT(9) :
+				 (frame->header->bit_depth == 8 ? BIT(9) : 0) | BIT(10));
 	if (ret)
 		return ret;
 	{
 		const struct reg_sequence seq[] = {
-			{ HEVCD_DECOMP_CTRL1, BIT(31) },
+			/* MMU: paged reference reads; else NV21 reference read mode. */
+			{ HEVCD_DECOMP_CTRL1, p.compressed ? BIT(4) : BIT(31) },
 			{ HEVC_CM_BODY_LENGTH, p.picture.body_bytes },
 			{ HEVC_CM_HEADER_OFFSET, p.picture.body_bytes },
 			{ HEVC_CM_HEADER_LENGTH, p.picture.header_bytes },
@@ -473,6 +543,16 @@ int s7d_vp9_inter_picture_configure(struct regmap *map,
 	ret = configure_cache(map, &p);
 	if (ret)
 		return ret;
+	if (p.compressed) {
+		const struct reg_sequence seq[] = {
+			{ HEVC_SAO_CTRL26, 0 },
+			{ HEVC_CM_HEADER_START_ADDR, p.current_header },
+		};
+
+		ret = write_many(map, seq, ARRAY_SIZE(seq));
+		if (ret)
+			return ret;
+	}
 	{
 		const struct reg_sequence seq[] = {
 			{ HEVC_SAO_Y_START, p.current_y },
