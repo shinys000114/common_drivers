@@ -94,6 +94,8 @@ struct s7d_cec {
 	/* CEC core callbacks take adap->lock before this indirect-access lock. */
 	struct mutex lock;
 	u16 logical_mask;
+	/* Physical address of the last claim, under adap->lock. */
+	u16 phys_addr;
 	int irq;
 	bool enabled;
 	bool running;
@@ -210,6 +212,14 @@ static int s7d_cec_log_addr(struct cec_adapter *adap, u8 address)
 	u16 mask;
 	int ret;
 
+	/*
+	 * Remember the physical address of a claim for the handoff. The
+	 * unconfigure for a lost physical address runs without one and keeps
+	 * it; any other unconfigure forgets it.
+	 */
+	if (adap->phys_addr != CEC_PHYS_ADDR_INVALID)
+		cec->phys_addr = address == CEC_LOG_ADDR_INVALID ?
+			CEC_PHYS_ADDR_INVALID : adap->phys_addr;
 	mutex_lock(&cec->lock);
 	mask = address == CEC_LOG_ADDR_INVALID ? 0 :
 		cec->logical_mask | BIT(address) | BIT(CEC_LOG_ADDR_UNREGISTERED);
@@ -480,12 +490,22 @@ static void s7d_cec_handoff(struct s7d_cec *cec)
 {
 	struct cec_adapter *adap = cec->adap;
 	const struct cec_log_addrs *la = &adap->log_addrs;
+	u16 phys_addr = adap->phys_addr;
 	u32 config = 0, address = 0;
 
 	lockdep_assert_held(&adap->lock);
-	if (cec->enabled && adap->is_configured && la->num_log_addrs) {
+	/*
+	 * Like the vendor, keep the last address while HPD is low: a TV in
+	 * standby or the HDMI shutdown takes the physical address away, but
+	 * the logical addresses stay.
+	 */
+	if (phys_addr == CEC_PHYS_ADDR_INVALID)
+		phys_addr = cec->phys_addr;
+	if (cec->enabled && la->num_log_addrs &&
+	    la->log_addr[0] != CEC_LOG_ADDR_INVALID &&
+	    phys_addr != CEC_PHYS_ADDR_INVALID) {
 		config = AO_CEC_ON | AO_CEC_AUTO_POWER_ON;
-		address = FIELD_PREP(AO_CEC_PHYS_ADDR, adap->phys_addr) |
+		address = FIELD_PREP(AO_CEC_PHYS_ADDR, phys_addr) |
 			  FIELD_PREP(AO_CEC_LOG_ADDR, la->log_addr[0]) |
 			  FIELD_PREP(AO_CEC_DEV_TYPE, la->primary_device_type[0]);
 	}
@@ -584,6 +604,7 @@ static int s7d_cec_probe(struct platform_device *pdev)
 	if (!cec)
 		return -ENOMEM;
 	cec->dev = dev;
+	cec->phys_addr = CEC_PHYS_ADDR_INVALID;
 	mutex_init(&cec->lock);
 	cec->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(cec->base))
