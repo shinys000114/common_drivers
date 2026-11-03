@@ -1868,7 +1868,8 @@ static int backend_clear_stream(void *priv)
 		backend->sequence_poc_type = 0;
 		backend->sequence_log2_frame_num = 0;
 		backend->sequence_log2_poc_lsb = 0;
-		backend->hunting = false;
+		/* A new stream may begin anywhere: skip to its first IDR (dev-decoder.rst). */
+		backend->hunting = true;
 	}
 	mutex_unlock(&decoder->transaction);
 	mutex_unlock(&decoder->clients);
@@ -1941,6 +1942,7 @@ static void *backend_factory_create(void *priv)
 	}
 	backend->decoder = decoder;
 	backend->dispatch_blocked = true;
+	backend->hunting = true;
 	mutex_init(&backend->notifications);
 	spin_lock_init(&backend->event_lock);
 	INIT_WORK(&backend->protocol_work, backend_protocol_work);
