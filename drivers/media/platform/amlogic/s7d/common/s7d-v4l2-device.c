@@ -125,6 +125,27 @@ static int s7d_enum_format(struct file *file, void *priv,
 	return 0;
 }
 
+/* Coded sizes per OUTPUT format; Chromium caps hardware decode at 1920x1088 without them. */
+static int s7d_enum_framesizes(struct file *file, void *priv,
+			       struct v4l2_frmsizeenum *size)
+{
+	struct s7d_v4l2_device *device = video_drvdata(file);
+	struct s7d_v4l2_codec_entry *entry = s7d_output_entry(device, size->pixel_format);
+	const struct s7d_v4l2_codec *codec;
+
+	if (size->index || !entry)
+		return -EINVAL;
+	codec = &entry->factory.codec;
+	size->type = V4L2_FRMSIZE_TYPE_CONTINUOUS;
+	size->stepwise.min_width = 64;
+	size->stepwise.max_width = codec->max_width;
+	size->stepwise.step_width = 1;
+	size->stepwise.min_height = 64;
+	size->stepwise.max_height = codec->max_height;
+	size->stepwise.step_height = 1;
+	return 0;
+}
+
 static int s7d_try_format(struct file *file, void *priv, struct v4l2_format *format)
 {
 	struct s7d_v4l2_device *device = video_drvdata(file);
@@ -246,6 +267,7 @@ static const struct v4l2_ioctl_ops s7d_ioctl_ops = {
 	.vidioc_querycap = s7d_querycap,
 	.vidioc_enum_fmt_vid_out = s7d_enum_format,
 	.vidioc_enum_fmt_vid_cap = s7d_enum_format,
+	.vidioc_enum_framesizes = s7d_enum_framesizes,
 	.vidioc_try_fmt_vid_out_mplane = s7d_try_format,
 	.vidioc_try_fmt_vid_cap_mplane = s7d_try_format,
 	.vidioc_s_fmt_vid_out_mplane = s7d_set_format,
