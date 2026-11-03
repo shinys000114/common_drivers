@@ -118,6 +118,9 @@ static void panthor_gem_alloc_contig(struct panthor_gem_object *bo)
 			   min_t(unsigned int, get_order(shmem->base.size), CONFIG_CMA_ALIGNMENT),
 			   true);
 	if (!contig) {
+		drm_info_once(&ptdev->base,
+			      "scanout area has no %zu KiB block, shareable BOs fall back to shmem\n",
+			      shmem->base.size >> 10);
 		kvfree(pages);
 		return;
 	}
