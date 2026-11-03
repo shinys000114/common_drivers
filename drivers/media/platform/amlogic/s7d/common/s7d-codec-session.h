@@ -85,6 +85,7 @@ s7d_codec_core_create(struct device *dev, struct module *owner,
 		     const struct s7d_codec_resource_ops *ops, void *priv,
 		     unsigned int dma_bits);
 int s7d_codec_core_destroy(struct s7d_codec_core *core);
+bool s7d_codec_core_busy(struct s7d_codec_core *core, const struct s7d_codec_session *own);
 int s7d_codec_session_open(struct s7d_codec_core *core,
 			   enum s7d_codec_engine engine,
 			   const struct s7d_codec_callbacks *callbacks, void *priv,

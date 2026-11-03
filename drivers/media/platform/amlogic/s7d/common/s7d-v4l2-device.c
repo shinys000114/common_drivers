@@ -102,6 +102,23 @@ s7d_output_entry(struct s7d_v4l2_device *device, u32 fourcc)
 	return NULL;
 }
 
+/*
+ * The DOS runs one decoder session at a time across all codecs. A second client
+ * is refused when it sets its coded format or allocates bitstream buffers, before
+ * any frame, so players can fall back to software decoding instead of failing at
+ * STREAMON (Chromium falls back only when initialisation, the OUTPUT S_FMT, fails).
+ */
+static bool s7d_device_taken(struct s7d_v4l2_device *device, void *priv)
+{
+	struct s7d_codec_session *own = s7d_v4l2_session(s7d_file_context(priv));
+	unsigned int i;
+
+	for (i = 0; i < device->entries; i++)
+		if (s7d_codec_core_busy(device->entry[i].core, own))
+			return true;
+	return false;
+}
+
 static int s7d_querycap(struct file *file, void *priv,
 			   struct v4l2_capability *capability)
 {
@@ -206,6 +223,8 @@ static int s7d_set_format(struct file *file, void *priv, struct v4l2_format *for
 	int ret;
 
 	if (format->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+		if (s7d_device_taken(device, priv))
+			return -EBUSY;
 		entry = s7d_output_entry(device, format->fmt.pix_mp.pixelformat);
 		client = s7d_file_client(device, priv);
 		if (!client)
@@ -255,6 +274,9 @@ static int s7d_streamoff(struct file *file, void *priv, enum v4l2_buf_type type)
 static int s7d_reqbufs(struct file *file, void *priv,
 		       struct v4l2_requestbuffers *request)
 {
+	if (request->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE && request->count &&
+	    s7d_device_taken(video_drvdata(file), priv))
+		return -EBUSY;
 	return s7d_v4l2_reqbufs(s7d_file_context(priv), file, request);
 }
 

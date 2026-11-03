@@ -263,6 +263,7 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *context,
 			 struct v4l2_fmtdesc *format);
 int s7d_v4l2_try_format(struct s7d_v4l2_context *context,
 			struct v4l2_format *format);
+struct s7d_codec_session *s7d_v4l2_session(struct s7d_v4l2_context *ctx);
 int s7d_v4l2_set_format(struct s7d_v4l2_context *context,
 			struct v4l2_format *format);
 int s7d_v4l2_get_format(struct s7d_v4l2_context *context,

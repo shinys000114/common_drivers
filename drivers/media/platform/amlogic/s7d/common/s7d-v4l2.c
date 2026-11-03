@@ -659,6 +659,11 @@ int s7d_v4l2_try_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format
 	return 0;
 }
 
+struct s7d_codec_session *s7d_v4l2_session(struct s7d_v4l2_context *ctx)
+{
+	return READ_ONCE(ctx->session);
+}
+
 int s7d_v4l2_set_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format)
 {
 	struct s7d_codec_layout placeholder;
