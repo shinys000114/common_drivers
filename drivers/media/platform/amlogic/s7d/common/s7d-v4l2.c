@@ -2694,9 +2694,10 @@ static int s7d_context_controls(struct s7d_v4l2_context *ctx)
 		V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	if (control)
 		control->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	/* Every level the HEVC decoder admits: 4096x2304 takes level 6. */
 	control = v4l2_ctrl_new_std_menu(&ctx->controls, NULL,
-		V4L2_CID_MPEG_VIDEO_HEVC_LEVEL, V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1,
-		0, V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1);
+		V4L2_CID_MPEG_VIDEO_HEVC_LEVEL, V4L2_MPEG_VIDEO_HEVC_LEVEL_6_2,
+		0, V4L2_MPEG_VIDEO_HEVC_LEVEL_6_2);
 	if (control)
 		control->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	/* VP9 profiles 0 and 2 (8- and 10-bit 4:2:0). */
