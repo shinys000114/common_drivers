@@ -118,12 +118,13 @@
 		dmaheap_cma_reserved:heap-gfx {
 			compatible = "shared-dma-pool";
 			reusable;
-			/* maximum size of fbdev and wayland-drm backend
-			 * fbdev: 2 * (number of /dev/fbx device) buffers
-			 * wayland-drm: 4 buffers for westeros or 2 buffers for weston,
-			 *   3 buffers for direct display(enabled on weston)
+			/*
+			 * Buffers the display scans out: the libMali dma-heap,
+			 * shareable Panthor BOs and GE2D frames. U-Boot sets the
+			 * size from gfx-heap-size in /boot/config.ini; without it,
+			 * reserve the 320 MB that 4K desktop video was tested with.
 			 */
-			size = <0x0 0x3000000>;
+			size = <0x0 0x14000000>;
 			alignment = <0x0 0x400000>;
 		};
 		dmaheap_fb_reserved:heap-fb {
