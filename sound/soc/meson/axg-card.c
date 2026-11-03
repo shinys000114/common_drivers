@@ -6,8 +6,13 @@
 
 #include <linux/module.h>
 #include <linux/of_platform.h>
+#include <linux/slab.h>
+#include <drm/drm_eld.h>
+#include <sound/control.h>
 #include <sound/soc.h>
 #include <sound/soc-dai.h>
+#include <sound/soc-dapm.h>
+#include <sound/pcm_drm_eld.h>
 
 #include "axg-tdm.h"
 #include "meson-card.h"
@@ -298,6 +303,79 @@ static int axg_card_cpu_is_playback_fe(struct device_node *np)
 		of_device_is_compatible(np, DT_PREFIX "s7d-frddr");
 }
 
+/* The ELD control of a codec DAI, which hdmi-codec adds for its link's PCM. */
+static struct snd_kcontrol *axg_card_eld_ctl(struct snd_soc_card *card,
+					     struct snd_soc_dai *dai)
+{
+	struct snd_ctl_elem_id id = {
+		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+		.name = "ELD",
+	};
+	struct snd_soc_pcm_runtime *rtd;
+	struct snd_soc_dai *codec;
+	int i;
+
+	for_each_card_rtds(card, rtd) {
+		if (!rtd->pcm)
+			continue;
+		for_each_rtd_codec_dais(rtd, i, codec) {
+			if (codec != dai)
+				continue;
+			id.device = rtd->pcm->device;
+			return snd_ctl_find_id(card->snd_card, &id);
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The HDMI codec sits behind a codec-to-codec link, which opens it from a
+ * DAPM event: its ELD constraints never reach the application's stream, and
+ * a channel count or rate the sink lacks then fails there unseen while the
+ * stream plays silence. Apply the sink's ELD to the playback FE instead.
+ */
+static int axg_card_fe_startup(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct meson_card *priv = snd_soc_card_get_drvdata(rtd->card);
+	struct snd_soc_dapm_widget_list *list;
+	struct snd_soc_dapm_widget *w;
+	struct snd_ctl_elem_value *value;
+	struct snd_kcontrol *kctl = NULL;
+	int i, ret;
+
+	if (snd_soc_dapm_dai_get_connected_widgets(snd_soc_rtd_to_cpu(rtd, 0),
+						   substream->stream, &list, NULL) < 0)
+		return 0;
+	for_each_dapm_widgets(list, i, w) {
+		if (w->id == snd_soc_dapm_dai_in && w->priv)
+			kctl = axg_card_eld_ctl(rtd->card, w->priv);
+		if (kctl)
+			break;
+	}
+	snd_soc_dapm_dai_free_widgets(&list);
+	if (!kctl)
+		return 0;
+
+	value = kzalloc(sizeof(*value), GFP_KERNEL);
+	if (!value)
+		return -ENOMEM;
+	down_read(&rtd->card->snd_card->controls_rwsem);
+	ret = kctl->get(kctl, value);
+	up_read(&rtd->card->snd_card->controls_rwsem);
+	if (!ret)
+		memcpy(priv->eld, value->value.bytes.data, sizeof(priv->eld));
+	kfree(value);
+	/* No sink audio data (unplugged, DVI): leave the stream unconstrained. */
+	if (ret || !drm_eld_sad_count(priv->eld))
+		return 0;
+	return snd_pcm_hw_constraint_eld(substream->runtime, priv->eld);
+}
+
+static const struct snd_soc_ops axg_card_fe_ops = {
+	.startup = axg_card_fe_startup,
+};
+
 static int axg_card_cpu_is_tdm_iface(struct device_node *np)
 {
 	return of_device_is_compatible(np, DT_PREFIX "axg-tdm-iface");
@@ -330,8 +408,10 @@ static int axg_card_add_link(struct snd_soc_card *card, struct device_node *np,
 	if (ret)
 		return ret;
 
-	if (axg_card_cpu_is_playback_fe(dai_link->cpus->of_node))
+	if (axg_card_cpu_is_playback_fe(dai_link->cpus->of_node)) {
+		dai_link->ops = &axg_card_fe_ops;
 		return meson_card_set_fe_link(card, dai_link, np, true);
+	}
 	else if (axg_card_cpu_is_capture_fe(dai_link->cpus->of_node))
 		return meson_card_set_fe_link(card, dai_link, np, false);
 

@@ -7,6 +7,8 @@
 #ifndef _MESON_SND_CARD_H
 #define _MESON_SND_CARD_H
 
+#include <linux/types.h>
+
 struct device_node;
 struct platform_device;
 
@@ -15,6 +17,9 @@ struct snd_pcm_substream;
 struct snd_pcm_hw_params;
 
 #define DT_PREFIX "amlogic,"
+
+/* MAX_ELD_BYTES, the size of hdmi-codec's ELD control */
+#define MESON_CARD_ELD_BYTES 128
 
 struct meson_card_match_data {
 	int (*add_link)(struct snd_soc_card *card,
@@ -26,6 +31,8 @@ struct meson_card {
 	const struct meson_card_match_data *match_data;
 	struct snd_soc_card card;
 	void **link_data;
+	/* The HDMI sink's ELD, constraining the playback FEs that reach it */
+	u8 eld[MESON_CARD_ELD_BYTES];
 };
 
 unsigned int meson_card_parse_daifmt(struct device_node *node,
