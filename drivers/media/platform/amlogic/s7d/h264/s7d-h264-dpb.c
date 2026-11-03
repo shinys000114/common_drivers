@@ -535,7 +535,7 @@ int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 	struct s7d_h264_marking marking;
 	struct s7d_h264_poc_state next;
 	struct s7d_h264_picture picture = { .long_term_index = -1, .mv_slot = -1 };
-	u32 slot = 0, i;
+	u32 slot = 0, pass, i;
 	bool new_picture;
 	u64 token;
 	int ret;
@@ -575,21 +575,28 @@ int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 	if (ret)
 		return ret;
 	if (new_picture) {
-		for (slot = 0; slot < dpb->count; slot++) {
-			if (dpb->pictures[slot].occupied)
-				continue;
-			ret = plan_marking(dpb, slice, slot, &marking);
-			if (ret)
-				return ret;
-			if (marking.reset_poc &&
-			    ((s64)picture.top_poc - picture.poc > INT_MAX ||
-			     (s64)picture.bottom_poc - picture.poc > INT_MAX))
-				return -EOVERFLOW;
-			ret = s7d_codec_surface_acquire(dpb->bindings[slot].surface, &token);
-			if (!ret)
+		for (pass = 0; pass < 2; pass++) {
+			for (slot = 0; slot < dpb->count; slot++) {
+				if (dpb->pictures[slot].occupied)
+					continue;
+				/* First a buffer no importer still reads, then any. */
+				if (!pass && s7d_codec_surface_reading(dpb->bindings[slot].surface))
+					continue;
+				ret = plan_marking(dpb, slice, slot, &marking);
+				if (ret)
+					return ret;
+				if (marking.reset_poc &&
+				    ((s64)picture.top_poc - picture.poc > INT_MAX ||
+				     (s64)picture.bottom_poc - picture.poc > INT_MAX))
+					return -EOVERFLOW;
+				ret = s7d_codec_surface_acquire(dpb->bindings[slot].surface, &token);
+				if (!ret)
+					break;
+				if (ret != -EAGAIN)
+					return ret;
+			}
+			if (slot < dpb->count)
 				break;
-			if (ret != -EAGAIN)
-				return ret;
 		}
 		if (slot == dpb->count)
 			return -EAGAIN;

@@ -470,6 +470,21 @@ static int hevc_emit(struct s7d_hevc_decoder *decoder, bool drain,
 	}
 }
 
+/* The queued slots of @mask whose buffer no importer still reads. */
+static u32 hevc_idle_slots(struct s7d_hevc_decoder *decoder, u32 mask)
+{
+	u32 idle = 0, rest = mask, slot;
+
+	while (rest) {
+		slot = __ffs(rest);
+		rest &= ~BIT(slot);
+		if (slot < decoder->captures &&
+		    !s7d_codec_surface_reading(decoder->capture[slot].surface))
+			idle |= BIT(slot);
+	}
+	return idle;
+}
+
 static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *job,
 			bool *cancelled)
 {
@@ -525,11 +540,20 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 		return hevc_header_failure(decoder, job, stage, ret,
 			status, status_valid, rpm_valid);
 	for (;;) {
+		u32 idle;
+
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		mask = decoder->queued_mask;
 		spin_unlock_irqrestore(&decoder->irq_lock, flags);
-		ret = s7d_hevc_dpb_plan(decoder->dpb, &job->slice, &job->metadata,
-					mask, &job->picture);
+		/* First a buffer no importer still reads, then any queued one. */
+		idle = hevc_idle_slots(decoder, mask);
+		ret = -EAGAIN;
+		if (idle && idle != mask)
+			ret = s7d_hevc_dpb_plan(decoder->dpb, &job->slice, &job->metadata,
+						idle, &job->picture);
+		if (ret == -EAGAIN)
+			ret = s7d_hevc_dpb_plan(decoder->dpb, &job->slice, &job->metadata,
+						mask, &job->picture);
 		if (ret)
 			return hevc_header_failure(decoder, job, "dpb-plan", ret,
 				status, status_valid, rpm_valid);

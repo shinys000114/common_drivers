@@ -212,6 +212,20 @@ static irqreturn_t vp9_irq(void *priv, const struct s7d_hevc_irq_cookie *cookie)
 	return IRQ_WAKE_THREAD;
 }
 
+/* The lowest queued slot no importer still reads, else the lowest queued. */
+static u32 vp9_pick_slot(struct s7d_vp9_decoder *decoder, u32 available)
+{
+	u32 mask = available, slot;
+
+	while (mask) {
+		slot = __ffs(mask);
+		if (!s7d_codec_surface_reading(decoder->capture[slot].surface))
+			return slot;
+		mask &= ~BIT(slot);
+	}
+	return __ffs(available);
+}
+
 static int vp9_acquire_surface(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 {
 	unsigned long flags;
@@ -225,11 +239,13 @@ static int vp9_acquire_surface(struct s7d_vp9_decoder *decoder, struct vp9_job *
 	for (;;) {
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		available = decoder->queued_mask & ~decoder->pin_mask;
-		slot = available ? __ffs(available) : S7D_VP9_NO_PHYSICAL;
-		serial = available ? decoder->queue_serial[slot] : 0;
 		spin_unlock_irqrestore(&decoder->irq_lock, flags);
 		if (!available)
 			return -EAGAIN;
+		slot = vp9_pick_slot(decoder, available);
+		spin_lock_irqsave(&decoder->irq_lock, flags);
+		serial = decoder->queue_serial[slot];
+		spin_unlock_irqrestore(&decoder->irq_lock, flags);
 		ret = vp9_stop_check(decoder);
 		if (ret)
 			return ret;

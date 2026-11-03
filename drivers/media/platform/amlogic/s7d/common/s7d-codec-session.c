@@ -4,7 +4,9 @@
 #include <linux/device.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-resv.h>
 #include <linux/err.h>
+#include <linux/jiffies.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/log2.h>
@@ -630,6 +632,59 @@ int s7d_codec_surface_return_queued(struct s7d_codec_surface *surface)
 	return ret;
 }
 
+/*
+ * A queued CAPTURE buffer may still be read by an importer: a compositor
+ * releases a buffer once its GPU job is submitted, and that job holds a read
+ * fence on the dma-buf until it finishes. Decoding over the frame before then
+ * tears the picture on screen, so wait for those fences first.
+ */
+#define S7D_SURFACE_READ_WAIT_MS	500
+
+static void s7d_surface_wait_readers(struct s7d_codec_surface *surface)
+{
+	struct s7d_codec_core *core = surface->session->core;
+	struct dma_buf *dmabuf[S7D_CODEC_MAX_PLANES];
+	unsigned int i, j, count = 0;
+	long ret;
+
+	mutex_lock(&core->lock);
+	if (surface->session->state == S7D_SESSION_OPEN && surface->queued &&
+	    !surface->writing && !surface->user_owned && !surface->dpb_refs)
+		for (i = 0; i < surface->request.num_planes; i++) {
+			for (j = 0; j < count; j++)
+				if (dmabuf[j]->resv == surface->plane[i].dmabuf->resv)
+					break;
+			if (j < count)
+				continue;
+			get_dma_buf(surface->plane[i].dmabuf);
+			dmabuf[count++] = surface->plane[i].dmabuf;
+		}
+	mutex_unlock(&core->lock);
+	for (i = 0; i < count; i++) {
+		ret = dma_resv_wait_timeout(dmabuf[i]->resv, DMA_RESV_USAGE_READ, false,
+					    msecs_to_jiffies(S7D_SURFACE_READ_WAIT_MS));
+		if (!ret)
+			dev_warn_ratelimited(core->dev,
+					     "capture buffer still read after %u ms\n",
+					     S7D_SURFACE_READ_WAIT_MS);
+		dma_buf_put(dmabuf[i]);
+	}
+}
+
+bool s7d_codec_surface_reading(struct s7d_codec_surface *surface)
+{
+	unsigned int i;
+
+	if (!surface)
+		return false;
+	/* Planes are fixed from pin to unpin; the fence lists are RCU. */
+	for (i = 0; i < surface->request.num_planes; i++)
+		if (!dma_resv_test_signaled(surface->plane[i].dmabuf->resv,
+					    DMA_RESV_USAGE_READ))
+			return true;
+	return false;
+}
+
 int s7d_codec_surface_acquire(struct s7d_codec_surface *surface, u64 *token)
 {
 	struct s7d_codec_core *core = surface->session->core;
@@ -637,6 +692,7 @@ int s7d_codec_surface_acquire(struct s7d_codec_surface *surface, u64 *token)
 
 	if (!token)
 		return -EINVAL;
+	s7d_surface_wait_readers(surface);
 	mutex_lock(&core->lock);
 	if (surface->session->state != S7D_SESSION_OPEN)
 		ret = -ESHUTDOWN;

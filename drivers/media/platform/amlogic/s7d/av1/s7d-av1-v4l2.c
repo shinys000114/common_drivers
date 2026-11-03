@@ -365,21 +365,25 @@ static bool av1_copy_cancelled(void *priv)
 static int av1_acquire_free(struct av1_backend *backend, u32 *index, u64 *token)
 {
 	struct s7d_codec_surface *surface;
-	u32 i;
+	u32 i, pass;
 	int ret;
 
-	for (i = 0; i < backend->captures; i++) {
-		if (backend->bind[i].state != AV1_BIND_FREE)
-			continue;
-		surface = backend->capture[i].surface;
-		ret = s7d_codec_surface_acquire(surface, token);
-		if (ret == -EAGAIN)
-			continue;
-		if (ret)
-			return ret;
-		*index = i;
-		return s7d_codec_surface_ref_get(surface);
-	}
+	/* First a buffer no importer still reads, then any. */
+	for (pass = 0; pass < 2; pass++)
+		for (i = 0; i < backend->captures; i++) {
+			if (backend->bind[i].state != AV1_BIND_FREE)
+				continue;
+			surface = backend->capture[i].surface;
+			if (!pass && s7d_codec_surface_reading(surface))
+				continue;
+			ret = s7d_codec_surface_acquire(surface, token);
+			if (ret == -EAGAIN)
+				continue;
+			if (ret)
+				return ret;
+			*index = i;
+			return s7d_codec_surface_ref_get(surface);
+		}
 	return -EAGAIN;
 }
 
