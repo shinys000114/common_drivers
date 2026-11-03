@@ -18,54 +18,60 @@ config VIDEO_AMLOGIC_S7D
 	  device.
 
 config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
-	bool "Amlogic S7D experimental HEVC decoder"
+	bool "Amlogic S7D HEVC decoder"
 	depends on VIDEO_AMLOGIC_S7D
 	default n
 	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	help
-	  Register an additional standard V4L2 node for progressive Main 8-bit
-	  HEVC up to 1920x1080, with NV12M output and reference-picture reorder.
-	  The initial path accepts one independent slice without tiles. Main10,
-	  long-term references and dynamic resolution changes are not supported.
-	  Hardware validation is incomplete. Leave this disabled for normal
-	  H.264-only operation.
+	  Add HEVC to the S7D video decoder node, decoded on the HEVC engine.
+	  It takes progressive Main and Main10 4:2:0 streams up to 4096x2304
+	  at 60 frames per second, including resolution changes, and returns
+	  8-bit NV12 or NV12M frames or Amlogic FBC frames of the stream's
+	  depth. Tiles, dependent slices and long-term references are not
+	  supported. The node runs one decoder session at a time and shares
+	  the DOS with the JPEG encoder.
 
 config VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL
-	bool "Amlogic S7D experimental VP9 decoder"
+	bool "Amlogic S7D VP9 decoder"
 	depends on VIDEO_AMLOGIC_S7D
 	default n
 	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	help
-	  Register an additional standard V4L2 node for progressive
-	  Profile 0 VP9 up to 1920x1080 with NV12M output. The initial path
-	  accepts fixed-resolution frames and superframes, including hidden
-	  reference and intra-only frames, and can show existing references.
-	  Reference scaling is not supported. Hardware validation is incomplete.
+	  Add VP9 to the S7D video decoder node, decoded on the HEVC engine.
+	  It takes profile 0 and profile 2 (8-bit and 10-bit 4:2:0) streams
+	  up to 4096x2304 at 60 frames per second, including superframes with
+	  hidden, intra-only and show-existing frames, and returns 8-bit NV12
+	  or NV12M frames or Amlogic FBC frames of the stream's depth. The
+	  frame size must not change within a stream, so reference scaling is
+	  not supported. The node runs one decoder session at a time and
+	  shares the DOS with the JPEG encoder.
 
 config VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	bool
 
 config VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL
-	bool "Amlogic S7D experimental AV1 decoder"
+	bool "Amlogic S7D AV1 decoder"
 	depends on VIDEO_AMLOGIC_S7D
 	default n
 	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	help
-	  Register a standard stateful AV1 OBU/TU decoder with NV12M output.
-	  The initial path supports Main profile 8-bit 4:2:0 up to 1920x1080,
-	  up to 16 complete frames per temporal unit and fixed even frame
-	  geometry.
-	  Film grain, super-resolution and dynamic format changes are unsupported.
-	  Internal compressed references and double-write shadows are copied to
-	  capture buffers after full engine stop. Hardware validation is incomplete.
+	  Add AV1 to the S7D video decoder node, decoded on the HEVC engine.
+	  It takes Main profile 8-bit and 10-bit 4:2:0 OBU streams up to
+	  4096x2304 at 60 frames per second, with up to 16 frames in a
+	  temporal unit, and returns 8-bit NV12 or NV12M frames or Amlogic
+	  FBC frames of the stream's depth. Film grain, super-resolution and
+	  frame size changes within a stream are not supported. The node runs
+	  one decoder session at a time and shares the DOS with the JPEG
+	  encoder.
 
 config VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL
-	bool "Amlogic S7D experimental JPEG encoder"
+	bool "Amlogic S7D JPEG encoder"
 	depends on VIDEO_AMLOGIC_S7D
 	default n
 	help
-	  Register an additional standard V4L2 memory-to-memory JPEG encoder.
-	  The initial path accepts contiguous progressive NV12/NV21 up to
-	  1920x1080 through MMAP buffers and provides baseline 8-bit JPEG with
-	  the standard compression quality control. Hardware validation is
-	  incomplete. Leave this disabled for normal decoder-only operation.
+	  Register an additional standard V4L2 memory-to-memory JPEG encoder
+	  on the HCODEC engine. It takes contiguous NV12 or NV21 frames from
+	  16x16 up to 1920x1080 through MMAP buffers and produces baseline
+	  8-bit 4:2:0 JPEG with the standard compression quality control.
+	  The encoder shares the DOS with the video decoders, so it cannot
+	  start streaming while a decoder session is active.
