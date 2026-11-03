@@ -145,6 +145,16 @@
 	c5_sound: auge_sound {
 		compatible = "amlogic,s7d-sound-card";
 		model = "AML-AUGESOUND";
+		/*
+		 * One hifi PLL per rate family, as the MPLLs on G12A/SM1:
+		 * every 48 kHz and 44.1 kHz family MCLK and SPDIF clock up
+		 * to 192 kHz divides from them exactly, so streams of both
+		 * families can run together without retuning either.
+		 */
+		assigned-clocks = <&clkc CLKID_HIFI_PLL>,
+				  <&clkc CLKID_HIFI1_PLL>;
+		assigned-clock-parents = <0>, <0>;
+		assigned-clock-rates = <491520000>, <451584000>;
 		audio-aux-devs = <&c5_tdmout_a>, <&c5_tdmout_b>, <&c5_tdmout_c>,
 				 <&c5_tdmin_lb>;
 		/* The i2s overlay replaces the routes to add TDM_A. */
