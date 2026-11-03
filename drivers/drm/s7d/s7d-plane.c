@@ -165,8 +165,10 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	     drm_rect_height(&base->dst) != base->crtc_h))
 		return -EINVAL;
 	if (video) {
+		/* The VD2 limit is on the source window, not the buffer. */
 		if (plane->slot == S7D_PLANE_VIDEO2 &&
-		    (base->fb->width > 2048 || base->fb->height > 1080))
+		    (drm_rect_width(&base->src) >> 16 > 2048 ||
+		     drm_rect_height(&base->src) >> 16 > 1080))
 			return -EINVAL;
 		ret = s7d_video_build_state(base->fb, &base->src, plane->dma_mask,
 					    &state->video);
