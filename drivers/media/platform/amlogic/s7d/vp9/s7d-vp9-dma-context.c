@@ -380,8 +380,6 @@ int s7d_vp9_dma_context_stage(struct s7d_vp9_dma_context *context,
 		return ret;
 	if (input->prefix.width != context->width ||
 	    input->prefix.height != context->height ||
-	    input->prefix.render_width != context->width ||
-	    input->prefix.render_height != context->height ||
 	    input->prefix.show_existing)
 		return -EINVAL;
 	ring = context->cpu + context->sizes.input_offset;

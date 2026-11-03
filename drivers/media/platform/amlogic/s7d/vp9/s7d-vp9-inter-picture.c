@@ -248,7 +248,6 @@ int s7d_vp9_inter_picture_plan(const struct s7d_vp9_picture_frame *f,
 	l = f->layout;
 	if (f->coded_frames != 1 || h->show_existing ||
 	    (!f->compressed && h->bit_depth != 8) ||
-	    h->render_width != h->width || h->render_height != h->height ||
 	    (h->keyframe && (h->refresh_flags != 0xff || h->color_space == 4 ||
 			     h->color_space > 5)))
 		return -EOPNOTSUPP;

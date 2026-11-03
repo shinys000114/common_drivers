@@ -87,11 +87,10 @@ static int vp9_layout(const struct s7d_vp9_header_prefix *prefix,
 	};
 	int ret;
 
+	/* The render size is only a display hint: frames show at their decoded size. */
 	if (prefix->width < 64 || prefix->width > S7D_VP9_MAX_WIDTH ||
 	    prefix->height < 64 || prefix->height > S7D_VP9_MAX_HEIGHT ||
-	    ((prefix->width | prefix->height) & 1) ||
-	    prefix->width != prefix->render_width ||
-	    prefix->height != prefix->render_height)
+	    ((prefix->width | prefix->height) & 1))
 		return -EOPNOTSUPP;
 	next.pitch[0] = ALIGN(prefix->width, S7D_CODEC_STORAGE_ALIGNMENT);
 	next.pitch[1] = next.pitch[0];
