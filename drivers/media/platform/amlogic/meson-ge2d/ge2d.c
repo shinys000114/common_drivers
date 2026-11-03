@@ -1104,7 +1104,8 @@ static void vidioc_setup_cap_fmt(struct ge2d_ctx *ctx, struct v4l2_pix_format *f
 
 /*
  * The capture keeps the colorimetry of the output. A YUV capture of an RGB
- * output may pick its own encoding and range for the conversion.
+ * output may pick its own encoding and range for the conversion, and an RGB
+ * capture of a YUV output is always full range.
  */
 static void ge2d_copy_colorimetry(struct ge2d_ctx *ctx, const struct ge2d_fmt *fmt,
 				  struct v4l2_pix_format *f)
@@ -1114,6 +1115,11 @@ static void ge2d_copy_colorimetry(struct ge2d_ctx *ctx, const struct ge2d_fmt *f
 
 	f->colorspace = in->colorspace;
 	f->xfer_func = in->xfer_func;
+	if (!fmt->yuv && ctx->in.fmt->yuv) {
+		f->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+		f->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+		return;
+	}
 	if (!own || f->ycbcr_enc == V4L2_YCBCR_ENC_DEFAULT)
 		f->ycbcr_enc = in->ycbcr_enc;
 	if (!own || f->quantization == V4L2_QUANTIZATION_DEFAULT)
