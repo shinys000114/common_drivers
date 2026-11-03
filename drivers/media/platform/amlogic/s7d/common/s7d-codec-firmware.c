@@ -15,15 +15,52 @@
 #include "s7d-codec-session.h"
 
 #define S7D_TEE_FW_H264_MH264	15
-#define S7D_TEE_CORE_VDEC		0
 #define S7D_TEE_FW_HEVC		16
 /* VIDEO_DEC_HEVC_MMU_SWAP, '265S'; S7D archives carry no plain hevc_mmu. */
 #define S7D_TEE_FW_HEVC_MMU_SWAP	0x32363553
 #define S7D_TEE_FW_VP9_MMU		19
-#define S7D_TEE_CORE_HEVC		2
 #define S7D_TEE_FW_JPEG_ENC	21
 #define S7D_TEE_FW_AV1_MMU	0x4156314d
-#define S7D_TEE_CORE_HCODEC	3
+#define S7D_TEE_CORE_VDEC		0
+#define S7D_TEE_CORE_HEVC		2
+#define S7D_TEE_CORE_HCODEC		3
+
+/* A TEE image and the engine whose TEE core runs it. */
+struct s7d_codec_firmware_image {
+	enum s7d_codec_engine engine;
+	u32 tee_id;
+	u32 tee_core;
+	bool swap;
+	const char *name;
+};
+
+static const struct s7d_codec_firmware_image s7d_codec_firmware_images[] = {
+	[S7D_CODEC_FIRMWARE_H264_MH264] = {
+		.engine = S7D_CODEC_ENGINE_VDEC, .tee_id = S7D_TEE_FW_H264_MH264,
+		.tee_core = S7D_TEE_CORE_VDEC, .name = "H.264",
+	},
+	/* As the vendor: both HEVC images are swap builds on S7D. */
+	[S7D_CODEC_FIRMWARE_HEVC] = {
+		.engine = S7D_CODEC_ENGINE_HEVC, .tee_id = S7D_TEE_FW_HEVC,
+		.tee_core = S7D_TEE_CORE_HEVC, .swap = true, .name = "HEVC",
+	},
+	[S7D_CODEC_FIRMWARE_HEVC_MMU] = {
+		.engine = S7D_CODEC_ENGINE_HEVC, .tee_id = S7D_TEE_FW_HEVC_MMU_SWAP,
+		.tee_core = S7D_TEE_CORE_HEVC, .swap = true, .name = "HEVC MMU",
+	},
+	[S7D_CODEC_FIRMWARE_VP9] = {
+		.engine = S7D_CODEC_ENGINE_HEVC, .tee_id = S7D_TEE_FW_VP9_MMU,
+		.tee_core = S7D_TEE_CORE_HEVC, .name = "VP9",
+	},
+	[S7D_CODEC_FIRMWARE_JPEG_ENC] = {
+		.engine = S7D_CODEC_ENGINE_HCODEC, .tee_id = S7D_TEE_FW_JPEG_ENC,
+		.tee_core = S7D_TEE_CORE_HCODEC, .name = "JPEG",
+	},
+	[S7D_CODEC_FIRMWARE_AV1_MMU] = {
+		.engine = S7D_CODEC_ENGINE_HEVC, .tee_id = S7D_TEE_FW_AV1_MMU,
+		.tee_core = S7D_TEE_CORE_HEVC, .name = "AV1",
+	},
+};
 
 struct s7d_codec_firmware_owner {
 	struct device *dev;
@@ -202,67 +239,15 @@ void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job)
 	module_put(module);
 }
 
-static int firmware_load_hevc(struct device *dev, bool mmu)
+static const struct s7d_codec_firmware_image *
+firmware_image(enum s7d_codec_engine engine, enum s7d_codec_firmware firmware)
 {
-	int ret;
+	const struct s7d_codec_firmware_image *image;
 
-	if (!tee_enabled())
-		return -EOPNOTSUPP;
-
-	/* As the vendor: both HEVC images are swap builds on S7D. */
-	ret = tee_load_video_fw_swap(mmu ? S7D_TEE_FW_HEVC_MMU_SWAP : S7D_TEE_FW_HEVC,
-				     S7D_TEE_CORE_HEVC, true);
-	if (ret != TEEC_SUCCESS) {
-		dev_err(dev, "HEVC%s firmware load failed, TEE status %#x\n",
-			mmu ? " MMU" : "", (u32)ret);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int firmware_load_vp9(struct device *dev)
-{
-	int ret;
-
-	if (!tee_enabled())
-		return -EOPNOTSUPP;
-	ret = tee_load_video_fw(S7D_TEE_FW_VP9_MMU, S7D_TEE_CORE_HEVC);
-	if (ret != TEEC_SUCCESS) {
-		dev_err(dev, "VP9 firmware load failed, TEE status %#x\n", (u32)ret);
-		return -EIO;
-	}
-	return 0;
-}
-
-static int firmware_load_av1(struct device *dev)
-{
-	int ret;
-
-	if (!tee_enabled())
-		return -EOPNOTSUPP;
-	ret = tee_load_video_fw(S7D_TEE_FW_AV1_MMU, S7D_TEE_CORE_HEVC);
-	if (ret != TEEC_SUCCESS) {
-		dev_err(dev, "AV1 firmware load failed, TEE status %#x\n", (u32)ret);
-		return -EIO;
-	}
-	return 0;
-}
-
-static int firmware_load_jpeg(struct device *dev)
-{
-	int ret;
-
-	if (!tee_enabled())
-		return -EOPNOTSUPP;
-
-	ret = tee_load_video_fw(S7D_TEE_FW_JPEG_ENC, S7D_TEE_CORE_HCODEC);
-	if (ret != TEEC_SUCCESS) {
-		dev_err(dev, "JPEG firmware load failed, TEE status %#x\n", (u32)ret);
-		return -EIO;
-	}
-
-	return 0;
+	if (firmware >= ARRAY_SIZE(s7d_codec_firmware_images))
+		return NULL;
+	image = &s7d_codec_firmware_images[firmware];
+	return image->name && image->engine == engine ? image : NULL;
 }
 
 int s7d_codec_firmware_set_policy(struct device *dev, enum s7d_codec_engine engine)
@@ -291,32 +276,21 @@ int s7d_codec_firmware_set_policy(struct device *dev, enum s7d_codec_engine engi
 int s7d_codec_firmware_load(struct device *dev, enum s7d_codec_engine engine,
 			    enum s7d_codec_firmware firmware)
 {
+	const struct s7d_codec_firmware_image *image = firmware_image(engine, firmware);
 	int ret;
 
 	if (!dev)
 		return -EINVAL;
-	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_HEVC)
-		return firmware_load_hevc(dev, false);
-	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_HEVC_MMU)
-		return firmware_load_hevc(dev, true);
-	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_VP9)
-		return firmware_load_vp9(dev);
-	if (engine == S7D_CODEC_ENGINE_HEVC && firmware == S7D_CODEC_FIRMWARE_AV1_MMU)
-		return firmware_load_av1(dev);
-	if (engine == S7D_CODEC_ENGINE_HCODEC && firmware == S7D_CODEC_FIRMWARE_JPEG_ENC)
-		return firmware_load_jpeg(dev);
-	if (engine != S7D_CODEC_ENGINE_VDEC ||
-	    firmware != S7D_CODEC_FIRMWARE_H264_MH264)
+	if (!image || !tee_enabled())
 		return -EOPNOTSUPP;
-	if (!tee_enabled())
-		return -EOPNOTSUPP;
-
-	ret = tee_load_video_fw(S7D_TEE_FW_H264_MH264, S7D_TEE_CORE_VDEC);
+	if (image->swap)
+		ret = tee_load_video_fw_swap(image->tee_id, image->tee_core, true);
+	else
+		ret = tee_load_video_fw(image->tee_id, image->tee_core);
 	if (ret != TEEC_SUCCESS) {
-		dev_err(dev, "H.264 firmware load failed, TEE status %#x\n", (u32)ret);
+		dev_err(dev, "%s firmware load failed, TEE status %#x\n", image->name, (u32)ret);
 		return -EIO;
 	}
-
 	return 0;
 }
 
@@ -332,15 +306,7 @@ int s7d_codec_firmware_prepare_for_engine(struct s7d_codec_firmware_owner *owner
 	*out = NULL;
 	if (!owner)
 		return -EINVAL;
-	if (!((engine == S7D_CODEC_ENGINE_VDEC &&
-	       firmware == S7D_CODEC_FIRMWARE_H264_MH264) ||
-	      (engine == S7D_CODEC_ENGINE_HEVC &&
-	       (firmware == S7D_CODEC_FIRMWARE_HEVC ||
-		firmware == S7D_CODEC_FIRMWARE_HEVC_MMU ||
-		firmware == S7D_CODEC_FIRMWARE_VP9 ||
-		firmware == S7D_CODEC_FIRMWARE_AV1_MMU)) ||
-	      (engine == S7D_CODEC_ENGINE_HCODEC &&
-	       firmware == S7D_CODEC_FIRMWARE_JPEG_ENC)))
+	if (!firmware_image(engine, firmware))
 		return -EOPNOTSUPP;
 
 	return s7d_codec_firmware_prepare(owner, session, lease_epoch, out);
