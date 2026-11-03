@@ -9,6 +9,7 @@
 #include <linux/errno.h>
 #include <linux/kref.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 
 #include "s7d-codec-firmware.h"
@@ -61,6 +62,13 @@ static const struct s7d_codec_firmware_image s7d_codec_firmware_images[] = {
 		.tee_core = S7D_TEE_CORE_HEVC, .name = "AV1",
 	},
 };
+
+/*
+ * Every engine reaches BL32 through the same TEE calls, and nothing says their
+ * handler is re-entrant. The vendor issues them all from one thread; keep one
+ * call in flight here too.
+ */
+static DEFINE_MUTEX(s7d_codec_tee_lock);
 
 struct s7d_codec_firmware_owner {
 	struct device *dev;
@@ -265,7 +273,9 @@ int s7d_codec_firmware_set_policy(struct device *dev, enum s7d_codec_engine engi
 		return -EINVAL;
 	if (!tee_enabled())
 		return -EOPNOTSUPP;
+	mutex_lock(&s7d_codec_tee_lock);
 	ret = tee_config_device_state_lock(ids[engine], 0);
+	mutex_unlock(&s7d_codec_tee_lock);
 	if (ret != TEEC_SUCCESS) {
 		dev_err(dev, "engine %u nonsecure policy failed, TEE status %#x\n", engine, (u32)ret);
 		return -EIO;
@@ -283,10 +293,12 @@ int s7d_codec_firmware_load(struct device *dev, enum s7d_codec_engine engine,
 		return -EINVAL;
 	if (!image || !tee_enabled())
 		return -EOPNOTSUPP;
+	mutex_lock(&s7d_codec_tee_lock);
 	if (image->swap)
 		ret = tee_load_video_fw_swap(image->tee_id, image->tee_core, true);
 	else
 		ret = tee_load_video_fw(image->tee_id, image->tee_core);
+	mutex_unlock(&s7d_codec_tee_lock);
 	if (ret != TEEC_SUCCESS) {
 		dev_err(dev, "%s firmware load failed, TEE status %#x\n", image->name, (u32)ret);
 		return -EIO;

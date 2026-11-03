@@ -49,6 +49,10 @@ int s7d_codec_firmware_prepare_for_engine(struct s7d_codec_firmware_owner *owner
 					enum s7d_codec_engine engine,
 					enum s7d_codec_firmware firmware,
 					struct s7d_codec_firmware_job **job);
+/*
+ * After a failed TEE load: every engine's later prepare fails. The TEE path is
+ * shared, so a broken TA or BL32 breaks all engines, not only the caller's.
+ */
 void s7d_codec_firmware_invalidate(struct s7d_codec_firmware_owner *owner);
 
 bool s7d_codec_firmware_job_queue(struct s7d_codec_firmware_job *job);
@@ -66,6 +70,7 @@ void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job);
 
 /*
  * Caller holds a powered, idle engine; zero acknowledges only the TEE load.
+ * Loads from different engines run one at a time.
  * HEVC runtime captures SCRATCH_8 after success under that same lease. Its
  * opaque TEE-supplied value is never a kernel DMA allocation. The selected
  * post-load IQIT and normal CPU-start resets remain within that load sequence.
