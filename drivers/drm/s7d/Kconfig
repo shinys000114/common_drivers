@@ -16,38 +16,48 @@ config DRM_S7D
 	select DRM_BRIDGE_CONNECTOR
 	select SND_SOC_HDMI_CODEC if SND_SOC
 	help
-	  Build the S7D VPU execution path and RGB8 TMDS bridge, with
+	  Build the S7D VPU execution path and HDMI transmitter bridge, with
 	  DRM EDID/SCDC helpers, CCF consumers and generic PHY ownership.
 	  Built in or as the module s7d-drm. Unbinding stops the output and
 	  frees its resources; buffers the hardware may still read after a
 	  failed stop are leaked.
-	  Register one CRTC, linear RGB primary, linear YUV VD1/VD2 video and
-	  shared OSD2 cursor/overlay planes, and an HDMI connector.
-	  Cursor and RGB overlay cannot be visible together. Video is progressive
-	  8-bit NV12/NV21/UYVY/VYUY with BT.601/709 limited/full-range conversion.
+	  Register one CRTC, a linear RGB primary, VD1/VD2 video planes and
+	  shared OSD2 cursor/overlay planes, an HDMI connector and a VDIN1
+	  writeback connector. NV12/NV21 primary framebuffers scan out on VD1.
+	  Cursor and RGB overlay cannot be visible together; the cursor takes
+	  ARGB8888 up to 256x256. Video is progressive NV12/NV21/NV16/NV61,
+	  UYVY/VYUY, VUY888 or XVYU2101010 with BT.601/709/2020
+	  limited/full-range conversion; VD1 also reads 8- and 10-bit 4:2:0
+	  Amlogic FBC decoder frames.
 	  Each local OSD scaler supports up to 4x enlargement and 2:1 reduction,
 	  including simultaneous primary and RGB overlay scaling. Linear RGB
-	  scaling requires opaque pixels and input width up to 1920.
-	  VD1 supports up to 4x enlargement and 8x downscaling
-	  in 1080p output modes. Linear video and OSD scaling may run together
-	  within a checked combined clock budget. VD2 uses independent classic PPS
-	  for sources up to 2048x1080. Four inputs require an opaque bottom plane.
-	  VD2 does not combine with AFBC.
-	  AFBC ABGR8888 supports a primary or OSD2 overlay up to 4096x2160,
-	  with opaque global alpha and optional premultiplied pixel alpha.
+	  scaling requires opaque pixels and input width up to 3840.
+	  VD1 supports up to 4x enlargement and 8x downscaling up to UHD
+	  output, skipping source lines where a reduction would outrun the
+	  fetch. Linear video and OSD scaling may run together within a checked
+	  combined clock budget. VD2 uses independent classic PPS for sources
+	  up to 2048x1080.
+	  The primary takes compressed framebuffers only with
+	  s7d_drm.primary_afbc=1, as switching it between compressed and
+	  linear or YUV framebuffers takes a modeset. Mali AFBCD reads ABGR8888
+	  in the tiled 32x8 layout and ARGB8888/XRGB8888 in the untiled one,
+	  on a primary or OSD2 overlay up to 4096x2160, with opaque global
+	  alpha and optional premultiplied pixel alpha.
 	  AFBC scaling uses the same local OSD limits and uncropped source.
 	  An AFBC primary can use a linear OSD2 cursor or
 	  overlay. Mali AFBCD can decode the primary and the OSD2 overlay together
 	  (no cursor), up to 3840x2160 decoded pixels in total; adding or
-	  removing one of them requires a stopped modeset. An opaque AFBC primary can
-	  combine with VD1 up to 1080p at 148.5 MHz, but local OSD and VD1 scaling
-	  cannot run together with AFBC;
-	  joint primary/video changes require a stopped modeset.
+	  removing one of them requires a stopped modeset. An AFBC primary can
+	  combine with VD1 and VD2 up to 1080p at 148.5 MHz while only VD1
+	  scales, and only to enlarge; joint primary/video changes require a
+	  stopped modeset. FBC video does not combine with compressed graphics.
+	  Interlaced 1080i, 480i and 576i output takes linear OSD planes only.
 	  Supports S7D revision B, with TMDS up to 594 MHz. Takes over a firmware
 	  output when there is one; otherwise starts the display from reset.
 	  Do not enable with legacy media/display writers. System sleep, including
 	  deep sleep where firmware powers the display domain off, restores the
-	  output after the driver has taken over.
+	  output. Before the first commit, sleep is refused while a firmware
+	  output still runs.
 	  HDMI PCM uses SND_SOC_HDMI_CODEC with the Amlogic AXG sound card
 	  (SND_MESON_AXG_SOUND_CARD). Cold HDMI SRAM initialization is not
 	  supported.
@@ -69,7 +79,8 @@ config DRM_S7D_GFCD
 	  16, 24 or 32 bytes) with dimensions aligned to 64x16, within the
 	  same window, scaler and alpha limits and without reflection.
 	  Linear or Mali AFBCD OSD2 overlays remain available; video and
-	  simultaneous GFCD surfaces are excluded.
+	  simultaneous GFCD surfaces are excluded. GFCD primaries need
+	  s7d_drm.primary_afbc=1.
 	  Requires the retained GFCD automatic clock and reset configuration.
 	  Keep disabled to use only the Mali AFBCD backend.
 
@@ -78,8 +89,9 @@ choice
 	depends on DRM_S7D
 	default DRM_S7D_AFBC_POLICY_MALI
 	help
-	  Select which decoder reads an ABGR8888 AFBC primary. The
-	  s7d_drm.afbc_policy parameter (0 Mali, 1 GFCD) overrides it.
+	  Select which decoder reads an ABGR8888 AFBC primary, offered with
+	  s7d_drm.primary_afbc=1. The s7d_drm.afbc_policy parameter (0 Mali,
+	  1 GFCD) overrides it.
 
 config DRM_S7D_AFBC_POLICY_MALI
 	bool "Mali AFBCD"
