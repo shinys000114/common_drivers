@@ -570,10 +570,15 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *form
 	}
 	if (!s7d_capture(format->type))
 		return -EINVAL;
-	/* NV12M first: the multi-planar layout is the default. */
+	/*
+	 * Offer the one-buffer NV12/NV21 only. GStreamer prefers the two-buffer
+	 * NV12M whenever it is listed, and GBM (Mesa 26.2) imports such a
+	 * picture for scanout with the luma buffer in both planes, so the
+	 * compositor's direct scanout showed luma as chroma. NV12M is still
+	 * accepted when asked for, and taken when a layout cannot be contiguous.
+	 */
 	if (ctx->codec.nv21) {
 		static const u32 formats[] = {
-			V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV21M,
 			V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV21,
 		};
 
@@ -581,10 +586,9 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *form
 			return -EINVAL;
 		format->pixelformat = formats[format->index];
 	} else {
-		/* FBC last: generic clients keep picking NV12M/NV12. */
+		/* FBC last: generic clients keep picking NV12. */
 		static const u32 formats[] = {
-			V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_AM08C,
-			V4L2_PIX_FMT_AM08F,
+			V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_AM08C, V4L2_PIX_FMT_AM08F,
 		};
 		struct s7d_codec_layout layout;
 		unsigned long flags;
@@ -2720,7 +2724,9 @@ s7d_v4l2_context_create(struct device *dev, struct video_device *video,
 	ret = s7d_placeholder(codec, 1920, 1080, V4L2_PIX_FMT_NV12M, &ctx->layout);
 	if (ret)
 		goto free;
-	s7d_capture_format(&ctx->layout, S7D_CAPTURE_MPLANE, &ctx->output, &ctx->capture);
+	/* One-buffer NV12 by default, the only plain layout ENUM_FMT offers. */
+	ctx->capture_mode = S7D_CAPTURE_SINGLE;
+	s7d_capture_format(&ctx->layout, ctx->capture_mode, &ctx->output, &ctx->capture);
 	s7d_capture_follow_output(&ctx->output, &ctx->capture);
 	ret = s7d_context_controls(ctx);
 	if (ret)
