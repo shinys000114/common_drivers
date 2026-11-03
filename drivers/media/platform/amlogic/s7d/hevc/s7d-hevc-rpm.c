@@ -201,6 +201,7 @@ int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 	}
 	next.no_output_of_prior_pics = cpu->no_output_of_prior_pics;
 	next.pic_output_flag = cpu->pic_output_flag;
+	next.follows_eos = cpu->follows_eos;
 	next.parameter_epoch = cpu->parameter_epoch;
 	if (!hevc_slice_same(&next, cpu))
 		return -ESTALE;

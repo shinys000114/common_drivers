@@ -242,7 +242,7 @@ static int hevc_poc_plan(const struct s7d_hevc_dpb *dpb,
 	u32 max_lsb = 1U << dpb->log2_max_poc_lsb;
 	u32 previous_lsb;
 	bool no_rasl = hevc_idr(slice->nal_type) || hevc_bla(slice->nal_type) ||
-		(!dpb->poc.started && slice->nal_type == 21);
+		((!dpb->poc.started || slice->follows_eos) && slice->nal_type == 21);
 
 	*next = dpb->poc;
 	/* Decoding may begin anywhere; pictures before the first IRAP are dropped (dev-decoder.rst). */
@@ -467,7 +467,9 @@ int s7d_hevc_dpb_plan(const struct s7d_hevc_dpb *dpb,
 			return -EBADMSG;
 	}
 	if (next.clear_dpb) {
-		if (slice->no_output_of_prior_pics)
+		/* A CRA that starts a coded video sequence outputs no prior picture (C.5.2.2). */
+		if (slice->no_output_of_prior_pics ||
+		    (slice->nal_type == 21 && slice->follows_eos))
 			next.drop_output_mask = output_mask;
 		else if (output_mask)
 			next.kind = S7D_HEVC_PLAN_BUMP;

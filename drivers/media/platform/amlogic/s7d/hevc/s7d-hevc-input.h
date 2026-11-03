@@ -34,6 +34,8 @@ struct s7d_hevc_slice_info {
 	bool collocated_from_l0;
 	bool no_output_of_prior_pics;
 	bool pic_output_flag;
+	/* The first picture after an end of sequence NAL unit. */
+	bool follows_eos;
 	bool modification[2];
 	u64 parameter_epoch;
 };

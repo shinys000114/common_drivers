@@ -42,6 +42,8 @@ struct s7d_hevc_input_bank {
 	struct hevc_parameter *pps[HEVC_PPS_COUNT];
 	size_t bytes;
 	u64 revision;
+	/* An end of sequence NAL unit came after the last picture. */
+	bool end_of_sequence;
 };
 
 struct s7d_hevc_input {
@@ -60,6 +62,7 @@ struct s7d_hevc_input {
 	const struct s7d_hevc_input_bank *bank;
 	bool changed;
 	bool committed;
+	bool end_of_sequence;
 };
 
 static u32 hevc_get(struct hevc_bits *b, u32 count)
@@ -813,11 +816,12 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 	struct s7d_hevc_input *input;
 	size_t pos = 0, kept;
 	u32 nals = 0;
-	bool picture = false, dropped = false;
+	bool picture = false, dropped = false, eos;
 	int ret = 0;
 
 	if (IS_ERR_OR_NULL(bank) || !annexb || !bytes || !out)
 		return -EINVAL;
+	eos = bank->end_of_sequence;
 	if (bytes > S7D_HEVC_AU_MAX_BYTES)
 		return -E2BIG;
 	input = kvzalloc(sizeof(*input), GFP_KERNEL);
@@ -854,7 +858,7 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 		while (end > start && !input->data[end - 1])
 			end--;
 		nal = input->data + start;
-		if (end - start < 3 || (nal[0] & 0x80)) {
+		if (end - start < 2 || (nal[0] & 0x80)) {
 			ret = -EBADMSG;
 			goto failed;
 		}
@@ -866,6 +870,19 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 			goto failed;
 		}
 		type = (nal[0] >> 1) & 63;
+		/*
+		 * An end of sequence or bitstream: the next picture starts a coded
+		 * video sequence (8.1.3). The firmware would stop at it, so it is
+		 * removed as well.
+		 */
+		if (type == 36 || type == 37) {
+			eos = true;
+			continue;
+		}
+		if (end - start < 3) {
+			ret = -EBADMSG;
+			goto failed;
+		}
 		if (kept != begin) {
 			memmove(input->data + kept, input->data + begin, pos - begin);
 			nal = input->data + kept + code;
@@ -903,6 +920,10 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 					ret = 0;
 				}
 				picture = !ret && !dropped;
+				if (picture) {
+					input->view.slice.follows_eos = eos;
+					eos = false;
+				}
 			}
 		} else if (type == 35 || type == 38 || type == 39 || type == 40) {
 			if ((type == 35 || type == 39) && picture)
@@ -938,6 +959,7 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 		ret = -EOVERFLOW;
 		goto failed;
 	}
+	input->end_of_sequence = eos;
 	input->view.data = input->data;
 	input->view.bytes = kept;
 	input->view.kind = picture ? S7D_HEVC_INPUT_PICTURE : S7D_HEVC_INPUT_HEADERS;
@@ -978,6 +1000,7 @@ int s7d_hevc_input_commit(struct s7d_hevc_input_bank *bank,
 		}
 	bank->bytes = input->bank_bytes;
 	bank->revision += input->changed;
+	bank->end_of_sequence = input->end_of_sequence;
 	input->committed = true;
 	return 0;
 }
