@@ -153,7 +153,6 @@ struct meson_ge2d {
 	.vsub = 1,					\
 }
 
-/* TOFIX Handle the YUV input formats */
 static const struct ge2d_fmt formats[] = {
 	/*  FOURCC Alpha  HW FMT  HW MAP */
 	FMT(V4L2_PIX_FMT_XRGB32, false, 32, BGRA8888),
