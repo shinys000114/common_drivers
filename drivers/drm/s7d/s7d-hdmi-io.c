@@ -75,6 +75,43 @@ static const struct regmap_access_table s7d_hdmi_core_access = {
 	.n_no_ranges = ARRAY_SIZE(s7d_hdmi_core_holes),
 };
 
+/*
+ * Reading all 64 KiB through the secure monitor resets the board, and the
+ * faulting banks are not mapped: the video clocks are gated while no output
+ * runs. Mark all but the registers this driver itself reads with only the
+ * basic clocks on as precious, so debugfs skips them. The DDC data FIFO at
+ * 0x000a stays precious as well: a read pops a byte.
+ */
+static const struct regmap_range s7d_hdmi_core_debugfs[] = {
+	regmap_reg_range(0x0003, 0x0008),	/* DDC_ADDR to DDC_STATUS */
+	regmap_reg_range(0x000b, 0x000c),	/* DDC_FIFO_COUNT, DDC_DELAY */
+	regmap_reg_range(0x0018, 0x0018),	/* DDC_CYP */
+	regmap_reg_range(0x001d, 0x001d),	/* DDC_DUTY */
+	regmap_reg_range(0x062a, 0x062a),	/* CORE_HDCP1 */
+	regmap_reg_range(0x06e3, 0x06e3),	/* CORE_GCP_AUTO */
+	regmap_reg_range(0x06f8, 0x06f8),	/* DDC_MASTER */
+	regmap_reg_range(0x08bd, 0x08bd),	/* CORE_HDCP2 */
+};
+
+static const struct regmap_access_table s7d_hdmi_core_precious = {
+	.no_ranges = s7d_hdmi_core_debugfs,
+	.n_no_ranges = ARRAY_SIZE(s7d_hdmi_core_debugfs),
+};
+
+static const struct regmap_range s7d_hdmi_top_debugfs[] = {
+	regmap_reg_range(0x000, 0x010),		/* TOP_RESET to TOP_STATUS */
+	regmap_reg_range(0x038, 0x038),		/* TOP_PIN_STATUS */
+	regmap_reg_range(0x074, 0x074),		/* TOP_INFILTER */
+	regmap_reg_range(0x07c, 0x07c),		/* TOP_SCRATCH */
+	regmap_reg_range(0x084, 0x084),		/* TOP_HS_INTR */
+	regmap_reg_range(0x0a0, 0x0a0),		/* TOP_I2C_BUSY */
+};
+
+static const struct regmap_access_table s7d_hdmi_top_precious = {
+	.no_ranges = s7d_hdmi_top_debugfs,
+	.n_no_ranges = ARRAY_SIZE(s7d_hdmi_top_debugfs),
+};
+
 static struct regmap *s7d_hdmi_regmap(struct platform_device *pdev,
 				    const char *name, unsigned int width)
 {
@@ -88,6 +125,8 @@ static struct regmap *s7d_hdmi_regmap(struct platform_device *pdev,
 		.cache_type = REGCACHE_NONE,
 		.rd_table = width == 8 ? &s7d_hdmi_core_access : NULL,
 		.wr_table = width == 8 ? &s7d_hdmi_core_access : NULL,
+		.precious_table = width == 8 ? &s7d_hdmi_core_precious :
+			&s7d_hdmi_top_precious,
 	};
 	struct s7d_hdmi_bus *bus;
 	struct resource *res;
