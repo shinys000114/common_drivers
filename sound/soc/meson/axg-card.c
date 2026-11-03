@@ -32,6 +32,14 @@ struct axg_dai_link_tdm_data {
 	struct axg_dai_link_tdm_mask *codec_masks;
 };
 
+/* A playback FE, which may play to the HDMI transmitter */
+struct axg_card_fe {
+	/* The sink's ELD; the FE's constraint rules read it again. */
+	u8 eld[MESON_CARD_ELD_BYTES];
+	/* Its channel maps, one per channel count, ended by an empty one */
+	struct snd_pcm_chmap_elem chmaps[5];
+};
+
 /*
  * Base params for the codec to codec links
  * Those will be over-written by the CPU side of the link
@@ -339,6 +347,118 @@ static struct snd_kcontrol *axg_card_eld_ctl(struct snd_soc_card *card,
 	return axg_card_codec_ctl(card, dai, "ELD");
 }
 
+#define AXG_CARD_CHMAP4(a, b, c, d) \
+	{ SNDRV_CHMAP_##a, SNDRV_CHMAP_##b, SNDRV_CHMAP_##c, SNDRV_CHMAP_##d }
+
+/*
+ * The speakers of HDMI audio slots 0-7 for a CEA-861 channel allocation:
+ * FL and FR, LFE and FC by bits 0 and 1, then slots 4-7 by bits 2-4.
+ */
+static void axg_card_hdmi_ca_map(u8 ca, unsigned char *map)
+{
+	static const unsigned char rear[8][4] = {
+		AXG_CARD_CHMAP4(NA, NA, NA, NA),
+		AXG_CARD_CHMAP4(RC, NA, NA, NA),
+		AXG_CARD_CHMAP4(RL, RR, NA, NA),
+		AXG_CARD_CHMAP4(RL, RR, RC, NA),
+		AXG_CARD_CHMAP4(RL, RR, RLC, RRC),
+		AXG_CARD_CHMAP4(NA, NA, FLC, FRC),
+		AXG_CARD_CHMAP4(RC, NA, FLC, FRC),
+		AXG_CARD_CHMAP4(RL, RR, FLC, FRC),
+	};
+
+	map[0] = SNDRV_CHMAP_FL;
+	map[1] = SNDRV_CHMAP_FR;
+	map[2] = ca & BIT(0) ? SNDRV_CHMAP_LFE : SNDRV_CHMAP_NA;
+	map[3] = ca & BIT(1) ? SNDRV_CHMAP_FC : SNDRV_CHMAP_NA;
+	memcpy(&map[4], rear[ca >> 2], sizeof(rear[0]));
+}
+
+/* The speakers an ELD speaker allocation lists, as SNDRV_CHMAP_* bits */
+static unsigned int axg_card_hdmi_spk_mask(u8 spk_alloc)
+{
+	static const unsigned int spk[] = {
+		BIT(SNDRV_CHMAP_FL) | BIT(SNDRV_CHMAP_FR),
+		BIT(SNDRV_CHMAP_LFE),
+		BIT(SNDRV_CHMAP_FC),
+		BIT(SNDRV_CHMAP_RL) | BIT(SNDRV_CHMAP_RR),
+		BIT(SNDRV_CHMAP_RC),
+		BIT(SNDRV_CHMAP_FLC) | BIT(SNDRV_CHMAP_FRC),
+		BIT(SNDRV_CHMAP_RLC) | BIT(SNDRV_CHMAP_RRC),
+	};
+	unsigned int mask = BIT(SNDRV_CHMAP_NA), i;
+
+	for (i = 0; i < ARRAY_SIZE(spk); i++)
+		if (spk_alloc & BIT(i))
+			mask |= spk[i];
+	return mask;
+}
+
+/*
+ * The channel allocation hdmi-codec sends for a channel count: stereo
+ * when the sink lists no speakers, else the first of these, in
+ * hdmi_codec_channel_alloc[] order, whose speakers the sink has.
+ */
+static int axg_card_hdmi_ca(u8 spk_alloc, unsigned int channels)
+{
+	static const u8 cas[][2] = {
+		{ 2, 0x00 },
+		{ 4, 0x03 }, { 4, 0x02 }, { 4, 0x01 },
+		{ 6, 0x0b }, { 6, 0x0a }, { 6, 0x09 }, { 6, 0x08 },
+		{ 6, 0x07 }, { 6, 0x06 }, { 6, 0x05 }, { 6, 0x04 },
+		{ 8, 0x13 }, { 8, 0x1f }, { 8, 0x12 }, { 8, 0x1e },
+		{ 8, 0x11 }, { 8, 0x1d }, { 8, 0x10 }, { 8, 0x1c },
+		{ 8, 0x0f }, { 8, 0x1b }, { 8, 0x0e }, { 8, 0x1a },
+		{ 8, 0x0d }, { 8, 0x19 }, { 8, 0x0c }, { 8, 0x18 },
+		{ 8, 0x17 }, { 8, 0x16 }, { 8, 0x15 }, { 8, 0x14 },
+		{ 8, 0x0b }, { 8, 0x0a }, { 8, 0x09 }, { 8, 0x08 },
+		{ 8, 0x07 }, { 8, 0x06 }, { 8, 0x05 }, { 8, 0x04 },
+		{ 8, 0x03 }, { 8, 0x02 }, { 8, 0x01 },
+	};
+	unsigned int sink = axg_card_hdmi_spk_mask(spk_alloc), mask, i, j;
+	unsigned char map[8];
+
+	if (!spk_alloc)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(cas); i++) {
+		if (cas[i][0] != channels)
+			continue;
+		axg_card_hdmi_ca_map(cas[i][1], map);
+		for (mask = 0, j = 0; j < ARRAY_SIZE(map); j++)
+			mask |= BIT(map[j]);
+		if (!(mask & ~sink))
+			return cas[i][1];
+	}
+	return -EINVAL;
+}
+
+/*
+ * The FE's channel maps for the sink in its ELD: the slot order of what
+ * hdmi-codec sends at each channel count it can, stereo only when the
+ * sink lists no speakers, as hdmi-codec's own map does.
+ */
+static void axg_card_fe_set_chmaps(struct axg_card_fe *fe,
+				   unsigned int max_channels)
+{
+	struct snd_pcm_chmap_elem chmaps[ARRAY_SIZE(fe->chmaps) - 1] = {};
+	u8 spk_alloc = drm_eld_get_spk_alloc(fe->eld);
+	unsigned int ch, n = 0;
+	int ca;
+
+	if (!spk_alloc)
+		max_channels = 2;
+	for (ch = 2; ch <= max_channels && n < ARRAY_SIZE(chmaps); ch += 2) {
+		ca = axg_card_hdmi_ca(spk_alloc, ch);
+		if (ca < 0)
+			continue;
+		chmaps[n].channels = ch;
+		axg_card_hdmi_ca_map(ca, chmaps[n].map);
+		n++;
+	}
+	/* The last entry stays empty, so readers always find the end. */
+	memcpy(fe->chmaps, chmaps, sizeof(chmaps));
+}
+
 /*
  * The HDMI codec sits behind a codec-to-codec link, which opens it from a
  * DAPM event: its constraints never reach the application's stream, and a
@@ -350,8 +470,7 @@ static int axg_card_fe_startup(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct meson_card *priv = snd_soc_card_get_drvdata(rtd->card);
 	const struct snd_soc_pcm_stream *stream;
-	/* The rules read the ELD again at each refinement of this stream. */
-	u8 *eld = priv->link_data[rtd->num];
+	struct axg_card_fe *fe = priv->link_data[rtd->num];
 	struct snd_soc_dapm_widget_list *list;
 	struct snd_soc_dapm_widget *w;
 	struct snd_ctl_elem_value *value;
@@ -393,13 +512,16 @@ static int axg_card_fe_startup(struct snd_pcm_substream *substream)
 	 * copies its ELD.
 	 */
 	ret = kctl->get(kctl, value);
-	if (!ret)
-		memcpy(eld, value->value.bytes.data, MESON_CARD_ELD_BYTES);
+	if (!ret) {
+		memcpy(fe->eld, value->value.bytes.data, MESON_CARD_ELD_BYTES);
+		axg_card_fe_set_chmaps(fe, stream->channels_max);
+	}
 	kfree(value);
 	/* No sink audio data (unplugged, DVI): leave the rest unconstrained. */
-	if (ret || !drm_eld_sad_count(eld))
+	if (ret || !drm_eld_sad_count(fe->eld))
 		return 0;
-	return snd_pcm_hw_constraint_eld(substream->runtime, eld);
+	/* The rules read the ELD again at each refinement of this stream. */
+	return snd_pcm_hw_constraint_eld(substream->runtime, fe->eld);
 }
 
 static const struct snd_soc_ops axg_card_fe_ops = {
@@ -527,6 +649,26 @@ static int axg_card_add_fwd_ctl(struct snd_soc_card *card,
 }
 
 /*
+ * hdmi-codec's channel map is on the internal PCM as well, and there is
+ * one per component: the SPDIF DAI's, made last, replaces the I2S DAI's.
+ * Give the FE its own, which each open sets for the sink.
+ */
+static int axg_card_add_fe_chmap(struct snd_soc_card *card,
+				 struct snd_soc_pcm_runtime *rtd,
+				 struct snd_soc_dai *hdmi)
+{
+	struct meson_card *priv = snd_soc_card_get_drvdata(card);
+	struct axg_card_fe *fe = priv->link_data[rtd->num];
+	const struct snd_soc_pcm_stream *stream;
+
+	stream = snd_soc_dai_get_pcm_stream(hdmi, SNDRV_PCM_STREAM_PLAYBACK);
+	axg_card_fe_set_chmaps(fe, stream->channels_max);
+	return snd_pcm_add_chmap_ctls(rtd->pcm, SNDRV_PCM_STREAM_PLAYBACK,
+				      fe->chmaps, stream->channels_max, 0,
+				      NULL);
+}
+
+/*
  * hdmi-codec adds its ELD and IEC958 controls for the internal PCM of the
  * codec-to-codec link, and SPDIF out adds its IEC958 controls under its
  * own name, so nobody finds them by the device they open. Give each
@@ -551,6 +693,9 @@ static int axg_card_add_fe_ctls(struct snd_soc_card *card,
 	if (hdmi) {
 		ret = axg_card_add_fwd_ctl(card, rtd, "ELD",
 					   axg_card_eld_ctl(card, hdmi), NULL);
+		if (ret)
+			return ret;
+		ret = axg_card_add_fe_chmap(card, rtd, hdmi);
 		if (ret)
 			return ret;
 		dflt = axg_card_codec_ctl(card, hdmi, AXG_CARD_IEC958_DEFAULT);
@@ -641,6 +786,7 @@ static int axg_card_add_link(struct snd_soc_card *card, struct device_node *np,
 	struct meson_card *priv = snd_soc_card_get_drvdata(card);
 	struct snd_soc_dai_link *dai_link = &card->dai_link[*index];
 	struct snd_soc_dai_link_component *cpu;
+	struct axg_card_fe *fe;
 	int ret;
 
 	cpu = devm_kzalloc(card->dev, sizeof(*cpu), GFP_KERNEL);
@@ -656,12 +802,10 @@ static int axg_card_add_link(struct snd_soc_card *card, struct device_node *np,
 		return ret;
 
 	if (axg_card_cpu_is_playback_fe(dai_link->cpus->of_node)) {
-		/* The HDMI sink's ELD, constraining this FE's stream */
-		priv->link_data[*index] = devm_kzalloc(card->dev,
-						       MESON_CARD_ELD_BYTES,
-						       GFP_KERNEL);
-		if (!priv->link_data[*index])
+		fe = devm_kzalloc(card->dev, sizeof(*fe), GFP_KERNEL);
+		if (!fe)
 			return -ENOMEM;
+		priv->link_data[*index] = fe;
 		dai_link->ops = &axg_card_fe_ops;
 		return meson_card_set_fe_link(card, dai_link, np, true);
 	}
