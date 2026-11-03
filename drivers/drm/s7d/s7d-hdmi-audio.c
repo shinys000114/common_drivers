@@ -55,7 +55,7 @@ bool s7d_hdmi_audio_supported(const u8 *eld, const struct hdmi_codec_params *par
 	u8 rate, width;
 	int i;
 
-	if (params->channels < 2 || params->channels > 8 || !r)
+	if (params->channels < 2 || params->channels > (compressed ? 2 : 8) || !r)
 		return false;
 	rate = r->sad_freq;
 	if (params->sample_width == 16)
@@ -211,6 +211,7 @@ int s7d_hdmi_audio_configure(struct regmap *core, struct regmap *top,
 		{ 0x0a26, 0x0b },
 		{ 0x0a1b, 0 },
 	};
+	bool pcm = !(params->iec.status[0] & IEC958_AES0_NONAUDIO);
 	struct hdmi_audio_infoframe frame = params->cea;
 	u8 info[HDMI_INFOFRAME_HEADER_SIZE + HDMI_AUDIO_INFOFRAME_SIZE];
 	/* One I2S data lane carries each channel pair. */
@@ -218,9 +219,12 @@ int s7d_hdmi_audio_configure(struct regmap *core, struct regmap *top,
 	unsigned int n, i;
 	int ret;
 
-	if (params->channels < 2 || params->channels > (spdif ? 2 : 8) ||
-	    params->cea.channels != params->channels ||
-	    (!spdif && (params->iec.status[0] & IEC958_AES0_NONAUDIO)) ||
+	/*
+	 * IEC 61937 is a two-channel stream on lane 0 whose InfoFrame refers
+	 * to the stream header, so it gives no channel count.
+	 */
+	if (params->channels < 2 || params->channels > (spdif || !pcm ? 2 : 8) ||
+	    (pcm && params->cea.channels != params->channels) ||
 	    (params->sample_width != 16 && params->sample_width != 24 &&
 	     params->sample_width != 32))
 		return -EINVAL;
