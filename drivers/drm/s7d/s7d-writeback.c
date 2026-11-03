@@ -91,8 +91,9 @@ static int wb_plane_check(struct drm_framebuffer *fb, unsigned int plane,
 	struct drm_gem_object *obj;
 	u64 row, object_end, start, end;
 
+	/* An imported dma-buf is contiguous here too; CPU readers sync it. */
 	obj = drm_gem_fb_get_obj(fb, plane);
-	if (!obj || obj->dev != fb->dev || obj->import_attach)
+	if (!obj || obj->dev != fb->dev)
 		return -EINVAL;
 	gem = to_drm_gem_dma_obj(obj);
 	if (gem->map_noncoherent)
