@@ -348,7 +348,6 @@ static int vdin_check(void *data, const struct s7d_crtc_state *state,
 		return -EINVAL;
 	if (!state->valid || !state->base.active || !state->base.enable ||
 	    state->base.async_flip || state->base.vrr_enabled ||
-	    state->base.self_refresh_active ||
 	    vdin_mode_valid(data, mode) != MODE_OK ||
 	    buffer->width > mode->hdisplay || buffer->height > mode->vdisplay ||
 	    (buffer->height != mode->vdisplay && buffer->width > VD_VSC_MAX_WIDTH) ||

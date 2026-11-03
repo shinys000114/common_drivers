@@ -162,8 +162,7 @@ static int wb_output_check(struct s7d_writeback *wb,
 	const struct drm_crtc_state *base = &state->base;
 
 	if (base->crtc != wb->crtc || !base->active || !base->enable ||
-	    !state->valid || base->vrr_enabled || base->self_refresh_active ||
-	    base->async_flip ||
+	    !state->valid || base->vrr_enabled || base->async_flip ||
 	    buffer->width > base->adjusted_mode.hdisplay ||
 	    buffer->height > base->adjusted_mode.vdisplay)
 		return -EINVAL;
