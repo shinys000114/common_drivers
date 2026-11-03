@@ -1040,6 +1040,10 @@ static int vidioc_s_selection(struct file *file, void *priv,
 		return -EINVAL;
 	}
 
+	/* A running job reads the rectangles without the queue lock. */
+	if (vb2_is_streaming(v4l2_m2m_get_vq(ctx->fh.m2m_ctx, s->type)))
+		return -EBUSY;
+
 	if (s->r.top < 0 || s->r.left < 0) {
 		v4l2_err(&ge2d->v4l2_dev,
 			 "doesn't support negative values for top & left.\n");
