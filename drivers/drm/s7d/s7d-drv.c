@@ -25,7 +25,6 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_of.h>
 #include <drm/drm_probe_helper.h>
-#include <drm/drm_self_refresh_helper.h>
 #include <drm/drm_vblank.h>
 
 #include "s7d-fb.h"
@@ -148,7 +147,7 @@ static bool s7d_writeback_output_reusable(const struct s7d_crtc_state *before,
 
 	return old->active && base->active && before->valid && before->writeback_only &&
 		next->writeback_only && !drm_atomic_crtc_needs_modeset(base) &&
-		!base->color_mgmt_changed && !base->self_refresh_active && !base->vrr_enabled &&
+		!base->color_mgmt_changed && !base->vrr_enabled &&
 		old->ctm == base->ctm && old->gamma_lut == base->gamma_lut &&
 		old->degamma_lut == base->degamma_lut &&
 		old->mode.clock == base->mode.clock && old->mode.flags == base->mode.flags &&
@@ -251,7 +250,6 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 		if (ret)
 			return ret;
 	}
-	drm_self_refresh_helper_alter_state(state);
 	return s7d_writeback_atomic_check(display->vpu.writeback, state);
 }
 

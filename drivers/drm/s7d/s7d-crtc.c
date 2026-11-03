@@ -560,8 +560,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	}
 	if (!base->active)
 		return 0;
-	if (!base->enable || base->vrr_enabled || base->self_refresh_active ||
-	    base->async_flip)
+	if (!base->enable || base->vrr_enabled || base->async_flip)
 		return -EINVAL;
 	ret = drm_atomic_helper_check_crtc_primary_plane(base);
 	if (ret)
