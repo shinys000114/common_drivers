@@ -161,12 +161,14 @@ static int hevc_rbsp(const u8 *nal, size_t bytes, u8 **out, size_t *written)
 
 static int hevc_vps_parse(struct hevc_bits *b, struct hevc_vps *vps)
 {
-	u32 profile, compatibility, i, constraint;
+	u32 profile, compatibility, i, constraint, layers, sets;
 	bool interlaced;
 
 	vps->id = hevc_get(b, 4);
-	if (!hevc_get(b, 1) || !hevc_get(b, 1) || hevc_get(b, 6))
+	if (!hevc_get(b, 1) || !hevc_get(b, 1))
 		return b->error ?: -EOPNOTSUPP;
+	/* Only the base layer is decoded; NAL units of the others are dropped. */
+	hevc_get(b, 6);
 	vps->max_sub_layers = hevc_get(b, 3) + 1;
 	if (vps->max_sub_layers != 1 || !hevc_get(b, 1))
 		return b->error ?: -EOPNOTSUPP;
@@ -192,8 +194,10 @@ static int hevc_vps_parse(struct hevc_bits *b, struct hevc_vps *vps)
 	vps->max_dec_pic_buffering = hevc_ue(b, 15) + 1;
 	vps->num_reorder_pics = hevc_ue(b, vps->max_dec_pic_buffering - 1);
 	hevc_ue(b, U32_MAX - 1);
-	if (hevc_get(b, 6) || hevc_ue(b, 1023))
-		return b->error ?: -EOPNOTSUPP;
+	layers = hevc_get(b, 6) + 1;
+	sets = hevc_ue(b, 1023);
+	for (i = 0; i < sets * layers; i++)
+		hevc_get(b, 1);
 	if (hevc_get(b, 1)) {
 		u32 tick = hevc_get(b, 32), scale = hevc_get(b, 32);
 
@@ -205,8 +209,9 @@ static int hevc_vps_parse(struct hevc_bits *b, struct hevc_vps *vps)
 		if (i)
 			return b->error ?: -EOPNOTSUPP;
 	}
+	/* The VPS extension only describes the other layers. */
 	if (hevc_get(b, 1))
-		return b->error ?: -EOPNOTSUPP;
+		return b->error;
 	return hevc_parameter_trailing(b);
 }
 
@@ -727,6 +732,19 @@ static int hevc_select_parameters(const struct s7d_hevc_input_bank *bank,
 	return hevc_slice_parse(bits, nal, bytes, input);
 }
 
+/*
+ * Reserved and unspecified NAL unit types, such as a Dolby Vision RPU (62),
+ * and NAL units of layers above the base layer, such as MV-HEVC views. A
+ * decoder of the Annex A profiles ignores them (7.4.2.2).
+ */
+static bool hevc_ignored(const u8 *nal)
+{
+	u32 type = (nal[0] >> 1) & 63;
+
+	return (nal[0] & 1) || (nal[1] >> 3) || (type >= 10 && type <= 15) ||
+	       (type >= 22 && type <= 31) || type >= 41;
+}
+
 static size_t hevc_start_code(const u8 *data, size_t bytes, size_t pos)
 {
 	if (bytes - pos < 3 || data[pos] || data[pos + 1])
@@ -793,7 +811,7 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 			   const u8 *annexb, size_t bytes, struct s7d_hevc_input **out)
 {
 	struct s7d_hevc_input *input;
-	size_t pos = 0;
+	size_t pos = 0, kept;
 	u32 nals = 0;
 	bool picture = false, dropped = false;
 	int ret = 0;
@@ -816,11 +834,13 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 	input->bank_bytes = bank->bytes;
 	while (pos < bytes && !hevc_start_code(input->data, bytes, pos) && !input->data[pos])
 		pos++;
+	kept = pos;
 	while (pos < bytes) {
 		struct hevc_bits bits = { };
 		u8 *rbsp = NULL;
 		const u8 *nal;
-		size_t code = hevc_start_code(input->data, bytes, pos), start = pos + code, end;
+		size_t code = hevc_start_code(input->data, bytes, pos), begin = pos,
+		       start = pos + code, end;
 		u32 type;
 
 		if (!code || ++nals > HEVC_NAL_COUNT) {
@@ -838,11 +858,19 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 			ret = -EBADMSG;
 			goto failed;
 		}
-		if ((nal[0] & 1) || nal[1] != 1) {
+		/* Removed from the access unit: the firmware would parse them too. */
+		if (hevc_ignored(nal))
+			continue;
+		if ((nal[1] & 7) != 1) {
 			ret = -EOPNOTSUPP;
 			goto failed;
 		}
 		type = (nal[0] >> 1) & 63;
+		if (kept != begin) {
+			memmove(input->data + kept, input->data + begin, pos - begin);
+			nal = input->data + kept + code;
+		}
+		kept += pos - begin;
 		ret = hevc_rbsp(nal, end - start, &rbsp, &bits.bytes);
 		/* A damaged SEI is skipped, as below, even when it cannot be unescaped. */
 		if (ret == -EBADMSG && (type == 39 || type == 40)) {
@@ -911,7 +939,7 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 		goto failed;
 	}
 	input->view.data = input->data;
-	input->view.bytes = bytes;
+	input->view.bytes = kept;
 	input->view.kind = picture ? S7D_HEVC_INPUT_PICTURE : S7D_HEVC_INPUT_HEADERS;
 	input->view.slice.parameter_epoch = input->selected_epoch;
 	*out = input;
