@@ -405,6 +405,7 @@ int meson_card_probe(struct platform_device *pdev)
 	priv->card.owner = THIS_MODULE;
 	priv->card.dev = dev;
 	priv->card.driver_name = dev->driver->name;
+	priv->card.late_probe = data->late_probe;
 	priv->card.fixup_controls = meson_card_apply_defaults;
 	priv->match_data = data;
 

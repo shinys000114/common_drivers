@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <drm/drm_eld.h>
 #include <sound/control.h>
+#include <sound/jack.h>
 #include <sound/soc.h>
 #include <sound/soc-dai.h>
 #include <sound/soc-dapm.h>
@@ -392,6 +393,46 @@ static const struct snd_soc_ops axg_card_fe_ops = {
 	.startup = axg_card_fe_startup,
 };
 
+static void axg_card_hdmi_jack_free(struct snd_jack *jack)
+{
+	snd_soc_component_set_jack(jack->private_data, NULL, NULL);
+}
+
+/* Report whether the HDMI sink takes audio, as hdmi-codec learns it. */
+static int axg_card_add_hdmi_jack(struct snd_soc_card *card,
+				  struct snd_soc_component *component)
+{
+	struct meson_card *priv = snd_soc_card_get_drvdata(card);
+	struct snd_soc_jack *jack = &priv->hdmi_jack;
+	int ret;
+
+	ret = snd_soc_card_jack_new(card, "HDMI Jack", SND_JACK_LINEOUT, jack);
+	/* Without CONFIG_SND_JACK there is no jack to report to. */
+	if (ret || !jack->jack)
+		return ret;
+	jack->jack->private_data = component;
+	jack->jack->private_free = axg_card_hdmi_jack_free;
+
+	ret = snd_soc_component_set_jack(component, jack, NULL);
+	return ret == -ENOTSUPP ? 0 : ret;
+}
+
+static int axg_card_late_probe(struct snd_soc_card *card)
+{
+	struct snd_soc_pcm_runtime *rtd;
+	struct snd_soc_dai *dai;
+	int i;
+
+	/* One HDMI transmitter: its I2S and SPDIF DAIs share a component. */
+	for_each_card_rtds(card, rtd) {
+		for_each_rtd_codec_dais(rtd, i, dai) {
+			if (axg_card_eld_ctl(card, dai))
+				return axg_card_add_hdmi_jack(card, dai->component);
+		}
+	}
+	return 0;
+}
+
 static int axg_card_cpu_is_tdm_iface(struct device_node *np)
 {
 	return of_device_is_compatible(np, DT_PREFIX "axg-tdm-iface");
@@ -457,6 +498,7 @@ static int axg_card_add_link(struct snd_soc_card *card, struct device_node *np,
 
 static const struct meson_card_match_data axg_card_match_data = {
 	.add_link = axg_card_add_link,
+	.late_probe = axg_card_late_probe,
 };
 
 static const struct of_device_id axg_card_of_match[] = {

@@ -25,12 +25,14 @@ struct meson_card_match_data {
 	int (*add_link)(struct snd_soc_card *card,
 			struct device_node *node,
 			int *index);
+	int (*late_probe)(struct snd_soc_card *card);
 };
 
 struct meson_card {
 	const struct meson_card_match_data *match_data;
 	struct snd_soc_card card;
 	void **link_data;
+	struct snd_soc_jack hdmi_jack;
 };
 
 unsigned int meson_card_parse_daifmt(struct device_node *node,
