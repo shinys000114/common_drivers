@@ -39,12 +39,12 @@ MODULE_PARM_DESC(afbc_policy,
  * Switching the primary between a compressed and a linear or YUV framebuffer
  * restarts the AFBC decoder, which takes a modeset, so a compositor cannot
  * move between composition and direct scanout of a client or video buffer.
- * Clearing this keeps the primary linear (and YUV on VD1); the OSD2 overlay
- * still takes AFBC.
+ * So the primary stays linear (and YUV on VD1) unless this is set; the OSD2
+ * overlay still takes AFBC.
  */
-static bool primary_afbc = true;
+static bool primary_afbc;
 module_param(primary_afbc, bool, 0444);
-MODULE_PARM_DESC(primary_afbc, "Offer AFBC/AFRC modifiers on the primary plane (default: true)");
+MODULE_PARM_DESC(primary_afbc, "Offer AFBC/AFRC modifiers on the primary plane (default: false)");
 
 /*
  * GFCD decodes only what Mali AFBCD cannot read, XBGR8888 AFBC and AFRC,
