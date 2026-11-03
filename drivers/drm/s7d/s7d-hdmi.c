@@ -133,7 +133,9 @@ struct s7d_hdmi {
 	hdmi_codec_plugged_cb audio_plugged;
 	struct device *codec_dev;
 	struct work_struct audio_notify;
+	struct drm_connector *connector;
 	struct cec_notifier *cec_notifier;
+	struct hdmi_spd_infoframe spd_frame;
 	u8 spd[HDMI_INFOFRAME_HEADER_SIZE + HDMI_SPD_INFOFRAME_SIZE];
 	unsigned int sink_generation;
 	unsigned int edid_generation;
@@ -179,6 +181,7 @@ int s7d_hdmi_bridge_set_connector(struct drm_bridge *bridge, struct drm_connecto
 		cec_notifier_conn_unregister(h->cec_notifier);
 		h->cec_notifier = NULL;
 	}
+	h->connector = connector;
 out:
 	mutex_unlock(&h->lock);
 	return ret;
@@ -261,6 +264,23 @@ static int s7d_hdmi_audio_hook(struct device *dev, void *data,
 	return 0;
 }
 
+/* Keep the stream's audio InfoFrame where DRM debugfs reads it, as upstream does. */
+static void s7d_hdmi_audio_infoframe(struct s7d_hdmi *h,
+				     const struct hdmi_audio_infoframe *frame)
+{
+	struct drm_connector_hdmi_infoframe *infoframe;
+
+	lockdep_assert_held(&h->lock);
+	if (!h->connector)
+		return;
+	infoframe = &h->connector->hdmi.infoframes.audio;
+	mutex_lock(&h->connector->hdmi.infoframes.lock);
+	if (frame)
+		infoframe->data.audio = *frame;
+	infoframe->set = !!frame;
+	mutex_unlock(&h->connector->hdmi.infoframes.lock);
+}
+
 static int s7d_hdmi_audio_apply(struct s7d_hdmi *h)
 {
 	int ret;
@@ -321,6 +341,8 @@ static int s7d_hdmi_audio_hw_params(struct device *dev, void *data,
 	if (ret) {
 		clk_disable_unprepare(h->audio_clk);
 		h->audio_clock_on = false;
+	} else {
+		s7d_hdmi_audio_infoframe(h, &h->audio_params.cea);
 	}
 out:
 	mutex_unlock(&h->lock);
@@ -359,6 +381,7 @@ static void s7d_hdmi_audio_shutdown(struct device *dev, void *data)
 	mutex_lock(&h->lock);
 	h->audio_valid = false;
 	h->audio_muted = true;
+	s7d_hdmi_audio_infoframe(h, NULL);
 	ret = s7d_hdmi_audio_disable(h->core);
 	if (ret)
 		dev_err(h->dev, "HDMI audio shutdown failed: %d\n", ret);
@@ -1225,6 +1248,12 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 	int ret;
 
 	state->valid = false;
+	/* DRM debugfs and the state dump read the link and InfoFrames from here. */
+	memset(&conn_state->hdmi.infoframes, 0, sizeof(conn_state->hdmi.infoframes));
+	conn_state->hdmi.is_limited_range = false;
+	conn_state->hdmi.output_bpc = 0;
+	conn_state->hdmi.output_format = HDMI_COLORSPACE_RGB;
+	conn_state->hdmi.tmds_char_rate = 0;
 	if (!crtc_state->active)
 		return 0;
 	if (s7d_hdmi_mode_valid(bridge, &connector->display_info,
@@ -1247,6 +1276,10 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 	state->high_tmds = state->output.high_tmds;
 	state->vendor_len = 0;
 	state->hdr_len = 0;
+	conn_state->hdmi.is_limited_range = state->output.rgb_limited;
+	conn_state->hdmi.output_bpc = state->output.bpc;
+	conn_state->hdmi.tmds_char_rate = div_u64(state->output.rate.tmds_numerator,
+						  state->output.rate.tmds_denominator);
 	if (state->hdmi) {
 		ret = drm_hdmi_avi_infoframe_from_display_mode(&avi, connector, &state->mode);
 		if (ret)
@@ -1276,6 +1309,11 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 		ret = hdmi_avi_infoframe_pack(&avi, state->avi, sizeof(state->avi));
 		if (ret < 0)
 			return ret;
+		conn_state->hdmi.output_format = avi.colorspace;
+		conn_state->hdmi.infoframes.avi.data.avi = avi;
+		conn_state->hdmi.infoframes.avi.set = true;
+		conn_state->hdmi.infoframes.spd.data.spd = to_s7d_hdmi(bridge)->spd_frame;
+		conn_state->hdmi.infoframes.spd.set = true;
 		/*
 		 * Like the upstream HDMI state helper, send the metadata as given and
 		 * leave DVI sinks without InfoFrames instead of failing the commit.
@@ -1288,6 +1326,8 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 			if (ret < 0)
 				return ret;
 			state->hdr_len = ret;
+			conn_state->hdmi.infoframes.hdr_drm.data.drm = hdr;
+			conn_state->hdmi.infoframes.hdr_drm.set = true;
 		}
 	}
 	if (state->hdmi && connector->display_info.has_hdmi_infoframe) {
@@ -1298,6 +1338,8 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 		if (ret < 0)
 			return ret;
 		state->vendor_len = ret;
+		conn_state->hdmi.infoframes.hdmi.data.vendor.hdmi = vendor;
+		conn_state->hdmi.infoframes.hdmi.set = true;
 	}
 	state->valid = true;
 	/* Copy the checked plan before prepare; VPU applies it before PHY/start. */
@@ -1712,7 +1754,10 @@ static int s7d_hdmi_init_spd(struct s7d_hdmi *h)
 		return ret;
 	spd.sdi = sdi;
 	ret = hdmi_spd_infoframe_pack(&spd, h->spd, sizeof(h->spd));
-	return ret < 0 ? ret : 0;
+	if (ret < 0)
+		return ret;
+	h->spd_frame = spd;
+	return 0;
 }
 
 /* Deep suspend can power-cycle the domain, leaving the TX in soft reset. */
