@@ -133,6 +133,8 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *vpu,
 		 const struct s7d_vpu_link *link);
 /* Retain the firmware clock/PM references until the first CRTC acquire. */
 int s7d_vpu_hold_boot(struct s7d_vpu *vpu);
+/* Drop that hold before the first commit if the firmware output is off. */
+int s7d_vpu_release_boot(struct s7d_vpu *vpu);
 /* Only before first modeset, or after successful s7d_crtc_shutdown(). */
 int s7d_vpu_fini(struct s7d_vpu *vpu);
 

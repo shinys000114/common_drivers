@@ -556,14 +556,21 @@ static int s7d_drm_suspend(struct device *dev)
 	struct s7d_drm *display = dev_get_drvdata(dev);
 	int ret, restore;
 
-	/* The firmware output is still held; there is no state to save yet. */
-	if (display->vpu.boot_held)
-		return -EBUSY;
 	ret = drm_mode_config_helper_suspend(&display->drm);
 	if (ret)
 		return ret;
 	/* Atomic disable cannot return its hardware-stop error to the helper. */
 	ret = s7d_crtc_last_error(display->vpu.crtc);
+	/*
+	 * Without a commit since boot, sleep may give up the firmware's
+	 * display only when that output is off; a running one stays held.
+	 * The CRTC lock keeps a hotplug-driven fbdev enable from racing it.
+	 */
+	if (!ret) {
+		drm_modeset_lock(&display->vpu.crtc->mutex, NULL);
+		ret = s7d_vpu_release_boot(&display->vpu);
+		drm_modeset_unlock(&display->vpu.crtc->mutex);
+	}
 	if (!ret)
 		return 0;
 	restore = drm_mode_config_helper_resume(&display->drm);
