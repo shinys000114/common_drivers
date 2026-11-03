@@ -279,6 +279,24 @@ static bool s7d_video_scaler_reduction_fits(const struct s7d_video_scaler_state 
 	return htotal && need <= have;
 }
 
+u32 s7d_video_skip_factor(u32 src_width, u32 src_height, u32 dst_height,
+			  u32 htotal, unsigned long pixel_rate)
+{
+	struct s7d_video_scaler_state state = {
+		.src_width = src_width, .dst_height = dst_height,
+	};
+	u32 factor;
+
+	for (factor = 1; factor < 8; factor *= 2) {
+		state.src_height = src_height / factor;
+		if (state.src_height <= dst_height ||
+		    s7d_video_scaler_reduction_fits(&state, htotal, pixel_rate,
+						    S7D_VPU_CORE_RATE))
+			break;
+	}
+	return factor;
+}
+
 int s7d_video_scaler_check_mode(const struct s7d_video_scaler_state *state,
 			      u32 width, u32 height, u32 htotal, unsigned long pixel_rate,
 			      unsigned long core_rate)

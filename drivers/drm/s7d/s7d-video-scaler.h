@@ -44,6 +44,15 @@ struct s7d_video_scaler_state {
 int s7d_video_scaler_build(u32 src_width, u32 src_height,
 			 u32 dst_width, u32 dst_height,
 			 bool input444, struct s7d_video_scaler_state *out);
+/* The VPU core clock the display driver runs and protects (fclk_div3). */
+#define S7D_VPU_CORE_RATE 666666666UL
+
+/*
+ * The smallest source line skip (1, 2, 4 or 8) whose reduction keeps up at
+ * the mode, by the rule of s7d_video_scaler_check_mode(); 8 when none does.
+ */
+u32 s7d_video_skip_factor(u32 src_width, u32 src_height, u32 dst_height,
+			  u32 htotal, unsigned long pixel_rate);
 int s7d_video_scaler_check_mode(const struct s7d_video_scaler_state *state,
 			      u32 width, u32 height, u32 htotal, unsigned long pixel_rate,
 			      unsigned long core_rate);
