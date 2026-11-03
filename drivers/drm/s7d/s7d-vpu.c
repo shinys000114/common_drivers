@@ -797,8 +797,12 @@ static int s7d_vpu_acquire(void *data)
 		v->pixel_enabled = true;
 	}
 	s7d_vpu_afbc_admission(v);
-	if (IS_ENABLED(CONFIG_DRM_S7D_GFCD))
+	if (IS_ENABLED(CONFIG_DRM_S7D_GFCD)) {
 		v->gfcd_available = !s7d_gfcd_admit(v->regmap);
+		/* A GFCD power-cycled by deep sleep passes admission again. */
+		if (v->gfcd_available)
+			WRITE_ONCE(v->gfcd_fault, false);
+	}
 	return 0;
 disable_bus:
 	v->acquired = false;
@@ -1042,12 +1046,13 @@ static int s7d_vpu_stop_hw(void *data)
 	if (v->gfcd_enabled) {
 		/*
 		 * GFCD is closed and the AXI side is idle, so its buffers can go;
-		 * there is no known way to clear the error, so refuse GFCD later.
+		 * there is no known way to clear the error, so refuse GFCD until
+		 * an acquire finds it cleared.
 		 */
 		if (!v->gfcd_fault && (vpu_read(v, S7D_GFCD_ERROR) & GENMASK(31, 28)))
 			WRITE_ONCE(v->gfcd_fault, true);
 		if (v->gfcd_fault)
-			dev_err_once(v->dev, "GFCD decode fault; GFCD disabled until reboot\n");
+			dev_err(v->dev, "GFCD decode fault; GFCD disabled until its error clears\n");
 		ret = vpu_update(v, OSD_PATH, S7D_GFCD_ROUTE, 0);
 		if (!ret)
 			ret = vpu_update(v, 0x1d7f, 0x1f, v->gfcd_hdr_saved);
