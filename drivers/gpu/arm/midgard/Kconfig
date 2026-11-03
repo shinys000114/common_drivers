@@ -23,6 +23,7 @@ source "$(COMMON_DRIVERS_DIR)/drivers/gpu/arm/midgard/platform/c5/Kconfig"
 menuconfig MALI_MIDGARD
 	tristate "Mali Midgard series support" if !AMLOGIC_C5_GPU_KBASE
 	depends on AMLOGIC_UVM || !AMLOGIC_UVM
+	depends on !AMLOGIC_C5_GPU_PANTHOR
 	select DMA_SHARED_BUFFER
 	select PM_DEVFREQ
 	select DEVFREQ_THERMAL

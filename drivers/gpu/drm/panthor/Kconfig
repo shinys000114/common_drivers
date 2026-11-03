@@ -4,6 +4,7 @@ config DRM_S7D_PANTHOR
 	tristate "Panthor for the S7D Mali-G310 (Linux 6.18 backport)"
 	depends on DRM
 	depends on ARM || ARM64 || COMPILE_TEST
+	depends on AMLOGIC_C5_GPU_PANTHOR || COMPILE_TEST
 	depends on !DRM_PANTHOR && MALI_MIDGARD = n
 	depends on !GENERIC_ATOMIC64  # for IOMMU_IO_PGTABLE_LPAE
 	depends on MMU
