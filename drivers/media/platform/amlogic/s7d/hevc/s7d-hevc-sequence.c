@@ -264,7 +264,7 @@ static void hevc_hrd(struct hevc_bits *b, u32 layers)
 
 static void hevc_vui(struct hevc_bits *b, struct s7d_hevc_sps *sps)
 {
-	u32 i, window = 0;
+	u32 i;
 
 	if (hevc_get(b, 1) && hevc_get(b, 8) == 255)
 		hevc_skip(b, 32);
@@ -289,9 +289,10 @@ static void hevc_vui(struct hevc_bits *b, struct s7d_hevc_sps *sps)
 	hevc_skip(b, 1);
 	sps->field_seq = hevc_get(b, 1);
 	hevc_skip(b, 1);
+	/* The default display window is only a hint; the conformance window crops. */
 	if (hevc_get(b, 1))
 		for (i = 0; i < 4; i++)
-			window |= hevc_ue(b, U32_MAX);
+			hevc_ue(b, U32_MAX);
 	if (hevc_get(b, 1)) {
 		hevc_skip(b, 64);
 		if (hevc_get(b, 1))
@@ -307,8 +308,6 @@ static void hevc_vui(struct hevc_bits *b, struct s7d_hevc_sps *sps)
 		hevc_ue(b, 15);
 		hevc_ue(b, 15);
 	}
-	if (!b->error && window)
-		b->error = -EOPNOTSUPP;
 }
 
 static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps,
