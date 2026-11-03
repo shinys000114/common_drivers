@@ -373,33 +373,55 @@ struct ge2d_csc {
 	u32 offset;
 };
 
-/* BT.601 and BT.709, limited and full range, indexed by ge2d_csc_index() */
+/*
+ * BT.601, BT.709 and BT.2020 (non-constant luminance), limited then full
+ * range, indexed by ge2d_csc_index()
+ */
 static const struct ge2d_csc ge2d_yuv2rgb[] = {
 	{ 0x1f060180, 0x04a80000, 0x066204a8, 0x1e6f1cbf, 0x04a80811, 0x00000081, 0 },
 	{ 0x1f060180, 0x04a80000, 0x072c04a8, 0x1f261dde, 0x04a80873, 0x00000081, 0 },
+	{ 0x1f060180, 0x04a80000, 0x06b704a8, 0x1f401d66, 0x04a80891, 0x00000081, 0 },
 	{ 0x00060180, 0x04000000, 0x059c0400, 0x1ea01d25, 0x04000717, 0x00000001, 0 },
 	{ 0x00060180, 0x04000000, 0x064d0400, 0x1f401e21, 0x0400076c, 0x00000001, 0 },
+	{ 0x00060180, 0x04000000, 0x05e60400, 0x1f571db7, 0x04000787, 0x00000001, 0 },
 };
 
 static const struct ge2d_csc ge2d_rgb2yuv[] = {
 	{ 0, 0x01070204, 0x00641f68, 0x1ed601c2, 0x01c21e87, 0x1fb70001, 0x01020080 },
 	{ 0, 0x00bb0275, 0x003f1f99, 0x1ea601c2, 0x01c21e67, 0x1fd70001, 0x01020080 },
+	{ 0, 0x00e70254, 0x00341f82, 0x1ebc01c2, 0x01c21e62, 0x1fdc0001, 0x01020080 },
 	{ 0, 0x01320259, 0x00751f53, 0x1ead0200, 0x02001e53, 0x1fad0001, 0x00020080 },
 	{ 0, 0x00da02dc, 0x004a1f8b, 0x1e750200, 0x02001e2f, 0x1fd10001, 0x00020080 },
+	{ 0, 0x010d02b6, 0x003d1f71, 0x1e8f0200, 0x02001e29, 0x1fd70001, 0x00020080 },
 };
 
 static unsigned int ge2d_csc_index(const struct v4l2_pix_format *pix)
 {
 	enum v4l2_ycbcr_encoding enc = pix->ycbcr_enc;
 	enum v4l2_quantization quant = pix->quantization;
+	unsigned int index;
 
 	if (enc == V4L2_YCBCR_ENC_DEFAULT)
 		enc = V4L2_MAP_YCBCR_ENC_DEFAULT(pix->colorspace);
 	if (quant == V4L2_QUANTIZATION_DEFAULT)
 		quant = V4L2_MAP_QUANTIZATION_DEFAULT(false, pix->colorspace, enc);
 
-	return (enc == V4L2_YCBCR_ENC_709 ? 1 : 0) +
-	       (quant == V4L2_QUANTIZATION_FULL_RANGE ? 2 : 0);
+	switch (enc) {
+	case V4L2_YCBCR_ENC_709:
+	case V4L2_YCBCR_ENC_XV709:
+		index = 1;
+		break;
+	/* Constant luminance has no matrix; the non-constant one is closest. */
+	case V4L2_YCBCR_ENC_BT2020_CONST_LUM:
+	case V4L2_YCBCR_ENC_BT2020:
+		index = 2;
+		break;
+	default:
+		index = 0;
+		break;
+	}
+
+	return index + (quant == V4L2_QUANTIZATION_FULL_RANGE ? 3 : 0);
 }
 
 static void ge2d_set_csc(struct meson_ge2d *ge2d, struct ge2d_ctx *ctx)
