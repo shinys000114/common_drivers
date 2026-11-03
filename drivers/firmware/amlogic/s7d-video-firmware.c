@@ -529,8 +529,7 @@ static int video_fw_pm_prepare(struct device *dev)
 	int ret = 0;
 
 	mutex_lock(&provider->lock);
-	if (provider->active || (provider->state == S7D_VIDEO_FW_READY &&
-				 pm_suspend_target_state != PM_SUSPEND_TO_IDLE))
+	if (provider->active)
 		ret = -EBUSY;
 	else
 		provider->blocked = true;
@@ -540,11 +539,26 @@ static int video_fw_pm_prepare(struct device *dev)
 	return ret;
 }
 
+/*
+ * Deep sleep and hibernation may take the archive out of the secure world.
+ * Let the next lease upload it again: the TA answers BAD_STATE if it kept it.
+ */
+static void video_fw_rearm(struct s7d_video_fw_provider *provider)
+{
+	if (provider->state != S7D_VIDEO_FW_READY)
+		return;
+	release_firmware(provider->archive);
+	provider->archive = NULL;
+	provider->state = S7D_VIDEO_FW_EMPTY;
+}
+
 static void video_fw_pm_complete(struct device *dev)
 {
 	struct s7d_video_fw_provider *provider = dev_get_drvdata(dev);
 
 	mutex_lock(&provider->lock);
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+		video_fw_rearm(provider);
 	provider->blocked = false;
 	mutex_unlock(&provider->lock);
 }
@@ -554,8 +568,7 @@ static int video_fw_pm_restore(struct device *dev)
 	struct s7d_video_fw_provider *provider = dev_get_drvdata(dev);
 
 	mutex_lock(&provider->lock);
-	provider->state = S7D_VIDEO_FW_UNKNOWN;
-	provider->error = -ESTALE;
+	video_fw_rearm(provider);
 	mutex_unlock(&provider->lock);
 	return 0;
 }
