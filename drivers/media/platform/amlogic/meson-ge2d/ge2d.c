@@ -892,6 +892,12 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->ge2d->mutex;
 	dst_vq->dev = ctx->ge2d->v4l2_dev.dev;
+	/*
+	 * A 4K RGB frame is about 33 MB: when CMA cannot give it, the page
+	 * allocator fallback warns about the order. REQBUFS fails either way.
+	 */
+	src_vq->gfp_flags = __GFP_NOWARN;
+	dst_vq->gfp_flags = __GFP_NOWARN;
 
 	return vb2_queue_init(dst_vq);
 }
