@@ -60,6 +60,9 @@ struct axg_spdifout {
 	struct regmap_field *field_chmask;
 	struct clk *mclk;
 	struct clk *pclk;
+	/* Channel status bytes 0-4; hw_params fills in the rate and length */
+	struct mutex iec_lock;
+	u8 iec_status[5];
 };
 
 struct axg_spdifout_match_data {
@@ -186,10 +189,12 @@ static int axg_spdifout_set_chsts(struct snd_pcm_hw_params *params,
 	struct axg_spdifout *priv = snd_soc_dai_get_drvdata(dai);
 	unsigned int offset;
 	int ret;
-	u8 cs[5];
+	u8 cs[sizeof(priv->iec_status)];
 	u32 val;
 
-	snd_pcm_create_iec958_consumer_default(cs, sizeof(cs));
+	mutex_lock(&priv->iec_lock);
+	memcpy(cs, priv->iec_status, sizeof(cs));
+	mutex_unlock(&priv->iec_lock);
 	/* IEC 60958 has no word length code for 8-bit samples */
 	ret = snd_pcm_fill_iec958_consumer_hw_params(params, cs,
 			params_width(params) == 8 ? 4 : sizeof(cs));
@@ -384,6 +389,84 @@ static const struct snd_kcontrol_new axg_spdifout_controls[] = {
 		   SPDIFOUT_CTRL0, 23, 1, 0),
 };
 
+static int s7d_spdifout_iec958_info(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_IEC958;
+	uinfo->count = 1;
+
+	return 0;
+}
+
+static int s7d_spdifout_iec958_mask_get(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct axg_spdifout *priv = snd_soc_component_get_drvdata(component);
+
+	memset(ucontrol->value.iec958.status, 0,
+	       sizeof(ucontrol->value.iec958.status));
+	memset(ucontrol->value.iec958.status, 0xff, sizeof(priv->iec_status));
+
+	return 0;
+}
+
+static int s7d_spdifout_iec958_get(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct axg_spdifout *priv = snd_soc_component_get_drvdata(component);
+
+	memset(ucontrol->value.iec958.status, 0,
+	       sizeof(ucontrol->value.iec958.status));
+	mutex_lock(&priv->iec_lock);
+	memcpy(ucontrol->value.iec958.status, priv->iec_status,
+	       sizeof(priv->iec_status));
+	mutex_unlock(&priv->iec_lock);
+
+	return 0;
+}
+
+/* Applied at the next hw_params, like hdmi-codec does */
+static int s7d_spdifout_iec958_put(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct axg_spdifout *priv = snd_soc_component_get_drvdata(component);
+	int changed;
+
+	mutex_lock(&priv->iec_lock);
+	changed = memcmp(priv->iec_status, ucontrol->value.iec958.status,
+			 sizeof(priv->iec_status));
+	memcpy(priv->iec_status, ucontrol->value.iec958.status,
+	       sizeof(priv->iec_status));
+	mutex_unlock(&priv->iec_lock);
+
+	return changed ? 1 : 0;
+}
+
+static const struct snd_kcontrol_new s7d_spdifout_controls[] = {
+	SOC_DOUBLE("Playback Volume", SPDIFOUT_GAIN0,  0,  8, 255, 0),
+	SOC_DOUBLE("Playback Switch", SPDIFOUT_CTRL0, 22, 21, 1, 1),
+	SOC_SINGLE("Playback Gain Enable Switch",
+		   SPDIFOUT_CTRL1, 26, 1, 0),
+	SOC_SINGLE("Playback Channels Mix Switch",
+		   SPDIFOUT_CTRL0, 23, 1, 0),
+	{
+		.access = SNDRV_CTL_ELEM_ACCESS_READ,
+		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+		.name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, MASK),
+		.info = s7d_spdifout_iec958_info,
+		.get = s7d_spdifout_iec958_mask_get,
+	}, {
+		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+		.name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT),
+		.info = s7d_spdifout_iec958_info,
+		.get = s7d_spdifout_iec958_get,
+		.put = s7d_spdifout_iec958_put,
+	},
+};
+
 static int axg_spdifout_set_bias_level(struct snd_soc_component *component,
 				       enum snd_soc_bias_level level)
 {
@@ -423,8 +506,8 @@ static const struct snd_soc_component_driver axg_spdifout_component_drv = {
 };
 
 static const struct snd_soc_component_driver s7d_spdifout_component_drv = {
-	.controls		= axg_spdifout_controls,
-	.num_controls		= ARRAY_SIZE(axg_spdifout_controls),
+	.controls		= s7d_spdifout_controls,
+	.num_controls		= ARRAY_SIZE(s7d_spdifout_controls),
 	.dapm_widgets		= s7d_spdifout_dapm_widgets,
 	.num_dapm_widgets	= ARRAY_SIZE(s7d_spdifout_dapm_widgets),
 	.dapm_routes		= s7d_spdifout_dapm_routes,
@@ -478,6 +561,9 @@ static int axg_spdifout_probe(struct platform_device *pdev)
 	if (!priv)
 		return -ENOMEM;
 	platform_set_drvdata(pdev, priv);
+	mutex_init(&priv->iec_lock);
+	snd_pcm_create_iec958_consumer_default(priv->iec_status,
+					       sizeof(priv->iec_status));
 
 	regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(regs))

@@ -403,31 +403,70 @@ static const struct snd_soc_ops axg_card_fe_ops = {
 	.startup = axg_card_fe_startup,
 };
 
+#define AXG_CARD_IEC958_DEFAULT SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT)
+#define AXG_CARD_IEC958_MASK SNDRV_CTL_NAME_IEC958("", PLAYBACK, MASK)
+
+static bool axg_card_is_hdmi_dai(struct snd_soc_card *card,
+				 struct snd_soc_dai *dai)
+{
+	return axg_card_eld_ctl(card, dai);
+}
+
+/* A PCM control a component adds under its own name, for no PCM. */
+static struct snd_kcontrol *
+axg_card_component_ctl(struct snd_soc_card *card,
+		       struct snd_soc_component *component, const char *name)
+{
+	struct snd_ctl_elem_id id = {
+		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+	};
+
+	if (!component->name_prefix)
+		return NULL;
+	snprintf(id.name, sizeof(id.name), "%s %s", component->name_prefix,
+		 name);
+	return snd_ctl_find_id(card->snd_card, &id);
+}
+
+/* SPDIF out, which sends the channel status it is given itself */
+static bool axg_card_is_spdif_dai(struct snd_soc_card *card,
+				  struct snd_soc_dai *dai)
+{
+	return axg_card_component_ctl(card, dai->component,
+				      AXG_CARD_IEC958_DEFAULT);
+}
+
 /*
- * The hdmi-codec DAI a playback widget is wired to within @depth widgets,
- * whatever the mixer settings: the card binds before they are applied.
+ * The first DAI that @match accepts which a playback widget is wired to
+ * within @depth widgets, whatever the mixer settings: the card binds
+ * before they are applied.
  */
-static struct snd_soc_dai *axg_card_wired_hdmi_dai(struct snd_soc_card *card,
-						    struct snd_soc_dapm_widget *w,
-						    unsigned int depth)
+static struct snd_soc_dai *
+axg_card_wired_dai(struct snd_soc_card *card, struct snd_soc_dapm_widget *w,
+		   unsigned int depth,
+		   bool (*match)(struct snd_soc_card *card,
+				 struct snd_soc_dai *dai))
 {
 	struct snd_soc_dapm_path *p;
 	struct snd_soc_dai *dai;
 
-	if (w->id == snd_soc_dapm_dai_in && w->priv &&
-	    axg_card_eld_ctl(card, w->priv))
+	if (w->id == snd_soc_dapm_dai_in && w->priv && match(card, w->priv))
 		return w->priv;
 	if (!depth)
 		return NULL;
 
 	snd_soc_dapm_widget_for_each_sink_path(w, p) {
-		dai = axg_card_wired_hdmi_dai(card, p->sink, depth - 1);
+		dai = axg_card_wired_dai(card, p->sink, depth - 1, match);
 		if (dai)
 			return dai;
 	}
 	return NULL;
 }
 
+/*
+ * A forwarded control reads and writes the control in private_value, and
+ * writes the one in private_data, if any, as well.
+ */
 static int axg_card_fwd_info(struct snd_kcontrol *kcontrol,
 			     struct snd_ctl_elem_info *uinfo)
 {
@@ -448,59 +487,90 @@ static int axg_card_fwd_put(struct snd_kcontrol *kcontrol,
 			    struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_kcontrol *kctl = (struct snd_kcontrol *)kcontrol->private_value;
+	struct snd_kcontrol *also = snd_kcontrol_chip(kcontrol);
+	int changed, ret;
 
-	return kctl->put(kctl, ucontrol);
+	changed = kctl->put(kctl, ucontrol);
+	if (changed < 0 || !also)
+		return changed;
+	ret = also->put(also, ucontrol);
+	return ret < 0 ? ret : changed;
+}
+
+static int axg_card_add_fwd_ctl(struct snd_soc_card *card,
+				struct snd_soc_pcm_runtime *rtd,
+				const char *name, struct snd_kcontrol *kctl,
+				struct snd_kcontrol *also)
+{
+	struct snd_kcontrol_new tmpl = {
+		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+		.device = rtd->pcm->device,
+		.name = name,
+		.info = axg_card_fwd_info,
+		.get = axg_card_fwd_get,
+	};
+
+	if (!kctl)
+		return 0;
+	tmpl.access = kctl->vd[0].access &
+		(SNDRV_CTL_ELEM_ACCESS_READWRITE |
+		 SNDRV_CTL_ELEM_ACCESS_VOLATILE);
+	tmpl.put = kctl->put ? axg_card_fwd_put : NULL;
+	tmpl.private_value = (unsigned long)kctl;
+	kctl = snd_ctl_new1(&tmpl, also && also->put ? also : NULL);
+	if (!kctl)
+		return -ENOMEM;
+	return snd_ctl_add(card->snd_card, kctl);
 }
 
 /*
  * hdmi-codec adds its ELD and IEC958 controls for the internal PCM of the
- * codec-to-codec link, where nobody looks for them. Give the playback FE
- * wired to it controls of the same names that forward to them.
+ * codec-to-codec link, and SPDIF out adds its IEC958 controls under its
+ * own name, so nobody finds them by the device they open. Give each
+ * playback FE controls of the usual names that forward to those of the
+ * HDMI codec or SPDIF out it is wired to.
  */
-static int axg_card_add_fe_hdmi_ctls(struct snd_soc_card *card,
-				     struct snd_soc_pcm_runtime *rtd)
+static int axg_card_add_fe_ctls(struct snd_soc_card *card,
+				struct snd_soc_pcm_runtime *rtd)
 {
-	static const char * const names[] = {
-		"ELD",
-		SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT),
-		SNDRV_CTL_NAME_IEC958("", PLAYBACK, MASK),
-	};
-	struct snd_kcontrol_new tmpl = {
-		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
-		.info = axg_card_fwd_info,
-		.get = axg_card_fwd_get,
-	};
+	struct snd_kcontrol *dflt = NULL, *mask = NULL, *also = NULL;
 	struct snd_soc_dapm_widget *w;
-	struct snd_kcontrol *kctl;
-	struct snd_soc_dai *dai;
-	int i, ret;
+	struct snd_soc_dai *hdmi, *spdif;
+	int ret;
 
 	if (!rtd->dai_link->dynamic)
 		return 0;
 	w = snd_soc_dai_get_widget_playback(snd_soc_rtd_to_cpu(rtd, 0));
-	dai = w ? axg_card_wired_hdmi_dai(card, w, 32) : NULL;
-	if (!dai)
+	if (!w)
 		return 0;
 
-	tmpl.device = rtd->pcm->device;
-	for (i = 0; i < ARRAY_SIZE(names); i++) {
-		kctl = axg_card_codec_ctl(card, dai, names[i]);
-		if (!kctl)
-			continue;
-		tmpl.name = names[i];
-		tmpl.access = kctl->vd[0].access &
-			(SNDRV_CTL_ELEM_ACCESS_READWRITE |
-			 SNDRV_CTL_ELEM_ACCESS_VOLATILE);
-		tmpl.put = kctl->put ? axg_card_fwd_put : NULL;
-		tmpl.private_value = (unsigned long)kctl;
-		kctl = snd_ctl_new1(&tmpl, NULL);
-		if (!kctl)
-			return -ENOMEM;
-		ret = snd_ctl_add(card->snd_card, kctl);
-		if (ret < 0)
+	hdmi = axg_card_wired_dai(card, w, 32, axg_card_is_hdmi_dai);
+	if (hdmi) {
+		ret = axg_card_add_fwd_ctl(card, rtd, "ELD",
+					   axg_card_eld_ctl(card, hdmi), NULL);
+		if (ret)
 			return ret;
+		dflt = axg_card_codec_ctl(card, hdmi, AXG_CARD_IEC958_DEFAULT);
+		mask = axg_card_codec_ctl(card, hdmi, AXG_CARD_IEC958_MASK);
 	}
-	return 0;
+	/*
+	 * The channel status on the wire is SPDIF out's own. hdmi-codec gets
+	 * a copy, as it sets up the InfoFrame and the transmitter from it.
+	 */
+	spdif = axg_card_wired_dai(card, w, 32, axg_card_is_spdif_dai);
+	if (spdif) {
+		also = dflt;
+		dflt = axg_card_component_ctl(card, spdif->component,
+					      AXG_CARD_IEC958_DEFAULT);
+		mask = axg_card_component_ctl(card, spdif->component,
+					      AXG_CARD_IEC958_MASK);
+	}
+	ret = axg_card_add_fwd_ctl(card, rtd, AXG_CARD_IEC958_DEFAULT, dflt,
+				   also);
+	if (ret)
+		return ret;
+	return axg_card_add_fwd_ctl(card, rtd, AXG_CARD_IEC958_MASK, mask,
+				    NULL);
 }
 
 static void axg_card_hdmi_jack_free(struct snd_jack *jack)
@@ -534,7 +604,7 @@ static int axg_card_late_probe(struct snd_soc_card *card)
 	int i, ret;
 
 	for_each_card_rtds(card, rtd) {
-		ret = axg_card_add_fe_hdmi_ctls(card, rtd);
+		ret = axg_card_add_fe_ctls(card, rtd);
 		if (ret)
 			return ret;
 	}
