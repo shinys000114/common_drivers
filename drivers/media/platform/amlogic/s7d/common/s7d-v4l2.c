@@ -27,8 +27,7 @@
 
 /* How the client lays out each CAPTURE buffer; kept across source changes. */
 enum s7d_capture_mode {
-	S7D_CAPTURE_MPLANE,	/* NV12M/NV21M */
-	S7D_CAPTURE_SINGLE,	/* NV12/NV21 in one buffer */
+	S7D_CAPTURE_SINGLE,	/* NV12/NV21 in one buffer, NV12M/NV21M if it cannot be */
 	S7D_CAPTURE_AM08C,	/* 8-bit FBC header and body, then NV12, in one buffer */
 	S7D_CAPTURE_AM10C,	/* 10-bit FBC header and body, then NV12, in one buffer */
 	S7D_CAPTURE_AM08F,	/* 8-bit FBC header and body only, in one buffer */
@@ -152,23 +151,21 @@ static bool s7d_nv21_fourcc(u32 fourcc)
 	return fourcc == V4L2_PIX_FMT_NV21M || fourcc == V4L2_PIX_FMT_NV21;
 }
 
-static bool s7d_contiguous_fourcc(u32 fourcc)
-{
-	return fourcc == V4L2_PIX_FMT_NV12 || fourcc == V4L2_PIX_FMT_NV21;
-}
-
+/* Any request but an FBC one gets the listed one-buffer NV12/NV21. */
 static enum s7d_capture_mode s7d_fourcc_mode(const struct s7d_v4l2_codec *codec,
 					     u32 fourcc)
 {
+	if (!codec->fbc)
+		return S7D_CAPTURE_SINGLE;
 	if (fourcc == V4L2_PIX_FMT_AM08C)
-		return codec->fbc ? S7D_CAPTURE_AM08C : S7D_CAPTURE_MPLANE;
+		return S7D_CAPTURE_AM08C;
 	if (fourcc == V4L2_PIX_FMT_AM10C)
-		return codec->fbc ? S7D_CAPTURE_AM10C : S7D_CAPTURE_MPLANE;
+		return S7D_CAPTURE_AM10C;
 	if (fourcc == V4L2_PIX_FMT_AM08F)
-		return codec->fbc ? S7D_CAPTURE_AM08F : S7D_CAPTURE_MPLANE;
+		return S7D_CAPTURE_AM08F;
 	if (fourcc == V4L2_PIX_FMT_AM10F)
-		return codec->fbc ? S7D_CAPTURE_AM10F : S7D_CAPTURE_MPLANE;
-	return s7d_contiguous_fourcc(fourcc) ? S7D_CAPTURE_SINGLE : S7D_CAPTURE_MPLANE;
+		return S7D_CAPTURE_AM10F;
+	return S7D_CAPTURE_SINGLE;
 }
 
 /* Until a stream reports its depth, the layout reads as 8-bit. */
@@ -303,7 +300,7 @@ static void s7d_capture_format(const struct s7d_codec_layout *layout,
 	format->field = V4L2_FIELD_NONE;
 	s7d_capture_colour(&layout->colourimetry, output, format);
 	/* A luma plane padded past pitch * height can only be offered as NV12M. */
-	if (mode != S7D_CAPTURE_MPLANE && s7d_layout_contiguous(layout)) {
+	if (s7d_layout_contiguous(layout)) {
 		format->pixelformat = nv21 ? V4L2_PIX_FMT_NV21 : V4L2_PIX_FMT_NV12;
 		format->num_planes = 1;
 		format->plane_fmt[0].bytesperline = layout->pitch[0];
@@ -574,8 +571,9 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *ctx, struct v4l2_fmtdesc *form
 	 * Offer the one-buffer NV12/NV21 only. GStreamer prefers the two-buffer
 	 * NV12M whenever it is listed, and GBM (Mesa 26.2) imports such a
 	 * picture for scanout with the luma buffer in both planes, so the
-	 * compositor's direct scanout showed luma as chroma. NV12M is still
-	 * accepted when asked for, and taken when a layout cannot be contiguous.
+	 * compositor's direct scanout showed luma as chroma. A request for
+	 * NV12M gets NV12; NV12M is taken only when a layout cannot be
+	 * contiguous.
 	 */
 	if (ctx->codec.nv21) {
 		static const u32 formats[] = {
