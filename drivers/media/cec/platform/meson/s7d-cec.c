@@ -656,7 +656,7 @@ static int s7d_cec_probe(struct platform_device *pdev)
 	s7d_cec_stop(cec);
 	mutex_unlock(&cec->lock);
 	cec->adap = cec_allocate_adapter(&s7d_cec_ops, cec, "s7d-cecb",
-					(CEC_CAP_DEFAULTS & ~CEC_CAP_RC) | CEC_CAP_CONNECTOR_INFO,
+					CEC_CAP_DEFAULTS | CEC_CAP_CONNECTOR_INFO,
 					CEC_MAX_LOG_ADDRS);
 	if (IS_ERR(cec->adap)) {
 		ret = PTR_ERR(cec->adap);
