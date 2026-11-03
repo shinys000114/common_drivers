@@ -245,8 +245,11 @@ static int hevc_poc_plan(const struct s7d_hevc_dpb *dpb,
 		(!dpb->poc.started && slice->nal_type == 21);
 
 	*next = dpb->poc;
-	if (!dpb->poc.started && !hevc_irap(slice->nal_type))
-		return -ENODATA;
+	/* Decoding may begin anywhere; pictures before the first IRAP are dropped (dev-decoder.rst). */
+	if (!dpb->poc.started && !hevc_irap(slice->nal_type)) {
+		plan->kind = S7D_HEVC_PLAN_SKIP_START;
+		return 0;
+	}
 	if (!no_rasl) {
 		if (!dpb->poc.prev_tid0_valid)
 			return -ENODATA;
@@ -445,7 +448,7 @@ int s7d_hevc_dpb_plan(const struct s7d_hevc_dpb *dpb,
 	ret = hevc_poc_plan(dpb, slice, &next);
 	if (ret)
 		return ret;
-	if (next.kind == S7D_HEVC_PLAN_SKIP_RASL) {
+	if (next.kind == S7D_HEVC_PLAN_SKIP_RASL || next.kind == S7D_HEVC_PLAN_SKIP_START) {
 		*plan = next;
 		return 0;
 	}
@@ -559,11 +562,12 @@ int s7d_hevc_dpb_skip_committed(struct s7d_hevc_dpb *dpb,
 
 	if (ret)
 		return ret;
-	if (plan->kind != S7D_HEVC_PLAN_SKIP_RASL ||
-	    plan->current_slot != S7D_HEVC_NO_SLOT ||
+	if (plan->current_slot != S7D_HEVC_NO_SLOT || !hevc_poc_equal(&plan->next_poc, &dpb->poc))
+		return -EINVAL;
+	if (plan->kind == S7D_HEVC_PLAN_SKIP_START ? dpb->poc.started :
+	    plan->kind != S7D_HEVC_PLAN_SKIP_RASL ||
 	    !dpb->poc.irap_valid || !dpb->poc.no_rasl_output ||
-	    plan->poc >= dpb->poc.irap_poc ||
-	    !hevc_poc_equal(&plan->next_poc, &dpb->poc))
+	    plan->poc >= dpb->poc.irap_poc)
 		return -EINVAL;
 	dpb->revision = plan->plan_id;
 	dpb->last_input_token = plan->metadata.input_token;

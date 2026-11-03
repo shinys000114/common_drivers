@@ -34,6 +34,8 @@ struct s7d_hevc_poc_state {
 enum s7d_hevc_plan_kind {
 	S7D_HEVC_PLAN_PICTURE,
 	S7D_HEVC_PLAN_SKIP_RASL,
+	/* A picture before the stream's first IRAP: consumed without output. */
+	S7D_HEVC_PLAN_SKIP_START,
 	S7D_HEVC_PLAN_BUMP,
 };
 

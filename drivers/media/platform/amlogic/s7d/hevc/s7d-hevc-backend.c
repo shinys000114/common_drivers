@@ -533,7 +533,8 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 		if (ret)
 			return hevc_header_failure(decoder, job, "dpb-plan", ret,
 				status, status_valid, rpm_valid);
-		if (job->picture.kind == S7D_HEVC_PLAN_SKIP_RASL) {
+		if (job->picture.kind == S7D_HEVC_PLAN_SKIP_RASL ||
+		    job->picture.kind == S7D_HEVC_PLAN_SKIP_START) {
 			job->result.skipped = true;
 			hevc_finish(job, 0, false);
 			return 0;

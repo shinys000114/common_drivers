@@ -795,7 +795,7 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 	struct s7d_hevc_input *input;
 	size_t pos = 0;
 	u32 nals = 0;
-	bool picture = false;
+	bool picture = false, dropped = false;
 	int ret = 0;
 
 	if (IS_ERR_OR_NULL(bank) || !annexb || !bytes || !out)
@@ -857,13 +857,24 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 				hevc_parameter_parse(bank, input, nal, end - start, type, &bits);
 		} else if (type == 0 || type == 1 || (type >= 6 && type <= 9) ||
 			   (type >= 16 && type <= 21)) {
-			if (picture) {
+			if (dropped) {
+				ret = 0;
+			} else if (picture) {
 				ret = -EOPNOTSUPP;
 			} else {
 				input->view.slice.nal_type = type;
 				input->view.slice.temporal_id_plus1 = nal[1] & 7;
 				ret = hevc_select_parameters(bank, input, nal, end - start, &bits);
-				picture = !ret;
+				/*
+				 * A stream joined mid-way can carry pictures whose parameter
+				 * sets have not arrived (VLC sends them only with an IRAP).
+				 * Such a picture is dropped and the buffer completes as headers.
+				 */
+				if (ret == -ENODATA) {
+					dropped = true;
+					ret = 0;
+				}
+				picture = !ret && !dropped;
 			}
 		} else if (type == 35 || type == 38 || type == 39 || type == 40) {
 			if ((type == 35 || type == 39) && picture)
