@@ -512,6 +512,7 @@ static int hevc_dpb_limit(const struct s7d_hevc_sps *sps, u32 *limit)
 		break;
 	case 150:
 	case 153:
+	case 156:
 		max_luma = 8912896;
 		break;
 	/* 4096x2304 exceeds every level up to 5.2; level 6 is the first to hold it. */
