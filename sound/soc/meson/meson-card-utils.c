@@ -355,7 +355,8 @@ static int meson_card_set_control(struct snd_soc_card *card,
 /*
  * Boards without a UCM profile get a usable route from the device tree:
  * "amlogic,mixer-defaults" lists control name and value pairs, applied
- * once the card is registered. Userspace may change them afterwards.
+ * each time the card binds, once the DAPM controls exist and before
+ * userspace sees the card. Userspace may change them afterwards.
  */
 static void meson_card_apply_defaults(struct snd_soc_card *card)
 {
@@ -404,6 +405,7 @@ int meson_card_probe(struct platform_device *pdev)
 	priv->card.owner = THIS_MODULE;
 	priv->card.dev = dev;
 	priv->card.driver_name = dev->driver->name;
+	priv->card.fixup_controls = meson_card_apply_defaults;
 	priv->match_data = data;
 
 	ret = snd_soc_of_parse_card_name(&priv->card, "model");
@@ -435,9 +437,6 @@ int meson_card_probe(struct platform_device *pdev)
 	ret = devm_snd_soc_register_card(dev, &priv->card);
 	if (ret)
 		goto out_err;
-
-	if (snd_soc_card_is_instantiated(&priv->card))
-		meson_card_apply_defaults(&priv->card);
 
 	return 0;
 
