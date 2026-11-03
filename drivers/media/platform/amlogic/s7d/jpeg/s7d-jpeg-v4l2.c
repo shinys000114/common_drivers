@@ -19,6 +19,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-vmalloc.h>
 
+#include "s7d-codec-dos.h"
 #include "s7d-codec-session.h"
 #include "s7d-jpeg-backend.h"
 #include "s7d-jpeg-v4l2.h"
@@ -193,13 +194,26 @@ static int jpeg_try_format(struct file *file, void *priv, struct v4l2_format *fo
 	return 0;
 }
 
+/*
+ * The DOS runs one session at a time across the encoder and the decoders; refuse
+ * a client at its raw format or buffers rather than at STREAMON.
+ */
+static bool jpeg_taken(struct s7d_jpeg_client *ctx)
+{
+	struct s7d_codec_dos *dos = s7d_jpeg_encoder_dos(ctx->device->encoder);
+
+	return s7d_codec_core_busy(ctx->device->core, ctx->session) ||
+	       s7d_codec_dos_leased_by_other(dos, S7D_CODEC_ENGINE_HCODEC);
+}
+
 static int jpeg_set_format(struct file *file, void *priv, struct v4l2_format *format)
 {
 	struct s7d_jpeg_client *ctx = jpeg_client(priv);
 	int ret;
 
 	if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
-	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)) ||
+	    (jpeg_output(format->type) && jpeg_taken(ctx)))
 		return -EBUSY;
 	ret = jpeg_try_format(file, priv, format);
 	if (ret)
@@ -224,6 +238,14 @@ static int jpeg_get_format(struct file *file, void *priv, struct v4l2_format *fo
 	else
 		return -EINVAL;
 	return 0;
+}
+
+static int jpeg_reqbufs(struct file *file, void *priv,
+			struct v4l2_requestbuffers *request)
+{
+	if (jpeg_output(request->type) && request->count && jpeg_taken(jpeg_client(priv)))
+		return -EBUSY;
+	return v4l2_m2m_ioctl_reqbufs(file, priv, request);
 }
 
 static void jpeg_eos(struct s7d_jpeg_client *ctx)
@@ -588,7 +610,7 @@ static const struct v4l2_ioctl_ops jpeg_ioctl_ops = {
 	.vidioc_s_fmt_vid_cap_mplane = jpeg_set_format,
 	.vidioc_g_fmt_vid_out_mplane = jpeg_get_format,
 	.vidioc_g_fmt_vid_cap_mplane = jpeg_get_format,
-	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_reqbufs = jpeg_reqbufs,
 	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
 	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,

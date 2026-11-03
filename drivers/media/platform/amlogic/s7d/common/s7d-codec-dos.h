@@ -57,6 +57,10 @@ int s7d_codec_dos_start(struct s7d_codec_dos *dos,
 /* A failure retains the lease and pins the owner until an explicit retry. */
 int s7d_codec_dos_release(struct s7d_codec_dos *dos,
 			  enum s7d_codec_engine engine);
+/* An open session of this engine holds the DOS; no other engine can be held. */
+bool s7d_codec_dos_leased(struct s7d_codec_dos *dos, enum s7d_codec_engine engine);
+/* An open session of any other engine holds the DOS. */
+bool s7d_codec_dos_leased_by_other(struct s7d_codec_dos *dos, enum s7d_codec_engine engine);
 int s7d_codec_dos_suspend_check(struct s7d_codec_dos *dos);
 
 #endif

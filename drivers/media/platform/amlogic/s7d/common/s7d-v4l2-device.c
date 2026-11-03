@@ -14,6 +14,7 @@
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
+#include "s7d-codec-dos.h"
 #include "s7d-v4l2-device.h"
 
 struct s7d_v4l2_codec_entry {
@@ -35,6 +36,7 @@ struct s7d_v4l2_client {
 /* One node for every codec, as stateful decoders usually expose them. */
 struct s7d_v4l2_device {
 	struct device *dev;
+	struct s7d_codec_dos *dos;
 	struct s7d_v4l2_codec_entry entry[S7D_V4L2_MAX_CODECS];
 	unsigned int entries;
 	struct v4l2_device v4l2;
@@ -103,10 +105,11 @@ s7d_output_entry(struct s7d_v4l2_device *device, u32 fourcc)
 }
 
 /*
- * The DOS runs one decoder session at a time across all codecs. A second client
- * is refused when it sets its coded format or allocates bitstream buffers, before
- * any frame, so players can fall back to software decoding instead of failing at
- * STREAMON (Chromium falls back only when initialisation, the OUTPUT S_FMT, fails).
+ * The DOS runs one session at a time across all codecs and the JPEG encoder. A
+ * second client is refused when it sets its coded format or allocates bitstream
+ * buffers, before any frame, so players can fall back to software decoding
+ * instead of failing at STREAMON (Chromium falls back only when initialisation,
+ * the OUTPUT S_FMT, fails).
  */
 static bool s7d_device_taken(struct s7d_v4l2_device *device, void *priv)
 {
@@ -116,7 +119,7 @@ static bool s7d_device_taken(struct s7d_v4l2_device *device, void *priv)
 	for (i = 0; i < device->entries; i++)
 		if (s7d_codec_core_busy(device->entry[i].core, own))
 			return true;
-	return false;
+	return s7d_codec_dos_leased(device->dos, S7D_CODEC_ENGINE_HCODEC);
 }
 
 static int s7d_querycap(struct file *file, void *priv,
@@ -459,17 +462,19 @@ static void s7d_video_release(struct video_device *video)
 	mutex_unlock(&device->lock);
 }
 
-struct s7d_v4l2_device *s7d_v4l2_device_create(struct device *dev)
+struct s7d_v4l2_device *s7d_v4l2_device_create(struct device *dev,
+					       struct s7d_codec_dos *dos)
 {
 	struct s7d_v4l2_device *device;
 	int ret;
 
-	if (!dev)
+	if (!dev || !dos)
 		return ERR_PTR(-EINVAL);
 	device = kzalloc(sizeof(*device), GFP_KERNEL);
 	if (!device)
 		return ERR_PTR(-ENOMEM);
 	device->dev = get_device(dev);
+	device->dos = dos;
 	mutex_init(&device->lock);
 	init_completion(&device->video_released);
 	complete_all(&device->video_released);

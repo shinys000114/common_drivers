@@ -311,7 +311,7 @@ static int s7d_vdec_probe(struct platform_device *pdev)
 		vdec->decoder = NULL;
 		goto fail;
 	}
-	vdec->video = s7d_v4l2_device_create(vdec->dev);
+	vdec->video = s7d_v4l2_device_create(vdec->dev, vdec->dos);
 	if (IS_ERR(vdec->video)) {
 		ret = PTR_ERR(vdec->video);
 		vdec->video = NULL;

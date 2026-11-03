@@ -600,6 +600,11 @@ struct s7d_codec_core *s7d_jpeg_encoder_core(struct s7d_jpeg_encoder *encoder)
 	return encoder ? encoder->core : NULL;
 }
 
+struct s7d_codec_dos *s7d_jpeg_encoder_dos(struct s7d_jpeg_encoder *encoder)
+{
+	return encoder ? encoder->dos : NULL;
+}
+
 int s7d_jpeg_encoder_destroy(struct s7d_jpeg_encoder *encoder)
 {
 	int ret;

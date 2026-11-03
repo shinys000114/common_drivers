@@ -7,6 +7,7 @@
 #include "s7d-v4l2.h"
 
 struct module;
+struct s7d_codec_dos;
 struct s7d_v4l2_device;
 
 struct s7d_v4l2_backend_factory {
@@ -24,7 +25,8 @@ struct s7d_v4l2_backend_factory {
 
 /* The caller serializes lifecycle calls and preserves core/provider ownership. */
 /* Frontend retirement must gate and join all driver-owned producers. */
-struct s7d_v4l2_device *s7d_v4l2_device_create(struct device *dev);
+struct s7d_v4l2_device *s7d_v4l2_device_create(struct device *dev,
+					       struct s7d_codec_dos *dos);
 /* Before registration; the first codec added is the default of a new open. */
 int s7d_v4l2_device_add_codec(struct s7d_v4l2_device *device,
 			      struct s7d_codec_core *core,

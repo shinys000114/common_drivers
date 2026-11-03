@@ -1698,6 +1698,26 @@ out:
 	return ret;
 }
 
+bool s7d_codec_dos_leased(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
+{
+	bool leased;
+
+	mutex_lock(&dos->lock);
+	leased = dos->leased && dos->engine == engine;
+	mutex_unlock(&dos->lock);
+	return leased;
+}
+
+bool s7d_codec_dos_leased_by_other(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
+{
+	bool leased;
+
+	mutex_lock(&dos->lock);
+	leased = dos->leased && dos->engine != engine;
+	mutex_unlock(&dos->lock);
+	return leased;
+}
+
 int s7d_codec_dos_suspend_check(struct s7d_codec_dos *dos)
 {
 	int ret;
