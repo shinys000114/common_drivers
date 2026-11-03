@@ -19,6 +19,7 @@
 #include "s7d-plane.h"
 #include "s7d-crtc.h"
 #include "s7d-fb.h"
+#include "s7d-video-scaler.h"
 
 struct s7d_plane {
 	struct drm_plane base;
@@ -172,15 +173,21 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		/*
 		 * The fetch reads about one source pixel per core cycle, so a
 		 * line's worth of time holds a little over one UHD source line or
-		 * a few FHD ones: a reduction by 2 or more above FHD, or by 3 or
-		 * more at FHD, fetches every other line.
+		 * a few FHD ones: a reduction that would not keep up at this mode
+		 * fetches one source line in 2, 4 or 8, and the scaler makes up
+		 * the rest.
 		 */
 		if (!ret && crtc_state &&
-		    !(crtc_state->adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE) &&
-		    drm_rect_height(&base->src) >> 16 >=
-		    (crtc_state->adjusted_mode.hdisplay > 1920 ? 2 : 3) *
-		    drm_rect_height(&base->dst))
-			ret = s7d_video_skip_lines(&state->video);
+		    !(crtc_state->adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE)) {
+			u32 factor = s7d_video_skip_factor(drm_rect_width(&base->src) >> 16,
+				drm_rect_height(&base->src) >> 16,
+				drm_rect_height(&base->dst),
+				crtc_state->adjusted_mode.htotal,
+				crtc_state->adjusted_mode.clock * 1000UL);
+
+			if (factor > 1)
+				ret = s7d_video_skip_lines(&state->video, factor);
+		}
 		/* An FBC body is at most the uncompressed 4:2:0 frame. */
 		if (!ret && state->video.fbc.enabled)
 			state->compressed_size = (u32)state->video.fbc.width *

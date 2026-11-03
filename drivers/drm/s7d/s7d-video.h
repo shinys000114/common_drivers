@@ -44,6 +44,6 @@ bool s7d_video_fbc_modifier(u32 format, u64 modifier);
 int s7d_video_build_state(struct drm_framebuffer *fb, const struct drm_rect *source,
 			  u64 dma_mask, struct s7d_video_state *state);
 /* Fetch every other line of a 4:2:0 layout (doubled strides, halved scopes). */
-int s7d_video_skip_lines(struct s7d_video_state *state);
+int s7d_video_skip_lines(struct s7d_video_state *state, u32 factor);
 
 #endif

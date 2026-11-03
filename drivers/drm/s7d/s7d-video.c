@@ -145,22 +145,23 @@ int s7d_video_build_state(struct drm_framebuffer *fb, const struct drm_rect *src
 }
 
 /*
- * Fetch every other source line: double the line strides and halve the
- * vertical scopes, so a reduction by 2 or more reads about one source line
- * per output line instead of two. 4:2:0 only.
+ * Fetch one source line in @factor (2, 4 or 8): multiply the line strides and
+ * divide the vertical scopes, so a large reduction reads fewer source lines
+ * per output line. 4:2:0 only.
  */
-int s7d_video_skip_lines(struct s7d_video_state *state)
+int s7d_video_skip_lines(struct s7d_video_state *state, u32 factor)
 {
 	u32 y1 = state->scope_y[0] & 0x1fff;
 	u32 y2 = (state->scope_y[0] >> 16) + 1;
 
-	if ((state->format != DRM_FORMAT_NV12 && state->format != DRM_FORMAT_NV21) ||
-	    state->fbc.enabled || (y1 | y2) & 3 ||
-	    state->stride[0] * 2 > 0x1fff || state->stride[1] * 2 > 0x1fff)
+	if ((factor != 2 && factor != 4 && factor != 8) ||
+	    (state->format != DRM_FORMAT_NV12 && state->format != DRM_FORMAT_NV21) ||
+	    state->fbc.enabled || (y1 | y2) & (2 * factor - 1) ||
+	    state->stride[0] * factor > 0x1fff || state->stride[1] * factor > 0x1fff)
 		return -EINVAL;
-	state->stride[0] *= 2;
-	state->stride[1] *= 2;
-	state->scope_y[0] = ((y2 / 2 - 1) << 16) | (y1 / 2);
-	state->scope_y[1] = ((y2 / 4 - 1) << 16) | (y1 / 4);
+	state->stride[0] *= factor;
+	state->stride[1] *= factor;
+	state->scope_y[0] = ((y2 / factor - 1) << 16) | (y1 / factor);
+	state->scope_y[1] = ((y2 / (2 * factor) - 1) << 16) | (y1 / (2 * factor));
 	return 0;
 }
