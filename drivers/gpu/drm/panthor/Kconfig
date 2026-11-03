@@ -7,6 +7,7 @@ config DRM_S7D_PANTHOR
 	depends on !DRM_PANTHOR && MALI_MIDGARD = n
 	depends on !GENERIC_ATOMIC64
 	depends on MMU
+	depends on DMA_CMA
 	select DEVFREQ_GOV_SIMPLE_ONDEMAND
 	select DRM_EXEC
 	select DRM_GEM_SHMEM_HELPER
