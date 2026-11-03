@@ -408,7 +408,7 @@ static void s7d_vpu_afbc_admission(struct s7d_vpu *v)
 	if (!ret && ((o.status & GENMASK(1, 0)) || (o.top & BIT(31)) || o.surfaces))
 		ret = -EBUSY;
 	v->afbc_ready_mask = 0;
-	for (i = 0; i < ARRAY_SIZE(v->afbc_admission_error); i++) {
+	for (i = 0; i < S7D_AFBC_MAX_SURFACES; i++) {
 		const struct s7d_afbc_surface *s = s7d_afbc_surface_get(BIT(i));
 		int err = ret;
 
@@ -420,7 +420,6 @@ static void s7d_vpu_afbc_admission(struct s7d_vpu *v)
 			err = s7d_vpu_afbc_read(v, s->unpack, &unpack);
 		if (!err && (unpack & (BIT(16) | BIT(28))))
 			err = -EOPNOTSUPP;
-		v->afbc_admission_error[i] = err;
 		if (!err)
 			v->afbc_ready_mask |= s->mask;
 	}
@@ -686,11 +685,12 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_display_check_resources(&state->resources);
 	if (ret)
 		return ret;
+	/* Refuse what cannot run with -EINVAL, so clients fall back to composition. */
 	if (state->buffers.gfcd.fb) {
 		if (!IS_ENABLED(CONFIG_DRM_S7D_GFCD) || !v->gfcd_available ||
 		    READ_ONCE(v->gfcd_fault) ||
 		    state->pixel_rate > 148500000)
-			return -EOPNOTSUPP;
+			return -EINVAL;
 		ret = s7d_gfcd_check_scaler(&state->buffers.gfcd.plan,
 					    &state->osd.scalers[0]);
 		if (ret)
@@ -705,14 +705,14 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 		missing = state->buffers.afbc.plan.surface_mask &
 			~(v->afbc_available ? v->afbc_ready_mask : 0);
 		if (missing)
-			return v->afbc_admission_error[__ffs(missing)] ?: -EOPNOTSUPP;
+			return -EINVAL;
 	}
 	/* One unscaled RGB pixel per VPU cycle; protect this rate at prepare. */
 	if (s7d_display_mode_valid(&state->base.adjusted_mode) != MODE_OK)
 		return -ERANGE;
 	/* An older device tree lacks the ENCI clocks. */
 	if (state->encp.enci && (!v->enci || !v->enci_mux))
-		return -EOPNOTSUPP;
+		return -EINVAL;
 	core_rate = clk_get_rate(v->clocks[0].clk);
 	if (core_rate < state->pixel_rate)
 		return -ERANGE;
