@@ -358,8 +358,6 @@ static int backend_set_host_sequence(struct s7d_h264_backend *backend,
 	int ret;
 
 	lockdep_assert_held(&backend->decoder->transaction);
-	if ((sps->profile_idc == 66 || sps->profile_idc == 77) && sps->level_idc == 11)
-		return -EOPNOTSUPP;
 	backend_normalize_sps(&sequence.sps);
 	ret = s7d_h264_build_layout(&sequence.sps, S7D_CODEC_CAPTURE_NV12M,
 				    0, &sequence.layout);
@@ -383,9 +381,6 @@ static int backend_hold_reconfigure(struct s7d_h264_backend *backend)
 	    !backend->hardware_started || !backend->captures || !backend->generation ||
 	    backend->input_staging || backend->config_waiting || backend->slice_waiting ||
 	    backend->timeout_armed || backend->change_pending)
-		return -EOPNOTSUPP;
-	if ((next.sps.profile_idc == 66 || next.sps.profile_idc == 77) &&
-	    next.sps.level_idc == 11)
 		return -EOPNOTSUPP;
 	backend_normalize_sps(&next.sps);
 	ret = s7d_h264_build_layout(&next.sps, S7D_CODEC_CAPTURE_NV12M,

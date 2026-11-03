@@ -10,15 +10,12 @@
 
 static int s7d_h264_max_dpb_mbs(const struct s7d_h264_sps *sps, u32 *max_mbs)
 {
-	u32 level = sps->level_idc;
-
-	if ((sps->profile_idc == 66 || sps->profile_idc == 77) &&
-	    level == 11 && sps->constraint_set3)
-		level = 9;
-	if (level == 9 && sps->profile_idc == 100)
-		return -EINVAL;
-
-	switch (level) {
+	/*
+	 * level_idc 9 is level 1b in High. Baseline and Main code 1b as 11 with
+	 * constraint_set3, which the firmware does not report; 11 always takes
+	 * the larger level 1.1 DPB, which only delays output.
+	 */
+	switch (sps->level_idc) {
 	case 9:
 	case 10:
 		*max_mbs = 396;
@@ -55,7 +52,13 @@ static int s7d_h264_max_dpb_mbs(const struct s7d_h264_sps *sps, u32 *max_mbs)
 		*max_mbs = 110400;
 		break;
 	case 51:
+	case 52:
 		*max_mbs = 184320;
+		break;
+	case 60:
+	case 61:
+	case 62:
+		*max_mbs = 696320;
 		break;
 	default:
 		return -EOPNOTSUPP;

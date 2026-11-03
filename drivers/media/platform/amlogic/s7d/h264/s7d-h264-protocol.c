@@ -52,10 +52,6 @@ int s7d_h264_parse_config(const struct s7d_h264_config_snapshot *snapshot,
 		sps->chroma_format_idc = 1;
 	sps->level_idc = snapshot->scratchb & 0xff;
 	sps->max_num_ref_frames = (snapshot->scratchb >> 8) & 0xff;
-	/* The selected RPM mapping does not supply constraint_set3. */
-	if ((sps->profile_idc == 66 || sps->profile_idc == 77) &&
-	    sps->level_idc == 11)
-		return -EOPNOTSUPP;
 
 	sps->crop_left = s7d_h264_rpm_word(snapshot->rpm, RPM_CROP_LEFT);
 	sps->crop_right = s7d_h264_rpm_word(snapshot->rpm, RPM_CROP_RIGHT);

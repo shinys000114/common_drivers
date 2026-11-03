@@ -575,8 +575,6 @@ static int au_sps_parse(struct au_bits *b, struct au_cache *cache, u32 *sps_id)
 	sps.sps.chroma_format_idc = 1;
 	sps.sps.bit_depth_luma = 8;
 	sps.sps.bit_depth_chroma = 8;
-	if ((profile == 66 || profile == 77) && level == 11)
-		return -EOPNOTSUPP;
 	if (profile == 100) {
 		ret = au_ue(b, 3, &v);
 		if (ret)
