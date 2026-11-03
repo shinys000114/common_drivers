@@ -330,32 +330,48 @@ static struct snd_kcontrol *axg_card_eld_ctl(struct snd_soc_card *card,
 
 /*
  * The HDMI codec sits behind a codec-to-codec link, which opens it from a
- * DAPM event: its ELD constraints never reach the application's stream, and
- * a channel count or rate the sink lacks then fails there unseen while the
- * stream plays silence. Apply the sink's ELD to the playback FE instead.
+ * DAPM event: its constraints never reach the application's stream, and a
+ * channel count or rate the codec or sink lacks then fails there unseen
+ * while the stream plays silence. Apply them to the playback FE instead.
  */
 static int axg_card_fe_startup(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct meson_card *priv = snd_soc_card_get_drvdata(rtd->card);
+	const struct snd_soc_pcm_stream *stream;
+	/* The rules read the ELD again at each refinement of this stream. */
+	u8 *eld = priv->link_data[rtd->num];
 	struct snd_soc_dapm_widget_list *list;
 	struct snd_soc_dapm_widget *w;
 	struct snd_ctl_elem_value *value;
 	struct snd_kcontrol *kctl = NULL;
+	struct snd_soc_dai *dai = NULL;
 	int i, ret;
 
 	if (snd_soc_dapm_dai_get_connected_widgets(snd_soc_rtd_to_cpu(rtd, 0),
 						   substream->stream, &list, NULL) < 0)
 		return 0;
 	for_each_dapm_widgets(list, i, w) {
-		if (w->id == snd_soc_dapm_dai_in && w->priv)
-			kctl = axg_card_eld_ctl(rtd->card, w->priv);
-		if (kctl)
+		if (w->id != snd_soc_dapm_dai_in || !w->priv)
+			continue;
+		kctl = axg_card_eld_ctl(rtd->card, w->priv);
+		if (kctl) {
+			dai = w->priv;
 			break;
+		}
 	}
 	snd_soc_dapm_dai_free_widgets(&list);
 	if (!kctl)
 		return 0;
+
+	/* hdmi-codec takes two channels at least, and up to its DAI's maximum. */
+	stream = snd_soc_dai_get_pcm_stream(dai, SNDRV_PCM_STREAM_PLAYBACK);
+	ret = snd_pcm_hw_constraint_minmax(substream->runtime,
+					   SNDRV_PCM_HW_PARAM_CHANNELS,
+					   stream->channels_min,
+					   stream->channels_max);
+	if (ret < 0)
+		return ret;
 
 	value = kzalloc(sizeof(*value), GFP_KERNEL);
 	if (!value)
@@ -364,12 +380,12 @@ static int axg_card_fe_startup(struct snd_pcm_substream *substream)
 	ret = kctl->get(kctl, value);
 	up_read(&rtd->card->snd_card->controls_rwsem);
 	if (!ret)
-		memcpy(priv->eld, value->value.bytes.data, sizeof(priv->eld));
+		memcpy(eld, value->value.bytes.data, MESON_CARD_ELD_BYTES);
 	kfree(value);
-	/* No sink audio data (unplugged, DVI): leave the stream unconstrained. */
-	if (ret || !drm_eld_sad_count(priv->eld))
+	/* No sink audio data (unplugged, DVI): leave the rest unconstrained. */
+	if (ret || !drm_eld_sad_count(eld))
 		return 0;
-	return snd_pcm_hw_constraint_eld(substream->runtime, priv->eld);
+	return snd_pcm_hw_constraint_eld(substream->runtime, eld);
 }
 
 static const struct snd_soc_ops axg_card_fe_ops = {
@@ -392,6 +408,7 @@ static int axg_card_cpu_is_codec(struct device_node *np)
 static int axg_card_add_link(struct snd_soc_card *card, struct device_node *np,
 			     int *index)
 {
+	struct meson_card *priv = snd_soc_card_get_drvdata(card);
 	struct snd_soc_dai_link *dai_link = &card->dai_link[*index];
 	struct snd_soc_dai_link_component *cpu;
 	int ret;
@@ -409,6 +426,12 @@ static int axg_card_add_link(struct snd_soc_card *card, struct device_node *np,
 		return ret;
 
 	if (axg_card_cpu_is_playback_fe(dai_link->cpus->of_node)) {
+		/* The HDMI sink's ELD, constraining this FE's stream */
+		priv->link_data[*index] = devm_kzalloc(card->dev,
+						       MESON_CARD_ELD_BYTES,
+						       GFP_KERNEL);
+		if (!priv->link_data[*index])
+			return -ENOMEM;
 		dai_link->ops = &axg_card_fe_ops;
 		return meson_card_set_fe_link(card, dai_link, np, true);
 	}

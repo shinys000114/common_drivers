@@ -31,8 +31,6 @@ struct meson_card {
 	const struct meson_card_match_data *match_data;
 	struct snd_soc_card card;
 	void **link_data;
-	/* The HDMI sink's ELD, constraining the playback FEs that reach it */
-	u8 eld[MESON_CARD_ELD_BYTES];
 };
 
 unsigned int meson_card_parse_daifmt(struct device_node *node,
