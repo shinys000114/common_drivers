@@ -14,11 +14,13 @@ description: |
   The S7D Mali-G310 GPU has separate core and stack clocks and two reset
   inputs. The ODROID-C5 integration uses a fixed supply and clock gating for
   runtime power management. It has no controllable regulator or GPU power
-  domain. Its buffers are allocated through the GPU and DMA-BUF interfaces,
-  rather than a GPU memory-region reservation.
+  domain.
 
-  This binding describes the resource-based vendor kbase CSF integration.
-  GPU, MMU and JOB interrupt names retain the ordering used by that platform.
+  The S7D Panthor driver uses this node by default; the resource-based vendor
+  kbase CSF integration is the alternative, and only one of them is built.
+  Panthor backs shareable buffers with the optional scanout memory region, so
+  that the display controller, which needs contiguous buffers, can scan them
+  out. kbase does not use the region.
 
 properties:
   $nodename:
@@ -41,9 +43,9 @@ properties:
 
   interrupt-names:
     items:
-      - const: GPU
-      - const: MMU
-      - const: JOB
+      - const: gpu
+      - const: mmu
+      - const: job
 
   clocks:
     items:
@@ -66,6 +68,15 @@ properties:
       - const: core
 
   operating-points-v2: true
+
+  memory-region:
+    maxItems: 1
+    description:
+      Reusable shared-dma-pool that backs shareable buffers for scanout.
+
+  memory-region-names:
+    items:
+      - const: scanout
 
   '#cooling-cells':
     const: 2
@@ -98,11 +109,13 @@ examples:
         interrupts = <GIC_SPI 144 IRQ_TYPE_LEVEL_HIGH>,
                      <GIC_SPI 145 IRQ_TYPE_LEVEL_HIGH>,
                      <GIC_SPI 146 IRQ_TYPE_LEVEL_HIGH>;
-        interrupt-names = "GPU", "MMU", "JOB";
+        interrupt-names = "gpu", "mmu", "job";
         clocks = <&gpu_core_clk>, <&gpu_stack_clk>;
         clock-names = "core", "stacks";
         resets = <&gpu_bus_reset>, <&gpu_core_reset>;
         reset-names = "bus", "core";
         operating-points-v2 = <&gpu_opp_table>;
+        memory-region = <&graphics_pool>;
+        memory-region-names = "scanout";
         #cooling-cells = <2>;
     };

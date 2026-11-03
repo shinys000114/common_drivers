@@ -11,9 +11,11 @@ maintainers:
   - YoungSoo Shin <shinys000114@gmail.com>
 
 description: |
-  This board device exports one dedicated reusable CMA pool for contiguous
-  graphics DMA-BUF allocations. It is separate from the shared-dma-pool node
-  below /reserved-memory and must reference that pool with memory-region.
+  This board device exports a reusable CMA pool for contiguous graphics
+  DMA-BUF allocations. The GPU and GE2D allocate buffers for the display
+  from the same pool through their own memory-region references. The heap
+  device is separate from the shared-dma-pool node below /reserved-memory and
+  must reference that pool with memory-region.
   The referenced pool must have compatible shared-dma-pool and reusable;
   it must not have no-map. No MMIO resource or interrupt is associated with
   the heap device.
@@ -24,7 +26,7 @@ properties:
 
   memory-region:
     maxItems: 1
-    description: Dedicated reusable shared-dma-pool for graphics buffers.
+    description: Reusable shared-dma-pool for graphics buffers.
 
 required:
   - compatible
