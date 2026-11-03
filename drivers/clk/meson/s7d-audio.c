@@ -149,10 +149,15 @@ static struct clk_hw *s7d_audio_mclk(struct device *dev, struct regmap *map, int
 	struct clk_hw *hw;
 	char name[24];
 
+	/*
+	 * As on G12A/SM1, the MCLKs pick the closest of their fixed-rate
+	 * parents and never retune one: the DT sets a hifi PLL per rate
+	 * family, which other running MCLKs share.
+	 */
 	snprintf(name, sizeof(name), "mclk_%c_sel", 'a' + index);
 	hw = s7d_audio_register(dev, map, name, &clk_regmap_mux_ops,
 			&src, sizeof(src), s7d_mclk_parents,
-			ARRAY_SIZE(s7d_mclk_parents), CLK_SET_RATE_PARENT);
+			ARRAY_SIZE(s7d_mclk_parents), 0);
 	snprintf(name, sizeof(name), "mclk_%c_div", 'a' + index);
 	hw = s7d_audio_div(dev, map, name, hw, src.offset, 0, 16, CLK_SET_RATE_PARENT);
 	snprintf(name, sizeof(name), "mclk_%c_gate", 'a' + index);
@@ -321,7 +326,7 @@ static int s7d_audio_spdif_a(struct device *dev, struct regmap *map,
 {
 	struct clk_regmap_mux_data mux = {
 		.offset = S7D_AUDIO_SPDIFOUT_CLK, .shift = 24, .mask = 0xf,
-		.table = s7d_mclk_mux_table,
+		.table = s7d_mclk_mux_table, .flags = CLK_MUX_ROUND_CLOSEST,
 	};
 	struct clk_regmap_mux_data bypass = {
 		.offset = S7D_AUDIO_SPDIFOUT_CLK, .shift = 30, .mask = 1,
@@ -330,10 +335,10 @@ static int s7d_audio_spdif_a(struct device *dev, struct regmap *map,
 	struct clk_parent_data p = {}, bypass_parents[2] = { {}, { .fw_name = "xtal" } };
 	struct clk_hw *hw;
 
+	/* Like the MCLKs, pick a parent and leave its rate alone. */
 	hw = s7d_audio_register(dev, map, "spdif_a_sel", &clk_regmap_mux_ops,
 			&mux, sizeof(mux), s7d_mclk_parents,
-			ARRAY_SIZE(s7d_mclk_parents),
-			CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT);
+			ARRAY_SIZE(s7d_mclk_parents), 0);
 	if (IS_ERR(hw))
 		return PTR_ERR(hw);
 	clks->hws[S7D_AUDIO_CLK_SPDIF_A_SEL] = hw;
@@ -359,15 +364,14 @@ static int s7d_audio_spdif_b(struct device *dev, struct regmap *map,
 {
 	struct clk_regmap_mux_data mux = {
 		.offset = S7D_AUDIO_SPDIFOUT_B_CLK, .shift = 24, .mask = 0xf,
-		.table = s7d_mclk_mux_table,
+		.table = s7d_mclk_mux_table, .flags = CLK_MUX_ROUND_CLOSEST,
 	};
 	struct clk_parent_data p = {};
 	struct clk_hw *hw;
 
 	hw = s7d_audio_register(dev, map, "spdif_b_sel", &clk_regmap_mux_ops,
 			&mux, sizeof(mux), s7d_mclk_parents,
-			ARRAY_SIZE(s7d_mclk_parents),
-			CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT);
+			ARRAY_SIZE(s7d_mclk_parents), 0);
 	if (IS_ERR(hw))
 		return PTR_ERR(hw);
 	clks->hws[S7D_AUDIO_CLK_SPDIF_B_SEL] = hw;
