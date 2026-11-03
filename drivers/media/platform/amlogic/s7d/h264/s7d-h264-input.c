@@ -55,6 +55,7 @@
 #define AU_MAX_REFS 32
 #define AU_MAX_MMCO (AU_MAX_REFS * 2 + 3)
 #define AU_MAX_NALS 512
+#define AU_MIN_SLICE_TABLE 16U
 #define AU_MAX_MB_DIM 1055
 #define AU_MAX_MBS 139264
 #define AU_U32_MAX ((u32)~0U)
@@ -97,6 +98,12 @@ struct au_raw {
 	u32 bytes;
 };
 
+/* What the firmware's SLICE_HEAD_DONE of each slice must report. */
+struct au_slice_head {
+	u32 first_mb;
+	u32 type;
+};
+
 /* No session, DMA, firmware address or one-shot prefix belongs to this bank. */
 struct s7d_h264_parameters {
 	struct au_cache cache;
@@ -118,6 +125,9 @@ struct au_pending {
 	u32 selected_pps;
 	bool selected_valid;
 	struct s7d_h264_au_info info;
+	/* info.slice_count entries, in bitstream order. */
+	struct au_slice_head *slices;
+	u32 slice_capacity;
 	struct s7d_h264_preflight preflight;
 	u8 *prefix;
 	u32 prefix_bytes;
@@ -1181,8 +1191,44 @@ static void au_pending_free(struct au_pending *pending)
 		kvfree(pending->sps[i].data);
 	for (i = 0; i < AU_PPS_COUNT; i++)
 		kvfree(pending->pps[i].data);
+	kvfree(pending->slices);
 	kvfree(pending->prefix);
 	kvfree(pending);
+}
+
+/*
+ * first_mb rises strictly below the picture's macroblock count, so the table
+ * never holds more than mb_count entries; it grows only as slices arrive.
+ */
+static int au_slice_add(struct au_pending *draft, const struct au_slice *slice,
+			u32 mb_count)
+{
+	struct au_slice_head *slices;
+	u32 count = draft->info.slice_count, capacity;
+
+	if (count >= mb_count)
+		return -EBADMSG;
+	if (count == draft->slice_capacity) {
+		capacity = min(max(count * 2, AU_MIN_SLICE_TABLE), mb_count);
+		slices = kvrealloc(draft->slices, array_size(capacity, sizeof(*slices)),
+				   GFP_KERNEL);
+		if (!slices)
+			return -ENOMEM;
+		draft->slices = slices;
+		draft->slice_capacity = capacity;
+	}
+	draft->slices[count].first_mb = slice->first_mb;
+	draft->slices[count].type = slice->type;
+	draft->info.slice_count = count + 1;
+	return 0;
+}
+
+static bool au_same_slices(const struct au_pending *a, const struct au_pending *b)
+{
+	u32 count = a->info.slice_count;
+
+	return count == b->info.slice_count &&
+	       (!count || !memcmp(a->slices, b->slices, count * sizeof(*a->slices)));
 }
 
 static void s7d_h264_au_discard(struct s7d_h264_au_parser *parser)
@@ -1446,7 +1492,8 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 		goto free_draft;
 	}
 	for (;;) {
-		if (++nal_count > AU_MAX_NALS) {
+		/* au_slice_add() bounds the slices; this bounds the other NAL units. */
+		if (++nal_count > AU_MAX_NALS + draft->info.slice_count) {
 			ret = parser->hunting ? -E2BIG : -EOPNOTSUPP;
 			goto free_all;
 		}
@@ -1580,13 +1627,10 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 				ret = -EBADMSG;
 				break;
 			}
-			if (draft->info.slice_count == S7D_H264_AU_MAX_SLICES) {
-				ret = parser->hunting ? -E2BIG : -EOPNOTSUPP;
+			ret = au_slice_add(draft, &slice,
+					   draft->cache.sps[slice.sps_id].mb_count);
+			if (ret)
 				break;
-			}
-			i = draft->info.slice_count++;
-			draft->info.first_mb[i] = slice.first_mb;
-			draft->info.slice_type[i] = slice.type;
 			draft->info.last_vcl_end = nonzero_end;
 			draft->info.cavlc_tail_bits =
 				!draft->cache.pps[slice.pps_id].cabac &&
@@ -1890,7 +1934,8 @@ static int input_hunt_validate(struct s7d_h264_au_parser *parser,
 		end = checked.last_vcl_end;
 		checked.last_vcl_end = au->last_vcl_end;
 		if (preflight->kind != S7D_H264_INPUT_PICTURE ||
-		    memcmp(&checked, au, sizeof(checked)))
+		    memcmp(&checked, au, sizeof(checked)) ||
+		    !au_same_slices(validator.pending, original))
 			ret = -EBADMSG;
 		checked.last_vcl_end = end;
 	}
@@ -2644,6 +2689,8 @@ int s7d_h264_input_confirm_slice(struct s7d_h264_input *input, u64 token,
 	};
 	struct s7d_h264_input_observation observation;
 	const struct s7d_h264_au_info *au;
+	const struct au_slice_head *head;
+	const struct au_pending *pending;
 	u32 ordinal;
 	int ret = input_token_check(input, token);
 
@@ -2651,6 +2698,9 @@ int s7d_h264_input_confirm_slice(struct s7d_h264_input *input, u64 token,
 		return ret ? ret : -EINVAL;
 	if (input->picture_ready)
 		return -EALREADY;
+	pending = input->au_parser->pending;
+	if (!pending || pending->preflight.kind != S7D_H264_INPUT_PICTURE)
+		return -ESTALE;
 	ret = s7d_h264_input_observe(input, token, &observation);
 	if (ret)
 		return ret;
@@ -2658,9 +2708,10 @@ int s7d_h264_input_confirm_slice(struct s7d_h264_input *input, u64 token,
 		return -EAGAIN;
 	au = &input->au;
 	ordinal = input->confirmed_slices;
-	if (ordinal >= au->slice_count || au->slice_type[ordinal] >= ARRAY_SIZE(type) ||
-	    slice->first_mb != au->first_mb[ordinal] ||
-	    slice->type != type[au->slice_type[ordinal]] ||
+	head = ordinal < au->slice_count && ordinal < pending->info.slice_count ?
+	       &pending->slices[ordinal] : NULL;
+	if (!head || head->type >= ARRAY_SIZE(type) ||
+	    slice->first_mb != head->first_mb || slice->type != type[head->type] ||
 	    slice->frame_num != au->frame_num || slice->idr != au->idr ||
 	    slice->reference != au->reference || slice->poc_type != au->poc_type ||
 	    slice->no_output_of_prior_pics != au->no_output_of_prior_pics ||

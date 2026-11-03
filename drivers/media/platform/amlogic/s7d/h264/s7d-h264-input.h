@@ -19,7 +19,6 @@ struct s7d_codec_dma;
 struct s7d_h264_slice;
 struct s7d_v4l2_drain;
 
-#define S7D_H264_AU_MAX_SLICES 128U
 #define S7D_H264_PREFIX_MAX_BYTES (64U * 1024U)
 #define S7D_H264_PARAMETERS_MAX_BYTES (64U * 1024U)
 #define S7D_H264_ASSEMBLY_MAX_BYTES \
@@ -54,12 +53,11 @@ struct s7d_h264_au_info {
 	s32 delta_bottom;
 	u32 coded_width;
 	u32 coded_height;
+	/* The first_mb and type of each slice stay in the parser's pending AU. */
 	u32 slice_count;
 	u32 last_vcl_end;
 	struct s7d_codec_colour colour;
 	struct s7d_h264_sps sps;
-	u32 first_mb[S7D_H264_AU_MAX_SLICES];
-	u8 slice_type[S7D_H264_AU_MAX_SLICES];
 	u8 cavlc_tail_bits;
 	bool idr;
 	bool reference;
