@@ -2538,6 +2538,19 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	return 0;
 }
 
+int s7d_vpu_release_boot(struct s7d_vpu *v)
+{
+	if (!v->boot_held)
+		return 0;
+	/* Only a prepare stops a running firmware output safely. */
+	if (v->pixel_enabled ||
+	    ((vpu_read(v, ENCP_EN) | vpu_read(v, ENCI_EN) | vpu_read(v, ENCL_EN)) & BIT(0)))
+		return -EBUSY;
+	v->boot_held = false;
+	s7d_vpu_release(v);
+	return 0;
+}
+
 int s7d_vpu_fini(struct s7d_vpu *v)
 {
 	int ret;
