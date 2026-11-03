@@ -847,19 +847,7 @@ static void ge2d_buf_queue(struct vb2_buffer *vb)
 	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
 }
 
-static int ge2d_start_streaming(struct vb2_queue *vq, unsigned int count)
-{
-	struct ge2d_ctx *ctx = vb2_get_drv_priv(vq);
-
-	if (V4L2_TYPE_IS_OUTPUT(vq->type))
-		ctx->sequence_out = 0;
-	else
-		ctx->sequence_cap = 0;
-
-	return 0;
-}
-
-static void ge2d_stop_streaming(struct vb2_queue *vq)
+static void ge2d_return_bufs(struct vb2_queue *vq, enum vb2_buffer_state state)
 {
 	struct ge2d_ctx *ctx = vb2_get_drv_priv(vq);
 	struct vb2_v4l2_buffer *vbuf;
@@ -871,8 +859,39 @@ static void ge2d_stop_streaming(struct vb2_queue *vq)
 			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
 		if (!vbuf)
 			break;
-		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
+		v4l2_m2m_buf_done(vbuf, state);
 	}
+}
+
+static int ge2d_start_streaming(struct vb2_queue *vq, unsigned int count)
+{
+	struct ge2d_ctx *ctx = vb2_get_drv_priv(vq);
+	struct vb2_queue *other;
+
+	/*
+	 * Once both queues stream, neither the formats nor the rectangles
+	 * can change: refuse a scaling ratio that would fail every job.
+	 */
+	other = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+				V4L2_TYPE_IS_OUTPUT(vq->type) ?
+				V4L2_BUF_TYPE_VIDEO_CAPTURE :
+				V4L2_BUF_TYPE_VIDEO_OUTPUT);
+	if (ctx->ge2d->data->c1 && vb2_is_streaming(other) && !ge2d_scale_ok(ctx)) {
+		ge2d_return_bufs(vq, VB2_BUF_STATE_QUEUED);
+		return -EINVAL;
+	}
+
+	if (V4L2_TYPE_IS_OUTPUT(vq->type))
+		ctx->sequence_out = 0;
+	else
+		ctx->sequence_cap = 0;
+
+	return 0;
+}
+
+static void ge2d_stop_streaming(struct vb2_queue *vq)
+{
+	ge2d_return_bufs(vq, VB2_BUF_STATE_ERROR);
 }
 
 static const struct vb2_ops ge2d_qops = {
