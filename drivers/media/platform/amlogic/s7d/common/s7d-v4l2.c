@@ -2669,11 +2669,36 @@ static int s7d_context_controls(struct s7d_v4l2_context *ctx)
 {
 	struct v4l2_ctrl *control;
 
-	v4l2_ctrl_handler_init(&ctx->controls, 3);
+	v4l2_ctrl_handler_init(&ctx->controls, 7);
 	control = v4l2_ctrl_new_std(&ctx->controls, &s7d_ctrl_ops,
 		V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, 1, S7D_CODEC_MAX_CAPTURE_BUFFERS, 1, 1);
 	if (control)
 		control->flags |= V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE;
+	/*
+	 * Profiles and levels the cores decode. Players read these menus to send
+	 * other streams (H.264 High 10 or 4:2:2, HEVC RExt) to software decoders.
+	 */
+	control = v4l2_ctrl_new_std_menu(&ctx->controls, NULL,
+		V4L2_CID_MPEG_VIDEO_H264_PROFILE, V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
+		BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED), V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
+	if (control)
+		control->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	control = v4l2_ctrl_new_std_menu(&ctx->controls, NULL,
+		V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_5_2,
+		0, V4L2_MPEG_VIDEO_H264_LEVEL_5_2);
+	if (control)
+		control->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	control = v4l2_ctrl_new_std_menu(&ctx->controls, NULL,
+		V4L2_CID_MPEG_VIDEO_HEVC_PROFILE, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
+		BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_STILL_PICTURE),
+		V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+	if (control)
+		control->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	control = v4l2_ctrl_new_std_menu(&ctx->controls, NULL,
+		V4L2_CID_MPEG_VIDEO_HEVC_LEVEL, V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1,
+		0, V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1);
+	if (control)
+		control->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	/* VP9 profiles 0 and 2 (8- and 10-bit 4:2:0). */
 	control = v4l2_ctrl_new_std_menu(&ctx->controls, NULL,
 		V4L2_CID_MPEG_VIDEO_VP9_PROFILE, V4L2_MPEG_VIDEO_VP9_PROFILE_2,
