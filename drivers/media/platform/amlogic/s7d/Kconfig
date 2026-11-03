@@ -20,7 +20,7 @@ config VIDEO_AMLOGIC_S7D
 config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
 	bool "Amlogic S7D HEVC decoder"
 	depends on VIDEO_AMLOGIC_S7D
-	default n
+	default y
 	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	help
 	  Add HEVC to the S7D video decoder node, decoded on the HEVC engine.
@@ -34,7 +34,7 @@ config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
 config VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL
 	bool "Amlogic S7D VP9 decoder"
 	depends on VIDEO_AMLOGIC_S7D
-	default n
+	default y
 	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	help
 	  Add VP9 to the S7D video decoder node, decoded on the HEVC engine.
@@ -52,7 +52,7 @@ config VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 config VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL
 	bool "Amlogic S7D AV1 decoder"
 	depends on VIDEO_AMLOGIC_S7D
-	default n
+	default y
 	select VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	help
 	  Add AV1 to the S7D video decoder node, decoded on the HEVC engine.
@@ -67,7 +67,7 @@ config VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL
 config VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL
 	bool "Amlogic S7D JPEG encoder"
 	depends on VIDEO_AMLOGIC_S7D
-	default n
+	default y
 	help
 	  Register an additional standard V4L2 memory-to-memory JPEG encoder
 	  on the HCODEC engine. It takes contiguous NV12 or NV21 frames from
