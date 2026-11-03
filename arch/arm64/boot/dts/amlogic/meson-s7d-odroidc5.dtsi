@@ -795,7 +795,11 @@
 		clocks = <&clkc CLKID_GE2D>, <&clkc CLKID_SYS_GE2D>;
 		resets = <&reset RESET_GE2D>;
 		power-domains = <&pwrdm PDID_S7D_GE2D>;
-		/* Frames are shared with the display, so use its CMA area. */
-		memory-region = <&c5_display_cma>;
+		/*
+		 * Frames go to the display: take them from the graphics heap,
+		 * which the display scans out from and which leaves the display
+		 * CMA (console and 4K scanout pairs) room for 4K RGB frames.
+		 */
+		memory-region = <&dmaheap_cma_reserved>;
 	};
 };
