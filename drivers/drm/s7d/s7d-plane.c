@@ -422,6 +422,8 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		DRM_FORMAT_ABGR2101010, DRM_FORMAT_XBGR2101010,
 		DRM_FORMAT_NV12, DRM_FORMAT_NV21,
 	};
+	/* Only what cursors use, so clients do not take it for an overlay. */
+	static const u32 cursor_formats[] = { DRM_FORMAT_ARGB8888 };
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	static const u64 rgb_modifiers[] = {
 		DRM_FORMAT_MOD_LINEAR, S7D_AFBC_MODIFIER, S7D_AFBC_MODIFIER_UNTILED,
@@ -482,7 +484,9 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	case S7D_PLANE_CURSOR:
 		type = DRM_PLANE_TYPE_CURSOR;
 		name = "S7D OSD2 cursor";
-		zpos = 4;
+		zpos = S7D_DISPLAY_MAX_ZPOS;
+		plane_formats = cursor_formats;
+		format_count = ARRAY_SIZE(cursor_formats);
 		break;
 	case S7D_PLANE_VIDEO:
 	case S7D_PLANE_VIDEO2:
@@ -512,7 +516,12 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	plane->gfcd_primary = IS_ENABLED(CONFIG_DRM_S7D_GFCD) &&
 		(afbc_policy < 0 ? IS_ENABLED(CONFIG_DRM_S7D_AFBC_POLICY_GFCD_PRIMARY) :
 		 afbc_policy == 1);
-	ret = drm_plane_create_zpos_property(&plane->base, zpos, 0, S7D_DISPLAY_MAX_ZPOS);
+	/* The cursor's zpos is fixed at the top; a plane given that value still sorts above it. */
+	if (slot == S7D_PLANE_CURSOR)
+		ret = drm_plane_create_zpos_immutable_property(&plane->base, zpos);
+	else
+		ret = drm_plane_create_zpos_property(&plane->base, zpos, 0,
+						     S7D_DISPLAY_MAX_ZPOS);
 	if (ret)
 		return ERR_PTR(ret);
 	ret = drm_plane_create_alpha_property(&plane->base);
