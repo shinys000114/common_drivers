@@ -249,6 +249,28 @@ static int s7d_get_selection(struct file *file, void *priv,
 	return s7d_v4l2_get_selection(s7d_file_context(priv), selection);
 }
 
+/*
+ * The visible rectangle is fixed by the stream; a CROP or COMPOSE request is
+ * answered with it, as FFmpeg's v4l2m2m sets CROP and sizes frames from the reply.
+ */
+static int s7d_set_selection(struct file *file, void *priv,
+			     struct v4l2_selection *selection)
+{
+	struct v4l2_selection visible = {
+		.type = selection->type,
+		.target = selection->target,
+	};
+	int ret;
+
+	if (selection->target != V4L2_SEL_TGT_CROP &&
+	    selection->target != V4L2_SEL_TGT_COMPOSE)
+		return -EINVAL;
+	ret = s7d_v4l2_get_selection(s7d_file_context(priv), &visible);
+	if (!ret)
+		selection->r = visible.r;
+	return ret;
+}
+
 static int s7d_decoder_cmd(struct file *file, void *priv,
 			   struct v4l2_decoder_cmd *command)
 {
@@ -297,6 +319,7 @@ static const struct v4l2_ioctl_ops s7d_ioctl_ops = {
 	.vidioc_g_fmt_vid_out_mplane = s7d_get_format,
 	.vidioc_g_fmt_vid_cap_mplane = s7d_get_format,
 	.vidioc_g_selection = s7d_get_selection,
+	.vidioc_s_selection = s7d_set_selection,
 	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_try_decoder_cmd,
 	.vidioc_decoder_cmd = s7d_decoder_cmd,
 	.vidioc_subscribe_event = s7d_subscribe_event,
