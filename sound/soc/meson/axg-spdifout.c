@@ -186,10 +186,13 @@ static int axg_spdifout_set_chsts(struct snd_pcm_hw_params *params,
 	struct axg_spdifout *priv = snd_soc_dai_get_drvdata(dai);
 	unsigned int offset;
 	int ret;
-	u8 cs[4];
+	u8 cs[5];
 	u32 val;
 
-	ret = snd_pcm_create_iec958_consumer_hw_params(params, cs, 4);
+	snd_pcm_create_iec958_consumer_default(cs, sizeof(cs));
+	/* IEC 60958 has no word length code for 8-bit samples */
+	ret = snd_pcm_fill_iec958_consumer_hw_params(params, cs,
+			params_width(params) == 8 ? 4 : sizeof(cs));
 	if (ret < 0) {
 		dev_err(dai->dev, "Creating IEC958 channel status failed %d\n",
 			ret);
@@ -197,19 +200,21 @@ static int axg_spdifout_set_chsts(struct snd_pcm_hw_params *params,
 	}
 	val = cs[0] | cs[1] << 8 | cs[2] << 16 | cs[3] << 24;
 
-	/* Setup channel status A bits [31 - 0]*/
+	/* Setup channel status A bits [39 - 0]*/
 	regmap_write(priv->map, SPDIFOUT_CHSTS0, val);
+	regmap_write(priv->map, SPDIFOUT_CHSTS1, cs[4]);
 
-	/* Clear channel status A bits [191 - 32] */
-	for (offset = SPDIFOUT_CHSTS1; offset <= SPDIFOUT_CHSTS5;
+	/* Clear channel status A bits [191 - 64] */
+	for (offset = SPDIFOUT_CHSTS2; offset <= SPDIFOUT_CHSTS5;
 	     offset += regmap_get_reg_stride(priv->map))
 		regmap_write(priv->map, offset, 0);
 
-	/* Setup channel status B bits [31 - 0]*/
+	/* Setup channel status B bits [39 - 0]*/
 	regmap_write(priv->map, SPDIFOUT_CHSTS6, val);
+	regmap_write(priv->map, SPDIFOUT_CHSTS7, cs[4]);
 
-	/* Clear channel status B bits [191 - 32] */
-	for (offset = SPDIFOUT_CHSTS7; offset <= SPDIFOUT_CHSTSB;
+	/* Clear channel status B bits [191 - 64] */
+	for (offset = SPDIFOUT_CHSTS8; offset <= SPDIFOUT_CHSTSB;
 	     offset += regmap_get_reg_stride(priv->map))
 		regmap_write(priv->map, offset, 0);
 
