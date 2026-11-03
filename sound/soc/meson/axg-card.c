@@ -453,6 +453,7 @@ static struct platform_driver axg_card_pdrv = {
 	.driver = {
 		.name = "axg-sound-card",
 		.of_match_table = axg_card_of_match,
+		.pm = &snd_soc_pm_ops,
 	},
 };
 module_platform_driver(axg_card_pdrv);
