@@ -99,6 +99,30 @@ static struct drm_plane_state *s7d_plane_duplicate_state(struct drm_plane *plane
 	return &state->base;
 }
 
+/*
+ * OSD fetches whole pixels and video whole chroma pairs. Like i915, move the
+ * origin down and shrink the size to that grid instead of refusing a
+ * fractional or odd window, which keeps it inside the framebuffer. An odd
+ * video window also loses its last column or line; the scalers check the
+ * resulting ratio.
+ */
+static int s7d_plane_round(struct drm_plane_state *base, bool video)
+{
+	const int mask = video ? 0x1ffff : 0xffff;
+	int width = drm_rect_width(&base->src) & ~mask;
+	int height = drm_rect_height(&base->src) & ~mask;
+
+	if (!width || !height)
+		return -EINVAL;
+	drm_rect_init(&base->src, base->src.x1 & ~mask, base->src.y1 & ~mask,
+		      width, height);
+	if (!video)
+		return 0;
+	base->dst.x2 -= drm_rect_width(&base->dst) & 1;
+	base->dst.y2 -= drm_rect_height(&base->dst) & 1;
+	return drm_rect_visible(&base->dst) ? 0 : -EINVAL;
+}
+
 static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base,
 			   const struct drm_crtc_state *crtc_state)
 {
@@ -164,6 +188,9 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 	     drm_rect_width(&base->dst) != base->crtc_w ||
 	     drm_rect_height(&base->dst) != base->crtc_h))
 		return -EINVAL;
+	ret = s7d_plane_round(base, video);
+	if (ret)
+		return ret;
 	if (video) {
 		/* The VD2 limit is on the source window, not the buffer. */
 		if (plane->slot == S7D_PLANE_VIDEO2 &&
