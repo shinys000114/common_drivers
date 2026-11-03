@@ -90,7 +90,6 @@ struct s7d_vpu {
 	bool afbc_replay_latch_pending;
 	bool afbc_replay_apply_pending;
 	bool afbc_replay_afbc_changed;
-	int afbc_admission_error[2];
 	u32 afbc_command_counter;
 	bool video_enable[2];
 	bool vd1_fbc;

@@ -799,7 +799,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		base->mode_changed = true;
 	/* A fault requires a full disable/enable or link-recovery modeset. */
 	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
-		return -EIO;
+		return -EINVAL;
 	ret = s7d_csc_build_state(encoding, range,
 		s7d_crtc_csc_order(video), &state->csc);
 	if (ret)
