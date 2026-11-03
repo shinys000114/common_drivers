@@ -387,9 +387,12 @@ static int axg_card_fe_startup(struct snd_pcm_substream *substream)
 	value = kzalloc(sizeof(*value), GFP_KERNEL);
 	if (!value)
 		return -ENOMEM;
-	down_read(&rtd->card->snd_card->controls_rwsem);
+	/*
+	 * Not under controls_rwsem: a DAPM route write holds it while it
+	 * waits for the pcm_mutex this open holds. hdmi-codec's get only
+	 * copies its ELD.
+	 */
 	ret = kctl->get(kctl, value);
-	up_read(&rtd->card->snd_card->controls_rwsem);
 	if (!ret)
 		memcpy(eld, value->value.bytes.data, MESON_CARD_ELD_BYTES);
 	kfree(value);
