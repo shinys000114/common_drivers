@@ -36,20 +36,26 @@ int s7d_codec_resolve_colour(const struct s7d_codec_colour *colour,
 		case 1:
 			next.colorspace = V4L2_COLORSPACE_REC709;
 			break;
+		case 4:
+			next.colorspace = V4L2_COLORSPACE_470_SYSTEM_M;
+			break;
 		case 5:
 			next.colorspace = V4L2_COLORSPACE_470_SYSTEM_BG;
 			break;
 		case 6:
 			next.colorspace = V4L2_COLORSPACE_SMPTE170M;
 			break;
+		case 7:
+			next.colorspace = V4L2_COLORSPACE_SMPTE240M;
+			break;
 		case 9:
 			next.colorspace = V4L2_COLORSPACE_BT2020;
 			break;
-		case 4:
-		case 7 ... 8:
-		case 10 ... 12:
-		case 22:
-			return -EOPNOTSUPP;
+		/* DCI-P3 and Display P3 (D65 white). */
+		case 11:
+		case 12:
+			next.colorspace = V4L2_COLORSPACE_DCI_P3;
+			break;
 		}
 	}
 	next.xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(next.colorspace);
@@ -58,24 +64,37 @@ int s7d_codec_resolve_colour(const struct s7d_codec_colour *colour,
 		V4L2_QUANTIZATION_FULL_RANGE :
 		V4L2_MAP_QUANTIZATION_DEFAULT(false, next.colorspace, next.ycbcr_enc);
 	if (flags & S7D_CODEC_COLOUR_DESCRIPTION_PRESENT) {
+		/*
+		 * V4L2 has no HLG (18), which keeps the colour space's default:
+		 * the BT.2020 SDR curve an HLG picture stays viewable with.
+		 */
 		switch (colour->transfer) {
 		case 1:
 		case 6:
-		case 14:
-		case 15:
+		case 11 ... 12:
+		case 14 ... 15:
 			next.xfer_func = V4L2_XFER_FUNC_709;
+			break;
+		case 7:
+			next.xfer_func = V4L2_XFER_FUNC_SMPTE240M;
+			break;
+		case 8:
+			next.xfer_func = V4L2_XFER_FUNC_NONE;
+			break;
+		case 13:
+			next.xfer_func = V4L2_XFER_FUNC_SRGB;
 			break;
 		case 16:
 			next.xfer_func = V4L2_XFER_FUNC_SMPTE2084;
 			break;
-		/* V4L2 has no HLG (18) transfer function. */
-		case 4:
-		case 5:
-		case 7 ... 13:
-		case 17 ... 18:
-			return -EOPNOTSUPP;
+		case 17:
+			next.xfer_func = V4L2_XFER_FUNC_DCI_P3;
+			break;
 		}
 		switch (colour->matrix) {
+		/* Identity (RGB) is coded in 4:4:4 only. */
+		case 0:
+			return -EOPNOTSUPP;
 		case 1:
 			next.ycbcr_enc = V4L2_YCBCR_ENC_709;
 			break;
@@ -83,17 +102,15 @@ int s7d_codec_resolve_colour(const struct s7d_codec_colour *colour,
 		case 6:
 			next.ycbcr_enc = V4L2_YCBCR_ENC_601;
 			break;
+		case 7:
+			next.ycbcr_enc = V4L2_YCBCR_ENC_SMPTE240M;
+			break;
 		case 9:
 			next.ycbcr_enc = V4L2_YCBCR_ENC_BT2020;
 			break;
 		case 10:
 			next.ycbcr_enc = V4L2_YCBCR_ENC_BT2020_CONST_LUM;
 			break;
-		case 0:
-		case 4:
-		case 7 ... 8:
-		case 11 ... 17:
-			return -EOPNOTSUPP;
 		}
 	}
 	*colourimetry = next;
