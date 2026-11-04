@@ -7,6 +7,9 @@ config SND_SOC_MESON_S7D
 	depends on SND_MESON_AXG_FIFO=n && SND_MESON_AXG_TDM_FORMATTER=n
 	depends on SND_MESON_CARD_UTILS=n && SND_MESON_CODEC_GLUE=n
 	depends on SND_SOC_MESON_T9015=n
+	depends on PINCTRL
+	select GENERIC_PINCONF
+	select PINMUX
 	select REGMAP_MMIO
 	select SND_DYNAMIC_MINORS
 	select SND_PCM_IEC958
@@ -14,6 +17,7 @@ config SND_SOC_MESON_S7D
 	imply RESET_S7D_AUDIO_ARB
 	help
 	  FRDDR/TODDR FIFOs, TDM interfaces and formatters, SPDIF output,
-	  HDMI and internal DAC glue, the T9015 DAC and the sound card for
-	  the S7D audio block. Forked from the upstream Meson AXG/G12A ASoC
-	  drivers, which cannot be built on this platform.
+	  HDMI and internal DAC glue, the T9015 DAC, the audio pad crossbar
+	  and the sound card for the S7D audio block. Forked from the
+	  upstream Meson AXG/G12A ASoC drivers, which cannot be built on
+	  this platform.

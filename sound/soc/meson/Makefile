@@ -15,6 +15,7 @@ snd-soc-s7d-codec-glue-y := meson-codec-glue.o
 snd-soc-s7d-g12a-toacodec-y := g12a-toacodec.o
 snd-soc-s7d-g12a-tohdmitx-y := g12a-tohdmitx.o
 snd-soc-s7d-t9015-y := t9015.o
+snd-soc-s7d-audio-pinctrl-y := s7d-audio-pinctrl.o
 
 obj-$(CONFIG_SND_SOC_MESON_S7D) += snd-soc-s7d-axg-fifo.o
 obj-$(CONFIG_SND_SOC_MESON_S7D) += snd-soc-s7d-axg-frddr.o
@@ -30,3 +31,4 @@ obj-$(CONFIG_SND_SOC_MESON_S7D) += snd-soc-s7d-codec-glue.o
 obj-$(CONFIG_SND_SOC_MESON_S7D) += snd-soc-s7d-g12a-toacodec.o
 obj-$(CONFIG_SND_SOC_MESON_S7D) += snd-soc-s7d-g12a-tohdmitx.o
 obj-$(CONFIG_SND_SOC_MESON_S7D) += snd-soc-s7d-t9015.o
+obj-$(CONFIG_SND_SOC_MESON_S7D) += snd-soc-s7d-audio-pinctrl.o
