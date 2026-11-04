@@ -197,6 +197,13 @@ int s7d_h264_input_return_after_abort(struct s7d_h264_input *input,
 				      struct s7d_vdec_runtime *runtime,
 				      u64 token, int status,
 				      struct s7d_h264_input_return *returned);
+/*
+ * After a runtime abort back to the last completed picture, before the
+ * firmware's first slice of the AU was set up: the AU stays pending and goes
+ * to the firmware again, from that park, when it is staged next.
+ */
+int s7d_h264_input_unstage(struct s7d_h264_input *input,
+			   struct s7d_vdec_runtime *runtime, u64 token);
 /* This tracks the input cut; it never publishes LAST or a drain notification. */
 int s7d_h264_input_begin_drain(struct s7d_h264_input *input,
 			     const struct s7d_v4l2_drain *request);

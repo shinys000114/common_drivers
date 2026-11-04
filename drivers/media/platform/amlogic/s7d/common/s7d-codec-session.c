@@ -698,6 +698,21 @@ bool s7d_codec_surface_reading(struct s7d_codec_surface *surface)
 	return false;
 }
 
+bool s7d_codec_surface_available(struct s7d_codec_surface *surface)
+{
+	struct s7d_codec_core *core;
+	bool available;
+
+	if (!surface)
+		return false;
+	core = surface->session->core;
+	mutex_lock(&core->lock);
+	available = surface->session->state == S7D_SESSION_OPEN && surface->queued &&
+		    !surface->writing && !surface->user_owned && !surface->dpb_refs;
+	mutex_unlock(&core->lock);
+	return available;
+}
+
 int s7d_codec_surface_acquire(struct s7d_codec_surface *surface, u64 *token)
 {
 	struct s7d_codec_core *core = surface->session->core;

@@ -3148,6 +3148,36 @@ int s7d_h264_input_return_after_abort(struct s7d_h264_input *input,
 	return 0;
 }
 
+int s7d_h264_input_unstage(struct s7d_h264_input *input,
+			   struct s7d_vdec_runtime *runtime, u64 token)
+{
+	int ret;
+
+	if (IS_ERR_OR_NULL(input) || IS_ERR_OR_NULL(runtime) || !token)
+		return -EINVAL;
+	if (!input->active || input->buffer.token != token || !input->last_park_epoch ||
+	    !input->preflight_ready || input->confirmed_slices || input->picture_ready)
+		return -ESTALE;
+	if (input->faulted || input->rejected)
+		return -EIO;
+	/* Parked again at the last completed picture, its FIFO stopped. */
+	ret = s7d_vdec_runtime_check_parked(runtime, input->session,
+					    input->last_completed_token,
+					    input->last_completed_write,
+					    input->last_park_epoch);
+	if (ret)
+		return ret;
+	ret = input_check_parked(input);
+	if (ret)
+		return ret;
+	input->active = false;
+	input->configured = false;
+	input->enabled = false;
+	input->write_token = 0;
+	memset(&input->picture, 0, sizeof(input->picture));
+	return 0;
+}
+
 int s7d_h264_input_begin_drain(struct s7d_h264_input *input,
 			     const struct s7d_v4l2_drain *request)
 {

@@ -44,6 +44,11 @@ struct s7d_vdec_runtime_backend_ops {
 			       struct s7d_codec_session *session, u64 input_token,
 			       u64 write_token, u64 park_epoch, u64 next_input_token,
 			       bool *cancelled);
+	/*
+	 * Optional, atomic: another session began to wait for VDEC while this
+	 * one runs it.
+	 */
+	void (*contended)(void *priv);
 };
 
 /*
@@ -95,6 +100,8 @@ int s7d_vdec_runtime_check_parked(struct s7d_vdec_runtime *runtime,
  */
 int s7d_vdec_runtime_end_run(struct s7d_vdec_runtime *runtime,
 			     struct s7d_codec_session *session);
+/* This session runs VDEC and another one waits for it. */
+bool s7d_vdec_runtime_contended(struct s7d_vdec_runtime *runtime);
 /* Confirm context and retire the matching DPB/input before starting next AU. */
 int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 			    struct s7d_codec_session *session, u64 input_token,

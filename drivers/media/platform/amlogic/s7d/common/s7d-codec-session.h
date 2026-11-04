@@ -136,6 +136,8 @@ int s7d_codec_surface_return_queued(struct s7d_codec_surface *surface);
  * so codecs pick another queued surface first when they can.
  */
 bool s7d_codec_surface_reading(struct s7d_codec_surface *surface);
+/* The client queued the surface and no picture holds it: acquire can take it. */
+bool s7d_codec_surface_available(struct s7d_codec_surface *surface);
 int s7d_codec_surface_acquire(struct s7d_codec_surface *surface, u64 *token);
 int s7d_codec_surface_written(struct s7d_codec_surface *surface, u64 token);
 /* Caller keeps source DPB and destination write pins until the copy returns. */

@@ -53,6 +53,7 @@
 #define COMMAND_DRAIN	BIT(2)
 #define COMMAND_ERROR	BIT(3)
 #define COMMAND_ABORT	BIT(4)
+#define COMMAND_YIELD	BIT(5)
 
 struct s7d_h264_event {
 	u64 token;
@@ -139,6 +140,12 @@ struct s7d_h264_backend {
 	bool hunting;
 	bool config_waiting;
 	bool slice_waiting;
+	/* The first picture waits for a free CAPTURE buffer before it takes VDEC. */
+	bool start_waiting;
+	/* A picture without a CAPTURE buffer gives VDEC to a session that waits. */
+	bool yield_pending;
+	/* It gave VDEC up: it runs again once a buffer it can take is queued. */
+	bool yielded;
 	bool drain_pending;
 	bool drain_notified;
 	bool timeout_armed;
@@ -700,6 +707,28 @@ static int backend_slice_identity(struct s7d_h264_backend *backend)
 	return 0;
 }
 
+/*
+ * A picture that found no free CAPTURE buffer at its first slice waits for
+ * the client with VDEC held while no other session wants the engine. When one
+ * does, the picture gives VDEC up: the runtime aborts it back to the last
+ * parked picture, and it runs again from its start once the client has queued
+ * a CAPTURE buffer it can take. A paused player, which stops returning them, so
+ * never freezes the other videos on VDEC. The first picture of a stream has
+ * no park to return to; it does not start until a buffer is free.
+ */
+static void backend_yield(struct s7d_h264_backend *backend)
+{
+	lockdep_assert_held(&backend->transaction);
+	if (!backend->slice_waiting || backend->yield_pending || backend->abort_error ||
+	    backend->failure || !backend->park_epoch || !backend->hardware_started ||
+	    !backend->input_staging || backend->dispatch_blocked ||
+	    !s7d_vdec_runtime_contended(backend->runtime))
+		return;
+	backend->yield_pending = true;
+	WRITE_ONCE(backend->dispatch_blocked, true);
+	backend_command(backend, COMMAND_YIELD);
+}
+
 static int backend_slice(struct s7d_h264_backend *backend, bool retry)
 {
 	struct s7d_h264_decoder *decoder = backend->decoder;
@@ -729,6 +758,7 @@ static int backend_slice(struct s7d_h264_backend *backend, bool retry)
 	if (ret == -EAGAIN) {
 		backend->slice_waiting = true;
 		backend_timeout_disarm(backend);
+		backend_yield(backend);
 		return 0;
 	}
 	if (ret)
@@ -1066,6 +1096,15 @@ static int backend_restore(void *priv, struct regmap *map,
 	return ret;
 }
 
+/* Atomic: another session waits for VDEC; a picture waiting for a buffer yields. */
+static void backend_contended(void *priv)
+{
+	struct s7d_h264_backend *backend = priv;
+
+	if (READ_ONCE(backend->slice_waiting))
+		queue_work(backend->protocol_queue, &backend->protocol_work);
+}
+
 static const struct s7d_vdec_runtime_backend_ops runtime_ops = {
 	.stage = backend_stage,
 	.configure = backend_configure,
@@ -1078,7 +1117,19 @@ static const struct s7d_vdec_runtime_backend_ops runtime_ops = {
 	.settle = backend_settle,
 	.save_context = backend_save,
 	.restore_context = backend_restore,
+	.contended = backend_contended,
 };
+
+static bool backend_capture_free(struct s7d_h264_backend *backend)
+{
+	u32 i;
+
+	lockdep_assert_held(&backend->transaction);
+	for (i = 0; i < backend->captures; i++)
+		if (s7d_codec_surface_available(backend->capture[i].surface))
+			return true;
+	return false;
+}
 
 static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 {
@@ -1196,9 +1247,13 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 	if (!ret && !completed && !changed && backend->captures) {
 		if (!backend->input_picture || !backend->sequence_valid) {
 			ret = -ESTALE;
+		} else if (!backend->hardware_started && !backend_capture_free(backend)) {
+			/* Nothing to decode the first picture into yet: wait without VDEC. */
+			backend->start_waiting = true;
 		} else {
 			resume = backend->hardware_started;
 			backend->hw_entered = true;
+			backend->start_waiting = false;
 			start = true;
 		}
 	}
@@ -1355,6 +1410,56 @@ static int backend_abort_picture(struct s7d_h264_backend *backend, bool *cancell
 	return ret ? ret : backend_notify_input(backend, input, error, cancelled);
 }
 
+static int backend_yield_picture(struct s7d_h264_backend *backend, bool *cancelled)
+{
+	u64 input;
+	bool resubmit = false;
+	int ret;
+
+	mutex_lock(&backend->transaction);
+	ret = backend_operation_check(backend, cancelled);
+	input = backend->input.token;
+	if (!ret && (!backend->yield_pending || !backend->slice_waiting ||
+		     !backend->input_pending || !backend->input_staging || !backend->park_epoch))
+		ret = -ESTALE;
+	mutex_unlock(&backend->transaction);
+	if (ret)
+		return ret;
+	ret = s7d_vdec_runtime_abort(backend->runtime, backend->session,
+				     backend->previous_input, backend->previous_write,
+				     backend->park_epoch, cancelled);
+	if (ret)
+		return ret;
+	mutex_lock(&backend->transaction);
+	ret = backend_operation_check(backend, cancelled);
+	if (!ret)
+		ret = s7d_h264_context_abort(backend->context, backend->runtime,
+					     backend->previous_input, backend->previous_write,
+					     backend->park_epoch);
+	if (!ret && backend->dpb)
+		ret = s7d_h264_dpb_abort_picture(backend->dpb);
+	if (!ret)
+		ret = s7d_h264_input_unstage(backend->stream, backend->runtime, input);
+	if (!ret) {
+		memset(&backend->picture, 0, sizeof(backend->picture));
+		backend->yield_pending = false;
+		backend->slice_waiting = false;
+		backend->input_staging = false;
+		/* A buffer the client queued since the picture looked lets it run now. */
+		resubmit = backend_capture_free(backend);
+		backend->yielded = !resubmit;
+	}
+	mutex_unlock(&backend->transaction);
+	if (!ret)
+		ret = s7d_vdec_runtime_end_run(backend->runtime, backend->session);
+	if (!ret && resubmit) {
+		mutex_lock(&backend->transaction);
+		backend_command(backend, COMMAND_SUBMIT);
+		mutex_unlock(&backend->transaction);
+	}
+	return ret;
+}
+
 static int backend_complete_drain(struct s7d_h264_backend *backend, bool *cancelled)
 {
 	struct s7d_h264_dpb_state state;
@@ -1488,6 +1593,8 @@ static void backend_executor_work(struct work_struct *work)
 			ret = backend_complete_drain(backend, &cancelled);
 		else if (command == COMMAND_ABORT)
 			ret = backend_abort_picture(backend, &cancelled);
+		else if (command == COMMAND_YIELD)
+			ret = backend_yield_picture(backend, &cancelled);
 		else
 			ret = -EINVAL;
 		if (ret && !cancelled) {
@@ -1790,6 +1897,13 @@ static int backend_capture_queue(void *priv, struct s7d_codec_surface *surface,
 	}
 	if (backend->slice_waiting && !backend->dispatch_blocked)
 		queue_work(backend->protocol_queue, &backend->protocol_work);
+	/* A buffer still held as a reference lets no waiting picture run. */
+	if ((backend->start_waiting || backend->yielded) &&
+	    s7d_codec_surface_available(surface)) {
+		backend->start_waiting = false;
+		backend->yielded = false;
+		backend_command(backend, COMMAND_SUBMIT);
+	}
 out:
 	mutex_unlock(&backend->transaction);
 	return ret;
@@ -1963,6 +2077,9 @@ static int backend_reset_epoch(struct s7d_h264_backend *backend, bool keep_chang
 	backend->hunting = true;
 	backend->config_waiting = false;
 	backend->slice_waiting = false;
+	backend->start_waiting = false;
+	backend->yield_pending = false;
+	backend->yielded = false;
 	backend->drain_pending = false;
 	backend->drain_notified = false;
 	backend->timeout_armed = false;

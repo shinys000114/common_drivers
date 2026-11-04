@@ -297,6 +297,15 @@ static const struct s7d_vdec_irq_ops runtime_irq_ops = {
 	.thread = runtime_irq_thread,
 };
 
+/* Atomic, with the engine's run queue locked. */
+static void runtime_contended(void *priv)
+{
+	struct s7d_vdec_runtime *runtime = priv;
+
+	if (runtime->ops.contended)
+		runtime->ops.contended(runtime->priv);
+}
+
 static int runtime_hold(void *priv, enum s7d_codec_engine engine)
 {
 	struct s7d_vdec_runtime *runtime = priv;
@@ -630,6 +639,8 @@ s7d_vdec_runtime_create(struct device *dev, struct module *owner,
 	runtime->ops = *ops;
 	runtime->priv = priv;
 	runtime->transaction = transaction;
+	runtime->lease.contended = runtime_contended;
+	runtime->lease.priv = runtime;
 	mutex_init(&runtime->control);
 	spin_lock_init(&runtime->lock);
 	runtime->map = s7d_codec_dos_regmap(dos, S7D_CODEC_ENGINE_VDEC);
@@ -1100,6 +1111,11 @@ int s7d_vdec_runtime_end_run(struct s7d_vdec_runtime *runtime,
 		ret = runtime_end_run(runtime);
 	mutex_unlock(&runtime->control);
 	return ret;
+}
+
+bool s7d_vdec_runtime_contended(struct s7d_vdec_runtime *runtime)
+{
+	return s7d_codec_dos_run_contended(&runtime->lease);
 }
 
 int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
