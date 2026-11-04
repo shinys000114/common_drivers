@@ -17,6 +17,7 @@ struct s7d_h264_parameters;
 struct s7d_h264_input_checkpoint;
 struct s7d_codec_dma;
 struct s7d_h264_slice;
+struct s7d_h264_poc1;
 struct s7d_v4l2_drain;
 
 #define S7D_H264_PREFIX_MAX_BYTES (64U * 1024U)
@@ -51,6 +52,8 @@ struct s7d_h264_au_info {
 	u32 max_references;
 	u32 poc_lsb;
 	s32 delta_bottom;
+	/* pic_order_cnt_type 1; zero where the slice header leaves them out. */
+	s32 delta_poc[2];
 	u32 coded_width;
 	u32 coded_height;
 	/* The first_mb and type of each slice stay in the parser's pending AU. */
@@ -59,6 +62,7 @@ struct s7d_h264_au_info {
 	struct s7d_codec_colour colour;
 	struct s7d_h264_sps sps;
 	u8 cavlc_tail_bits;
+	u8 delta_poc_present;
 	bool idr;
 	bool reference;
 	bool no_output_of_prior_pics;
@@ -154,6 +158,9 @@ int s7d_h264_input_observe(struct s7d_h264_input *input, u64 token,
 /* Raw AU validation alone never proves entropy completion or DMA idleness. */
 int s7d_h264_input_get_au(struct s7d_h264_input *input, u64 token,
 			struct s7d_h264_au_info *au);
+/* The pic_order_cnt_type 1 cycle of the SPS this picture AU was parsed against. */
+int s7d_h264_input_get_poc1(struct s7d_h264_input *input, u64 token,
+			    struct s7d_h264_poc1 *poc1);
 /* Only an actual SLICE01 with a completed immutable RPM snapshot qualifies. */
 int s7d_h264_input_confirm_slice(struct s7d_h264_input *input, u64 token,
 				 const struct s7d_h264_slice *slice,

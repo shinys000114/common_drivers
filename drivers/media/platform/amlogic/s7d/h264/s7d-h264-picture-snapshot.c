@@ -16,6 +16,12 @@ static u16 rpm_word(const void *rpm, u32 word)
 	return get_unaligned_le16((const u8 *)rpm + index * 2U);
 }
 
+/* A 32-bit value kept as two words, low word first. */
+static s32 rpm_s32(const void *rpm, u32 word)
+{
+	return (s32)((u32)rpm_word(rpm, word) | ((u32)rpm_word(rpm, word + 1) << 16));
+}
+
 static int parse_reorder(const void *rpm, u32 base,
 			 struct s7d_h264_reorder *commands, u32 *count)
 {
@@ -78,7 +84,7 @@ int s7d_h264_parse_slice(const void *rpm, size_t bytes,
 	    rpm_word(rpm, 0x1cc) != 2 || rpm_word(rpm, 0x8b))
 		return -EOPNOTSUPP;
 	parsed.poc_type = rpm_word(rpm, 0x85);
-	if (parsed.poc_type != 0 && parsed.poc_type != 2)
+	if (parsed.poc_type > 2)
 		return -EOPNOTSUPP;
 	parsed.log2_frame_num = rpm_word(rpm, 0x83);
 	parsed.log2_poc_lsb = rpm_word(rpm, 0x86);
@@ -108,8 +114,9 @@ int s7d_h264_parse_slice(const void *rpm, size_t bytes,
 	parsed.idr_pic_id = rpm_word(rpm, 0x7f);
 	parsed.first_mb = rpm_word(rpm, 0xf0);
 	parsed.poc_lsb = rpm_word(rpm, 0x1ce);
-	parsed.delta_bottom = (s32)((u32)rpm_word(rpm, 0x1d3) |
-				 ((u32)rpm_word(rpm, 0x1d4) << 16));
+	parsed.delta_bottom = rpm_s32(rpm, 0x1d3);
+	parsed.delta_poc[0] = rpm_s32(rpm, 0x1d5);
+	parsed.delta_poc[1] = rpm_s32(rpm, 0x1d7);
 	parsed.max_references = rpm_word(rpm, 0xe4);
 	parsed.mode_8x8_flags = rpm_word(rpm, 0x8c);
 	if (parsed.frame_num >= (1U << parsed.log2_frame_num) ||

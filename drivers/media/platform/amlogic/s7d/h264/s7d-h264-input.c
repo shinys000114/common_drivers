@@ -72,6 +72,7 @@ struct au_sps {
 	u32 coded_height;
 	u32 mb_count;
 	u32 max_references;
+	bool poc1_always_zero;
 	struct s7d_codec_colour colour;
 	struct s7d_h264_sps sps;
 };
@@ -164,6 +165,8 @@ struct au_slice {
 	u32 idr_pic_id;
 	u32 poc_lsb;
 	s32 delta_bottom;
+	s32 delta_poc[2];
+	u8 delta_poc_present;
 	bool idr;
 	bool reference;
 	bool all_same_type;
@@ -556,12 +559,15 @@ static int au_vui(struct au_bits *b, u32 max_refs,
 	return 0;
 }
 
-static int au_sps_parse(struct au_bits *b, struct au_cache *cache, u32 *sps_id)
+/* @cache may be NULL to reparse a kept SPS for its type 1 POC cycle. */
+static int au_sps_parse(struct au_bits *b, struct au_cache *cache, u32 *sps_id,
+			struct s7d_h264_poc1 *poc1)
 {
 	struct au_sps sps = { 0 };
 	struct s7d_codec_layout layout;
 	u32 profile, constraints, level, id, v, refs, width, height;
-	u32 crop[4], i;
+	u32 crop[4], i, cycle;
+	s32 value;
 	int ret;
 
 	ret = au_get(b, 8, &profile);
@@ -624,8 +630,34 @@ static int au_sps_parse(struct au_bits *b, struct au_cache *cache, u32 *sps_id)
 	ret = au_ue(b, 2, &sps.poc_type);
 	if (ret)
 		return ret;
-	if (sps.poc_type == 1)
-		return -EOPNOTSUPP;
+	if (sps.poc_type == 1) {
+		ret = au_get(b, 1, &v);
+		if (ret)
+			return ret;
+		sps.poc1_always_zero = v;
+		ret = au_se(b, AU_S32_MIN + 1, AU_S32_MAX, &value);
+		if (ret)
+			return ret;
+		if (poc1)
+			poc1->non_ref = value;
+		ret = au_se(b, AU_S32_MIN + 1, AU_S32_MAX, &value);
+		if (ret)
+			return ret;
+		if (poc1)
+			poc1->top_to_bottom = value;
+		ret = au_ue(b, S7D_H264_POC_CYCLE_MAX, &cycle);
+		if (ret)
+			return ret;
+		for (i = 0; i < cycle; i++) {
+			ret = au_se(b, AU_S32_MIN + 1, AU_S32_MAX, &value);
+			if (ret)
+				return ret;
+			if (poc1)
+				poc1->offset[i] = value;
+		}
+		if (poc1)
+			poc1->cycle = cycle;
+	}
 	if (!sps.poc_type) {
 		ret = au_ue(b, 12, &v);
 		if (ret)
@@ -697,7 +729,8 @@ static int au_sps_parse(struct au_bits *b, struct au_cache *cache, u32 *sps_id)
 		return ret;
 	sps.colour = sps.sps.colour;
 	sps.valid = true;
-	cache->sps[id] = sps;
+	if (cache)
+		cache->sps[id] = sps;
 	*sps_id = id;
 	return 0;
 }
@@ -1003,6 +1036,18 @@ static int au_slice_parse(struct au_bits *b, const struct au_cache *cache,
 				return ret;
 		}
 	}
+	if (sps->poc_type == 1 && !sps->poc1_always_zero) {
+		ret = au_se(b, AU_S32_MIN + 1, AU_S32_MAX, &slice->delta_poc[0]);
+		if (ret)
+			return ret;
+		slice->delta_poc_present = BIT(0);
+		if (pps->bottom_poc_present) {
+			ret = au_se(b, AU_S32_MIN + 1, AU_S32_MAX, &slice->delta_poc[1]);
+			if (ret)
+				return ret;
+			slice->delta_poc_present |= BIT(1);
+		}
+	}
 	refs[0] = pps->ref_count[0];
 	refs[1] = pps->ref_count[1];
 	if (slice->type == 1) {
@@ -1106,9 +1151,10 @@ static bool au_same_picture(const struct s7d_h264_au_info *info,
 		info->no_output_of_prior_pics == slice->no_output_of_prior_pics &&
 		info->long_term_reference == slice->long_term_reference)) &&
 	       info->reference == slice->reference &&
-	       (info->poc_type == 2 ||
-		(info->poc_lsb == slice->poc_lsb &&
-		 info->delta_bottom == slice->delta_bottom));
+	       info->poc_lsb == slice->poc_lsb &&
+	       info->delta_bottom == slice->delta_bottom &&
+	       info->delta_poc[0] == slice->delta_poc[0] &&
+	       info->delta_poc[1] == slice->delta_poc[1];
 }
 
 static void au_info_first(struct s7d_h264_au_info *info,
@@ -1131,6 +1177,9 @@ static void au_info_first(struct s7d_h264_au_info *info,
 	info->colour = sps->colour;
 	info->sps = sps->sps;
 	info->delta_bottom = slice->delta_bottom;
+	info->delta_poc[0] = slice->delta_poc[0];
+	info->delta_poc[1] = slice->delta_poc[1];
+	info->delta_poc_present = slice->delta_poc_present;
 	info->idr = slice->idr;
 	info->reference = slice->reference;
 	info->no_output_of_prior_pics = slice->no_output_of_prior_pics;
@@ -1541,7 +1590,7 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 		bits.bit = 0;
 		switch (type) {
 		case 7:
-			ret = au_sps_parse(&bits, &draft->cache, &sps_id);
+			ret = au_sps_parse(&bits, &draft->cache, &sps_id, NULL);
 			if (!ret)
 				ret = au_raw_replace(parser, draft, true, sps_id,
 						     data + prefix.header,
@@ -2680,6 +2729,44 @@ int s7d_h264_input_get_au(struct s7d_h264_input *input, u64 token,
 	return 0;
 }
 
+int s7d_h264_input_get_poc1(struct s7d_h264_input *input, u64 token,
+			    struct s7d_h264_poc1 *poc1)
+{
+	struct s7d_h264_au_parser *parser;
+	const struct au_raw *raw;
+	struct au_bits bits;
+	u32 bytes, id;
+	u8 *rbsp;
+	int ret;
+
+	if (IS_ERR_OR_NULL(input) || !token || !poc1)
+		return -EINVAL;
+	parser = input->au_parser;
+	if (!input->preflight_ready || input->buffer.token != token || !parser->pending ||
+	    parser->pending->preflight.kind != S7D_H264_INPUT_PICTURE ||
+	    input->au.poc_type != 1 || input->au.sps_id >= AU_SPS_COUNT)
+		return -ESTALE;
+	/* The kept SPS is the one the AU was parsed against; read its cycle again. */
+	raw = au_raw_get(parser, parser->pending, true, input->au.sps_id);
+	if (!raw->data || raw->bytes <= 5 || (raw->data[4] & 31) != 7)
+		return -ENOENT;
+	rbsp = kvmalloc(raw->bytes - 5, GFP_KERNEL);
+	if (!rbsp)
+		return -ENOMEM;
+	ret = au_rbsp(raw->data + 5, raw->bytes - 5, rbsp, &bytes);
+	if (!ret) {
+		bits.data = rbsp;
+		bits.bytes = bytes;
+		bits.bit = 0;
+		memset(poc1, 0, sizeof(*poc1));
+		ret = au_sps_parse(&bits, NULL, &id, poc1);
+	}
+	kvfree(rbsp);
+	if (ret)
+		return ret;
+	return id == input->au.sps_id ? 0 : -EBADMSG;
+}
+
 int s7d_h264_input_confirm_slice(struct s7d_h264_input *input, u64 token,
 				 const struct s7d_h264_slice *slice,
 				 u64 write_token)
@@ -2721,6 +2808,9 @@ int s7d_h264_input_confirm_slice(struct s7d_h264_input *input, u64 token,
 	    (au->poc_type == 0 && (slice->log2_poc_lsb != au->log2_poc_lsb ||
 				 slice->poc_lsb != au->poc_lsb ||
 				 slice->delta_bottom != au->delta_bottom)) ||
+	    (au->poc_type == 1 &&
+	     (slice->delta_poc[0] != au->delta_poc[0] ||
+	      slice->delta_poc[1] != au->delta_poc[1])) ||
 	    (ordinal && input->write_token != write_token)) {
 		input->faulted = true;
 		return -EBADMSG;

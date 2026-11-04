@@ -10,6 +10,7 @@
 
 #define S7D_H264_REF_LIST_SIZE 32U
 #define S7D_H264_MMCO_SIZE 44U
+#define S7D_H264_POC_CYCLE_MAX 255U
 
 enum s7d_h264_slice_type {
 	S7D_H264_SLICE_I,
@@ -28,6 +29,14 @@ struct s7d_h264_mmco {
 	u32 long_term_index;
 };
 
+/* pic_order_cnt_type 1 syntax of the active SPS, at full range (7.4.2.1.1). */
+struct s7d_h264_poc1 {
+	u32 cycle;
+	s32 non_ref;
+	s32 top_to_bottom;
+	s32 offset[S7D_H264_POC_CYCLE_MAX];
+};
+
 struct s7d_h264_slice {
 	enum s7d_h264_slice_type type;
 	u32 first_mb;
@@ -38,6 +47,7 @@ struct s7d_h264_slice {
 	u32 log2_poc_lsb;
 	u32 poc_lsb;
 	s32 delta_bottom;
+	s32 delta_poc[2];
 	u32 max_references;
 	u32 mode_8x8_flags;
 	u32 active[2];
@@ -49,6 +59,8 @@ struct s7d_h264_slice {
 	bool reference;
 	bool long_term_reference;
 	bool no_output_of_prior_pics;
+	/* The host parse of the SPS; set for pic_order_cnt_type 1 only. */
+	const struct s7d_h264_poc1 *poc1;
 };
 
 struct s7d_h264_capture_binding {

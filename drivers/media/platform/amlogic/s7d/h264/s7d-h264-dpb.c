@@ -4,6 +4,7 @@
 #include <linux/errno.h>
 #include <linux/limits.h>
 #include <linux/minmax.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include "s7d-codec-types.h"
@@ -84,8 +85,11 @@ static int validate_slice(const struct s7d_h264_dpb *dpb,
 	    slice->first_mb >= (dpb->layout.coded_width / 16U) *
 			      (dpb->layout.coded_height / 16U))
 		return -EINVAL;
-	if (slice->poc_type != 0 && slice->poc_type != 2)
+	if (slice->poc_type > 2)
 		return -EOPNOTSUPP;
+	if (slice->poc_type == 1 &&
+	    (!slice->poc1 || slice->poc1->cycle > S7D_H264_POC_CYCLE_MAX))
+		return -EINVAL;
 	max_frame_num = 1U << slice->log2_frame_num;
 	if (slice->frame_num >= max_frame_num ||
 	    (slice->poc_type == 0 && (slice->log2_poc_lsb < 4 ||
@@ -108,6 +112,32 @@ static int validate_slice(const struct s7d_h264_dpb *dpb,
 	    (slice->type == S7D_H264_SLICE_P && (!slice->active[0] || slice->active[1])) ||
 	    (slice->type == S7D_H264_SLICE_B && (!slice->active[0] || !slice->active[1])))
 		return -EBADMSG;
+	return 0;
+}
+
+/* 8.2.1.2: the expected count of a picture from its absolute frame number. */
+static int expected_poc(const struct s7d_h264_poc1 *poc1, s64 absolute,
+			bool reference, s64 *expected)
+{
+	s64 delta = 0, partial = 0, cycles, value = 0;
+	u32 i, in_cycle;
+
+	if (poc1->cycle && absolute > 0) {
+		for (i = 0; i < poc1->cycle; i++)
+			delta += poc1->offset[i];
+		cycles = (absolute - 1) / poc1->cycle;
+		in_cycle = (absolute - 1) % poc1->cycle;
+		for (i = 0; i <= in_cycle; i++)
+			partial += poc1->offset[i];
+		if (check_mul_overflow(cycles, delta, &value) ||
+		    check_add_overflow(value, partial, &value))
+			return -EOVERFLOW;
+	}
+	if (!reference && check_add_overflow(value, (s64)poc1->non_ref, &value))
+		return -EOVERFLOW;
+	if (value < INT_MIN || value > INT_MAX)
+		return -EOVERFLOW;
+	*expected = value;
 	return 0;
 }
 
@@ -160,8 +190,21 @@ static int calculate_poc(const struct s7d_h264_dpb *dpb,
 		if (offset > U32_MAX)
 			return -EOVERFLOW;
 		next->frame_offset = offset;
-		top = slice->idr ? 0 : 2 * (offset + slice->frame_num) - !slice->reference;
-		bottom = top;
+		if (slice->poc_type == 1) {
+			s64 absolute = slice->poc1->cycle ? offset + slice->frame_num : 0;
+			int ret;
+
+			if (!slice->reference && absolute > 0)
+				absolute--;
+			ret = expected_poc(slice->poc1, absolute, slice->reference, &top);
+			if (ret)
+				return ret;
+			top += slice->delta_poc[0];
+			bottom = top + slice->poc1->top_to_bottom + slice->delta_poc[1];
+		} else {
+			top = slice->idr ? 0 : 2 * (offset + slice->frame_num) - !slice->reference;
+			bottom = top;
+		}
 	}
 	if (top < INT_MIN || top > INT_MAX || bottom < INT_MIN || bottom > INT_MAX)
 		return -EOVERFLOW;
@@ -456,6 +499,8 @@ static bool same_picture(const struct s7d_h264_slice *a,
 		a->poc_type == b->poc_type && a->log2_frame_num == b->log2_frame_num &&
 		(a->poc_type != 0 || (a->poc_lsb == b->poc_lsb &&
 		 a->delta_bottom == b->delta_bottom && a->log2_poc_lsb == b->log2_poc_lsb)) &&
+		(a->poc_type != 1 || (a->delta_poc[0] == b->delta_poc[0] &&
+		 a->delta_poc[1] == b->delta_poc[1])) &&
 		a->long_term_reference == b->long_term_reference &&
 		a->no_output_of_prior_pics == b->no_output_of_prior_pics &&
 		((a->mode_8x8_flags & 6U) == (b->mode_8x8_flags & 6U)) &&

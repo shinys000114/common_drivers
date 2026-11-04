@@ -70,6 +70,9 @@ struct s7d_h264_backend {
 	struct s7d_h264_capture_descriptor descriptor[S7D_CODEC_MAX_CAPTURE_BUFFERS];
 	struct s7d_h264_picture_plan picture;
 	struct s7d_h264_slice slice;
+	/* The type 1 POC cycle of the AU at poc1_token. */
+	struct s7d_h264_poc1 poc1;
+	u64 poc1_token;
 	struct s7d_h264_event irq_event;
 	struct s7d_h264_event event;
 	struct s7d_h264_mailbox_config config_packet;
@@ -482,14 +485,30 @@ static int backend_capture_setup(struct s7d_h264_backend *backend)
 static int backend_slice_identity(struct s7d_h264_backend *backend)
 {
 	int ret = s7d_h264_input_get_au(backend->stream, backend->input.token, &backend->au);
+	u32 i;
 
 	if (ret)
 		return ret;
 	if (backend->au.coded_width != backend->layout.coded_width ||
 	    backend->au.coded_height != backend->layout.coded_height ||
 	    backend->au.idr != backend->slice.idr ||
-	    (backend->au.idr && backend->au.idr_pic_id != backend->slice.idr_pic_id))
+	    (backend->au.idr && backend->au.idr_pic_id != backend->slice.idr_pic_id) ||
+	    backend->au.poc_type != backend->slice.poc_type)
 		return -EBADMSG;
+	if (backend->au.poc_type != 1)
+		return 0;
+	/* The host SPS decides type 1 POCs; the RPM keeps 128 truncated offsets. */
+	if (backend->poc1_token != backend->input.token) {
+		ret = s7d_h264_input_get_poc1(backend->stream, backend->input.token,
+					      &backend->poc1);
+		if (ret)
+			return ret;
+		backend->poc1_token = backend->input.token;
+	}
+	for (i = 0; i < 2; i++)
+		if (!(backend->au.delta_poc_present & BIT(i)))
+			backend->slice.delta_poc[i] = 0;
+	backend->slice.poc1 = &backend->poc1;
 	return 0;
 }
 
@@ -1630,6 +1649,7 @@ static int backend_reset_epoch(struct s7d_h264_backend *backend, bool keep_chang
 	memset(backend->descriptor, 0, sizeof(backend->descriptor));
 	memset(&backend->picture, 0, sizeof(backend->picture));
 	memset(&backend->slice, 0, sizeof(backend->slice));
+	backend->poc1_token = 0;
 	memset(&backend->irq_event, 0, sizeof(backend->irq_event));
 	memset(&backend->event, 0, sizeof(backend->event));
 	memset(&backend->config_packet, 0, sizeof(backend->config_packet));
