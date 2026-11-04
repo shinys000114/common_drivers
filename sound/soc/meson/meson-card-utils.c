@@ -198,10 +198,23 @@ int meson_card_set_fe_link(struct snd_soc_card *card,
 }
 EXPORT_SYMBOL_GPL(meson_card_set_fe_link);
 
+/*
+ * A stream that an unbind's disconnect closes queues the runtime's
+ * delayed DAPM power down after the core has flushed it, and the core
+ * runs it only when it frees the runtime, after the DAIs and their
+ * widgets are gone. Run it while they still exist, as upstream soc-core
+ * now does itself.
+ */
+static void meson_card_link_exit(struct snd_soc_pcm_runtime *rtd)
+{
+	flush_delayed_work(&rtd->delayed_work);
+}
+
 static int meson_card_add_links(struct snd_soc_card *card)
 {
 	struct meson_card *priv = snd_soc_card_get_drvdata(card);
 	struct device_node *node = card->dev->of_node;
+	struct snd_soc_dai_link *link;
 	struct device_node *np;
 	int num, i, ret;
 
@@ -225,6 +238,9 @@ static int meson_card_add_links(struct snd_soc_card *card)
 
 		i++;
 	}
+
+	for_each_card_prelinks(card, i, link)
+		link->exit = meson_card_link_exit;
 
 	return 0;
 }
