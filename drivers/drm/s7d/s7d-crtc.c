@@ -25,6 +25,7 @@
 #include "s7d-gamma.h"
 #include "s7d-hooks.h"
 #include "s7d-plane.h"
+#include "s7d-vendor-props.h"
 #include "s7d-writeback.h"
 
 struct s7d_crtc {
@@ -52,6 +53,8 @@ struct s7d_crtc {
 	bool awaiting_frame;
 	unsigned long deadline;
 	struct s7d_flip_timestamp flip_timestamp;
+	/* Set before registration, in vendor mode only. */
+	const struct s7d_vendor_props *vendor;
 };
 
 #define to_s7d_crtc(c) container_of(c, struct s7d_crtc, base)
@@ -100,6 +103,9 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->osd_scaler_live = 0;
 	state->live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
+	state->vendor.force_output = 0;
+	state->vendor.brr_update = false;
+	state->vendor.nonblock_by_vblank = false;
 	return &state->base;
 }
 
@@ -1598,6 +1604,19 @@ static void s7d_crtc_print_state(struct drm_printer *p, const struct drm_crtc_st
 				   b->input[i].average_bps, b->input[i].window_bps);
 }
 
+static int s7d_crtc_atomic_get_property(struct drm_crtc *crtc,
+					const struct drm_crtc_state *state,
+					struct drm_property *property, uint64_t *val)
+{
+	return s7d_vendor_props_crtc_get(to_s7d_crtc(crtc)->vendor, crtc, state, property, val);
+}
+
+static int s7d_crtc_atomic_set_property(struct drm_crtc *crtc, struct drm_crtc_state *state,
+					struct drm_property *property, uint64_t val)
+{
+	return s7d_vendor_props_crtc_set(to_s7d_crtc(crtc)->vendor, crtc, state, property, val);
+}
+
 static const struct drm_crtc_funcs s7d_crtc_funcs = {
 	.get_crc_sources = s7d_crtc_get_crc_sources,
 	.verify_crc_source = s7d_crtc_verify_crc_source,
@@ -1608,6 +1627,8 @@ static const struct drm_crtc_funcs s7d_crtc_funcs = {
 	.atomic_duplicate_state = s7d_crtc_duplicate_state,
 	.atomic_destroy_state = s7d_crtc_destroy_state,
 	.atomic_print_state = s7d_crtc_print_state,
+	.atomic_get_property = s7d_crtc_atomic_get_property,
+	.atomic_set_property = s7d_crtc_atomic_set_property,
 	.enable_vblank = s7d_crtc_enable_vblank,
 	.disable_vblank = s7d_crtc_disable_vblank,
 };
@@ -1615,6 +1636,11 @@ static const struct drm_crtc_funcs s7d_crtc_funcs = {
 bool s7d_crtc_is_native(const struct drm_crtc *crtc)
 {
 	return crtc && crtc->funcs == &s7d_crtc_funcs;
+}
+
+void s7d_crtc_set_vendor_props(struct drm_crtc *crtc, const struct s7d_vendor_props *props)
+{
+	to_s7d_crtc(crtc)->vendor = props;
 }
 
 static const struct drm_crtc_helper_funcs s7d_crtc_helper_funcs = {

@@ -26,7 +26,25 @@
 /* Room for live scaler writes; a commit needing more takes a modeset. */
 #define S7D_CRTC_LIVE_REG_COUNT (S7D_CRTC_UPDATE_REG_COUNT - S7D_CRTC_UPDATE_BASE_COUNT)
 
+struct s7d_vendor_props;
 struct s7d_writeback;
+
+/*
+ * Values of the vendor CRTC properties (s7d-vendor-props.c), zero without
+ * them. None has an effect on the output yet.
+ */
+struct s7d_crtc_vendor {
+	u64 background_color;
+	u32 game_rate;
+	u8 hdr_policy;
+	u8 vrr_type;
+	bool dv_enable;
+	bool dv_mode;
+	/* As the vendor driver, these hold for the commit that sets them. */
+	u8 force_output;
+	bool brr_update;
+	bool nonblock_by_vblank;
+};
 
 struct s7d_crtc_state {
 	struct drm_crtc_state base;
@@ -74,6 +92,7 @@ struct s7d_crtc_state {
 	bool video2_scaler_live;
 	/* OSD1 (bit 0) and OSD2 (bit 1) scalers changing at vblank. */
 	u8 osd_scaler_live;
+	struct s7d_crtc_vendor vendor;
 };
 
 static inline struct s7d_crtc_state *
@@ -137,6 +156,8 @@ void s7d_crtc_irq_latched(struct drm_crtc *crtc, bool vblank,
 			 const struct s7d_frame_state *frame,
 			 const struct s7d_flip_latch *latch);
 bool s7d_crtc_is_native(const struct drm_crtc *crtc);
+/* Hand the vendor CRTC properties to their owner; before the device registers. */
+void s7d_crtc_set_vendor_props(struct drm_crtc *crtc, const struct s7d_vendor_props *props);
 void s7d_crtc_capture_input(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
 void s7d_crtc_primary_dependency(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
 void s7d_crtc_osd2_dependency(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
