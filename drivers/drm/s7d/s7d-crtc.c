@@ -23,6 +23,7 @@
 #include "s7d-crtc.h"
 #include "s7d-afbc-engine.h"
 #include "s7d-gamma.h"
+#include "s7d-hooks.h"
 #include "s7d-plane.h"
 #include "s7d-writeback.h"
 
@@ -41,6 +42,8 @@ struct s7d_crtc {
 	bool vblank_ref;
 	bool link_status_bad;
 	bool link_required;
+	/* s7d_ext_mode_set() has announced the running mode. */
+	bool ext_mode;
 	int last_error;
 	/* Protected by drm_device.event_lock, including start-vs-IRQ ordering. */
 	struct drm_pending_vblank_event *event;
@@ -1048,6 +1051,11 @@ static int s7d_crtc_stop(struct s7d_crtc *c)
 {
 	int ret;
 
+	/* Withdraw the mode while the output and the VPU clock still run. */
+	if (c->ext_mode) {
+		s7d_ext_mode_clear(&c->base);
+		c->ext_mode = false;
+	}
 	if (c->vblank_ref) {
 		drm_crtc_vblank_put(&c->base);
 		c->vblank_ref = false;
@@ -1292,6 +1300,21 @@ static void s7d_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_sta
 			state->event = NULL;
 			spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
 		}
+	}
+	mutex_unlock(&c->mutex);
+}
+
+void s7d_crtc_ext_mode_set(struct drm_crtc *crtc, const struct drm_crtc_state *state)
+{
+	struct s7d_crtc *c = to_s7d_crtc(crtc);
+
+	if (!state->active || !drm_atomic_crtc_needs_modeset(state))
+		return;
+	/* Only s7d_crtc_stop(), under this mutex, gives up the VPU clock. */
+	mutex_lock(&c->mutex);
+	if (c->prepared && !READ_ONCE(c->last_error) && !c->ext_mode) {
+		s7d_ext_mode_set(crtc, &state->adjusted_mode);
+		c->ext_mode = true;
 	}
 	mutex_unlock(&c->mutex);
 }

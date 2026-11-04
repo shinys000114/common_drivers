@@ -268,10 +268,16 @@ static void s7d_atomic_commit_tail(struct drm_atomic_state *state)
 	struct drm_device *drm = state->dev;
 	struct s7d_drm *display = container_of(drm, struct s7d_drm, drm);
 	bool capture = s7d_writeback_has_job(display->vpu.writeback, state);
+	struct drm_crtc_state *crtc_state;
+	struct drm_crtc *crtc;
+	int i;
 
 	drm_atomic_helper_commit_modeset_disables(drm, state);
 	drm_atomic_helper_commit_planes(drm, state, 0);
 	drm_atomic_helper_commit_modeset_enables(drm, state);
+	/* Before hw_done, while these states are still the current ones. */
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
+		s7d_crtc_ext_mode_set(crtc, crtc_state);
 	drm_atomic_helper_fake_vblank(state);
 	if (capture) {
 		drm_atomic_helper_wait_for_flip_done(drm, state);

@@ -146,6 +146,12 @@ int s7d_crtc_writeback_capture(struct drm_crtc *crtc, struct drm_atomic_state *a
 /* Bridge completion/error, after atomic_enable; never used from atomic_check. */
 void s7d_crtc_link_ready(struct drm_crtc *crtc);
 void s7d_crtc_link_error(struct drm_crtc *crtc, int error);
+/*
+ * Commit tail, after the modeset enables and before hw_done: announce the
+ * mode of a CRTC that @state, its new state, took through a modeset to
+ * active, if it started without error. s7d_crtc_stop() withdraws it.
+ */
+void s7d_crtc_ext_mode_set(struct drm_crtc *crtc, const struct drm_crtc_state *state);
 
 /*
  * Before freeing backend resources, stop new commits and call shutdown. It
