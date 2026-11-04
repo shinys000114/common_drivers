@@ -29,12 +29,20 @@ struct s7d_vp9_decode_result {
 	bool corrupt;
 };
 
-/* Borrowed owners remain live until destroy succeeds. */
+/*
+ * The resource ops of a VP9 codec core. Each session holds the HEVC core with
+ * its own decoder, which it passes as the session's resource priv.
+ */
+extern const struct s7d_codec_resource_ops s7d_vp9_decoder_resource_ops;
+
+/*
+ * One stream's decoder; several take turns on the HEVC core. Borrowed owners
+ * remain live until destroy succeeds.
+ */
 struct s7d_vp9_decoder *
 s7d_vp9_decoder_create(struct device *dev, struct s7d_codec_dos *dos,
 			struct s7d_codec_firmware_owner *firmware,
 			struct s7d_hevc_engine *engine, struct module *owner);
-struct s7d_codec_core *s7d_vp9_decoder_core(struct s7d_vp9_decoder *decoder);
 int s7d_vp9_decoder_bind(struct s7d_vp9_decoder *decoder,
 			 struct s7d_codec_session *session,
 			 const struct s7d_codec_layout *layout, u64 generation,

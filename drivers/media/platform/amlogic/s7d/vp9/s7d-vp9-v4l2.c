@@ -20,6 +20,8 @@
 
 struct vp9_backend {
 	struct s7d_vp9_v4l2 *adapter;
+	/* This instance's stream state on the core, held through its sessions. */
+	struct s7d_vp9_decoder *decoder;
 	struct list_head node;
 	struct mutex lock; /* Admission, metadata and capture bindings. */
 	struct mutex notifications; /* Frontend lifetime and callbacks. */
@@ -76,12 +78,14 @@ struct vp9_backend {
 struct s7d_vp9_v4l2 {
 	struct device *dev;
 	struct module *owner;
-	struct s7d_vp9_decoder *decoder;
 	struct s7d_codec_dos *dos;
+	struct s7d_codec_firmware_owner *firmware;
+	struct s7d_hevc_engine *engine;
+	/* The VP9 sessions of all instances; each holds the core with its decoder. */
+	struct s7d_codec_core *core;
 	struct s7d_v4l2_backend_factory factory;
 	struct mutex clients; /* Instance lifetime and shutdown. */
 	struct list_head instances;
-	struct vp9_backend *active;
 	bool closing;
 };
 
@@ -379,7 +383,7 @@ static void vp9_work(struct work_struct *work)
 			backend->execution_attempted = true;
 			mutex_unlock(&backend->lock);
 			if (!bound) {
-				ret = s7d_vp9_decoder_bind(backend->adapter->decoder, backend->session,
+				ret = s7d_vp9_decoder_bind(backend->decoder, backend->session,
 					&backend->layout, backend->generation,
 					backend->capture, backend->captures);
 				mutex_lock(&backend->lock);
@@ -391,7 +395,7 @@ static void vp9_work(struct work_struct *work)
 			}
 			result = (struct s7d_vp9_decode_result) { };
 			if (!ret)
-				ret = s7d_vp9_decoder_decode(backend->adapter->decoder,
+				ret = s7d_vp9_decoder_decode(backend->decoder,
 					backend->session, backend->bank, backend->prepared,
 					picture_token, backend->input.timestamp_ns,
 					&backend->input.timestamp_meta, &result);
@@ -435,7 +439,7 @@ static void vp9_work(struct work_struct *work)
 			mutex_unlock(&backend->lock);
 			cancelled = false;
 			ret = backend->decoder_bound ?
-				s7d_vp9_decoder_drain(backend->adapter->decoder,
+				s7d_vp9_decoder_drain(backend->decoder,
 						backend->session, &published, &cancelled) : 0;
 			if (!ret) {
 				mutex_lock(&backend->notifications);
@@ -489,13 +493,12 @@ static int vp9_prepare(void *priv, struct s7d_codec_session *session,
 		return -EINVAL;
 	mutex_lock(&adapter->clients);
 	mutex_lock(&backend->lock);
-	if (adapter->closing || backend->closing || backend->session || adapter->active) {
+	if (adapter->closing || backend->closing || backend->session) {
 		ret = -EBUSY;
 	} else {
 		s7d_codec_session_get(session);
 		backend->session = session;
 		backend->frontend = frontend;
-		adapter->active = backend;
 	}
 	mutex_unlock(&backend->lock);
 	mutex_unlock(&adapter->clients);
@@ -650,7 +653,7 @@ static int vp9_capture_queue(void *priv, struct s7d_codec_surface *surface,
 		    backend->capture[i].surface_id == surface_id &&
 		    backend->capture[i].generation == generation) {
 			ret = backend->decoder_bound ?
-				s7d_vp9_decoder_capture_queue(backend->adapter->decoder,
+				s7d_vp9_decoder_capture_queue(backend->decoder,
 							surface, surface_id, generation) : 0;
 			if (!ret)
 				queue_work(system_unbound_wq, &backend->work);
@@ -708,7 +711,7 @@ static void vp9_detach(void *priv)
 	mutex_lock(&backend->lock);
 	backend->closing = true;
 	if (backend->session)
-		s7d_vp9_decoder_request_stop(backend->adapter->decoder);
+		s7d_vp9_decoder_request_stop(backend->decoder);
 	mutex_unlock(&backend->lock);
 	cancel_work_sync(&backend->work);
 	mutex_lock(&backend->notifications);
@@ -738,14 +741,12 @@ static int vp9_release_epoch(struct vp9_backend *backend)
 	if (backend->session) {
 		ret = s7d_codec_session_stop(backend->session);
 		if (!ret)
-			ret = s7d_vp9_decoder_stream_close(backend->adapter->decoder,
+			ret = s7d_vp9_decoder_stream_close(backend->decoder,
 							backend->session);
 		if (ret)
 			return ret;
 	}
 	mutex_lock(&backend->lock);
-	if (backend->adapter->active == backend)
-		backend->adapter->active = NULL;
 	session = backend->session;
 	backend->session = NULL;
 	vp9_input_release(backend);
@@ -857,7 +858,7 @@ static int vp9_reconfigure_stop(void *priv, const struct s7d_v4l2_reconfigure *c
 	ret = vp9_change_stop_check(backend, change);
 	mutex_unlock(&backend->lock);
 	if (!ret && backend->decoder_bound)
-		ret = s7d_vp9_decoder_drain(adapter->decoder, backend->session,
+		ret = s7d_vp9_decoder_drain(backend->decoder, backend->session,
 					    &published, &cancelled);
 	if (ret)
 		goto out;
@@ -870,7 +871,7 @@ static int vp9_reconfigure_stop(void *priv, const struct s7d_v4l2_reconfigure *c
 	}
 	ret = s7d_codec_session_stop(backend->session);
 	if (!ret)
-		ret = s7d_vp9_decoder_stream_close(adapter->decoder, backend->session);
+		ret = s7d_vp9_decoder_stream_close(backend->decoder, backend->session);
 	if (ret) {
 		kvfree(held);
 		goto out;
@@ -879,8 +880,6 @@ static int vp9_reconfigure_stop(void *priv, const struct s7d_v4l2_reconfigure *c
 	backend->frontend = NULL;
 	mutex_unlock(&backend->notifications);
 	mutex_lock(&backend->lock);
-	if (adapter->active == backend)
-		adapter->active = NULL;
 	session = backend->session;
 	backend->session = NULL;
 	backend->input.memory = NULL;
@@ -913,7 +912,7 @@ static int vp9_reconfigure_restore(void *priv, struct s7d_codec_session *session
 	if (adapter->closing || backend->closing || backend->failure)
 		ret = backend->failure ? backend->failure : -ESHUTDOWN;
 	else if (!vp9_change_matches(backend, change) || !backend->change_stopped ||
-		 backend->session || adapter->active || backend->captures ||
+		 backend->session || backend->captures ||
 		 !backend->input_pending || !backend->prepared || !backend->held_input ||
 		 !session || !frontend || !staging || generation <= change->generation ||
 		 s7d_codec_dma_size(staging) < backend->input.bytes)
@@ -923,7 +922,6 @@ static int vp9_reconfigure_restore(void *priv, struct s7d_codec_session *session
 	s7d_codec_session_get(session);
 	backend->session = session;
 	backend->frontend = frontend;
-	adapter->active = backend;
 	memcpy(s7d_codec_dma_cpu(staging), backend->held_input, backend->input.bytes);
 	backend->input.memory = staging;
 	/* The held key frame decodes first, once the new CAPTURE buffers come. */
@@ -952,7 +950,7 @@ static int vp9_clear_stream(void *priv)
 	mutex_lock(&backend->lock);
 	if (adapter->closing || backend->closing || backend->failure) {
 		ret = backend->failure ? backend->failure : -ESHUTDOWN;
-	} else if (backend->session || backend->frontend || adapter->active == backend ||
+	} else if (backend->session || backend->frontend ||
 		   backend->prepared || backend->generation || backend->captures ||
 		   backend->input_pending || backend->decoder_bound ||
 		   backend->execution_attempted || backend->drain_pending ||
@@ -974,7 +972,15 @@ static int vp9_clear_stream(void *priv)
 	return ret;
 }
 
+static void *vp9_resources(void *priv)
+{
+	struct vp9_backend *backend = priv;
+
+	return backend->decoder;
+}
+
 static const struct s7d_v4l2_backend_ops vp9_ops = {
+	.resources = vp9_resources,
 	.prepare = vp9_prepare,
 	.submit = vp9_submit,
 	.sync_initial = vp9_sync_initial,
@@ -1005,23 +1011,28 @@ static void *vp9_factory_create(void *priv)
 {
 	struct s7d_vp9_v4l2 *adapter = priv;
 	struct vp9_backend *backend;
+	int ret;
 
 	backend = kzalloc(sizeof(*backend), GFP_KERNEL);
 	if (!backend)
 		return ERR_PTR(-ENOMEM);
 	backend->bank = s7d_vp9_input_bank_create();
 	if (IS_ERR(backend->bank)) {
-		int ret = PTR_ERR(backend->bank);
-
-		kfree(backend);
-		return ERR_PTR(ret);
+		ret = PTR_ERR(backend->bank);
+		goto free;
+	}
+	backend->decoder = s7d_vp9_decoder_create(adapter->dev, adapter->dos,
+						 adapter->firmware, adapter->engine,
+						 adapter->owner);
+	if (IS_ERR(backend->decoder)) {
+		ret = PTR_ERR(backend->decoder);
+		goto bank;
 	}
 	mutex_lock(&adapter->clients);
 	if (adapter->closing || !try_module_get(adapter->owner)) {
 		mutex_unlock(&adapter->clients);
-		s7d_vp9_input_bank_destroy(backend->bank);
-		kfree(backend);
-		return ERR_PTR(-ESHUTDOWN);
+		ret = -ESHUTDOWN;
+		goto decoder;
 	}
 	backend->adapter = adapter;
 	mutex_init(&backend->lock);
@@ -1030,6 +1041,14 @@ static void *vp9_factory_create(void *priv)
 	list_add_tail(&backend->node, &adapter->instances);
 	mutex_unlock(&adapter->clients);
 	return backend;
+decoder:
+	/* Never held: nothing can keep it. */
+	WARN_ON(s7d_vp9_decoder_destroy(backend->decoder));
+bank:
+	s7d_vp9_input_bank_destroy(backend->bank);
+free:
+	kfree(backend);
+	return ERR_PTR(ret);
 }
 
 static void vp9_factory_destroy(void *priv, void *instance)
@@ -1041,6 +1060,8 @@ static void vp9_factory_destroy(void *priv, void *instance)
 	mutex_lock(&adapter->clients);
 	vp9_detach(backend);
 	ret = vp9_release_epoch(backend);
+	if (!ret)
+		ret = s7d_vp9_decoder_destroy(backend->decoder);
 	if (ret) {
 		dev_err(adapter->dev, "VP9 instance stop failed: %d; owner retained\n", ret);
 		mutex_unlock(&adapter->clients);
@@ -1064,20 +1085,27 @@ s7d_vp9_v4l2_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 	struct s7d_vp9_v4l2 *adapter;
 	int ret;
 
-	if (!dev)
+	if (!dev || IS_ERR_OR_NULL(borrowed_dos) || IS_ERR_OR_NULL(borrowed_firmware) ||
+	    IS_ERR_OR_NULL(borrowed_engine))
 		return ERR_PTR(-EINVAL);
+#ifdef MODULE
+	if (owner != THIS_MODULE)
+		return ERR_PTR(-EINVAL);
+#endif
 	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
 	if (!adapter)
 		return ERR_PTR(-ENOMEM);
 	adapter->dev = get_device(dev);
 	adapter->owner = owner;
 	adapter->dos = borrowed_dos;
+	adapter->firmware = borrowed_firmware;
+	adapter->engine = borrowed_engine;
 	mutex_init(&adapter->clients);
 	INIT_LIST_HEAD(&adapter->instances);
-	adapter->decoder = s7d_vp9_decoder_create(dev, borrowed_dos, borrowed_firmware,
-						 borrowed_engine, owner);
-	if (IS_ERR(adapter->decoder)) {
-		ret = PTR_ERR(adapter->decoder);
+	adapter->core = s7d_codec_core_create(dev, owner, &s7d_vp9_decoder_resource_ops,
+					      NULL, 32);
+	if (IS_ERR(adapter->core)) {
+		ret = PTR_ERR(adapter->core);
 		put_device(adapter->dev);
 		kfree(adapter);
 		return ERR_PTR(ret);
@@ -1107,7 +1135,7 @@ s7d_vp9_v4l2_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 
 struct s7d_codec_core *s7d_vp9_v4l2_core(struct s7d_vp9_v4l2 *adapter)
 {
-	return s7d_vp9_decoder_core(adapter->decoder);
+	return adapter->core;
 }
 
 const struct s7d_v4l2_backend_factory *
@@ -1118,10 +1146,20 @@ s7d_vp9_v4l2_factory(struct s7d_vp9_v4l2 *adapter)
 
 int s7d_vp9_v4l2_suspend_check(struct s7d_vp9_v4l2 *adapter)
 {
-	int ret;
+	struct vp9_backend *backend;
+	int ret = 0;
 
 	mutex_lock(&adapter->clients);
-	ret = adapter->active ? -EBUSY : s7d_codec_dos_suspend_check(adapter->dos);
+	list_for_each_entry(backend, &adapter->instances, node) {
+		mutex_lock(&backend->lock);
+		if (backend->session)
+			ret = -EBUSY;
+		mutex_unlock(&backend->lock);
+		if (ret)
+			break;
+	}
+	if (!ret)
+		ret = s7d_codec_dos_suspend_check(adapter->dos);
 	mutex_unlock(&adapter->clients);
 	return ret;
 }
@@ -1136,8 +1174,8 @@ int s7d_vp9_v4l2_shutdown(struct s7d_vp9_v4l2 *adapter)
 		mutex_lock(&backend->lock);
 		backend->closing = true;
 		mutex_unlock(&backend->lock);
+		s7d_vp9_decoder_request_stop(backend->decoder);
 	}
-	s7d_vp9_decoder_request_stop(adapter->decoder);
 	list_for_each_entry(backend, &adapter->instances, node)
 		vp9_detach(backend);
 	mutex_unlock(&adapter->clients);
@@ -1156,7 +1194,7 @@ int s7d_vp9_v4l2_destroy(struct s7d_vp9_v4l2 *adapter)
 		mutex_unlock(&adapter->clients);
 		return -EBUSY;
 	}
-	ret = s7d_vp9_decoder_destroy(adapter->decoder);
+	ret = s7d_codec_core_destroy(adapter->core);
 	mutex_unlock(&adapter->clients);
 	if (ret)
 		return ret;
