@@ -33,7 +33,7 @@ struct s7d_jpeg_irq_snapshot {
 
 int s7d_jpeg_protocol_check(const struct s7d_jpeg_job *job);
 
-/* Caller completed fresh JPEG prepare, port enable and firmware load. */
+/* Caller completed fresh JPEG prepare and port enable; firmware loaded in this lease. */
 /* It owns the same DOS lease/transaction, idle CPU and live DMA/FW refs. */
 /* quant is the immutable builder result also used for this job's CPU header. */
 /* IRQ is installed; a partial failure requires halt/join or retained backing. */

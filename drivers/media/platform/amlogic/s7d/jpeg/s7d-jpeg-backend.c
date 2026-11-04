@@ -77,6 +77,12 @@ struct s7d_jpeg_encoder {
 	bool running;
 	bool retained;
 	bool release_pin;
+	/*
+	 * The JPEG image stays in HCODEC IMEM for the rest of the lease: the
+	 * held lease keeps the domain powered, and the per-job halt resets the
+	 * CPU and the local blocks only. Any failed job loads it again.
+	 */
+	bool firmware_loaded;
 };
 
 static int jpeg_check_stop(struct s7d_jpeg_encoder *encoder)
@@ -231,6 +237,7 @@ static int jpeg_hold(void *priv, enum s7d_codec_engine engine)
 		return ret;
 	encoder->lease_epoch++;
 	encoder->firmware_epoch = 0;
+	encoder->firmware_loaded = false;
 	encoder->lease_active = true;
 	encoder->quiesced = false;
 	spin_lock_irqsave(&encoder->irq_lock, flags);
@@ -292,6 +299,7 @@ static int jpeg_quiesce(void *priv, enum s7d_codec_engine engine)
 		wait_for_completion(&encoder->idle);
 		mutex_lock(&encoder->control);
 	}
+	encoder->firmware_loaded = false;
 	ret = jpeg_halt_locked(encoder);
 	if (!ret) {
 		job = jpeg_detach_job(encoder);
@@ -509,15 +517,18 @@ int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 		ret = s7d_codec_firmware_set_policy(encoder->dev, S7D_CODEC_ENGINE_HCODEC);
 	if (!ret)
 		ret = s7d_codec_dos_jpeg_port_enable(encoder->dos);
-	if (!ret)
+	if (!ret && !encoder->firmware_loaded)
 		ret = jpeg_preload(encoder, job);
 	if (ret)
 		goto stop;
-	ret = s7d_codec_firmware_load(encoder->dev, S7D_CODEC_ENGINE_HCODEC,
-				      S7D_CODEC_FIRMWARE_JPEG_ENC);
-	if (ret) {
-		s7d_codec_firmware_invalidate(encoder->firmware);
-		goto stop;
+	if (!encoder->firmware_loaded) {
+		ret = s7d_codec_firmware_load(encoder->dev, S7D_CODEC_ENGINE_HCODEC,
+					      S7D_CODEC_FIRMWARE_JPEG_ENC);
+		if (ret) {
+			s7d_codec_firmware_invalidate(encoder->firmware);
+			goto stop;
+		}
+		encoder->firmware_loaded = true;
 	}
 	mutex_lock(&encoder->protocol);
 	ret = jpeg_check_stop(encoder);
@@ -567,6 +578,8 @@ stop:
 	}
 	retired = jpeg_detach_job(encoder);
 idle:
+	if (ret)
+		encoder->firmware_loaded = false;
 	encoder->running = false;
 	complete_all(&encoder->idle);
 out:
