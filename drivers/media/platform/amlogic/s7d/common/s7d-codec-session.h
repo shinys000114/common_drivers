@@ -27,8 +27,11 @@ struct s7d_codec_dma_copy_plane {
 	u32 rows;
 };
 
+/*
+ * @priv is what the session was opened with, or the core's when that is NULL.
+ * Failed hold must unwind; none of these callbacks may re-enter the core.
+ */
 struct s7d_codec_resource_ops {
-	/* Failed hold must unwind; none of these callbacks may re-enter the core. */
 	int (*hold)(void *priv, enum s7d_codec_engine engine);
 	/* Zero requires DMA idle and synchronized IRQ/work, not just reset. */
 	int (*quiesce)(void *priv, enum s7d_codec_engine engine);
@@ -87,10 +90,14 @@ s7d_codec_core_create(struct device *dev, struct module *owner,
 int s7d_codec_core_destroy(struct s7d_codec_core *core);
 /* A session of this core failed to stop; the core opens no other session. */
 bool s7d_codec_core_failed(struct s7d_codec_core *core);
+/*
+ * @resource_priv: what the resource ops get for this session, so that each
+ * session can hold the engine with its own state; NULL for the core's priv.
+ */
 int s7d_codec_session_open(struct s7d_codec_core *core,
 			   enum s7d_codec_engine engine,
 			   const struct s7d_codec_callbacks *callbacks, void *priv,
-			   struct s7d_codec_session **out);
+			   void *resource_priv, struct s7d_codec_session **out);
 void s7d_codec_session_get(struct s7d_codec_session *session);
 /* Each caller holds a live session reference and its execution/module context. */
 void s7d_codec_session_put(struct s7d_codec_session *session);

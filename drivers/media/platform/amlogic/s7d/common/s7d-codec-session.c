@@ -55,6 +55,8 @@ struct s7d_codec_session {
 	enum s7d_session_state state;
 	struct s7d_codec_callbacks callbacks;
 	void *callback_priv;
+	/* What the resource ops get for this session. */
+	void *resource_priv;
 	u64 retired_generation;
 };
 
@@ -138,7 +140,7 @@ static void s7d_session_release(struct kref *ref)
 		s7d_codec_ledger_uncharge(mem->ledger, mem->bytes);
 		kfree(mem);
 	}
-	core->ops.release(core->priv, session->engine);
+	core->ops.release(session->resource_priv, session->engine);
 	core->active--;
 	list_del(&session->node);
 	mutex_unlock(&core->lock);
@@ -199,7 +201,7 @@ bool s7d_codec_core_failed(struct s7d_codec_core *core)
 int s7d_codec_session_open(struct s7d_codec_core *core,
 			   enum s7d_codec_engine engine,
 			   const struct s7d_codec_callbacks *callbacks, void *priv,
-			   struct s7d_codec_session **out)
+			   void *resource_priv, struct s7d_codec_session **out)
 {
 	struct s7d_codec_session *session;
 	int ret;
@@ -223,7 +225,9 @@ int s7d_codec_session_open(struct s7d_codec_core *core,
 		ret = -ENODEV;
 		goto free;
 	}
-	ret = core->ops.hold(core->priv, engine);
+	if (!resource_priv)
+		resource_priv = core->priv;
+	ret = core->ops.hold(resource_priv, engine);
 	if (ret) {
 		module_put(core->owner);
 		ret = ret < 0 ? ret : -EIO;
@@ -236,6 +240,7 @@ int s7d_codec_session_open(struct s7d_codec_core *core,
 	session->state = S7D_SESSION_OPEN;
 	session->callbacks = *callbacks;
 	session->callback_priv = priv;
+	session->resource_priv = resource_priv;
 	INIT_LIST_HEAD(&session->surfaces);
 	INIT_LIST_HEAD(&session->allocations);
 	list_add_tail(&session->node, &core->sessions);
@@ -328,7 +333,7 @@ int s7d_codec_session_stop(struct s7d_codec_session *session)
 	session->callback_priv = NULL;
 	mutex_unlock(&core->lock);
 
-	ret = core->ops.quiesce(core->priv, session->engine);
+	ret = core->ops.quiesce(session->resource_priv, session->engine);
 	ret = ret > 0 ? -EIO : ret;
 	mutex_lock(&core->lock);
 	if (ret) {

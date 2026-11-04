@@ -133,6 +133,12 @@ static void s7d_frame_ready(void *priv, const struct s7d_codec_frame *frame);
 static int s7d_reconfigure_stop(struct s7d_v4l2_context *ctx);
 static int s7d_reconfigure_start(struct s7d_v4l2_context *ctx);
 
+/* What the core's resource ops get for this context's sessions. */
+static void *s7d_resources(struct s7d_v4l2_context *ctx)
+{
+	return ctx->ops.resources ? ctx->ops.resources(ctx->backend) : NULL;
+}
+
 static struct s7d_codec_layout s7d_query_layout(struct s7d_v4l2_context *ctx)
 {
 	lockdep_assert_held(&ctx->state_lock);
@@ -1988,7 +1994,8 @@ static int s7d_reconfigure_start(struct s7d_v4l2_context *ctx)
 			      ((size_t)ctx->codec.staging_headroom + SZ_16K +
 			       PAGE_SIZE + L1_CACHE_BYTES), &capacity))
 		return -EOVERFLOW;
-	ret = s7d_codec_session_open(ctx->core, ctx->codec.engine, &callbacks, ctx, &ctx->session);
+	ret = s7d_codec_session_open(ctx->core, ctx->codec.engine, &callbacks, ctx,
+				     s7d_resources(ctx), &ctx->session);
 	if (ret)
 		return ret;
 	ctx->staging = s7d_codec_dma_alloc(ctx->session, capacity);
@@ -2276,7 +2283,7 @@ static int s7d_start_streaming(struct vb2_queue *q, unsigned int count)
 		}
 		initial_token = s7d_buffer(&input->vb2_buf)->token;
 		ret = s7d_codec_session_open(ctx->core, ctx->codec.engine,
-					     &callbacks, ctx, &ctx->session);
+					     &callbacks, ctx, s7d_resources(ctx), &ctx->session);
 		if (ret)
 			goto return_queued;
 		if (check_add_overflow((size_t)ctx->output.plane_fmt[0].sizeimage,

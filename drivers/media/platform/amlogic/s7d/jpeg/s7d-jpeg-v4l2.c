@@ -467,7 +467,8 @@ static int jpeg_start_streaming(struct vb2_queue *queue, unsigned int count)
 		WRITE_ONCE(ctx->capture_streaming, true);
 	if (ctx->output_streaming && ctx->capture_streaming) {
 		ret = s7d_codec_session_open(ctx->device->core, S7D_CODEC_ENGINE_HCODEC,
-					     &jpeg_callbacks, NULL, &ctx->session);
+					     &jpeg_callbacks, NULL, NULL,
+					     &ctx->session);
 		if (ret)
 			goto clear_streaming;
 		ctx->output_sequence = 0;

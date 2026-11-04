@@ -203,6 +203,11 @@ struct s7d_v4l2_reconfigure {
 };
 
 struct s7d_v4l2_backend_ops {
+	/*
+	 * Optional: what the core's resource ops get for this backend's
+	 * sessions, when each backend holds the engine with its own state.
+	 */
+	void *(*resources)(void *priv);
 	/* Other-worker notifications may precede serialized request returns. */
 	/* Requests must not call frontend notifications inline. */
 	int (*prepare)(void *priv, struct s7d_codec_session *session,
