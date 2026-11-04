@@ -13,7 +13,12 @@ struct s7d_video_fw_ticket;
 struct s7d_video_fw_handle *s7d_video_fw_get(struct device *consumer);
 void s7d_video_fw_put(struct s7d_video_fw_handle *handle);
 int s7d_video_fw_next_epoch(struct s7d_video_fw_handle *handle, u64 *out);
-/* A NULL ticket acknowledges this boot's immutable archive, not an engine load. */
+/*
+ * A NULL ticket acknowledges this boot's immutable archive, not an engine load.
+ * While another lease uploads it, the ticket joins that upload: wait returns its
+ * result (-EAGAIN when its owner stopped it), and cancel ends only this wait.
+ * The owner's cancel takes effect once no joiner waits for the upload any more.
+ */
 int s7d_video_fw_prepare(struct s7d_video_fw_handle *handle, u64 lease_epoch,
 			 struct s7d_video_fw_ticket **out);
 /* Queue and cancel are non-sleeping; the caller retains the ticket. */

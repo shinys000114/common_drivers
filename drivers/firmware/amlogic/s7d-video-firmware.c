@@ -10,6 +10,7 @@
 #include <linux/firmware.h>
 #include <linux/kref.h>
 #include <linux/limits.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -71,6 +72,18 @@ struct s7d_video_fw_ticket {
 	struct s7d_video_fw_handle *handle;
 	const struct firmware *firmware;
 	struct s7d_codec_tee_result result;
+	/*
+	 * A joiner waits for the owner's upload instead of starting its own; the
+	 * owner lists its joiners under the provider lock. live_joiners counts the
+	 * joiners whose wait has not ended. While it is non-zero, the owner's
+	 * cancel only sets cancel_requested, and the last joiner to stop waiting
+	 * turns that into cancel.
+	 */
+	struct s7d_video_fw_ticket *owner;
+	struct list_head joiners;
+	struct list_head join_node;
+	atomic_t live_joiners;
+	atomic_t cancel_requested;
 	atomic_t queued;
 	atomic_t cancel;
 	u64 lease_epoch;
@@ -105,9 +118,46 @@ static void video_fw_ticket_free(struct kref *ref)
 	struct s7d_video_fw_ticket *ticket =
 		container_of(ref, struct s7d_video_fw_ticket, ref);
 
+	if (ticket->owner)
+		kref_put(&ticket->owner->ref, video_fw_ticket_free);
 	release_firmware(ticket->firmware);
 	s7d_video_fw_put(ticket->handle);
 	kfree(ticket);
+}
+
+/*
+ * A joiner no longer waits for @owner's upload. The fully ordered decrement
+ * pairs with the barrier in s7d_video_fw_ticket_cancel(): either the owner
+ * sees this joiner gone and stops the upload itself, or this sees its request.
+ */
+static void video_fw_joiner_left(struct s7d_video_fw_ticket *owner)
+{
+	if (atomic_dec_and_test(&owner->live_joiners) &&
+	    atomic_read(&owner->cancel_requested))
+		atomic_set(&owner->cancel, 1);
+}
+
+/* End a joiner's wait with @status unless it has already ended. */
+static void video_fw_joiner_end(struct s7d_video_fw_ticket *joiner, int status)
+{
+	if (cmpxchg(&joiner->status, -EINPROGRESS, status) != -EINPROGRESS)
+		return;
+	complete_all(&joiner->done);
+	video_fw_joiner_left(joiner->owner);
+}
+
+/* Hand the owner's result to its joiners; the caller holds the provider lock. */
+static void video_fw_finish_joiners(struct s7d_video_fw_ticket *owner, int status)
+{
+	struct s7d_video_fw_ticket *joiner, *next;
+
+	/* The owner was stopped, not the joiners: they may simply try again. */
+	if (status == -ECANCELED)
+		status = -EAGAIN;
+	list_for_each_entry_safe(joiner, next, &owner->joiners, join_node) {
+		list_del_init(&joiner->join_node);
+		video_fw_joiner_end(joiner, status);
+	}
 }
 
 void s7d_video_fw_ticket_put(struct s7d_video_fw_ticket *ticket)
@@ -116,7 +166,11 @@ void s7d_video_fw_ticket_put(struct s7d_video_fw_ticket *ticket)
 	bool abandoned = false;
 
 	mutex_lock(&provider->lock);
-	if (provider->active == ticket &&
+	if (ticket->owner) {
+		list_del_init(&ticket->join_node);
+		/* Put without a cancel or a result: it no longer waits either. */
+		video_fw_joiner_end(ticket, -ECANCELED);
+	} else if (provider->active == ticket &&
 	    atomic_cmpxchg(&ticket->queued, S7D_VIDEO_FW_PREPARED,
 			   S7D_VIDEO_FW_ABANDONED) == S7D_VIDEO_FW_PREPARED) {
 		provider->active = NULL;
@@ -125,6 +179,7 @@ void s7d_video_fw_ticket_put(struct s7d_video_fw_ticket *ticket)
 			provider->failed_epoch = ticket->lease_epoch;
 			provider->error = -ECANCELED;
 		}
+		video_fw_finish_joiners(ticket, -ECANCELED);
 		abandoned = true;
 	}
 	mutex_unlock(&provider->lock);
@@ -183,6 +238,7 @@ static void video_fw_work(struct work_struct *work)
 	}
 	provider->active = NULL;
 	ticket->status = ret;
+	video_fw_finish_joiners(ticket, ret);
 	mutex_unlock(&provider->lock);
 	complete_all(&ticket->done);
 	kref_put(&ticket->ref, video_fw_ticket_free);
@@ -193,6 +249,9 @@ bool s7d_video_fw_ticket_queue(struct s7d_video_fw_ticket *ticket)
 	if (atomic_cmpxchg(&ticket->queued, S7D_VIDEO_FW_PREPARED,
 			   S7D_VIDEO_FW_QUEUED) != S7D_VIDEO_FW_PREPARED)
 		return false;
+	/* The owner's work already runs, or runs once the owner queues it. */
+	if (ticket->owner)
+		return true;
 	if (queue_work(ticket->handle->provider->queue, &ticket->work))
 		return true;
 	atomic_set(&ticket->queued, S7D_VIDEO_FW_PREPARED);
@@ -200,9 +259,22 @@ bool s7d_video_fw_ticket_queue(struct s7d_video_fw_ticket *ticket)
 }
 EXPORT_SYMBOL_GPL(s7d_video_fw_ticket_queue);
 
+/*
+ * A joiner stops waiting at once. An owner's stop waits until no joiner waits
+ * any more: a stopped upload may leave the TA in an unknown state for this
+ * boot, so it is not stopped while another lease still needs it.
+ */
 void s7d_video_fw_ticket_cancel(struct s7d_video_fw_ticket *ticket)
 {
-	atomic_set(&ticket->cancel, 1);
+	if (ticket->owner) {
+		video_fw_joiner_end(ticket, -ECANCELED);
+		return;
+	}
+	atomic_set(&ticket->cancel_requested, 1);
+	/* Pairs with video_fw_join() and video_fw_joiner_left(). */
+	smp_mb();
+	if (!atomic_read(&ticket->live_joiners))
+		atomic_set(&ticket->cancel, 1);
 }
 EXPORT_SYMBOL_GPL(s7d_video_fw_ticket_cancel);
 
@@ -213,6 +285,12 @@ int s7d_video_fw_ticket_wait(struct s7d_video_fw_ticket *ticket, bool *cancelled
 	if (cancelled)
 		*cancelled = false;
 	wait_for_completion(&ticket->done);
+	if (ticket->owner) {
+		ret = ticket->status;
+		if (cancelled && ret == -ECANCELED)
+			*cancelled = true;
+		return ret;
+	}
 	flush_work(&ticket->work);
 	ret = ticket->status;
 	if (!cancelled || ret != -ECANCELED)
@@ -338,6 +416,51 @@ int s7d_video_fw_next_epoch(struct s7d_video_fw_handle *handle, u64 *out)
 }
 EXPORT_SYMBOL_GPL(s7d_video_fw_next_epoch);
 
+/*
+ * Two engines starting together after boot or deep sleep both need the archive.
+ * The second waits for the upload already in flight instead of failing.
+ */
+static int video_fw_join(struct s7d_video_fw_provider *provider,
+			 struct s7d_video_fw_handle *handle, u64 lease_epoch,
+			 struct s7d_video_fw_ticket **out)
+{
+	struct s7d_video_fw_ticket *owner = provider->active, *ticket;
+
+	lockdep_assert_held(&provider->lock);
+	ticket = kzalloc(sizeof(*ticket), GFP_KERNEL);
+	if (!ticket)
+		return -ENOMEM;
+	/*
+	 * Count this joiner before looking at the owner's stop request, the
+	 * reverse of s7d_video_fw_ticket_cancel(), so that one of the two sees
+	 * the other.
+	 */
+	atomic_inc(&owner->live_joiners);
+	smp_mb__after_atomic();
+	/* Its owner asked to stop it; the next lease retries. */
+	if (atomic_read(&owner->cancel) || atomic_read(&owner->cancel_requested)) {
+		video_fw_joiner_left(owner);
+		kfree(ticket);
+		return -EBUSY;
+	}
+	kref_init(&ticket->ref);
+	kref_get(&handle->ref);
+	kref_get(&owner->ref);
+	init_completion(&ticket->done);
+	INIT_LIST_HEAD(&ticket->joiners);
+	atomic_set(&ticket->live_joiners, 0);
+	atomic_set(&ticket->cancel_requested, 0);
+	atomic_set(&ticket->queued, S7D_VIDEO_FW_PREPARED);
+	atomic_set(&ticket->cancel, 0);
+	ticket->handle = handle;
+	ticket->owner = owner;
+	ticket->lease_epoch = lease_epoch;
+	ticket->status = -EINPROGRESS;
+	list_add_tail(&ticket->join_node, &owner->joiners);
+	*out = ticket;
+	return 0;
+}
+
 int s7d_video_fw_prepare(struct s7d_video_fw_handle *handle, u64 lease_epoch,
 			 struct s7d_video_fw_ticket **out)
 {
@@ -353,8 +476,12 @@ int s7d_video_fw_prepare(struct s7d_video_fw_handle *handle, u64 lease_epoch,
 		ret = provider->error;
 		goto unlock;
 	}
-	if (provider->blocked || provider->active) {
+	if (provider->blocked) {
 		ret = -EBUSY;
+		goto unlock;
+	}
+	if (provider->active) {
+		ret = video_fw_join(provider, handle, lease_epoch, out);
 		goto unlock;
 	}
 	if (provider->state == S7D_VIDEO_FW_READY)
@@ -378,6 +505,10 @@ int s7d_video_fw_prepare(struct s7d_video_fw_handle *handle, u64 lease_epoch,
 	kref_get(&handle->ref);
 	INIT_WORK(&ticket->work, video_fw_work);
 	init_completion(&ticket->done);
+	INIT_LIST_HEAD(&ticket->joiners);
+	INIT_LIST_HEAD(&ticket->join_node);
+	atomic_set(&ticket->live_joiners, 0);
+	atomic_set(&ticket->cancel_requested, 0);
 	atomic_set(&ticket->queued, S7D_VIDEO_FW_PREPARED);
 	atomic_set(&ticket->cancel, 0);
 	ticket->handle = handle;
@@ -497,7 +628,8 @@ static void video_fw_stop(struct s7d_video_fw_provider *provider)
 	ticket = provider->active;
 	if (ticket) {
 		kref_get(&ticket->ref);
-		s7d_video_fw_ticket_cancel(ticket);
+		/* Stop it even for joiners: the provider is going away. */
+		atomic_set(&ticket->cancel, 1);
 		s7d_video_fw_ticket_queue(ticket);
 	}
 	mutex_unlock(&provider->lock);
