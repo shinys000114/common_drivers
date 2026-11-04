@@ -35,6 +35,15 @@ struct s7d_vpu_boot {
 	bool retained;
 	/* A firmware output ran; it stays held until the first modeset. */
 	bool output;
+	/* OSD1 CTRL, BLK0_CFG_W0, FRAME_ADDR, LINE_STRIDE, W1, W2 it read. */
+	u32 osd1[6];
+	/* The boot-logo reservation, and whether it is mapped System RAM. */
+	phys_addr_t logo_base;
+	phys_addr_t logo_size;
+	bool logo_ram;
+	/* The firmware output showed the logo: return it after the first stop. */
+	bool logo_shown;
+	bool logo_returned;
 };
 
 /* HDMI owns PHY/packets. Return only after its transmitter is safely off. */

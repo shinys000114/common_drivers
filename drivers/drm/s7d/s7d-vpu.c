@@ -9,8 +9,11 @@
 #include <linux/iopoll.h>
 #include <linux/irq.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/pfn.h>
 #include <linux/regmap.h>
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
@@ -38,6 +41,12 @@
 #define ENCP_EN			0x1b80
 #define ENCL_EN			0x1ca0
 #define OSD1_CTRL		0x1a10
+#define OSD1_LINEAR		BIT(2)
+#define OSD1_FRAME_ADDR		0x1a14
+#define OSD1_LINE_STRIDE	0x1a15
+#define OSD1_BLK0_CFG_W0	0x1a1b
+#define OSD1_BLK0_CFG_W1	0x1a1c
+#define OSD1_BLK0_CFG_W2	0x1a1d
 #define OSD2_CTRL		0x1a30
 #define OSD_FIFO_OFFSET		0x1b
 #define OSD_FIFO_STATE		GENMASK(21, 20)
@@ -780,6 +789,97 @@ static void s7d_vpu_disable_pixel(struct s7d_vpu *v)
 }
 
 /*
+ * Whether the running firmware output shows the boot-logo reservation: OSD1
+ * on, linear and physically addressed, its fetch within the region. Read
+ * only while that output runs, before anything stops it.
+ */
+static void s7d_vpu_check_logo(struct s7d_vpu *v)
+{
+	static const u16 regs[] = {
+		OSD1_CTRL, OSD1_BLK0_CFG_W0, OSD1_FRAME_ADDR, OSD1_LINE_STRIDE,
+		OSD1_BLK0_CFG_W1, OSD1_BLK0_CFG_W2,
+	};
+	struct s7d_vpu_boot *b = &v->boot;
+	u32 *w = b->osd1, cpp, x1, x2, y1, y2;
+	u64 base, stride, first, end;
+	unsigned int i;
+
+	if (!b->logo_size)
+		return;
+	if (!b->output) {
+		dev_info(v->dev, "%s; boot logo %pa+%pa stays reserved\n",
+			 b->restarted ? "firmware display restarted" : "no firmware output",
+			 &b->logo_base, &b->logo_size);
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(regs); i++)
+		w[i] = vpu_read(v, regs[i]);
+	switch ((w[1] >> 8) & 0xf) {
+	case 4:
+		cpp = 2;
+		break;
+	case 5:
+		cpp = 4;
+		break;
+	case 7:
+		cpp = 3;
+		break;
+	default:
+		cpp = 0;
+		break;
+	}
+	base = (u64)w[2] << 4;
+	stride = (u64)(w[3] & 0xfff) << 4;
+	x1 = w[4] & 0x1fff;
+	x2 = (w[4] >> 16) & 0x1fff;
+	y1 = w[5] & 0x1fff;
+	y2 = (w[5] >> 16) & 0x1fff;
+	first = base + y1 * stride + x1 * cpp;
+	end = base + y2 * stride + (x2 + 1) * cpp;
+	if ((w[0] & (BIT(0) | OSD1_LINEAR)) != (BIT(0) | OSD1_LINEAR) ||
+	    (w[1] & BIT(30)) || !cpp || !stride || x2 < x1 || y2 < y1 ||
+	    (x2 + 1) * cpp > stride ||
+	    first < b->logo_base || end > b->logo_base + b->logo_size) {
+		dev_info(v->dev, "boot logo %pa+%pa not shown (OSD1 %#x %#x %#x %#x %#x %#x); it stays reserved\n",
+			 &b->logo_base, &b->logo_size, w[0], w[1], w[2], w[3], w[4], w[5]);
+		return;
+	}
+	b->logo_shown = b->logo_ram;
+	dev_info(v->dev, "boot logo %pa+%pa shown; %s\n", &b->logo_base, &b->logo_size,
+		 b->logo_ram ? "returning it after the first modeset" :
+		 "it is not plain RAM and stays reserved");
+}
+
+/*
+ * Return the boot logo once a stop has verified that no firmware output
+ * reads it any more. free_reserved_area() is not exported: free it page by
+ * page as that does, and only if every page is still reserved. Called once.
+ */
+static void s7d_vpu_return_logo(struct s7d_vpu *v)
+{
+	struct s7d_vpu_boot *b = &v->boot;
+	unsigned long pfn, first, last;
+
+	if (!b->logo_shown)
+		return;
+	b->logo_shown = false;
+	first = PFN_UP(b->logo_base);
+	last = PFN_DOWN(b->logo_base + b->logo_size);
+	for (pfn = first; pfn < last; pfn++) {
+		if (!pfn_valid(pfn) || !PageReserved(pfn_to_page(pfn))) {
+			dev_warn(v->dev, "boot logo page %#lx is not reserved; keeping the logo\n",
+				 pfn);
+			return;
+		}
+	}
+	for (pfn = first; pfn < last; pfn++)
+		free_reserved_page(pfn_to_page(pfn));
+	WRITE_ONCE(b->logo_returned, true);
+	dev_info(v->dev, "returned the boot logo %pa+%pa to the page allocator\n",
+		 &b->logo_base, &b->logo_size);
+}
+
+/*
  * Clock the VPU and check what it runs. At @boot, routes the takeover
  * refuses are stopped and reset instead; if that fails, the VPU stays
  * acquired, as after a failed stop.
@@ -885,6 +985,7 @@ int s7d_vpu_hold_boot(struct s7d_vpu *v)
 	}
 	v->boot_held = true;
 	v->boot.output = v->pixel_enabled;
+	s7d_vpu_check_logo(v);
 	return 0;
 }
 
@@ -2094,6 +2195,8 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_vpu_stop(v);
 	if (ret)
 		return ret;
+	/* The first stop has ended any firmware output. */
+	s7d_vpu_return_logo(v);
 	ret = clk_rate_exclusive_get(v->clocks[0].clk);
 	if (ret)
 		return ret;
@@ -2750,6 +2853,39 @@ static int s7d_vpu_local_resets_init(struct s7d_vpu *v)
 }
 
 /*
+ * The boot logo is a static reservation that the firmware draws into and
+ * scans out until the first modeset. Find it, and whether its pages could
+ * go back to the page allocator: mapped System RAM.
+ */
+static void s7d_vpu_find_logo(struct s7d_vpu *v)
+{
+	struct device_node *node;
+	struct reserved_mem *rmem;
+	bool no_map;
+	int index;
+
+	index = of_property_match_string(v->dev->of_node, "memory-region-names",
+					 "boot-logo");
+	if (index < 0)
+		return;
+	node = of_parse_phandle(v->dev->of_node, "memory-region", index);
+	if (!node)
+		return;
+	rmem = of_reserved_mem_lookup(node);
+	no_map = of_property_read_bool(node, "no-map");
+	of_node_put(node);
+	if (!rmem || !rmem->size) {
+		dev_warn(v->dev, "boot logo region is not reserved\n");
+		return;
+	}
+	v->boot.logo_base = rmem->base;
+	v->boot.logo_size = rmem->size;
+	v->boot.logo_ram = !no_map &&
+		region_intersects(rmem->base, rmem->size, IORESOURCE_SYSTEM_RAM,
+				  IORES_DESC_NONE) == REGION_INTERSECTS;
+}
+
+/*
  * Record the display power at probe, before any VCBUS access: the VPU/HDMI
  * domain and the VPU SRAM banks. The vendor provider powers the always-on
  * domain at its own probe when the firmware left it off, so the domain
@@ -2833,6 +2969,10 @@ static int s7d_vpu_boot_show(struct seq_file *m, void *data)
 	seq_printf(m, "restarted\t%d\n", b->restarted);
 	seq_printf(m, "retained\t%d\n", b->retained);
 	seq_printf(m, "output\t%d\n", b->output);
+	seq_printf(m, "osd1\t%#x %#x %#x %#x %#x %#x\n", b->osd1[0], b->osd1[1],
+		   b->osd1[2], b->osd1[3], b->osd1[4], b->osd1[5]);
+	seq_printf(m, "logo\t%pa %pa ram %d returned %d\n", &b->logo_base, &b->logo_size,
+		   b->logo_ram, READ_ONCE(b->logo_returned));
 	seq_printf(m, "unusable\t%d\n", v->unusable);
 	return 0;
 }
@@ -2937,6 +3077,7 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 		return ret;
 	s7d_scanout_init(&v->scanout, &v->rdma);
 	s7d_vpu_record_power(v);
+	s7d_vpu_find_logo(v);
 	return 0;
 }
 
