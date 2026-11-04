@@ -64,6 +64,9 @@ struct s7d_h264_au_info {
 	u8 cavlc_tail_bits;
 	u8 delta_poc_present;
 	bool frame_num_gaps;
+	/* A recovery point SEI came before the slices; recovery_frame_cnt. */
+	bool recovery;
+	u32 recovery_frame_cnt;
 	bool idr;
 	bool reference;
 	bool no_output_of_prior_pics;

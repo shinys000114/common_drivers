@@ -841,10 +841,30 @@ static int au_pps_parse(struct au_bits *b, struct au_cache *cache, u32 *pps_id)
 	return 0;
 }
 
-/* Payload content is opaque; only the byte-aligned SEI envelope is checked. */
-static int au_sei_parse(struct au_bits *b)
+/* D.1.8 recovery point: recovery_frame_cnt, exact_match, broken_link, ... */
+static int au_recovery_parse(struct au_bits *b, u32 bytes, u32 *frame_cnt)
 {
-	u32 v, payload_type, payload_bytes;
+	struct au_bits payload = {
+		.data = b->data + (b->bit >> 3), .bytes = bytes,
+	};
+	u32 v;
+	int ret;
+
+	if (b->bit & 7)
+		return -EBADMSG;
+	ret = au_ue(&payload, 65535, frame_cnt);
+	if (!ret)
+		ret = au_get(&payload, 4, &v);
+	return ret;
+}
+
+/*
+ * Only the byte-aligned SEI envelope is checked; payload content is opaque
+ * except a recovery point (type 6), which @recovery_cnt reports, or -1.
+ */
+static int au_sei_parse(struct au_bits *b, s32 *recovery_cnt)
+{
+	u32 v, payload_type, payload_bytes, frame_cnt;
 	bool seen = false;
 	int ret;
 
@@ -863,6 +883,10 @@ static int au_sei_parse(struct au_bits *b)
 				return -EBADMSG;
 			payload_bytes += v;
 		} while (v == 255);
+		if ((u64)payload_bytes * 8 > (u64)b->bytes * 8 - b->bit)
+			return -EBADMSG;
+		if (payload_type == 6 && !au_recovery_parse(b, payload_bytes, &frame_cnt))
+			*recovery_cnt = frame_cnt;
 		ret = au_skip(b, (u64)payload_bytes * 8);
 		if (ret)
 			return ret;
@@ -1516,6 +1540,7 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 	u32 type, ref_idc, v, i, j, sps_id, pps_id, prev_mb = 0, first_type = 0;
 	u32 nal_count = 0;
 	u32 aud_mask = 7;
+	s32 recovery_cnt;
 	static const u8 aud_masks[8] = { 4, 5, 7, 0, 0, 4, 5, 7 };
 	bool has_next, seen_vcl = false, all_same_type = false;
 	bool seen_nal = false, mixed_types = false, seen_aud = false;
@@ -1636,7 +1661,12 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 			break;
 		case 6:
 			/* Decoding never reads SEI; a damaged one is skipped. */
-			ret = au_sei_parse(&bits);
+			recovery_cnt = -1;
+			ret = au_sei_parse(&bits, &recovery_cnt);
+			if (!ret && recovery_cnt >= 0) {
+				draft->info.recovery = true;
+				draft->info.recovery_frame_cnt = recovery_cnt;
+			}
 			if (ret == -EBADMSG)
 				ret = 0;
 			break;
@@ -1720,7 +1750,8 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 		draft->selected_sps = draft->info.sps_id;
 		draft->selected_pps = draft->info.pps_id;
 		draft->selected_valid = true;
-		if (parser->hunting && !draft->info.idr) {
+		/* dev-decoder.rst resume points: an IDR, or a recovery point (D.2.8). */
+		if (parser->hunting && !draft->info.idr && !draft->info.recovery) {
 			draft->preflight.kind = S7D_H264_INPUT_SKIP;
 		} else {
 			draft->preflight.kind = S7D_H264_INPUT_PICTURE;
@@ -2022,7 +2053,8 @@ static int input_assemble(struct s7d_h264_input *input,
 	int ret;
 
 	if (parser->hunting) {
-		if (!au->idr || au->sps_id >= AU_SPS_COUNT || au->pps_id >= AU_PPS_COUNT)
+		if ((!au->idr && !au->recovery) || au->sps_id >= AU_SPS_COUNT ||
+		    au->pps_id >= AU_PPS_COUNT)
 			return -EBADMSG;
 		sps = au_raw_get(parser, parser->pending, true, au->sps_id);
 		pps = au_raw_get(parser, parser->pending, false, au->pps_id);

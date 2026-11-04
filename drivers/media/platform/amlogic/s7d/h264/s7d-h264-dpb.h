@@ -61,6 +61,9 @@ struct s7d_h264_slice {
 	bool no_output_of_prior_pics;
 	/* gaps_in_frame_num_value_allowed_flag of the host SPS. */
 	bool frame_num_gaps;
+	/* A recovery point SEI (D.2.8) in this AU; a start after a seek or error. */
+	bool recovery;
+	u32 recovery_frame_cnt;
 	/* The host parse of the SPS; set for pic_order_cnt_type 1 only. */
 	const struct s7d_h264_poc1 *poc1;
 };

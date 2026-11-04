@@ -221,9 +221,11 @@ static bool backend_stream_error(int error)
 /*
  * dev-decoder.rst: a picture that cannot be decoded is flagged and decoding
  * goes on. Output what is decoded, drop the references and resume at the next
- * IDR as after a seek. Only between pictures: the VDEC is parked or idle.
+ * IDR or recovery point as after a seek. Only between pictures: the VDEC is
+ * parked or idle. With @here the pending AU is that resume point: its
+ * preflight stands and it goes to the firmware from the last park.
  */
-static int backend_resync(struct s7d_h264_backend *backend, int error)
+static int backend_restart(struct s7d_h264_backend *backend, int error, bool here)
 {
 	int ret;
 
@@ -231,16 +233,26 @@ static int backend_resync(struct s7d_h264_backend *backend, int error)
 	if (backend->resyncs >= H264_MAX_RESYNCS)
 		return error;
 	ret = backend->dpb ? s7d_h264_dpb_resync(backend->dpb) : 0;
-	if (!ret)
+	if (!ret && !here)
 		ret = s7d_h264_input_resync(backend->stream);
 	if (ret)
 		return ret;
 	backend->resyncs++;
 	backend->hunting = true;
-	dev_warn_ratelimited(backend->decoder->dev,
-			     "H.264 picture error %d at input %llu, resuming at the next IDR\n",
-			     error, (unsigned long long)backend->input.token);
+	if (here)
+		dev_warn_ratelimited(backend->decoder->dev,
+				     "H.264 picture error %d before input %llu, resuming there\n",
+				     error, (unsigned long long)backend->input.token);
+	else
+		dev_warn_ratelimited(backend->decoder->dev,
+				     "H.264 picture error %d at input %llu, resuming at the next key picture\n",
+				     error, (unsigned long long)backend->input.token);
 	return 0;
+}
+
+static int backend_resync(struct s7d_h264_backend *backend, int error)
+{
+	return backend_restart(backend, error, false);
 }
 
 static int backend_status(struct s7d_h264_decoder *decoder, u32 expected)
@@ -270,7 +282,8 @@ static void backend_timeout_disarm(struct s7d_h264_backend *backend)
 /*
  * A picture error while the firmware waits for the host: the executor stops
  * the AU and parks again at the last picture, then decoding resumes at the
- * next IDR. The first AU of an epoch has no park to go back to.
+ * next IDR or recovery point. The first AU of an epoch has no park to go
+ * back to.
  */
 static void backend_fail(struct s7d_h264_backend *backend, int error)
 {
@@ -422,6 +435,12 @@ static bool backend_same_stream_sps(const struct s7d_h264_backend *backend,
 
 	stream.colour = backend->stream_colour;
 	return backend_same_sps(&stream, sps, false);
+}
+
+/* Where decoding may start or resume: an IDR or a recovery point. */
+static bool backend_resume_point(const struct s7d_h264_au_info *au)
+{
+	return au->idr || au->recovery;
 }
 
 static bool backend_same_sequence(struct s7d_h264_backend *backend,
@@ -622,6 +641,8 @@ static int backend_slice_identity(struct s7d_h264_backend *backend)
 	    backend->au.poc_type != backend->slice.poc_type)
 		return -EBADMSG;
 	backend->slice.frame_num_gaps = backend->au.frame_num_gaps;
+	backend->slice.recovery = backend->au.recovery;
+	backend->slice.recovery_frame_cnt = backend->au.recovery_frame_cnt;
 	if (backend->au.poc_type != 1)
 		return 0;
 	/* The host SPS decides type 1 POCs; the RPM keeps 128 truncated offsets. */
@@ -827,7 +848,7 @@ static int backend_stage(void *priv, struct s7d_codec_session *session,
 		ret = s7d_h264_input_get_au(backend->stream, backend->input.token,
 					  &backend->au);
 	if (!ret && (!backend_same_sequence(backend, &backend->au) ||
-		     (backend->hunting && !backend->au.idr)))
+		     (backend->hunting && !backend_resume_point(&backend->au))))
 		ret = -EOPNOTSUPP;
 	if (!ret && !backend->hardware_started)
 		ret = s7d_h264_context_begin(backend->context, backend->input.token);
@@ -1072,11 +1093,12 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 			ret = backend_set_host_sequence(backend, &preflight.sps, &notify);
 		if (!ret && backend->input_picture) {
 			ret = s7d_h264_input_get_au(backend->stream, token, &backend->au);
-			/* Only the validated, selected IDR can admit a seek sequence. */
-			if (!ret && backend->hunting && backend->au.idr && !backend->sequence_valid)
+			/* Only the validated, selected start can admit a seek sequence. */
+			if (!ret && backend->hunting && backend_resume_point(&backend->au) &&
+			    !backend->sequence_valid)
 				ret = backend_set_host_sequence(backend, &backend->au.sps, &notify);
 			if (!ret && (!backend_same_sequence(backend, &backend->au) ||
-				     (backend->hunting && !backend->au.idr))) {
+				     (backend->hunting && !backend_resume_point(&backend->au)))) {
 				if (backend->hunting && !backend->hw_entered) {
 					/* After a start or seek the bank keeps its SPS. */
 					status = -EOPNOTSUPP;
@@ -1108,14 +1130,19 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 						       backend->au.frame_num,
 						       backend->au.log2_frame_num)) {
 				/* A gap the SPS does not allow: a reference picture was lost. */
-				status = -ENODATA;
-				ret = s7d_h264_input_reject_picture(backend->stream, token,
-								 status, true, &returned);
-				if (!ret && (returned.token != token || returned.status != status))
-					ret = -ESTALE;
-				completed = !ret;
-				if (!ret)
-					ret = backend_resync(backend, status);
+				if (backend_resume_point(&backend->au)) {
+					ret = backend_restart(backend, -ENODATA, true);
+				} else {
+					status = -ENODATA;
+					ret = s7d_h264_input_reject_picture(backend->stream, token,
+									 status, true, &returned);
+					if (!ret && (returned.token != token ||
+						     returned.status != status))
+						ret = -ESTALE;
+					completed = !ret;
+					if (!ret)
+						ret = backend_resync(backend, status);
+				}
 			}
 		} else if (!ret && preflight.kind == S7D_H264_INPUT_HEADERS) {
 			ret = s7d_h264_input_accept_headers(backend->stream, token, &returned);
