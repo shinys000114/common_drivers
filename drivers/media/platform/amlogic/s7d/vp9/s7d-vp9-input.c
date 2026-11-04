@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 
+#include <linux/bits.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
@@ -149,6 +150,19 @@ void s7d_vp9_input_bank_resync(struct s7d_vp9_input_bank *bank)
 		return;
 	memset(bank->reference, 0, sizeof(bank->reference));
 	bank->valid = false;
+}
+
+bool s7d_vp9_input_keyframe(const u8 *data, size_t bytes)
+{
+	u32 profile, bit;
+
+	if (!data || !bytes || data[0] >> 6 != 2)
+		return false;
+	profile = ((data[0] >> 5) & 1) | (((data[0] >> 4) & 1) << 1);
+	/* Profile 3 has a reserved bit before show_existing_frame. */
+	bit = profile == 3 ? 2 : 3;
+	/* Neither show_existing_frame nor frame_type (0 is a key frame) set. */
+	return !(data[0] & (BIT(bit) | BIT(bit - 1)));
 }
 
 int s7d_vp9_input_prepare(const struct s7d_vp9_input_bank *bank,

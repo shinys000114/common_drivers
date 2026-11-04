@@ -106,5 +106,10 @@ int s7d_vp9_dma_context_snapshot_rpm(struct s7d_vp9_dma_context *context,
 int s7d_vp9_dma_context_mark_idle(struct s7d_vp9_dma_context *context,
 				 u64 lease_epoch, u64 token, int halt_status,
 				 bool irq_joined, bool decoded);
+/*
+ * A picture failed, but the core halted and the picture was undone: accept
+ * the next input again. Only the workspace a key frame resets is suspect.
+ */
+int s7d_vp9_dma_context_recover(struct s7d_vp9_dma_context *context, u64 lease_epoch);
 
 #endif

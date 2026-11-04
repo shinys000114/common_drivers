@@ -20,6 +20,13 @@ struct s7d_vp9_decoder;
 struct s7d_vp9_decode_result {
 	u32 published_frames;
 	bool cancelled;
+	/*
+	 * The firmware failed this picture (no end in time, an unexpected
+	 * status, a header it read otherwise than the parser) and the core
+	 * halted cleanly: only the frame is lost, its references and the
+	 * decoder stay usable.
+	 */
+	bool corrupt;
 };
 
 /* Borrowed owners remain live until destroy succeeds. */

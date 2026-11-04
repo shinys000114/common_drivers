@@ -68,6 +68,12 @@ struct vp9_job {
 	/* 4 KiB body pages the picture took through the MMU, from its end IRQ. */
 	u32 body_pages;
 	int status;
+	/*
+	 * The firmware, not the driver, failed the picture: no end in time, an
+	 * end status or a probability request it should not have reported, or
+	 * a frame header it read otherwise than the parser. Protocol lock.
+	 */
+	bool stream_error;
 	bool rpm_valid;
 	bool staged;
 	bool context_begun;
@@ -419,8 +425,11 @@ static int vp9_header(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 	if (!ret && !job->rpm_valid) {
 		ret = s7d_vp9_dma_context_snapshot_rpm(decoder->context, job->epoch,
 						      job->token, &job->rpm);
-		if (!ret)
+		if (!ret) {
 			ret = s7d_vp9_input_check_rpm(job->prepared, &job->rpm);
+			if (ret == -EBADMSG)
+				job->stream_error = true;
+		}
 		if (!ret) {
 			vp9_normalize_rpm(job);
 			job->rpm_valid = true;
@@ -436,6 +445,9 @@ static int vp9_header(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 	memcpy(frame.logical_to_physical, job->picture.logical_to_physical,
 	       sizeof(frame.logical_to_physical));
 	ret = s7d_vp9_inter_picture_configure(decoder->map, &frame);
+	/* -EBADMSG: the RPM disagrees with the parsed header. */
+	if (ret == -EBADMSG)
+		job->stream_error = true;
 	if (!ret)
 		ret = vp9_stop_check(decoder);
 	if (!ret)
@@ -472,8 +484,10 @@ static irqreturn_t vp9_irq_thread(void *priv, const struct s7d_hevc_irq_cookie *
 	if (!job || job->finished)
 		goto out;
 	ret = snapshot.error ?: vp9_stop_check(decoder);
-	if (!ret && (snapshot.adapt & 0xff) == 0xfd)
+	if (!ret && (snapshot.adapt & 0xff) == 0xfd) {
 		ret = -EOPNOTSUPP;
+		job->stream_error = true;
+	}
 	if (!ret && snapshot.status == VP9_HEADER_DONE) {
 		ret = vp9_header(decoder, job);
 		if (ret == -EAGAIN) {
@@ -487,12 +501,14 @@ static irqreturn_t vp9_irq_thread(void *priv, const struct s7d_hevc_irq_cookie *
 		if (!job->header_armed || !job->planned || !snapshot.shift_bytes ||
 		    snapshot.shift_bytes > job->input.max_shift_bytes) {
 			ret = -EPROTO;
+			job->stream_error = true;
 		} else {
 			job->picture_complete = true;
 			job->body_pages = snapshot.mmu_pages;
 		}
 	} else if (!ret) {
 		ret = -EBADMSG;
+		job->stream_error = true;
 	}
 	job->status = ret;
 	job->finished = true;
@@ -900,8 +916,12 @@ static int vp9_wait(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 		if (READ_ONCE(job->header_waiting))
 			wait_for_completion(&job->wake);
 		else if (time_after_eq(jiffies, deadline) ||
-			 !wait_for_completion_timeout(&job->wake, deadline - jiffies))
+			 !wait_for_completion_timeout(&job->wake, deadline - jiffies)) {
+			mutex_lock(&decoder->protocol);
+			job->stream_error = true;
+			mutex_unlock(&decoder->protocol);
 			return -ETIMEDOUT;
+		}
 		reinit_completion(&job->wake);
 		mutex_lock(&decoder->protocol);
 		ret = vp9_stop_check(decoder);
@@ -1162,7 +1182,7 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 	struct s7d_codec_session *put_session = NULL;
 	unsigned long flags;
 	const char *stage = "admission";
-	bool load_failed = false;
+	bool load_failed = false, corrupt = false;
 	int ret, halted = 0, idle, cleanup;
 
 	if (!decoder || !session || !bank || !view || !token || !timestamp_meta || !result)
@@ -1304,6 +1324,13 @@ stop:
 		cleanup = vp9_discard(decoder, job);
 		if (cleanup && cleanup != -ESHUTDOWN)
 			ret = cleanup;
+		/*
+		 * The firmware failed it, halted and undone: the next picture
+		 * starts from the old references. A failure of the driver's own
+		 * still fails the session.
+		 */
+		corrupt = !cleanup && job->stream_error &&
+			!s7d_vp9_dma_context_recover(decoder->context, job->epoch);
 	}
 	if (!ret) {
 		decoder->last_token = token;
@@ -1318,7 +1345,8 @@ stop:
 	} else {
 		result->cancelled = ret == -ECANCELED ||
 			(ret == -ESHUTDOWN && READ_ONCE(decoder->stopping));
-		if (!result->cancelled)
+		result->corrupt = corrupt && !result->cancelled;
+		if (!result->cancelled && !result->corrupt)
 			decoder->failure = ret;
 		decoder->firmware_loaded = false;
 		/* The owner is shared by every codec; only a failed TEE load concerns it. */
@@ -1340,7 +1368,8 @@ retained:
 	if (load_failed)
 		s7d_codec_firmware_invalidate(decoder->firmware);
 completed:
-	if (ret && !result->cancelled)
+	/* The caller reports a lost frame. */
+	if (ret && !result->cancelled && !result->corrupt)
 		dev_err(decoder->dev,
 			"VP9 input %llu epoch %llu stage=%s error=%d halt=%d retained=%u\n",
 			token, decoder->epoch, stage, ret, halted, decoder->quarantined);

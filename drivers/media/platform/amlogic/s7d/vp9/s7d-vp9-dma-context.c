@@ -482,6 +482,18 @@ int s7d_vp9_dma_context_snapshot_rpm(struct s7d_vp9_dma_context *context,
 				   S7D_VP9_RPM_BYTES, true, rpm);
 }
 
+int s7d_vp9_dma_context_recover(struct s7d_vp9_dma_context *context, u64 lease_epoch)
+{
+	if (IS_ERR_OR_NULL(context))
+		return -EINVAL;
+	if (context->lease_epoch != lease_epoch)
+		return -ESTALE;
+	if (!context->idle || context->staged || context->begun)
+		return -EBUSY;
+	context->failed = false;
+	return 0;
+}
+
 int s7d_vp9_dma_context_mark_idle(struct s7d_vp9_dma_context *context,
 				 u64 lease_epoch, u64 token, int halt_status,
 				 bool irq_joined, bool decoded)

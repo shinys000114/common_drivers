@@ -41,6 +41,8 @@ struct vp9_backend {
 	u64 picture_serial;
 	u32 next_frame;
 	u32 captures;
+	/* The first frame error of the packet, reported on its OUTPUT buffer. */
+	int packet_status;
 	int failure;
 	bool closing;
 	bool input_pending;
@@ -53,6 +55,11 @@ struct vp9_backend {
 	bool execution_attempted;
 	bool drain_pending;
 	bool drain_notified;
+	/*
+	 * The firmware failed the last key frame the decoder ran. A second one
+	 * in a row is no damage the stream recovers from: fail the session.
+	 */
+	bool keyframe_failed;
 };
 
 struct s7d_vp9_v4l2 {
@@ -123,13 +130,60 @@ static bool vp9_drop_frame(struct vp9_backend *backend)
 	return backend->next_frame >= backend->packet.count;
 }
 
-static void vp9_packet_done(struct vp9_backend *backend, u64 token)
+/* Returns the status of the packet's OUTPUT buffer. */
+static int vp9_packet_done(struct vp9_backend *backend, u64 token)
 {
+	int status = backend->packet_status;
+
 	lockdep_assert_held(&backend->lock);
 	backend->input_pending = false;
 	backend->last_completed = token;
 	memset(&backend->packet, 0, sizeof(backend->packet));
 	backend->next_frame = 0;
+	backend->packet_status = 0;
+	return status;
+}
+
+/*
+ * A frame the parser refuses, other than a key frame the decoder cannot take
+ * (an unsupported stream): drop it as damaged and resume at a key frame.
+ */
+static bool vp9_damaged_input(struct vp9_backend *backend, int error)
+{
+	const u8 *data = s7d_codec_dma_cpu(backend->input.memory);
+	const struct s7d_vp9_frame_span *span;
+
+	lockdep_assert_held(&backend->lock);
+	switch (error) {
+	case -EBADMSG:
+	case -E2BIG:
+	case -ERANGE:
+		return true;
+	case -EOPNOTSUPP:
+		if (backend->next_frame >= backend->packet.count)
+			return false;
+		span = &backend->packet.frame[backend->next_frame];
+		return !s7d_vp9_input_keyframe(data + span->offset, span->size);
+	default:
+		return false;
+	}
+}
+
+/*
+ * One frame is lost: flag the packet's OUTPUT buffer and go on with the next
+ * frame, which, as every frame up to a resume point, is then dropped.
+ */
+static bool vp9_frame_error(struct vp9_backend *backend, u64 token, int error)
+{
+	lockdep_assert_held(&backend->lock);
+	dev_warn_ratelimited(backend->adapter->dev,
+			     "VP9 input %llu frame %u: error %d, resuming at a key frame\n",
+			     token, backend->next_frame, error);
+	if (!backend->packet_status)
+		backend->packet_status = error;
+	vp9_input_release(backend);
+	backend->preflight = false;
+	return vp9_drop_frame(backend);
 }
 
 static int vp9_notify_sequence(struct vp9_backend *backend, bool *cancelled)
@@ -148,15 +202,16 @@ static int vp9_notify_sequence(struct vp9_backend *backend, bool *cancelled)
 	return ret;
 }
 
+/* A fatal status fails the session; another one only flags this OUTPUT buffer. */
 static int vp9_notify_input(struct vp9_backend *backend, u64 token, int status,
-			     bool *cancelled)
+			    bool fatal, bool *cancelled)
 {
 	int ret;
 
 	*cancelled = false;
 	mutex_lock(&backend->notifications);
 	if (backend->frontend && !READ_ONCE(backend->closing)) {
-		if (status)
+		if (status && fatal)
 			s7d_v4l2_error(backend->frontend, status);
 		ret = s7d_v4l2_input_done_result(backend->frontend, token, status, cancelled);
 	} else {
@@ -175,10 +230,11 @@ static void vp9_notify_error(struct vp9_backend *backend, int error)
 	mutex_unlock(&backend->notifications);
 }
 
-static int vp9_complete_input(struct vp9_backend *backend, u64 token, int status)
+static int vp9_complete_input(struct vp9_backend *backend, u64 token, int status,
+			      bool fatal)
 {
 	bool cancelled;
-	int ret = vp9_notify_input(backend, token, status, &cancelled);
+	int ret = vp9_notify_input(backend, token, status, fatal, &cancelled);
 
 	if (ret && !cancelled) {
 		mutex_lock(&backend->lock);
@@ -194,7 +250,7 @@ static void vp9_work(struct work_struct *work)
 	struct vp9_backend *backend = container_of(work, struct vp9_backend, work);
 	struct s7d_vp9_decode_result result;
 	u64 token = 0, picture_token;
-	bool cancelled;
+	bool cancelled, keyframe;
 	int ret;
 
 	for (;;) {
@@ -212,11 +268,16 @@ static void vp9_work(struct work_struct *work)
 				/* Nothing to decode in this packet: return it, no CAPTURE. */
 				if (token == backend->initial_token)
 					backend->initial_complete = true;
-				vp9_packet_done(backend, token);
-				mutex_unlock(&backend->lock);
-				if (vp9_complete_input(backend, token, 0))
-					return;
-				continue;
+				goto packet_done;
+			}
+			if (ret && vp9_damaged_input(backend, ret)) {
+				if (!vp9_frame_error(backend, token, ret)) {
+					mutex_unlock(&backend->lock);
+					continue;
+				}
+				if (token == backend->initial_token)
+					backend->initial_complete = true;
+				goto packet_done;
 			}
 			if (ret)
 				goto failed;
@@ -267,11 +328,27 @@ static void vp9_work(struct work_struct *work)
 					picture_token, backend->input.timestamp_ns,
 					&backend->input.timestamp_meta, &result);
 			mutex_lock(&backend->lock);
+			keyframe = backend->view.prefix.keyframe;
+			if (ret && result.corrupt && keyframe && backend->keyframe_failed) {
+				dev_err(backend->adapter->dev,
+					"VP9 input %llu: key frame failed again: %d\n", token, ret);
+				goto failed;
+			}
+			if (ret && result.corrupt) {
+				backend->keyframe_failed |= keyframe;
+				if (!vp9_frame_error(backend, token, ret)) {
+					mutex_unlock(&backend->lock);
+					continue;
+				}
+				goto packet_done;
+			}
 			if (ret) {
 				if (result.cancelled && backend->closing)
 					goto unlock;
 				goto failed;
 			}
+			if (keyframe)
+				backend->keyframe_failed = false;
 			vp9_input_release(backend);
 			backend->preflight = false;
 			backend->next_frame++;
@@ -279,11 +356,7 @@ static void vp9_work(struct work_struct *work)
 				mutex_unlock(&backend->lock);
 				continue;
 			}
-			vp9_packet_done(backend, token);
-			mutex_unlock(&backend->lock);
-			if (vp9_complete_input(backend, token, 0))
-				return;
-			continue;
+			goto packet_done;
 		}
 		if (backend->drain_pending && !backend->drain_notified) {
 			struct s7d_v4l2_drain drain = backend->drain;
@@ -320,12 +393,18 @@ static void vp9_work(struct work_struct *work)
 unlock:
 		mutex_unlock(&backend->lock);
 		return;
+packet_done:
+		ret = vp9_packet_done(backend, token);
+		mutex_unlock(&backend->lock);
+		if (vp9_complete_input(backend, token, ret, false))
+			return;
+		continue;
 failed:
 		backend->failure = ret;
 		backend->input_pending = false;
 		vp9_input_release(backend);
 		mutex_unlock(&backend->lock);
-		vp9_complete_input(backend, token, ret);
+		vp9_complete_input(backend, token, ret, true);
 		return;
 	}
 }
@@ -373,6 +452,7 @@ static int vp9_submit(void *priv, const struct s7d_v4l2_input *input)
 		backend->input = *input;
 		memset(&backend->packet, 0, sizeof(backend->packet));
 		backend->next_frame = 0;
+		backend->packet_status = 0;
 		backend->last_submitted = input->token;
 		if (!backend->initial_token)
 			backend->initial_token = input->token;
@@ -622,6 +702,7 @@ static int vp9_reset(void *priv)
 		backend->initial_token = 0;
 		backend->picture_serial = 0;
 		backend->next_frame = 0;
+		backend->packet_status = 0;
 		backend->captures = 0;
 		backend->failure = 0;
 		backend->input_pending = false;
@@ -632,6 +713,7 @@ static int vp9_reset(void *priv)
 		backend->execution_attempted = false;
 		backend->drain_pending = false;
 		backend->drain_notified = false;
+		backend->keyframe_failed = false;
 		backend->closing = false;
 		mutex_unlock(&backend->lock);
 	}

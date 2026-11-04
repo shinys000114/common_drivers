@@ -43,6 +43,8 @@ void s7d_vp9_input_bank_destroy(struct s7d_vp9_input_bank *bank);
  * next, the others fail to prepare with -ENODATA.
  */
 void s7d_vp9_input_bank_resync(struct s7d_vp9_input_bank *bank);
+/* The frame header starts a key frame (of any profile). */
+bool s7d_vp9_input_keyframe(const u8 *data, size_t bytes);
 /* Profile 0/2 single frame; failed prepare changes neither bank nor out. */
 int s7d_vp9_input_prepare(const struct s7d_vp9_input_bank *bank,
 			 const u8 *data, size_t bytes, struct s7d_vp9_input **out);
