@@ -64,6 +64,8 @@ struct ge2d_fmt {
 	/* Only on the S7D, or only as a source */
 	bool s7d;
 	bool src_only;
+	/* Each plane in its own buffer: multi-planar node only */
+	bool mplane;
 	/* S7D: swapped chroma planes, DST2 colour map */
 	bool swap_uv;
 	u8 dst2_map;
@@ -88,6 +90,8 @@ struct ge2d_ctx {
 	struct ge2d_frame in;
 	struct ge2d_frame out;
 	struct v4l2_ctrl_handler ctrl_handler;
+	/* Opened on the multi-planar node */
+	bool mplane;
 
 	unsigned long sequence_out, sequence_cap;
 
@@ -109,6 +113,8 @@ struct meson_ge2d {
 	struct v4l2_device v4l2_dev;
 	struct v4l2_m2m_dev *m2m_dev;
 	struct video_device *vfd;
+	/* The same unit with the multi-planar API */
+	struct video_device *vfd_mplane;
 
 	struct device *dev;
 	struct regmap *map;
@@ -191,6 +197,13 @@ static const struct ge2d_fmt formats[] = {
 	YUV(V4L2_PIX_FMT_YUV422P, 8, 8, YUV422, 3, 2, 1, .src_only = true),
 	YUV(V4L2_PIX_FMT_UYVY, 16, 16, YUV422, 1, 2, 1, .src_only = true),
 	YUV(V4L2_PIX_FMT_YUV24, 24, 24, VUY888, 1, 1, 1),
+	/*
+	 * Two-buffer sources, as a decoder may give. Not as a destination:
+	 * GStreamer prefers these whenever a node lists them, and its sinks
+	 * expect one buffer.
+	 */
+	YUV(V4L2_PIX_FMT_NV12M, 8, 24, NV12, 2, 2, 2, .src_only = true, .mplane = true),
+	YUV(V4L2_PIX_FMT_NV21M, 8, 24, NV21, 2, 2, 2, .src_only = true, .mplane = true),
 };
 
 #define NUM_FORMATS ARRAY_SIZE(formats)
@@ -200,7 +213,23 @@ static bool fmt_supported(struct ge2d_ctx *ctx, const struct ge2d_fmt *fmt,
 {
 	if (fmt->s7d && !ctx->ge2d->data->c1)
 		return false;
-	return !(fmt->src_only && type == V4L2_BUF_TYPE_VIDEO_CAPTURE);
+	if (fmt->mplane && !ctx->mplane)
+		return false;
+	return !(fmt->src_only && !V4L2_TYPE_IS_OUTPUT(type));
+}
+
+static unsigned int ge2d_mem_planes(const struct ge2d_fmt *fmt)
+{
+	return fmt->mplane ? fmt->planes : 1;
+}
+
+/* Bytes of memory plane n of a frame */
+static u32 ge2d_plane_bytes(const struct ge2d_fmt *fmt,
+			    const struct v4l2_pix_format *pix, unsigned int n)
+{
+	if (!fmt->mplane)
+		return pix->sizeimage;
+	return pix->bytesperline * (n ? pix->height / fmt->vsub : pix->height);
 }
 
 static const struct ge2d_fmt *find_fmt(struct ge2d_ctx *ctx, struct v4l2_format *f)
@@ -227,8 +256,10 @@ static struct ge2d_frame *get_frame(struct ge2d_ctx *ctx,
 {
 	switch (type) {
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
 		return &ctx->in;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		return &ctx->out;
 	default:
 		/* This should never happen, warn and return OUTPUT frame */
@@ -445,18 +476,25 @@ static void ge2d_set_csc(struct meson_ge2d *ge2d, struct ge2d_ctx *ctx)
 	regmap_write(ge2d->map, GE2D_MATRIX_COEF22_CTRL, csc->coef22_ctrl);
 }
 
-/* DMA address and stride of plane n of a contiguous multi-plane buffer */
+/*
+ * DMA address and stride of plane n: in its own buffer, or after the planes
+ * before it in a contiguous one. An output buffer starts at its data offset.
+ */
 static void ge2d_plane(struct ge2d_frame *f, unsigned int n, dma_addr_t *addr,
 		       u32 *stride)
 {
 	const struct ge2d_fmt *fmt = f->fmt;
+	struct vb2_buffer *vb = &f->buf->vb2_buf;
+	unsigned int mem = fmt->mplane ? n : 0;
 	u32 bpl = f->pix_fmt.bytesperline, h = f->pix_fmt.height;
 	u32 cstride = fmt->planes == 3 ? bpl / fmt->hsub : bpl;
 	u32 csize = cstride * (h / fmt->vsub);
 
-	*addr = vb2_dma_contig_plane_dma_addr(&f->buf->vb2_buf, 0);
+	*addr = vb2_dma_contig_plane_dma_addr(vb, mem);
+	if (V4L2_TYPE_IS_OUTPUT(vb->type))
+		*addr += vb->planes[mem].data_offset;
 	*stride = n ? cstride : bpl;
-	if (n)
+	if (n && !fmt->mplane)
 		*addr += bpl * h + (n - 1) * csize;
 }
 
@@ -812,12 +850,20 @@ static int ge2d_queue_setup(struct vb2_queue *vq,
 {
 	struct ge2d_ctx *ctx = vb2_get_drv_priv(vq);
 	struct ge2d_frame *f = get_frame(ctx, vq->type);
+	unsigned int i, planes = ge2d_mem_planes(f->fmt);
 
-	if (*nplanes)
-		return sizes[0] < f->pix_fmt.sizeimage ? -EINVAL : 0;
+	if (*nplanes) {
+		if (*nplanes != planes)
+			return -EINVAL;
+		for (i = 0; i < planes; i++)
+			if (sizes[i] < ge2d_plane_bytes(f->fmt, &f->pix_fmt, i))
+				return -EINVAL;
+		return 0;
+	}
 
-	sizes[0] = f->pix_fmt.sizeimage;
-	*nplanes = 1;
+	for (i = 0; i < planes; i++)
+		sizes[i] = ge2d_plane_bytes(f->fmt, &f->pix_fmt, i);
+	*nplanes = planes;
 
 	return 0;
 }
@@ -827,13 +873,26 @@ static int ge2d_buf_prepare(struct vb2_buffer *vb)
 	struct ge2d_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct ge2d_frame *f = get_frame(ctx, vb->vb2_queue->type);
+	bool output = V4L2_TYPE_IS_OUTPUT(vb->type);
+	unsigned int i;
+	u32 bytes;
 
 	vbuf->field = V4L2_FIELD_NONE;
 
-	/* The engine reads or writes a whole frame of the current format. */
-	if (vb2_plane_size(vb, 0) < f->pix_fmt.sizeimage)
-		return -EINVAL;
-	vb2_set_plane_payload(vb, 0, f->pix_fmt.sizeimage);
+	/*
+	 * The engine reads or writes a whole frame of the current format, from
+	 * 8-byte aligned addresses.
+	 */
+	for (i = 0; i < ge2d_mem_planes(f->fmt); i++) {
+		u32 offset = output ? vb->planes[i].data_offset : 0;
+
+		if (!IS_ALIGNED(offset, 8) ||
+		    check_add_overflow(offset, ge2d_plane_bytes(f->fmt, &f->pix_fmt, i),
+				       &bytes) ||
+		    vb2_plane_size(vb, i) < bytes)
+			return -EINVAL;
+		vb2_set_plane_payload(vb, i, bytes);
+	}
 
 	return 0;
 }
@@ -909,7 +968,8 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	struct ge2d_ctx *ctx = priv;
 	int ret;
 
-	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	src_vq->type = ctx->mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE :
+				     V4L2_BUF_TYPE_VIDEO_OUTPUT;
 	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	src_vq->drv_priv = ctx;
 	src_vq->ops = &ge2d_qops;
@@ -923,7 +983,8 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	if (ret)
 		return ret;
 
-	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	dst_vq->type = ctx->mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
+				     V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->drv_priv = ctx;
 	dst_vq->ops = &ge2d_qops;
@@ -1291,6 +1352,115 @@ static int vidioc_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f
 	return 0;
 }
 
+/*
+ * The multi-planar node keeps the single-planar frame state: every plane
+ * shares one stride, and only NV12M/NV21M split a frame into two buffers.
+ */
+static void ge2d_to_mplane(const struct ge2d_fmt *fmt, const struct v4l2_pix_format *pix,
+			   struct v4l2_pix_format_mplane *mp)
+{
+	unsigned int i;
+
+	memset(mp, 0, sizeof(*mp));
+	mp->width = pix->width;
+	mp->height = pix->height;
+	mp->pixelformat = pix->pixelformat;
+	mp->field = pix->field;
+	mp->colorspace = pix->colorspace;
+	mp->ycbcr_enc = pix->ycbcr_enc;
+	mp->quantization = pix->quantization;
+	mp->xfer_func = pix->xfer_func;
+	mp->num_planes = ge2d_mem_planes(fmt);
+	for (i = 0; i < mp->num_planes; i++) {
+		mp->plane_fmt[i].bytesperline = pix->bytesperline;
+		mp->plane_fmt[i].sizeimage = ge2d_plane_bytes(fmt, pix, i);
+	}
+}
+
+static int ge2d_fmt_mplane(int (*op)(struct file *, void *, struct v4l2_format *),
+			   struct file *file, void *priv, struct v4l2_format *f)
+{
+	const struct v4l2_pix_format_mplane *mp = &f->fmt.pix_mp;
+	struct ge2d_ctx *ctx = priv;
+	struct v4l2_format sp = {
+		.type = V4L2_TYPE_IS_OUTPUT(f->type) ? V4L2_BUF_TYPE_VIDEO_OUTPUT :
+						       V4L2_BUF_TYPE_VIDEO_CAPTURE,
+		.fmt.pix = {
+			.width = mp->width,
+			.height = mp->height,
+			.pixelformat = mp->pixelformat,
+			.field = mp->field,
+			.bytesperline = mp->plane_fmt[0].bytesperline,
+			.colorspace = mp->colorspace,
+			.ycbcr_enc = mp->ycbcr_enc,
+			.quantization = mp->quantization,
+			.xfer_func = mp->xfer_func,
+		},
+	};
+	int ret;
+
+	ret = op(file, priv, &sp);
+	if (!ret)
+		ge2d_to_mplane(find_fmt(ctx, &sp), &sp.fmt.pix, &f->fmt.pix_mp);
+	return ret;
+}
+
+static int vidioc_g_fmt_mplane(struct file *file, void *priv, struct v4l2_format *f)
+{
+	return ge2d_fmt_mplane(vidioc_g_fmt, file, priv, f);
+}
+
+static int vidioc_try_fmt_cap_mplane(struct file *file, void *priv, struct v4l2_format *f)
+{
+	return ge2d_fmt_mplane(vidioc_try_fmt_cap, file, priv, f);
+}
+
+static int vidioc_s_fmt_cap_mplane(struct file *file, void *priv, struct v4l2_format *f)
+{
+	return ge2d_fmt_mplane(vidioc_s_fmt_cap, file, priv, f);
+}
+
+static int vidioc_try_fmt_out_mplane(struct file *file, void *priv, struct v4l2_format *f)
+{
+	return ge2d_fmt_mplane(vidioc_try_fmt_out, file, priv, f);
+}
+
+static int vidioc_s_fmt_out_mplane(struct file *file, void *priv, struct v4l2_format *f)
+{
+	return ge2d_fmt_mplane(vidioc_s_fmt_out, file, priv, f);
+}
+
+static const struct v4l2_ioctl_ops ge2d_ioctl_ops_mplane = {
+	.vidioc_querycap = vidioc_querycap,
+
+	.vidioc_enum_fmt_vid_cap = vidioc_enum_fmt,
+	.vidioc_g_fmt_vid_cap_mplane = vidioc_g_fmt_mplane,
+	.vidioc_try_fmt_vid_cap_mplane = vidioc_try_fmt_cap_mplane,
+	.vidioc_s_fmt_vid_cap_mplane = vidioc_s_fmt_cap_mplane,
+
+	.vidioc_enum_fmt_vid_out = vidioc_enum_fmt,
+	.vidioc_g_fmt_vid_out_mplane = vidioc_g_fmt_mplane,
+	.vidioc_try_fmt_vid_out_mplane = vidioc_try_fmt_out_mplane,
+	.vidioc_s_fmt_vid_out_mplane = vidioc_s_fmt_out_mplane,
+
+	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
+	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
+	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
+	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
+	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
+	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
+
+	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+
+	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
+	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
+
+	.vidioc_g_selection = vidioc_g_selection,
+	.vidioc_s_selection = vidioc_s_selection,
+};
+
 static const struct v4l2_ioctl_ops ge2d_ioctl_ops = {
 	.vidioc_querycap = vidioc_querycap,
 
@@ -1424,6 +1594,7 @@ static int ge2d_open(struct file *file)
 	if (!ctx)
 		return -ENOMEM;
 	ctx->ge2d = ge2d;
+	ctx->mplane = video_devdata(file) == ge2d->vfd_mplane;
 
 	/* Keep the unit powered while a context exists. */
 	ret = pm_runtime_resume_and_get(ge2d->dev);
@@ -1503,6 +1674,48 @@ static const struct video_device ge2d_videodev = {
 	.vfl_dir = VFL_DIR_M2M,
 	.device_caps = V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING,
 };
+
+/*
+ * Two-buffer frames need the multi-planar API. A second node keeps the
+ * single-planar one, and the formats GStreamer picks there, as they are.
+ */
+static const struct video_device ge2d_videodev_mplane = {
+	.name = "meson-ge2d-mplane",
+	.fops = &ge2d_fops,
+	.ioctl_ops = &ge2d_ioctl_ops_mplane,
+	.minor = -1,
+	.release = video_device_release,
+	.vfl_dir = VFL_DIR_M2M,
+	.device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING,
+};
+
+static int ge2d_register_mplane(struct meson_ge2d *ge2d)
+{
+	struct video_device *vfd;
+	int ret;
+
+	vfd = video_device_alloc();
+	if (!vfd)
+		return -ENOMEM;
+
+	*vfd = ge2d_videodev_mplane;
+	vfd->lock = &ge2d->mutex;
+	vfd->v4l2_dev = &ge2d->v4l2_dev;
+	video_set_drvdata(vfd, ge2d);
+	ge2d->vfd_mplane = vfd;
+
+	ret = video_register_device(vfd, VFL_TYPE_VIDEO, -1);
+	if (ret) {
+		ge2d->vfd_mplane = NULL;
+		video_device_release(vfd);
+		return ret;
+	}
+
+	v4l2_info(&ge2d->v4l2_dev, "Registered %s as /dev/%s\n",
+		  vfd->name, video_device_node_name(vfd));
+
+	return 0;
+}
 
 static const struct regmap_config meson_ge2d_regmap_conf = {
 	.reg_bits = 8,
@@ -1628,6 +1841,14 @@ static int ge2d_probe(struct platform_device *pdev)
 	v4l2_info(&ge2d->v4l2_dev, "Registered %s as /dev/%s\n",
 		  vfd->name, video_device_node_name(vfd));
 
+	ret = ge2d_register_mplane(ge2d);
+	if (ret) {
+		v4l2_err(&ge2d->v4l2_dev, "Failed to register multi-planar video device\n");
+		video_unregister_device(vfd);
+		v4l2_m2m_release(ge2d->m2m_dev);
+		goto unreg_v4l2_dev;
+	}
+
 	return 0;
 
 rel_m2m:
@@ -1646,6 +1867,7 @@ static void ge2d_remove(struct platform_device *pdev)
 {
 	struct meson_ge2d *ge2d = platform_get_drvdata(pdev);
 
+	video_unregister_device(ge2d->vfd_mplane);
 	video_unregister_device(ge2d->vfd);
 	cancel_delayed_work_sync(&ge2d->timeout);
 	v4l2_m2m_release(ge2d->m2m_dev);

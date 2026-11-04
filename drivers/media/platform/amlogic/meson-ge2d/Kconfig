@@ -13,7 +13,8 @@ config VIDEO_S7D_GE2D
 	  formats of the upstream driver and NV12, NV21, NV16, NV61 and
 	  YUV24, also reads YUV420, YVU420, YUV422P and UYVY, scales up to
 	  16x from the crop to the compose rectangle, flips and rotates, and
-	  converts colour with the BT.601, BT.709 or BT.2020 matrix. Forked
-	  from the upstream Meson GE2D driver, which depends on ARCH_MESON,
-	  with the S7D register block, direct address registers and runtime
-	  power management.
+	  converts colour with the BT.601, BT.709 or BT.2020 matrix. A second,
+	  multi-planar node offers the same and also reads two-buffer NV12M
+	  and NV21M. Forked from the upstream Meson GE2D driver, which depends
+	  on ARCH_MESON, with the S7D register block, direct address registers
+	  and runtime power management.
