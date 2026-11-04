@@ -4,7 +4,7 @@ config DRM_S7D_PANTHOR
 	tristate "Panthor for the S7D Mali-G310 (Linux 6.18 backport)"
 	depends on DRM
 	depends on ARM || ARM64 || COMPILE_TEST
-	depends on !DRM_PANTHOR && MALI_MIDGARD = n
+	depends on !DRM_PANTHOR
 	depends on !GENERIC_ATOMIC64
 	depends on MMU
 	depends on DMA_CMA
@@ -18,8 +18,9 @@ config DRM_S7D_PANTHOR
 	select PM_DEVFREQ
 	help
 	  DRM driver for ARM Mali CSF-based GPUs, forked from Linux 6.18 for
-	  the S7D Mali-G310. It replaces the vendor kbase driver, so only one
-	  of the two can be built.
+	  the S7D Mali-G310. It can be built beside the vendor kbase driver:
+	  the panthor device tree overlay gives the GPU node the compatible
+	  Panthor binds to, and without the overlay kbase keeps the GPU.
 
 	  This driver is for Mali (or Immortalis) Valhall Gxxx GPUs.
 
