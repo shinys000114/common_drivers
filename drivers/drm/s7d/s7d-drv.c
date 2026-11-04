@@ -3,6 +3,7 @@
 #include <linux/types.h>
 #include <linux/amlogic/cpu_info.h>
 #include <linux/amlogic/cpu_version.h>
+#include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -10,6 +11,7 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/reset.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -307,6 +309,66 @@ static int s7d_drm_link_hdmi(struct device *dev, struct drm_bridge *bridge)
 	return link ? 0 : dev_err_probe(dev, -EINVAL, "HDMI device link\n");
 }
 
+/* The VPU local reset controller is a child that this probe registers. */
+static bool s7d_drm_local_reset(struct device_node *np, int index)
+{
+	struct of_phandle_args args;
+	struct device_node *parent;
+	bool local;
+
+	if (of_parse_phandle_with_args(np, "resets", "#reset-cells", index, &args))
+		return false;
+	parent = of_get_parent(args.np);
+	local = args.np == np || parent == np;
+	of_node_put(parent);
+	of_node_put(args.np);
+	return local;
+}
+
+/*
+ * drm_dev_init() reserves the card and render minors. A probe deferred
+ * after devm_drm_dev_alloc() gives them up to whichever DRM device comes
+ * next, so wait for every supplier that can defer before allocating: look
+ * up and release the clocks, the resets of other controllers and the
+ * interrupts of the node. s7d_vpu_init() takes them again and reports any
+ * other error. The power domain is attached before probe, and the HDMI
+ * transmitter publishes its bridge only after its own resources.
+ */
+static int s7d_drm_preflight(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct device_node *np = dev->of_node;
+	struct reset_control *rstc;
+	const char *name;
+	struct clk *clk;
+	int count, i, ret;
+
+	count = of_count_phandle_with_args(np, "clocks", "#clock-cells");
+	for (i = 0; i < count; i++) {
+		clk = of_clk_get(np, i);
+		if (PTR_ERR(clk) == -EPROBE_DEFER)
+			return dev_err_probe(dev, -EPROBE_DEFER, "clock %d\n", i);
+		if (!IS_ERR(clk))
+			clk_put(clk);
+	}
+	count = of_count_phandle_with_args(np, "resets", "#reset-cells");
+	for (i = 0; i < count; i++) {
+		if (of_property_read_string_index(np, "reset-names", i, &name) ||
+		    s7d_drm_local_reset(np, i))
+			continue;
+		/* Released: claims nothing, even against a current holder. */
+		rstc = reset_control_get_exclusive_released(dev, name);
+		if (PTR_ERR(rstc) == -EPROBE_DEFER)
+			return dev_err_probe(dev, -EPROBE_DEFER, "%s reset\n", name);
+		if (!IS_ERR(rstc))
+			reset_control_put(rstc);
+	}
+	ret = platform_irq_count(pdev);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "interrupts\n");
+	return 0;
+}
+
 static int s7d_drm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -336,6 +398,9 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = s7d_hdmi_bridge_link(bridge, &link);
 	if (ret)
 		return dev_err_probe(dev, ret, "incompatible HDMI bridge\n");
+	ret = s7d_drm_preflight(pdev);
+	if (ret)
+		return ret;
 	ret = s7d_drm_link_hdmi(dev, bridge);
 	if (ret)
 		return ret;
