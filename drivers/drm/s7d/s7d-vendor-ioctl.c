@@ -7,12 +7,15 @@
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
+#include <linux/string.h>
 #include <linux/sync_file.h>
 #include <uapi/linux/dma-buf.h>
 
+#include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_device.h>
 #include <drm/drm_file.h>
@@ -309,5 +312,99 @@ put_fd:
 	put_unused_fd(fd);
 put_fence:
 	dma_fence_put(fence);
+	return ret;
+}
+
+/*
+ * Like the vendor driver, mute nothing on the OSD planes. The video mute
+ * is recorded for the device; it does not reach the hardware yet.
+ */
+int s7d_vendor_mute_plane_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct drm_meson_plane_mute *arg = data;
+	struct s7d_vendor *v = s7d_vendor_find(drm);
+
+	if (!v)
+		return -ENODEV;
+	switch (arg->plane_type) {
+	case 0:
+		return 0;
+	case 1:
+		WRITE_ONCE(v->video_mute, !!arg->plane_mute);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+/* The HDMI transmitter has no VRR or QMS mode group. */
+int s7d_vendor_vrr_range_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct drm_vrr_mode_groups *groups = data;
+	struct drm_connector *connector;
+	int ret;
+
+	connector = drm_connector_lookup(drm, file, groups->conn_id);
+	if (!connector)
+		return -ENOENT;
+	ret = connector->connector_type == DRM_MODE_CONNECTOR_HDMIA ? -EINVAL : -ENOENT;
+	drm_connector_put(connector);
+	return ret;
+}
+
+/*
+ * Force a connector by name as the video= option does, and probe it again.
+ * An unknown name is -EFAULT like in the vendor driver: its users try one
+ * name after another until one is accepted.
+ */
+int s7d_vendor_connector_force_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	static const struct {
+		const char *name;
+		enum drm_connector_force force;
+	} states[] = {
+		{ "detect", DRM_FORCE_UNSPECIFIED },
+		{ "on", DRM_FORCE_ON },
+		{ "on-digital", DRM_FORCE_ON_DIGITAL },
+		{ "off", DRM_FORCE_OFF },
+	};
+	struct drm_meson_connector_info *info = data;
+	char name[sizeof(info->name)], status[sizeof(info->status)];
+	struct drm_connector *connector, *found = NULL;
+	struct drm_connector_list_iter iter;
+	enum drm_connector_force old;
+	unsigned int i;
+	int ret;
+
+	strscpy(name, info->name, sizeof(name));
+	strscpy(status, info->status, sizeof(status));
+	drm_connector_list_iter_begin(drm, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		if (!strcmp(connector->name, name)) {
+			drm_connector_get(connector);
+			found = connector;
+			break;
+		}
+	}
+	drm_connector_list_iter_end(&iter);
+	if (!found)
+		return -EFAULT;
+	for (i = 0; i < ARRAY_SIZE(states); i++)
+		if (!strcmp(status, states[i].name))
+			break;
+	ret = -EINVAL;
+	if (i == ARRAY_SIZE(states))
+		goto put;
+	ret = mutex_lock_interruptible(&drm->mode_config.mutex);
+	if (ret)
+		goto put;
+	old = found->force;
+	found->force = states[i].force;
+	if (old != found->force || found->force == DRM_FORCE_UNSPECIFIED)
+		found->funcs->fill_modes(found, drm->mode_config.max_width,
+					 drm->mode_config.max_height);
+	mutex_unlock(&drm->mode_config.mutex);
+put:
+	drm_connector_put(found);
 	return ret;
 }

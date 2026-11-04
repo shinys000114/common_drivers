@@ -48,6 +48,8 @@ struct s7d_vendor {
 	int card_minor;
 	int render_minor;
 	bool node_order_ok;
+	/* MUTE_PLANE on video: kept for the whole device until unmuted. */
+	bool video_mute;
 };
 
 #if IS_ENABLED(CONFIG_DRM_S7D_VENDOR_UAPI)
@@ -71,6 +73,9 @@ int s7d_vendor_export_sync_file_ioctl(struct drm_device *drm, void *data,
 int s7d_vendor_prime_handle_to_fd_ioctl(struct drm_device *drm, void *data,
 					struct drm_file *file);
 int s7d_vendor_present_fence_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int s7d_vendor_mute_plane_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int s7d_vendor_vrr_range_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int s7d_vendor_connector_force_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
 void s7d_vendor_present_init(struct s7d_vendor *v);
 void s7d_vendor_present_fini(struct s7d_vendor *v);
 

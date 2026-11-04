@@ -37,7 +37,10 @@ static const struct drm_ioctl_desc s7d_vendor_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(MESON_DMABUF_EXPORT_SYNC_FILE, s7d_vendor_export_sync_file_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(MESON_PRIME_HANDLE_TO_FD, s7d_vendor_prime_handle_to_fd_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(MESON_MUTE_PLANE, s7d_vendor_mute_plane_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(MESON_GET_VRR_RANGE, s7d_vendor_vrr_range_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(MESON_CREAT_PRESENT_FENCE, s7d_vendor_present_fence_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(MESON_SET_CONNECTOR_FORCE, s7d_vendor_connector_force_ioctl, 0),
 };
 
 /* The vendor ADDFB2 takes the core arguments; its own formats are not offered. */
@@ -169,6 +172,7 @@ static int s7d_vendor_debugfs_show(struct seq_file *m, void *data)
 	seq_printf(m, "card_minor: %d\n", v->card_minor);
 	seq_printf(m, "render_minor: %d\n", v->render_minor);
 	seq_printf(m, "node_order_ok: %d\n", v->node_order_ok);
+	seq_printf(m, "video_mute: %d\n", READ_ONCE(v->video_mute));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(s7d_vendor_debugfs);
