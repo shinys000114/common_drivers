@@ -454,6 +454,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = s7d_vpu_hold_boot(&display->vpu);
 	if (ret)
 		goto fini_vpu;
+	s7d_vpu_debugfs_init(&display->vpu, drm);
 	primary = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
 				   S7D_PLANE_PRIMARY,
 				   IS_ENABLED(CONFIG_DRM_S7D_GFCD) ?

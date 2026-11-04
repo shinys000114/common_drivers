@@ -9,10 +9,22 @@
 #include "s7d-crtc.h"
 #include "s7d-afbc-engine.h"
 
+struct drm_device;
 struct platform_device;
 struct regmap;
 struct s7d_vdin;
 struct s7d_writeback;
+
+#define S7D_VPU_SRAM_BANKS	5
+
+/* What the probe found the firmware had left, for the log and debugfs. */
+struct s7d_vpu_boot {
+	/* The VPU/HDMI power domain at probe, after its provider: 0 on, 1 off. */
+	long power;
+	/* MEM_PD5..9, the VPU SRAM power-down controls, 0 when powered. */
+	u32 mem_pd[S7D_VPU_SRAM_BANKS];
+	bool mem_pd_read;
+};
 
 /* HDMI owns PHY/packets. Return only after its transmitter is safely off. */
 struct s7d_vpu_link {
@@ -114,6 +126,9 @@ struct s7d_vpu {
 	u16 flip_end;
 	u16 replay_prepare_end;
 	u32 failed_reg;
+	struct s7d_vpu_boot boot;
+	/* Set at probe: never touch the VPU, refuse to enable the CRTC. */
+	int unusable;
 };
 
 extern const struct s7d_crtc_ops s7d_vpu_crtc_ops;
@@ -131,8 +146,13 @@ extern const struct s7d_crtc_ops s7d_vpu_crtc_ops;
  */
 int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *vpu,
 		 const struct s7d_vpu_link *link);
-/* Retain the firmware clock/PM references until the first CRTC acquire. */
+/*
+ * Retain the firmware clock/PM references until the first CRTC acquire.
+ * A display found unusable is left alone, and its CRTC refuses to enable.
+ */
 int s7d_vpu_hold_boot(struct s7d_vpu *vpu);
+/* Show what the probe found in the DRM device's debugfs directory. */
+void s7d_vpu_debugfs_init(struct s7d_vpu *vpu, struct drm_device *drm);
 /* Drop that hold before the first commit if the firmware output is off. */
 int s7d_vpu_release_boot(struct s7d_vpu *vpu);
 /* Only before first modeset, or after successful s7d_crtc_shutdown(). */

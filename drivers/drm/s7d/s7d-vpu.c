@@ -2,6 +2,7 @@
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/amlogic/clk/s7d-hdmi-pll-rate.h>
 #include <linux/amlogic/s7d-vpu-reset.h>
+#include <linux/arm-smccc.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -14,6 +15,7 @@
 #include <linux/sizes.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_debugfs_crc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_vblank.h>
@@ -82,6 +84,14 @@
 #define AFBC_COMMAND		0x3a05
 #define AFBC_STATUS		0x3a06
 #define AFBC_SURFACES		0x3a07
+/* Firmware call returning the state of a power domain: 0 on, 1 off. */
+#define PWR_STATUS_SMC		0x82000095
+/*
+ * PWRCTRL_MEM_PD5..9, the VPU SRAM power-down controls. The firmware switches
+ * them; the vendor power domain provider reaches them only through firmware
+ * calls, none of which reads them back.
+ */
+#define PWRCTRL_MEM_PD5		0xfe00c054
 
 static u32 vpu_read(struct s7d_vpu *v, u32 reg)
 {
@@ -682,6 +692,8 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	unsigned long core_rate;
 	int ret;
 
+	if (v->unusable)
+		return -EINVAL;
 	ret = s7d_display_check_resources(&state->resources);
 	if (ret)
 		return ret;
@@ -770,6 +782,8 @@ static int s7d_vpu_acquire(void *data)
 	struct s7d_vpu *v = data;
 	int ret;
 
+	if (v->unusable)
+		return v->unusable;
 	if (v->boot_held) {
 		v->boot_held = false;
 		return 0;
@@ -817,6 +831,9 @@ int s7d_vpu_hold_boot(struct s7d_vpu *v)
 
 	if (v->acquired || v->touched)
 		return -EBUSY;
+	/* Keep the device for the display, without one VCBUS access. */
+	if (v->unusable)
+		return 0;
 	ret = s7d_vpu_acquire(v);
 	if (!ret)
 		v->boot_held = true;
@@ -2444,6 +2461,94 @@ static int s7d_vpu_local_resets_init(struct s7d_vpu *v)
 		ARRAY_SIZE(v->vd1_fbc_resets), v->vd1_fbc_resets);
 }
 
+/*
+ * Record the display power at probe, before any VCBUS access: the VPU/HDMI
+ * domain and the VPU SRAM banks. The vendor provider powers the always-on
+ * domain at its own probe when the firmware left it off, so the domain
+ * reads off here only if that failed or something switched it off since.
+ * The provider does not touch the banks, which still show what the
+ * firmware left. VCBUS reads hang the bus with the domain off, and the
+ * scanout needs the banks. Native refused to probe then. Probe anyway, so
+ * that the DRM minors stay the display's, but never touch the VPU and
+ * refuse to enable the CRTC.
+ */
+static void s7d_vpu_record_power(struct s7d_vpu *v)
+{
+	struct s7d_vpu_boot *b = &v->boot;
+	struct of_phandle_args domain;
+	struct arm_smccc_res res;
+	void __iomem *banks;
+	unsigned int i;
+
+	b->power = -ENODEV;
+	if (!of_parse_phandle_with_args(v->dev->of_node, "power-domains",
+					"#power-domain-cells", 0, &domain)) {
+		of_node_put(domain.np);
+		if (domain.args_count == 1) {
+			arm_smccc_smc(PWR_STATUS_SMC, domain.args[0], 0, 0, 0, 0, 0, 0, &res);
+			b->power = res.a0;
+		}
+	}
+	/*
+	 * Read only, and not requested: the range is the firmware's, and the
+	 * vendor VPU driver maps the same words without a request too.
+	 */
+	banks = ioremap(PWRCTRL_MEM_PD5, sizeof(b->mem_pd));
+	if (banks) {
+		for (i = 0; i < ARRAY_SIZE(b->mem_pd); i++)
+			b->mem_pd[i] = readl(banks + i * sizeof(u32));
+		iounmap(banks);
+		b->mem_pd_read = true;
+	}
+	if (b->power == 1) {
+		v->unusable = -ENODEV;
+		dev_err(v->dev, "VPU/HDMI power domain is off; display disabled\n");
+		return;
+	}
+	if (b->power)
+		dev_warn(v->dev, "VPU/HDMI power domain state unknown (%ld)\n", b->power);
+	if (!b->mem_pd_read) {
+		dev_warn(v->dev, "VPU SRAM state unknown\n");
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(b->mem_pd); i++) {
+		if (b->mem_pd[i]) {
+			v->unusable = -EIO;
+			dev_err(v->dev, "VPU SRAM MEM_PD%u is %#x, not powered; display disabled\n",
+				i + 5, b->mem_pd[i]);
+			return;
+		}
+	}
+	dev_info(v->dev, "VPU/HDMI power domain %s at probe, VPU SRAM MEM_PD5..9 powered\n",
+		 b->power ? "assumed on" : "on");
+}
+
+static int s7d_vpu_boot_show(struct seq_file *m, void *data)
+{
+	struct drm_debugfs_entry *entry = m->private;
+	const struct s7d_vpu *v = entry->file.data;
+	const struct s7d_vpu_boot *b = &v->boot;
+	unsigned int i;
+
+	/* What the probe recorded; no hardware access. */
+	seq_printf(m, "power_domain\t%ld\n", b->power);
+	seq_puts(m, "mem_pd5_9\t");
+	for (i = 0; i < ARRAY_SIZE(b->mem_pd); i++) {
+		if (b->mem_pd_read)
+			seq_printf(m, "%#x%c", b->mem_pd[i],
+				   i + 1 < ARRAY_SIZE(b->mem_pd) ? ' ' : '\n');
+		else
+			seq_puts(m, i + 1 < ARRAY_SIZE(b->mem_pd) ? "? " : "?\n");
+	}
+	seq_printf(m, "unusable\t%d\n", v->unusable);
+	return 0;
+}
+
+void s7d_vpu_debugfs_init(struct s7d_vpu *v, struct drm_device *drm)
+{
+	drm_debugfs_add_file(drm, "s7d_boot", s7d_vpu_boot_show, v);
+}
+
 int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 		 const struct s7d_vpu_link *link)
 {
@@ -2538,6 +2643,7 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	if (ret)
 		return ret;
 	s7d_scanout_init(&v->scanout, &v->rdma);
+	s7d_vpu_record_power(v);
 	return 0;
 }
 
