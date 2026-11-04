@@ -15,7 +15,8 @@ description: |
   its analogue register window. The child has no separate reg resource.
   The clock controller owns the HDMI PLL; the PHY owns HDMIPHY_CTRL0
   through HDMIPHY_CTRL5 at offsets 0x200 through 0x214 of the pll resource.
-  Its pixel clock is the HDMI PLL output before the VENC dividers.
+  Its serializer clock is the HDMI PLL serial output (CLKID_HDMI_SERIAL),
+  from which the PHY derives the TMDS character rate.
   Firmware provides the resistor calibration value through an SMC service.
 
 properties:
@@ -29,7 +30,7 @@ properties:
     maxItems: 1
 
   clock-names:
-    const: pixel
+    const: serializer
 
   resets:
     maxItems: 1
@@ -56,8 +57,8 @@ examples:
     hdmi-phy {
         compatible = "amlogic,s7d-hdmi-phy";
         #phy-cells = <0>;
-        clocks = <&clkc 254>;
-        clock-names = "pixel";
+        clocks = <&clkc 256>;
+        clock-names = "serializer";
         resets = <&reset 22>;
         reset-names = "phy";
         power-domains = <&pwrdm 3>;
