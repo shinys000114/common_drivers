@@ -29,6 +29,19 @@ struct s7d_plane {
 	bool gfcd_primary;
 };
 
+/*
+ * zpos as amdgpu exposes it: the primary is fixed, with room below it for the
+ * OSD2 overlay and both video planes, so compositors can use them as
+ * underlays. Those planes range from the bottom to just under the cursor,
+ * which stays on top. Their defaults stack them above the primary, VD1 below
+ * VD2 below OSD2, for clients that never set zpos.
+ */
+#define S7D_PLANE_ZPOS_PRIMARY	3
+#define S7D_PLANE_ZPOS_VD1	4
+#define S7D_PLANE_ZPOS_VD2	5
+#define S7D_PLANE_ZPOS_OSD2	6
+#define S7D_PLANE_ZPOS_CURSOR	7
+
 /* -1 keeps the Kconfig policy, 0 selects Mali AFBCD, 1 the GFCD primary. */
 static int afbc_policy = -1;
 module_param(afbc_policy, int, 0444);
@@ -490,7 +503,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	case S7D_PLANE_PRIMARY:
 		type = DRM_PLANE_TYPE_PRIMARY;
 		name = "S7D OSD1";
-		zpos = 0;
+		zpos = S7D_PLANE_ZPOS_PRIMARY;
 		plane_formats = primary_formats;
 		format_count = ARRAY_SIZE(primary_formats);
 		if (afbc_supported && primary_afbc) {
@@ -502,7 +515,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	case S7D_PLANE_RGB:
 		type = DRM_PLANE_TYPE_OVERLAY;
 		name = "S7D OSD2 overlay";
-		zpos = 3;
+		zpos = S7D_PLANE_ZPOS_OSD2;
 		if (afbc_supported) {
 			funcs = &s7d_rgb_plane_funcs;
 			plane_modifiers = rgb_modifiers;
@@ -511,7 +524,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	case S7D_PLANE_CURSOR:
 		type = DRM_PLANE_TYPE_CURSOR;
 		name = "S7D OSD2 cursor";
-		zpos = S7D_DISPLAY_MAX_ZPOS;
+		zpos = S7D_PLANE_ZPOS_CURSOR;
 		plane_formats = cursor_formats;
 		format_count = ARRAY_SIZE(cursor_formats);
 		break;
@@ -519,7 +532,7 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	case S7D_PLANE_VIDEO2:
 		type = DRM_PLANE_TYPE_OVERLAY;
 		name = slot == S7D_PLANE_VIDEO ? "S7D VD1" : "S7D VD2";
-		zpos = slot == S7D_PLANE_VIDEO ? 1 : 2;
+		zpos = slot == S7D_PLANE_VIDEO ? S7D_PLANE_ZPOS_VD1 : S7D_PLANE_ZPOS_VD2;
 		plane_formats = video_formats;
 		format_count = ARRAY_SIZE(video_formats) -
 			(slot == S7D_PLANE_VIDEO ? 0 : 2);
@@ -543,12 +556,11 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	plane->gfcd_primary = IS_ENABLED(CONFIG_DRM_S7D_GFCD) &&
 		(afbc_policy < 0 ? IS_ENABLED(CONFIG_DRM_S7D_AFBC_POLICY_GFCD_PRIMARY) :
 		 afbc_policy == 1);
-	/* The cursor's zpos is fixed at the top; a plane given that value still sorts above it. */
-	if (slot == S7D_PLANE_CURSOR)
+	if (slot == S7D_PLANE_PRIMARY || slot == S7D_PLANE_CURSOR)
 		ret = drm_plane_create_zpos_immutable_property(&plane->base, zpos);
 	else
 		ret = drm_plane_create_zpos_property(&plane->base, zpos, 0,
-						     S7D_DISPLAY_MAX_ZPOS);
+						     S7D_PLANE_ZPOS_CURSOR - 1);
 	if (ret)
 		return ERR_PTR(ret);
 	ret = drm_plane_create_alpha_property(&plane->base);
