@@ -4,6 +4,8 @@
 /dts-v1/;
 /plugin/;
 
+#include <dt-bindings/clock/amlogic,s7d-audio-clkc.h>
+
 &{/} {
 	c5_i2s_dac: i2s-dac {
 		compatible = "ti,pcm5102a";
@@ -13,7 +15,13 @@
 
 &c5_tdmif_a {
 	pinctrl-names = "default";
-	pinctrl-0 = <&c5_i2s_pins>;
+	pinctrl-0 = <&c5_i2s_pins>, <&c5_i2s_audio_pads>;
+	/* MCLK pad 1 (pin 7) is the master clock the DAC gets. */
+	clocks = <&c5_audio_clkc S7D_AUDIO_CLK_MST_A_SCLK>,
+		 <&c5_audio_clkc S7D_AUDIO_CLK_MST_A_LRCLK>,
+		 <&c5_audio_clkc S7D_AUDIO_CLK_MCLK_PAD1>;
+	assigned-clocks = <&c5_audio_clkc S7D_AUDIO_CLK_MCLK_PAD1_SEL>;
+	assigned-clock-parents = <&c5_audio_clkc CLKID_AUDIO_MCLK_A>;
 	status = "okay";
 };
 

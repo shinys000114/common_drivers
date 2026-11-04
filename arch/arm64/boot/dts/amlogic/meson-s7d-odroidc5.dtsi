@@ -312,7 +312,7 @@
 
 			c5_audio_clkc: clock-controller@0 {
 				compatible = "amlogic,s7d-audio-clkc";
-				reg = <0 0x0 0 0xb8>, <0 0xe80 0 0x10>;
+				reg = <0 0x0 0 0xb8>, <0 0xe80 0 0x8>;
 				#clock-cells = <1>;
 				#reset-cells = <1>;
 				clocks = <&clkc CLKID_SYS_AUDIO>,
@@ -490,6 +490,26 @@
 					 <&c5_audio_clkc S7D_AUDIO_RESET_FRDDRD>;
 				reset-names = "arb", "rst";
 				amlogic,fifo-depth = <1024>;
+			};
+
+			c5_audio_pads: pinctrl@e40 {
+				compatible = "amlogic,s7d-audio-pinctrl";
+				reg = <0 0xe40 0 0x40>, <0 0xe88 0 0x8>;
+				clocks = <&clkc CLKID_SYS_AUDIO>;
+				power-domains = <&pwrdm PDID_S7D_AUDIO>;
+
+				/* 40-pin header I2S: TDM A lane 0 and MST A clocks */
+				c5_i2s_audio_pads: c5-i2s-audio-pins {
+					mux-out {
+						groups = "tdm_d0";
+						function = "tdmouta_lane0";
+					};
+
+					mux-clk {
+						groups = "tdm_sclk0", "tdm_lrclk0";
+						function = "tdm_clk_outa";
+					};
+				};
 			};
 		};
 
