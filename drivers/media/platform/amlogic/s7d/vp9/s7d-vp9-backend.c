@@ -941,11 +941,13 @@ static int vp9_wait(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 	}
 }
 
-static int vp9_frame_ready(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
+/* Give out the picture in @slot, written with @token, for this job. */
+static int vp9_frame_ready(struct s7d_vp9_decoder *decoder, struct vp9_job *job,
+			   u32 slot, u64 token)
 {
 	struct s7d_codec_frame frame = {
-		.surface_id = decoder->capture[job->current_slot].surface_id,
-		.generation = decoder->generation, .write_token = job->write_token,
+		.surface_id = decoder->capture[slot].surface_id,
+		.generation = decoder->generation, .write_token = token,
 		.timestamp_ns = job->timestamp_ns, .timestamp_meta = job->timestamp_meta,
 		.sequence = decoder->output_sequence,
 		.flags = job->header.show_existing ? 0 :
@@ -973,7 +975,7 @@ static int vp9_publish(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 	job->acquired = false;
 	decoder->content_token[job->current_slot] = job->write_token;
 	if (job->header.show_frame) {
-		ret = vp9_frame_ready(decoder, job);
+		ret = vp9_frame_ready(decoder, job, job->current_slot, job->write_token);
 		if (ret)
 			return ret;
 		job->published = true;
@@ -1107,6 +1109,12 @@ static int vp9_copy_fbc(struct s7d_vp9_decoder *decoder, struct vp9_job *job,
 	return 0;
 }
 
+/*
+ * show_existing_frame of a picture the DPB holds: give out its own buffer
+ * when it was never given out (a hidden alt-ref frame) or the client has
+ * queued it again since; the picture stays a reference either way. Only
+ * while the client still holds the buffer is the picture copied.
+ */
 static int vp9_present_existing(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 {
 	const size_t bytes[2] = { decoder->layout.size[0], decoder->layout.size[1] };
@@ -1123,6 +1131,21 @@ static int vp9_present_existing(struct s7d_vp9_decoder *decoder, struct vp9_job 
 	    !decoder->content_token[source])
 		return -ENODATA;
 	source_token = decoder->content_token[source];
+	ret = decoder->hidden_mask & BIT(source) ? 0 :
+		s7d_codec_surface_reshow(decoder->capture[source].surface, source_token);
+	if (!ret) {
+		ret = s7d_vp9_input_commit_metadata(job->bank, job->prepared);
+		if (!ret)
+			ret = vp9_frame_ready(decoder, job, source, source_token);
+		if (ret)
+			return ret;
+		decoder->hidden_mask &= ~BIT(source);
+		job->published = true;
+		decoder->output_sequence++;
+		return 0;
+	}
+	if (ret != -EBUSY)
+		return ret;
 	for (;;) {
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		reinit_completion(&job->wake);
@@ -1156,7 +1179,7 @@ static int vp9_present_existing(struct s7d_vp9_decoder *decoder, struct vp9_job 
 	decoder->content_token[job->current_slot] = job->write_token;
 	ret = s7d_vp9_input_commit_metadata(job->bank, job->prepared);
 	if (!ret)
-		ret = vp9_frame_ready(decoder, job);
+		ret = vp9_frame_ready(decoder, job, job->current_slot, job->write_token);
 	if (ret)
 		return ret;
 	job->published = true;
