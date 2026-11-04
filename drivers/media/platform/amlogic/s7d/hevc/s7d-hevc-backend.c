@@ -132,7 +132,6 @@ struct s7d_hevc_decoder {
 	struct s7d_codec_dos *dos;
 	/* The HEVC core lease, held through each session. */
 	struct s7d_codec_lease lease;
-	struct s7d_codec_core *core;
 	struct s7d_codec_firmware_owner *firmware;
 	struct s7d_codec_firmware_job *preload;
 	struct regmap *map;
@@ -891,6 +890,8 @@ static int hevc_hold(void *priv, enum s7d_codec_engine engine)
 	unsigned long flags;
 	int ret;
 
+	if (!decoder)
+		return -EINVAL;
 	if (engine != S7D_CODEC_ENGINE_HEVC)
 		return -EOPNOTSUPP;
 	if (READ_ONCE(decoder->closing) || decoder->quarantined || decoder->release_error)
@@ -1041,7 +1042,7 @@ static void hevc_release(void *priv, enum s7d_codec_engine engine)
 	mutex_unlock(&decoder->control);
 }
 
-static const struct s7d_codec_resource_ops hevc_resource_ops = {
+const struct s7d_codec_resource_ops s7d_hevc_decoder_resource_ops = {
 	.hold = hevc_hold,
 	.quiesce = hevc_quiesce,
 	.release = hevc_release,
@@ -2151,21 +2152,11 @@ s7d_hevc_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 		ret = decoder->map ? PTR_ERR(decoder->map) : -ENODEV;
 		goto free;
 	}
-	decoder->core = s7d_codec_core_create(dev, owner, &hevc_resource_ops, decoder, 32);
-	if (IS_ERR(decoder->core)) {
-		ret = PTR_ERR(decoder->core);
-		goto free;
-	}
 	return decoder;
 free:
 	put_device(decoder->dev);
 	kfree(decoder);
 	return ERR_PTR(ret);
-}
-
-struct s7d_codec_core *s7d_hevc_decoder_core(struct s7d_hevc_decoder *decoder)
-{
-	return decoder ? decoder->core : NULL;
 }
 
 int s7d_hevc_decoder_destroy(struct s7d_hevc_decoder *decoder)
@@ -2181,14 +2172,11 @@ int s7d_hevc_decoder_destroy(struct s7d_hevc_decoder *decoder)
 	s7d_hevc_decoder_request_stop(decoder);
 	mutex_lock(&decoder->control);
 	if (decoder->job || decoder->session || decoder->context || decoder->dpb ||
-	    decoder->quarantined || decoder->release_error ||
+	    decoder->quarantined || decoder->release_error || decoder->lease_active ||
 	    decoder->release_pin || decoder->irq_binding) {
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = s7d_codec_core_destroy(decoder->core);
-	if (ret)
-		goto out;
 	mutex_unlock(&decoder->control);
 	put_device(decoder->dev);
 	kfree(decoder);

@@ -28,12 +28,20 @@ struct s7d_hevc_decode_result {
 	bool recovered;
 };
 
-/* The caller keeps DOS, firmware and engine owners alive until destroy succeeds. */
+/*
+ * The resource ops of a HEVC codec core. Each session holds the HEVC core
+ * with its own decoder, which it passes as the session's resource priv.
+ */
+extern const struct s7d_codec_resource_ops s7d_hevc_decoder_resource_ops;
+
+/*
+ * One stream's decoder; several take turns on the HEVC core. The caller keeps
+ * DOS, firmware and engine owners alive until destroy succeeds.
+ */
 struct s7d_hevc_decoder *
 s7d_hevc_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 			struct s7d_codec_firmware_owner *borrowed_firmware,
 			struct s7d_hevc_engine *borrowed_engine, struct module *owner);
-struct s7d_codec_core *s7d_hevc_decoder_core(struct s7d_hevc_decoder *decoder);
 /* Gate and join frontend requests before stopping the borrowed session. */
 /* Capture bindings remain live through successful stream_close. */
 int s7d_hevc_decoder_bind(struct s7d_hevc_decoder *decoder,
