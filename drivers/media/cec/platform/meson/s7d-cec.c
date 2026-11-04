@@ -17,6 +17,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/pm_wakeup.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
@@ -96,6 +97,8 @@ struct s7d_cec {
 	u16 logical_mask;
 	/* Physical address of the last claim, under adap->lock. */
 	u16 phys_addr;
+	/* Own physical address that s2idle wakes for, or invalid. */
+	u16 wake_phys_addr;
 	int irq;
 	bool enabled;
 	bool running;
@@ -103,6 +106,7 @@ struct s7d_cec {
 	bool suspended;
 	bool stopping;
 	bool handed_off;
+	bool irq_off;
 };
 
 static int s7d_cec_wait(struct s7d_cec *cec, u32 *value)
@@ -140,6 +144,16 @@ static int s7d_cec_write(struct s7d_cec *cec, u8 reg, u8 value)
 	return s7d_cec_wait(cec, &data);
 }
 
+static int s7d_cec_write_mask(struct s7d_cec *cec, u16 mask)
+{
+	int ret;
+
+	ret = s7d_cec_write(cec, CEC_LADDR_LOW, mask);
+	if (!ret)
+		ret = s7d_cec_write(cec, CEC_LADDR_HIGH, mask >> 8);
+	return ret;
+}
+
 static void s7d_cec_stop(struct s7d_cec *cec)
 {
 	lockdep_assert_held(&cec->lock);
@@ -168,10 +182,7 @@ static int s7d_cec_start(struct s7d_cec *cec)
 	ret = s7d_cec_write(cec, CEC_WAKE_CONTROL, 0);
 	if (ret)
 		goto stop;
-	ret = s7d_cec_write(cec, CEC_LADDR_LOW, cec->logical_mask);
-	if (ret)
-		goto stop;
-	ret = s7d_cec_write(cec, CEC_LADDR_HIGH, cec->logical_mask >> 8);
+	ret = s7d_cec_write_mask(cec, cec->logical_mask);
 	if (ret)
 		goto stop;
 	ret = s7d_cec_write(cec, CEC_RX_LOCK, 0);
@@ -228,9 +239,7 @@ static int s7d_cec_log_addr(struct cec_adapter *adap, u8 address)
 		ret = 0;
 		goto out;
 	}
-	ret = s7d_cec_write(cec, CEC_LADDR_LOW, mask);
-	if (!ret)
-		ret = s7d_cec_write(cec, CEC_LADDR_HIGH, mask >> 8);
+	ret = s7d_cec_write_mask(cec, mask);
 	if (!ret)
 		cec->logical_mask = mask;
 	else
@@ -310,10 +319,47 @@ static u8 s7d_cec_tx_status(u32 status)
 	return CEC_TX_STATUS_OK;
 }
 
+/* The messages that the vendor driver wakes a standby device for in s2idle. */
+static bool s7d_cec_wakes(struct s7d_cec *cec, const struct cec_msg *msg)
+{
+	u16 phys_addr = cec->wake_phys_addr;
+	bool broadcast = cec_msg_is_broadcast(msg);
+
+	lockdep_assert_held(&cec->lock);
+	if (phys_addr == CEC_PHYS_ADDR_INVALID || msg->len < 2)
+		return false;
+	switch (msg->msg[1]) {
+	case CEC_MSG_SET_STREAM_PATH:
+		return broadcast && msg->len >= 4 &&
+		       (msg->msg[2] << 8 | msg->msg[3]) == phys_addr;
+	case CEC_MSG_ROUTING_CHANGE:
+		return broadcast && msg->len >= 6 &&
+		       (msg->msg[4] << 8 | msg->msg[5]) == phys_addr;
+	case CEC_MSG_IMAGE_VIEW_ON:
+	case CEC_MSG_TEXT_VIEW_ON:
+		return !broadcast;
+	case CEC_MSG_USER_CONTROL_PRESSED:
+		return !broadcast && msg->len >= 3 &&
+		       (msg->msg[2] == CEC_OP_UI_CMD_POWER ||
+			msg->msg[2] == CEC_OP_UI_CMD_POWER_ON_FUNCTION);
+	}
+	return false;
+}
+
+/*
+ * A key that woke the system is not passed on after either sleep state: user
+ * space would take the Power key for a request to sleep or power off again.
+ */
+static bool s7d_cec_wake_key(const struct cec_msg *msg)
+{
+	return msg->len >= 2 && msg->msg[1] == CEC_MSG_USER_CONTROL_PRESSED;
+}
+
 static irqreturn_t s7d_cec_irq(int irq, void *data)
 {
 	struct s7d_cec *cec = data;
 	struct cec_msg msg = {};
+	bool wake = false;
 	u32 status;
 	u8 value, tx_status = 0;
 	int i, ret = 0;
@@ -325,7 +371,8 @@ static irqreturn_t s7d_cec_irq(int irq, void *data)
 		return IRQ_NONE;
 	}
 	writel(status, cec->base + CECB_IRQ_CLEAR);
-	if (!cec->running || cec->suspended || cec->stopping)
+	/* Only s2idle leaves the controller running while suspended. */
+	if (!cec->running || cec->stopping)
 		goto out;
 	if ((status & IRQ_TX) && cec->transmitting) {
 		cec->transmitting = false;
@@ -364,8 +411,16 @@ static irqreturn_t s7d_cec_irq(int irq, void *data)
 			s7d_cec_stop(cec);
 		}
 	}
+	if (cec->suspended && msg.len) {
+		wake = s7d_cec_wakes(cec, &msg);
+		/* As after deep sleep, only a wake message reaches the core. */
+		if (!wake || s7d_cec_wake_key(&msg))
+			msg.len = 0;
+	}
 out:
 	mutex_unlock(&cec->lock);
+	if (wake)
+		pm_wakeup_hard_event(cec->dev);
 	/* The framework takes adap->lock; never hold the register lock here. */
 	if (tx_status == CEC_TX_STATUS_ERROR)
 		dev_warn_ratelimited(&cec->adap->devnode.dev,
@@ -461,6 +516,9 @@ static void s7d_cec_aocpu_replay(struct s7d_cec *cec)
 		memset(&msg, 0, sizeof(msg));
 		msg.len = buf[0];
 		memcpy(msg.msg, buf + 1, msg.len);
+		/* The firmware also keeps the key that woke the system. */
+		if (s7d_cec_wake_key(&msg))
+			continue;
 		cec_received_msg(cec->adap, &msg);
 	}
 }
@@ -485,25 +543,34 @@ static void s7d_cec_aocpu_release(struct s7d_cec *cec)
 }
 #endif
 
-/* Hand the controller to the AOCPU for wake; zero hands it nothing. */
-static void s7d_cec_handoff(struct s7d_cec *cec)
+/*
+ * The physical address the AOCPU or s2idle answers for, or invalid without a
+ * claim. Like the vendor, keep the last address while HPD is low: a TV in
+ * standby or the HDMI shutdown takes the physical address away, but the
+ * logical addresses stay.
+ */
+static u16 s7d_cec_claim(struct s7d_cec *cec)
 {
 	struct cec_adapter *adap = cec->adap;
 	const struct cec_log_addrs *la = &adap->log_addrs;
-	u16 phys_addr = adap->phys_addr;
-	u32 config = 0, address = 0;
 
 	lockdep_assert_held(&adap->lock);
-	/*
-	 * Like the vendor, keep the last address while HPD is low: a TV in
-	 * standby or the HDMI shutdown takes the physical address away, but
-	 * the logical addresses stay.
-	 */
-	if (phys_addr == CEC_PHYS_ADDR_INVALID)
-		phys_addr = cec->phys_addr;
-	if (cec->enabled && la->num_log_addrs &&
-	    la->log_addr[0] != CEC_LOG_ADDR_INVALID &&
-	    phys_addr != CEC_PHYS_ADDR_INVALID) {
+	if (!cec->enabled || !la->num_log_addrs ||
+	    la->log_addr[0] == CEC_LOG_ADDR_INVALID)
+		return CEC_PHYS_ADDR_INVALID;
+	if (adap->phys_addr != CEC_PHYS_ADDR_INVALID)
+		return adap->phys_addr;
+	return cec->phys_addr;
+}
+
+/* Hand the controller to the AOCPU for wake; zero hands it nothing. */
+static void s7d_cec_handoff(struct s7d_cec *cec)
+{
+	const struct cec_log_addrs *la = &cec->adap->log_addrs;
+	u16 phys_addr = s7d_cec_claim(cec);
+	u32 config = 0, address = 0;
+
+	if (phys_addr != CEC_PHYS_ADDR_INVALID) {
 		config = AO_CEC_ON | AO_CEC_AUTO_POWER_ON;
 		address = FIELD_PREP(AO_CEC_PHYS_ADDR, phys_addr) |
 			  FIELD_PREP(AO_CEC_LOG_ADDR, la->log_addr[0]) |
@@ -514,6 +581,33 @@ static void s7d_cec_handoff(struct s7d_cec *cec)
 	if (config)
 		s7d_cec_aocpu_set(cec, config, address);
 	cec->handed_off = true;
+}
+
+/*
+ * The AOCPU runs CEC only in deep sleep. Through s2idle keep the controller
+ * receiving instead, so that the TV can still wake the system; only an
+ * ongoing transfer is dropped. Without a wake address nothing is delivered
+ * until resume.
+ */
+static void s7d_cec_idle(struct s7d_cec *cec)
+{
+	u16 phys_addr = s7d_cec_claim(cec);
+	u16 mask;
+
+	lockdep_assert_held(&cec->lock);
+	if (!cec->running)
+		return;
+	if (cec->transmitting && s7d_cec_start(cec))
+		return;
+	if (phys_addr == CEC_PHYS_ADDR_INVALID || !device_may_wakeup(cec->dev))
+		return;
+	/* With HPD low nothing is claimed; answer for the last claim. */
+	mask = BIT(cec->adap->log_addrs.log_addr[0]) | BIT(CEC_LOG_ADDR_UNREGISTERED);
+	if (!cec->logical_mask && s7d_cec_write_mask(cec, mask)) {
+		s7d_cec_stop(cec);
+		return;
+	}
+	cec->wake_phys_addr = phys_addr;
 }
 
 static int s7d_cec_suspend(struct device *dev)
@@ -528,12 +622,19 @@ static int s7d_cec_suspend(struct device *dev)
 	mutex_lock(&cec->lock);
 	cec->suspended = true;
 	abort = cec->transmitting;
-	s7d_cec_stop(cec);
+	if (deep)
+		s7d_cec_stop(cec);
+	else
+		s7d_cec_idle(cec);
 	mutex_unlock(&cec->lock);
 	if (deep)
 		s7d_cec_handoff(cec);
 	mutex_unlock(&cec->adap->lock);
-	synchronize_irq(cec->irq);
+	/* The IRQ is left enabled for s2idle; deep sleep needs it off. */
+	if (deep) {
+		disable_irq(cec->irq);
+		cec->irq_off = true;
+	}
 	if (abort)
 		cec_transmit_done(cec->adap,
 				  CEC_TX_STATUS_ABORTED | CEC_TX_STATUS_MAX_RETRIES,
@@ -549,7 +650,11 @@ static int s7d_cec_resume(struct device *dev)
 
 	mutex_lock(&cec->adap->lock);
 	mutex_lock(&cec->lock);
-	if (cec->enabled)
+	cec->wake_phys_addr = CEC_PHYS_ADDR_INVALID;
+	/* After s2idle, keep receiving and restore the claimed addresses. */
+	if (cec->running && s7d_cec_write_mask(cec, cec->logical_mask))
+		s7d_cec_stop(cec);
+	if (cec->enabled && !cec->running)
 		ret = s7d_cec_start(cec);
 	if (!ret)
 		cec->suspended = false;
@@ -557,6 +662,10 @@ static int s7d_cec_resume(struct device *dev)
 	cec->handed_off = false;
 	mutex_unlock(&cec->lock);
 	mutex_unlock(&cec->adap->lock);
+	if (cec->irq_off) {
+		cec->irq_off = false;
+		enable_irq(cec->irq);
+	}
 	/* The framework takes adap->lock to receive. */
 	if (replay)
 		s7d_cec_aocpu_replay(cec);
@@ -605,6 +714,7 @@ static int s7d_cec_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	cec->dev = dev;
 	cec->phys_addr = CEC_PHYS_ADDR_INVALID;
+	cec->wake_phys_addr = CEC_PHYS_ADDR_INVALID;
 	mutex_init(&cec->lock);
 	cec->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(cec->base))
@@ -663,8 +773,9 @@ static int s7d_cec_probe(struct platform_device *pdev)
 		goto disable_clocks;
 	}
 	cec->adap->owner = THIS_MODULE;
+	/* s2idle wakes from the handler for chosen messages, not any traffic. */
 	ret = devm_request_threaded_irq(dev, cec->irq, NULL, s7d_cec_irq,
-					IRQF_ONESHOT | IRQF_NO_AUTOEN,
+					IRQF_ONESHOT | IRQF_NO_AUTOEN | IRQF_NO_SUSPEND,
 					dev_name(dev), cec);
 	if (ret)
 		goto delete_adapter;
@@ -678,6 +789,7 @@ static int s7d_cec_probe(struct platform_device *pdev)
 	ret = cec_register_adapter(cec->adap, dev);
 	if (ret)
 		goto unregister_notifier;
+	device_init_wakeup(dev, true);
 	return 0;
 unregister_notifier:
 	s7d_cec_shutdown(pdev);
@@ -697,6 +809,7 @@ static void s7d_cec_remove(struct platform_device *pdev)
 {
 	struct s7d_cec *cec = platform_get_drvdata(pdev);
 
+	device_init_wakeup(&pdev->dev, false);
 	s7d_cec_shutdown(pdev);
 	s7d_cec_aocpu_release(cec);
 	devm_free_irq(&pdev->dev, cec->irq, cec);
