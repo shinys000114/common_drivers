@@ -17,6 +17,7 @@ dtb-y += \
 	mcp2515_12mhz.dtbo \
 	mcp2515_16mhz.dtbo \
 	mcp2517fd.dtbo \
+	native_display.dtbo \
 	onewire.dtbo \
 	panthor.dtbo \
 	pcf8563.dtbo \

@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Copyright (c) 2026 Hardkernel Co., Ltd.
+ *
+ * Run the display on the S7D DRM driver instead of the vendor display stack.
+ * The vendor nodes that program the VPU, the video layers, the encoders, the
+ * HDMI transmitter or VDIN are disabled. The decoders, codec_mm, canvas,
+ * GE2D, the sound card and the GPU keep their vendor nodes. Without this
+ * overlay the vendor display stack runs as before.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/amlogic,s7d-clkc.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/power/s7d-pd.h>
+#include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
+#include <dt-bindings/reset/amlogic,s7d-vpu-reset.h>
+
+/* Vendor DRM. */
+&drm_subsystem {
+	status = "disabled";
+};
+
+&drm_vpu {
+	status = "disabled";
+};
+
+&drm_amhdmitx {
+	status = "disabled";
+};
+
+&drm_amcvbsout {
+	status = "disabled";
+};
+
+/* HDMI TX, CEC, CVBS, the encoders and the video output servers. */
+&amhdmitx {
+	status = "disabled";
+};
+
+&aocec {
+	status = "disabled";
+};
+
+&cvbsout {
+	status = "disabled";
+};
+
+&vdac {
+	status = "disabled";
+};
+
+&vout {
+	status = "disabled";
+};
+
+&vout_mux {
+	status = "disabled";
+};
+
+&vout_sys {
+	status = "disabled";
+};
+
+&dummy_venc {
+	status = "disabled";
+};
+
+&vclk_serve {
+	status = "disabled";
+};
+
+/* Video and OSD layers, colour processing and the vendor video paths. */
+&{/meson-amvideom} {
+	status = "disabled";
+};
+
+&amlvecm {
+	status = "disabled";
+};
+
+&{/amdolby_vision} {
+	status = "disabled";
+};
+
+&{/aml_primesl} {
+	status = "disabled";
+};
+
+&{/video_composer} {
+	status = "disabled";
+};
+
+&{/videodisplay} {
+	status = "disabled";
+};
+
+&{/meson_videotunnel} {
+	status = "disabled";
+};
+
+&{/ionvideo} {
+	status = "disabled";
+};
+
+&amlvideo2_0 {
+	status = "disabled";
+};
+
+&amlvideo2_1 {
+	status = "disabled";
+};
+
+&fb {
+	status = "disabled";
+};
+
+/* VDIN and the deinterlacer run on the VPU. */
+&vdin0 {
+	status = "disabled";
+};
+
+&vdin1 {
+	status = "disabled";
+};
+
+&{/multi-di} {
+	status = "disabled";
+};
+
+&{/di_process} {
+	status = "disabled";
+};
+
+/* VPU clock and arbiter setup, display RDMA, LUT DMA and VPU security. */
+&vpu {
+	status = "disabled";
+};
+
+&{/rdma} {
+	status = "disabled";
+};
+
+&lut_dma {
+	status = "disabled";
+};
+
+&{/vpu_security} {
+	status = "disabled";
+};
+
+/* It declares the VPU vsync interrupt, which the DRM driver does not share. */
+&{/aml_watermark} {
+	status = "disabled";
+};
+
+&clkc {
+	c5_hdmi_phy: hdmi-phy {
+		compatible = "amlogic,s7d-hdmi-phy";
+		#phy-cells = <0>;
+		clocks = <&clkc CLKID_HDMI_SERIAL>;
+		clock-names = "serializer";
+		resets = <&reset RESET_HDMITXPHY>;
+		reset-names = "phy";
+		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
+	};
+};
+
+&{/reserved-memory} {
+	c5_display_cma: display-cma {
+		compatible = "shared-dma-pool";
+		reusable;
+		/* Console plus old/new 4K scanout buffer pairs. */
+		size = <0 0xc000000>;
+		alignment = <0 0x400000>;
+		/* Coherent RDMA descriptors and GEM DMA must fit below 4 GiB. */
+		alloc-ranges = <0 0 1 0>;
+	};
+};
+
+&{/} {
+	/* As in the base root node; lets dtc check the reg sizes. */
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	s7d_vpu: display-controller@ff000000 {
+		compatible = "amlogic,s7d-vpu";
+		reg = <0 0xff000000 0 0x40000>;
+		reg-names = "vcbus";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 197 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 215 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "vsync", "rdma";
+		clocks = <&clkc CLKID_VPU>, <&clkc CLKID_VAPB>,
+			 <&clkc CLKID_SYS_VPU_INTR>, <&clkc CLKID_ENCP>, <&xtal>,
+			 <&clkc CLKID_HDMI_PLL>, <&clkc CLKID_VIDEO_SRC0_IN_MUX>,
+			 <&clkc CLKID_ENCP_MUX>, <&clkc CLKID_VIDEO0_DIV1>,
+			 <&clkc CLKID_HDMI_SHARED>, <&clkc CLKID_HDMI_SERIAL>,
+			 <&clkc CLKID_ENCI>, <&clkc CLKID_ENCI_MUX>;
+		clock-names = "vpu", "vapb", "intr", "encp", "xtal", "pixel-pll",
+			      "pixel-source", "pixel-mux", "pixel-parent",
+			      "hdmi-shared", "hdmi-serial", "enci", "enci-mux";
+		/*
+		 * With the vendor vpu node disabled nothing else sets the VPU
+		 * clock: use the vendor clk_level 8, fclk_div3 undivided on vpu_0.
+		 * The vpu mux does not pass rate requests on, so vpu_0 takes the
+		 * rate. When firmware left this setup nothing is written. Any
+		 * other setup is changed in place, not through vpu_1 as the
+		 * vendor driver does: all parents are set before the rates, and
+		 * moving the vpu mux leaves vpu_0 gated until the driver enables
+		 * the vpu clock.
+		 *
+		 * VAPB keeps the firmware rate until the vendor GE2D driver
+		 * raises it: a rate change here would gate the running leg
+		 * until the driver enables the clock.
+		 */
+		assigned-clocks = <&clkc CLKID_VPU_0_MUX>, <&clkc CLKID_VPU_0>,
+				  <&clkc CLKID_VPU>;
+		assigned-clock-parents = <&clkc CLKID_FCLK_DIV3>, <0>,
+					 <&clkc CLKID_VPU_0>;
+		assigned-clock-rates = <0>, <666666667>, <0>;
+		resets = <&reset RESET_VIU>, <&reset RESET_VENC>,
+			 <&reset RESET_VENCP>, <&reset RESET_RDMA>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBCD_REGS>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBCD_LOGIC>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBC_ARBITER_REGS>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_AFBC_ARBITER_LOGIC>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_VDIN1>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_WRMIF1>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_VD1_AFBC>,
+			 <&c5_vpu_local_reset S7D_VPU_RESET_VD1_LBUF>;
+		reset-names = "viu", "venc", "vencp", "rdma", "afbc-regs",
+			      "afbc-logic", "afbc-arbiter-regs", "afbc-arbiter-logic",
+			      "vdin1", "wrmif1", "vd1-afbc", "vd1-lbuf";
+		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
+		/* The boot logo is the firmware framebuffer reservation. */
+		memory-region = <&c5_display_cma>, <&logo_reserved>;
+		memory-region-names = "scanout", "boot-logo";
+
+		c5_vpu_local_reset: reset-controller {
+			compatible = "amlogic,s7d-vpu-reset";
+			#reset-cells = <1>;
+		};
+
+		port {
+			c5_vpu_out: endpoint {
+				remote-endpoint = <&c5_hdmi_in>;
+			};
+		};
+	};
+
+	s7d_hdmi_tx: hdmi@fe300000 {
+		compatible = "amlogic,s7d-hdmi-tx";
+		#sound-dai-cells = <1>;
+		reg = <0 0xfe300000 0 0x10000>, <0 0xfe310000 0 0x10000>;
+		reg-names = "top", "core";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 204 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&hdmitx_hpd &hdmitx_ddc>;
+		clocks = <&clkc CLKID_SYS_HDMITX_APB>, <&clkc CLKID_HDMITX_SYS>,
+			 <&clkc CLKID_HDMITX_PRIF>, <&clkc CLKID_HDMITX_200M>,
+			 <&clkc CLKID_HDMITX_PIXEL>, <&clkc CLKID_HDMITX_FE>,
+			 <&clkc CLKID_HDMITX_AUD>, <&clkc CLKID_HDMITX_PIXEL_MUX>,
+			 <&clkc CLKID_HDMITX_FE_MUX>, <&clkc CLKID_VIDEO0_DIV1>,
+			 <&clkc CLKID_VIDEO0_DIV2>;
+		clock-names = "apb", "sys", "prif", "200m", "pixel", "fe", "aud",
+			      "pixel-mux", "fe-mux", "video-parent", "video-div2";
+		/* Firmware sets the 200 MHz DDC/HPD clocks only when it drives HDMI. */
+		assigned-clocks = <&clkc CLKID_HDMITX_AUD_MUX>,
+				  <&clkc CLKID_HDMITX_SYS_MUX>,
+				  <&clkc CLKID_HDMITX_PRIF_MUX>,
+				  <&clkc CLKID_HDMITX_200M_MUX>,
+				  <&clkc CLKID_HDMITX_SYS>,
+				  <&clkc CLKID_HDMITX_PRIF>,
+				  <&clkc CLKID_HDMITX_200M>;
+		assigned-clock-parents = <&clkc CLKID_FCLK_DIV5>,
+					 <&clkc CLKID_FCLK_DIV5>,
+					 <&clkc CLKID_FCLK_DIV5>,
+					 <&clkc CLKID_FCLK_DIV5>,
+					 <0>, <0>, <0>;
+		assigned-clock-rates = <0>, <0>, <0>, <0>,
+				       <200000000>, <200000000>, <200000000>;
+		resets = <&reset RESET_HDMI_TX>, <&reset RESET_HDMITX_CAPB3>;
+		reset-names = "tx", "apb";
+		power-domains = <&pwrdm PDID_S7D_VPU_HDMI>;
+		phys = <&c5_hdmi_phy>;
+		phy-names = "hdmi";
+		amlogic,spd-vendor = "ODROID";
+		amlogic,spd-product = "ODROID-C5";
+
+		port {
+			c5_hdmi_in: endpoint {
+				remote-endpoint = <&c5_vpu_out>;
+			};
+		};
+	};
+};
