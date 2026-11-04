@@ -12,6 +12,7 @@
 #endif
 #include <linux/of_address.h>
 #include <linux/of_device.h>
+#include <linux/of_platform.h>
 #include <linux/syscore_ops.h>
 #include <linux/suspend.h>
 
@@ -21,6 +22,7 @@
 #include "clk-cpu-dyndiv.h"
 #include "clk-dualdiv.h"
 #include "s7d.h"
+#include "s7d-hdmi-pll.h"
 #include <dt-bindings/clock/amlogic,s7d-clkc.h>
 
 #include <linux/amlogic/cpu_version.h>
@@ -4504,6 +4506,202 @@ const struct dev_pm_ops meson_s7d_pm_ops = {
 	.restore_noirq	= meson_s7d_restore,
 };
 
+/*
+ * ODROID-C5 native display: an available "amlogic,s7d-hdmi-phy" child of the
+ * controller hands the video, ENCP and HDMI clocks to the native display
+ * driver. The controller then also provides the HDMI PLL and its outputs and
+ * names the analogue regmap the PHY child uses. Without such a child, every
+ * clock keeps the vendor definition above.
+ */
+#define S7D_DISPLAY_MUX_FLAGS	(CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT)
+
+/* Datasheet table 7-95: analogue vid_pix_clk, NOT digital vid_pll_clk. */
+static u32 s7d_display_src_parent_table[] = { 3, 1, 2, 4, 5, 6, 7 };
+static const struct clk_parent_data s7d_display_src_parent_data[] = {
+	/* A zero index would resolve DT clocks[0] (xtal) before this name. */
+	{ .name = "s7d_hdmi_pll", .index = -1 },
+	{ .fw_name = "gp1_pll" },
+	{ .hw = &hifi_pll.hw },
+	{ .hw = &fclk_div3.hw },
+	{ .hw = &fclk_div4.hw },
+	{ .hw = &fclk_div5.hw },
+	{ .hw = &fclk_div7.hw }
+};
+
+static_assert(ARRAY_SIZE(s7d_display_src_parent_table) ==
+	      ARRAY_SIZE(s7d_display_src_parent_data));
+
+/*
+ * The input gates are ORed: VID_CLK_DIV[16] | VID_CLK_CTRL[19:20].
+ * Firmware can leave DIV[16] clear while CLK_EN0 supplies a live ENCP.
+ * Keep the input's own request bit for normal CCF enable/disable, but
+ * report the effective hardware gate when adopting the boot clock tree.
+ */
+static int s7d_video_input_is_enabled(struct clk_hw *hw)
+{
+	struct clk_regmap *clk = to_clk_regmap(hw);
+	u32 div, ctrl;
+	int ret;
+
+	ret = regmap_read(clk->map, CLKCTRL_VID_CLK_DIV, &div);
+	if (ret)
+		return ret;
+	ret = regmap_read(clk->map, CLKCTRL_VID_CLK_CTRL, &ctrl);
+	if (ret)
+		return ret;
+	return !!((div & BIT(16)) | (ctrl & GENMASK(20, 19)));
+}
+
+static int s7d_video_input_enable(struct clk_hw *hw)
+{
+	return clk_regmap_gate_ops.enable(hw);
+}
+
+static void s7d_video_input_disable(struct clk_hw *hw)
+{
+	clk_regmap_gate_ops.disable(hw);
+}
+
+static int s7d_video_input_save(struct clk_hw *hw)
+{
+	/* Save the request bit, not the OR of downstream requests. */
+	return clk_regmap_gate_ops.save_context(hw);
+}
+
+static void s7d_video_input_restore(struct clk_hw *hw)
+{
+	clk_regmap_gate_ops.restore_context(hw);
+}
+
+static const struct clk_ops s7d_video_input_ops = {
+	.enable = s7d_video_input_enable,
+	.disable = s7d_video_input_disable,
+	.is_enabled = s7d_video_input_is_enabled,
+	.save_context = s7d_video_input_save,
+	.restore_context = s7d_video_input_restore,
+};
+
+/**
+ * struct s7d_display_clk - native display change to a vendor clock
+ * @clk:	the vendor clock
+ * @set:	flags to add
+ * @clear:	flags to remove
+ * @ops:	replacement ops, or NULL
+ * @hdmi_pll:	add the HDMI PLL as video source input 3
+ */
+struct s7d_display_clk {
+	struct clk_regmap *clk;
+	unsigned long set;
+	unsigned long clear;
+	const struct clk_ops *ops;
+	bool hdmi_pll;
+};
+
+static const struct s7d_display_clk s7d_display_clks[] = {
+	/* Keep rate requests on the explicitly selected display route. */
+	{ .clk = &video_src0_in_mux, .set = S7D_DISPLAY_MUX_FLAGS, .hdmi_pll = true },
+	{ .clk = &video_src1_in_mux, .hdmi_pll = true },
+	{ .clk = &video_src0_in, .ops = &s7d_video_input_ops },
+	{ .clk = &encp_mux, .set = S7D_DISPLAY_MUX_FLAGS },
+	{ .clk = &hdmitx_pixel_mux, .set = S7D_DISPLAY_MUX_FLAGS },
+	{ .clk = &hdmitx_fe_mux, .set = S7D_DISPLAY_MUX_FLAGS },
+	/* Firmware routes the native driver does not drive stay as they are. */
+	{ .clk = &lcd_an, .set = CLK_IGNORE_UNUSED },
+	{ .clk = &lcd_an_ph2, .set = CLK_IGNORE_UNUSED },
+	{ .clk = &lcd_an_ph3, .set = CLK_IGNORE_UNUSED },
+	{ .clk = &vid_lock, .set = CLK_IGNORE_UNUSED },
+	/* The native HDMI driver enables the audio clock it needs. */
+	{ .clk = &hdmitx_aud, .clear = CLK_IGNORE_UNUSED },
+};
+
+static bool s7d_display_requested(struct device *dev)
+{
+	for_each_available_child_of_node_scoped(dev->of_node, np) {
+		if (!of_device_is_compatible(np, "amlogic,s7d-hdmi-phy"))
+			continue;
+		if (IS_ENABLED(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES))
+			return true;
+		dev_warn(dev, "%pOF needs CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES\n", np);
+		break;
+	}
+	return false;
+}
+
+static const struct regmap_config s7d_display_analog_config = {
+	.reg_bits = 32,
+	.val_bits = 32,
+	.reg_stride = 4,
+	/* The HDMI PHY child looks the analogue registers up by this name. */
+	.name = "analog",
+};
+
+static struct regmap *s7d_display_analog_map(struct platform_device *pdev)
+{
+	void __iomem *base;
+
+	base = devm_platform_ioremap_resource(pdev, 1);
+	if (IS_ERR(base))
+		return ERR_CAST(base);
+	return devm_regmap_init_mmio(&pdev->dev, base, &s7d_display_analog_config);
+}
+
+/* Changed copies of the vendor init data, read at registration. */
+static struct clk_init_data s7d_display_init[ARRAY_SIZE(s7d_display_clks)];
+
+/*
+ * Must run before the vendor clocks are registered. Registration clears
+ * hw.init, so as with the vendor clocks the controller cannot be probed
+ * again once a clock has been registered.
+ */
+static int s7d_display_clocks_init(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(s7d_display_clks); i++) {
+		const struct s7d_display_clk *c = &s7d_display_clks[i];
+		struct clk_init_data *init = &s7d_display_init[i];
+
+		if (!c->clk->hw.init)
+			return -EBUSY;
+		/* Switched by an earlier probe that failed before registering it. */
+		if (c->clk->hw.init == init)
+			continue;
+		*init = *c->clk->hw.init;
+		init->flags = (init->flags & ~c->clear) | c->set;
+		if (c->ops)
+			init->ops = c->ops;
+		if (c->hdmi_pll) {
+			init->parent_data = s7d_display_src_parent_data;
+			init->num_parents = ARRAY_SIZE(s7d_display_src_parent_data);
+			clk_get_regmap_mux_data(c->clk)->table =
+				s7d_display_src_parent_table;
+		}
+		c->clk->hw.init = init;
+	}
+	clk_get_regmap_div_data(&video_src0_div)->flags |= CLK_DIVIDER_ROUND_CLOSEST;
+	return 0;
+}
+
+static struct meson_clk_hw_data *
+s7d_display_clocks_register(struct device *dev, struct regmap *pll_map,
+			    const struct meson_clk_hw_data *vendor)
+{
+	struct meson_clk_hw_data *data;
+	int ret;
+
+	BUILD_BUG_ON(ARRAY_SIZE(s7d_hw_clks) > CLKID_HDMI_PLL);
+	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return ERR_PTR(-ENOMEM);
+	data->num = CLKID_HDMI_SERIAL + 1;
+	data->hws = devm_kcalloc(dev, data->num, sizeof(*data->hws), GFP_KERNEL);
+	if (!data->hws)
+		return ERR_PTR(-ENOMEM);
+	memcpy(data->hws, vendor->hws, vendor->num * sizeof(*data->hws));
+	ret = s7d_hdmi_clocks_register(dev, pll_map, data);
+	return ret ? ERR_PTR(ret) : data;
+}
+
 static int meson_s7d_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -4511,11 +4709,13 @@ static int meson_s7d_probe(struct platform_device *pdev)
 	struct regmap *pll_map;
 	struct meson_clk_hw_data *data;
 	struct clk *clk;
+	bool display;
 	int ret, i;
 
 	data = (struct meson_clk_hw_data *)of_device_get_match_data(dev);
 	if (!data)
 		return -ENODEV;
+	display = s7d_display_requested(dev);
 
 #ifdef CONFIG_AMLOGIC_CLK_DEBUG
 	clk = devm_clk_get(dev, "xtal");
@@ -4539,7 +4739,10 @@ static int meson_s7d_probe(struct platform_device *pdev)
 		return PTR_ERR(basic_map);
 	}
 
-	pll_map = meson_clk_regmap_resource(pdev, dev, 1);
+	if (display)
+		pll_map = s7d_display_analog_map(pdev);
+	else
+		pll_map = meson_clk_regmap_resource(pdev, dev, 1);
 	if (IS_ERR(pll_map)) {
 		dev_err(dev, "pll clk registers not found\n");
 		return PTR_ERR(pll_map);
@@ -4551,6 +4754,14 @@ static int meson_s7d_probe(struct platform_device *pdev)
 
 	for (i = 0; i < ARRAY_SIZE(pll_regmaps); i++)
 		pll_regmaps[i]->map = pll_map;
+
+	if (display) {
+		ret = s7d_display_clocks_init();
+		if (ret) {
+			dev_err(dev, "display clocks already registered\n");
+			return ret;
+		}
+	}
 
 	for (i = 0; i < data->num; i++) {
 		/* array might be sparse */
@@ -4583,10 +4794,22 @@ static int meson_s7d_probe(struct platform_device *pdev)
 #endif
 	}
 
+	if (display) {
+		data = s7d_display_clocks_register(dev, pll_map, data);
+		if (IS_ERR(data))
+			return PTR_ERR(data);
+	}
+
 	ret = devm_of_clk_add_hw_provider(dev, meson_clk_hw_get,
 					   (void *)data);
 	if (ret)
 		return ret;
+
+	if (display) {
+		ret = devm_of_platform_populate(dev);
+		if (ret)
+			return ret;
+	}
 
 	/* register syscore ops to save clk status at std */
 	register_syscore_ops(&meson_s7d_syscore_ops);

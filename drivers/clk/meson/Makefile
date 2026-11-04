@@ -193,6 +193,7 @@ CFLAGS_s7.o += $(PR_FMT_DEFINE_S7)
 S7D_MODULE_NAME = amlogic-clk-soc-s7d
 obj-$(CONFIG_AMLOGIC_COMMON_CLK_S7D) += $(S7D_MODULE_NAME).o
 $(S7D_MODULE_NAME)-y += s7d.o
+$(S7D_MODULE_NAME)-$(CONFIG_AMLOGIC_C5_DISPLAY_RESOURCES) += s7d-hdmi-pll.o
 PR_FMT_S7D = $(subst amlogic-,,$(S7D_MODULE_NAME))
 PR_FMT_DEFINE_S7D="-Dpr_fmt(fmt)= \"[$(PR_FMT_S7D)]: \" fmt"
 CFLAGS_s7d.o += $(PR_FMT_DEFINE_S7D)

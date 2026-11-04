@@ -356,4 +356,19 @@ config AMLOGIC_COMMON_CLK_T6X
         help
           Support for the clock controller on Amlogic T6X
           devices, aka T6X. Say Y if you want peripherals to work.
+
+config AMLOGIC_C5_DISPLAY_RESOURCES
+	bool "ODROID-C5 native display clock resources"
+	depends on ARCH_MESON_ODROID_COMMON && ARM64 && OF
+	depends on PM && COMMON_CLK
+	depends on AMLOGIC_COMMON_CLK_S7D
+	depends on PM_GENERIC_DOMAINS && AMLOGIC_POWER
+	depends on AMLOGIC_RESET_MESON
+	help
+	  Build the HDMI PLL, display clock route and shared analog regmap
+	  used by the native S7D display driver and its HDMI PHY. The S7D
+	  clock controller provides them only when its device tree node has
+	  an enabled "amlogic,s7d-hdmi-phy" child; without one the vendor
+	  clock tree is unchanged. This alone does not provide a KMS device.
+
 endmenu
