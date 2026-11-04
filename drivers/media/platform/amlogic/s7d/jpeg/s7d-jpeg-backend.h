@@ -44,7 +44,8 @@ size_t s7d_jpeg_encoder_pool_bytes(u32 width, u32 height);
  * NV12/NV21 is contiguous, even, at most 1920x1080, stride ALIGN(width, 32).
  * Caller excludes session_stop and retains CPU buffers until return. Neither
  * CPU pointer is retained afterwards, including when private DMA is retained
- * after an unproved halt. Negative return leaves capture and result untouched.
+ * after an unproved halt. Negative return leaves result untouched and the
+ * capture contents undefined.
  */
 int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 			    struct s7d_codec_session *session,

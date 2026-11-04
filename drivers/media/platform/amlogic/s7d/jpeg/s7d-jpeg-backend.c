@@ -407,6 +407,26 @@ static int jpeg_stage(struct s7d_jpeg_encoder *encoder,
 	return 0;
 }
 
+/*
+ * The coherent scan buffer is uncached. Copy the produced bytes once and
+ * check their framing in the cached capture buffer, not byte by byte here.
+ */
+static int jpeg_copy_scan(struct s7d_jpeg_encoder *encoder,
+			  const struct s7d_jpeg_execution *job, void *capture,
+			  size_t capture_capacity, struct s7d_jpeg_output *output)
+{
+	u8 *scan = (u8 *)capture + sizeof(job->header.data);
+	u32 bytes = job->snapshot.scan_bytes;
+
+	if (bytes > job->hardware.scan_capacity)
+		return -EOVERFLOW;
+	if (bytes > capture_capacity - sizeof(job->header.data))
+		return -ENOSPC;
+	dma_rmb();
+	memcpy(scan, encoder->scan, bytes);
+	return s7d_jpeg_validate_output(scan, bytes, bytes, capture_capacity, output);
+}
+
 void s7d_jpeg_encoder_request_stop(struct s7d_jpeg_encoder *encoder)
 {
 	unsigned long flags;
@@ -536,15 +556,10 @@ stop:
 	}
 	if (!ret)
 		ret = jpeg_check_stop(encoder);
-	if (!ret) {
-		dma_rmb();
-		ret = s7d_jpeg_validate_output(encoder->scan, job->hardware.scan_capacity,
-				job->snapshot.scan_bytes, capture_capacity, &output);
-	}
+	if (!ret)
+		ret = jpeg_copy_scan(encoder, job, capture, capture_capacity, &output);
 	if (!ret) {
 		memcpy(capture, job->header.data, sizeof(job->header.data));
-		memcpy((u8 *)capture + sizeof(job->header.data), encoder->scan,
-		       output.scan_bytes);
 		*result = (struct s7d_jpeg_encode_result) {
 			.bytesused = output.bytesused, .scan_bytes = output.scan_bytes,
 			.generation = job->generation,
