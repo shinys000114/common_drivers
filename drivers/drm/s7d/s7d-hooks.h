@@ -40,15 +40,14 @@ struct s7d_vendor_objs {
  * sleep.
  */
 
+#if IS_ENABLED(CONFIG_DRM_S7D_VENDOR_UAPI)
+
 /*
  * s7d_drm_probe() (s7d-drv.c): the driver argument of devm_drm_dev_alloc(),
  * once every supplier is ready. Returns @native, or the driver to register
  * in its place. No locks held. Cannot fail.
  */
-static inline const struct drm_driver *s7d_vendor_driver(const struct drm_driver *native)
-{
-	return native;
-}
+const struct drm_driver *s7d_vendor_driver(const struct drm_driver *native);
 
 /*
  * s7d_drm_probe(): after the max bpc property attach and
@@ -59,10 +58,7 @@ static inline const struct drm_driver *s7d_vendor_driver(const struct drm_driver
  * probe. The DRM minors are already taken, so -EPROBE_DEFER is refused
  * with a warning and fails the probe as -EINVAL.
  */
-static inline int s7d_vendor_init(struct drm_device *drm, const struct s7d_vendor_objs *objs)
-{
-	return 0;
-}
+int s7d_vendor_init(struct drm_device *drm, const struct s7d_vendor_objs *objs);
 
 /*
  * s7d_drm_probe(): after drm_dev_register() and drm_kms_helper_poll_init(),
@@ -71,18 +67,36 @@ static inline int s7d_vendor_init(struct drm_device *drm, const struct s7d_vendo
  * vendor interfaces, so unregister must cope with a failed or partial
  * register.
  */
-static inline int s7d_vendor_register(struct drm_device *drm)
-{
-	return 0;
-}
+int s7d_vendor_register(struct drm_device *drm);
 
 /*
  * s7d_drm_remove(): first call, before drm_dev_unplug(); the output may
  * still run. No locks held. Not called on shutdown or on a failed probe.
  */
+void s7d_vendor_unregister(struct drm_device *drm);
+
+#else
+
+static inline const struct drm_driver *s7d_vendor_driver(const struct drm_driver *native)
+{
+	return native;
+}
+
+static inline int s7d_vendor_init(struct drm_device *drm, const struct s7d_vendor_objs *objs)
+{
+	return 0;
+}
+
+static inline int s7d_vendor_register(struct drm_device *drm)
+{
+	return 0;
+}
+
 static inline void s7d_vendor_unregister(struct drm_device *drm)
 {
 }
+
+#endif
 
 /*
  * s7d_hdmi_report_hpd() (s7d-hdmi.c): with a detected sink status, after

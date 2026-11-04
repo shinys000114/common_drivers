@@ -40,3 +40,7 @@ s7d-drm-y := \
 	s7d-video-scaler.o \
 	s7d-video2-scaler.o \
 	s7d-gfcd.o
+
+s7d-drm-$(CONFIG_DRM_S7D_VENDOR_UAPI) += \
+	s7d-vendor.o \
+	s7d-vendor-props.o

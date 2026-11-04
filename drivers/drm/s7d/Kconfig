@@ -111,3 +111,13 @@ config DRM_S7D_AFBC_POLICY_GFCD_PRIMARY
 	  leaving Mali AFBCD S1 for the OSD2 overlay.
 
 endchoice
+
+config DRM_S7D_VENDOR_UAPI
+	bool "S7D Amlogic vendor DRM interface"
+	depends on DRM_S7D
+	default y
+	help
+	  Offer the display as the Amlogic vendor DRM device that Amlogic
+	  userspace expects: driver name "meson" with a render node, and the
+	  vendor interfaces built on it. It is used by default;
+	  s7d_drm.vendor_uapi=0 registers the plain s7d-drm device instead.
