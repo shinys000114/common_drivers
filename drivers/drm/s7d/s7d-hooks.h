@@ -85,13 +85,18 @@ static inline void s7d_vendor_unregister(struct drm_device *drm)
 }
 
 /*
- * s7d_hdmi_report_hpd() (s7d-hdmi.c): after drm_bridge_hpd_notify() has
- * reported a detected sink status to DRM; @connected may repeat the
- * previous value. An unknown status (failed HPD acknowledge or pin read)
- * is not passed on: the last value stands until the next report, which
- * after a failed acknowledge comes from the HPD recovery work. Runs from
- * the HPD interrupt thread and that work with no driver or DRM locks held;
- * calls can overlap. The caller holds a reference on @drm for the call.
+ * s7d_hdmi_report_hpd() (s7d-hdmi.c): with a detected sink status, after
+ * drm_bridge_hpd_notify() has reported it to DRM, or when DRM was not told
+ * but it differs from the last value passed here (a probe may have updated
+ * the connector first). A same-status re-plug with the same EDID is not
+ * passed on; @connected may repeat the previous value otherwise. An
+ * unknown status (failed HPD acknowledge or pin read) is not passed on:
+ * the last value stands until the next report, which after a failed
+ * acknowledge comes from the HPD recovery work. Runs from the HPD
+ * interrupt thread and that work, one call at a time under the HDMI
+ * driver's report mutex, which nests outside mode_config.mutex and the
+ * bridge's hpd_mutex; no DRM locks are held, and the hook must not wait
+ * for HPD processing. The caller holds a reference on @drm for the call.
  *
  * Runs only while connector HPD is enabled (never with
  * drm_kms_helper.poll=0): from drm_kms_helper_poll_init() in probe, so it

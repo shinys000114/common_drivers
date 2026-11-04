@@ -114,6 +114,12 @@ struct s7d_hdmi {
 	bool stopping;
 	/* The HPD handler masked its IRQ after a failed acknowledgment. */
 	bool hpd_masked;
+	/*
+	 * Serializes hotplug reports, from the detection to the vendor hook.
+	 * Taken before mode_config.mutex (then eld_mutex, then lock) and
+	 * before the bridge's hpd_mutex (then mode_config.mutex).
+	 */
+	struct mutex hpd_lock;
 	struct delayed_work hpd_recovery;
 	/* Sink TMDS_Config while scrambling, rechecked as vc4 does; else 0. */
 	struct delayed_work scdc_check;
@@ -142,6 +148,8 @@ struct s7d_hdmi {
 	bool audio_detached;
 	struct work_struct audio_notify;
 	struct drm_connector *connector;
+	/* The status last passed to the vendor hook for that connector; under lock. */
+	enum drm_connector_status vendor_status;
 	struct cec_notifier *cec_notifier;
 	struct hdmi_spd_infoframe spd_frame;
 	u8 spd[HDMI_INFOFRAME_HEADER_SIZE + HDMI_SPD_INFOFRAME_SIZE];
@@ -190,6 +198,7 @@ int s7d_hdmi_bridge_set_connector(struct drm_bridge *bridge, struct drm_connecto
 		h->cec_notifier = NULL;
 	}
 	h->connector = connector;
+	h->vendor_status = connector_status_unknown;
 out:
 	mutex_unlock(&h->lock);
 	return ret;
@@ -1641,26 +1650,103 @@ static void s7d_hdmi_audio_hpd(struct s7d_hdmi *h)
 	schedule_work(&h->audio_notify);
 }
 
-/* Report a sink status to DRM, then a detected one to the vendor interfaces. */
-static void s7d_hdmi_report_hpd(struct s7d_hdmi *h, enum drm_connector_status status)
+/*
+ * Whether DRM must hear of @status. The bridge connector turns every report
+ * into a hotplug event, and with no DRM master the fbdev client then commits
+ * its mode again, over the boot logo or under a starting splash, for any HPD
+ * pulse, as some sinks make when a signal starts. Like
+ * drm_connector_helper_hpd_irq_event() with a detect that updates the EDID,
+ * as later upstream HDMI connector helpers do, report a status other than the
+ * connector's, or a connected sink whose EDID changed while HPD dropped and
+ * came back. That needs the EDID read and compared under the mode config
+ * mutex, as a probe does; with it unchanged, give back the audio and CEC
+ * state that the HPD edge withdrew, as the probe would have.
+ */
+static bool s7d_hdmi_sink_changed(struct s7d_hdmi *h, struct drm_connector *connector,
+				  enum drm_connector_status status)
 {
-	struct drm_device *drm = NULL;
+	struct drm_device *drm = connector->dev;
+	const struct drm_edid *edid;
+	bool changed = true;
+	u64 epoch;
 
-	drm_bridge_hpd_notify(&h->bridge, status);
-	/* An I/O error is no unplug; keep the last detected status. */
-	if (status == connector_status_unknown)
-		return;
+	mutex_lock(&drm->mode_config.mutex);
+	if (connector->status != status)
+		goto out;
+	changed = false;
+	if (status != connector_status_connected)
+		goto out;
+	/* A sink gone or silent meanwhile is for the probe to find out. */
+	edid = s7d_hdmi_get_edid(&h->bridge, connector);
+	changed = !edid || !connector->edid_blob_ptr;
+	if (!changed) {
+		/* An update with a different EDID moves the epoch, as in a probe. */
+		epoch = connector->epoch_counter;
+		changed = drm_edid_connector_update(connector, edid) ||
+			connector->epoch_counter != epoch;
+	}
+	drm_edid_free(edid);
+	if (!changed)
+		s7d_hdmi_bridge_eld_updated(&h->bridge, connector);
+out:
+	mutex_unlock(&drm->mode_config.mutex);
+	return changed;
+}
+
+/*
+ * Report the sink to DRM when it changed, or always with @force, then a
+ * detected status to the vendor interfaces. @failed: the HPD acknowledgment
+ * failed, so the status is unknown.
+ *
+ * Any probe rewrites connector->status from a fresh detection, also the
+ * fbdev probe that a report itself runs, and can do so between the compare
+ * and the report: after an HPD pulse, the falling edge is reported, the
+ * probe in it finds the sink back, and the rising edge then matches the
+ * connector. DRM has the right status then, but the vendor interfaces only
+ * hear of reports. They get their own baseline, so that a detected status
+ * other than the one they last heard reaches them as well.
+ */
+static void s7d_hdmi_report_hpd(struct s7d_hdmi *h, bool failed, bool force)
+{
+	enum drm_connector_status status;
+	struct drm_connector *connector;
+	struct drm_device *drm = NULL;
+	bool report = true, live = true, vendor;
+	int idx;
+
+	/* Detect inside the lock, so that the last report has the last status. */
+	mutex_lock(&h->hpd_lock);
+	status = failed ? connector_status_unknown : s7d_hdmi_detect(&h->bridge);
 	/* The display drops the connector before it releases its device. */
 	mutex_lock(&h->lock);
-	if (h->connector) {
-		drm = h->connector->dev;
+	connector = h->connector;
+	if (connector) {
+		drm = connector->dev;
 		drm_dev_get(drm);
 	}
 	mutex_unlock(&h->lock);
-	if (!drm)
-		return;
-	s7d_vendor_hpd(drm, status == connector_status_connected);
-	drm_dev_put(drm);
+	if (drm && !force) {
+		/* An unplugged display has nobody left to tell. */
+		live = drm_dev_enter(drm, &idx);
+		report = live && s7d_hdmi_sink_changed(h, connector, status);
+		if (live)
+			drm_dev_exit(idx);
+	}
+	if (report)
+		drm_bridge_hpd_notify(&h->bridge, status);
+	/* An I/O error is no unplug; keep the last detected status. */
+	if (drm && live && status != connector_status_unknown) {
+		mutex_lock(&h->lock);
+		vendor = report || h->vendor_status != status;
+		if (h->connector == connector)
+			h->vendor_status = status;
+		mutex_unlock(&h->lock);
+		if (vendor)
+			s7d_vendor_hpd(drm, status == connector_status_connected);
+	}
+	if (drm)
+		drm_dev_put(drm);
+	mutex_unlock(&h->hpd_lock);
 }
 
 static void s7d_hdmi_hpd_recovery(struct work_struct *work)
@@ -1685,7 +1771,7 @@ static void s7d_hdmi_hpd_recovery(struct work_struct *work)
 	mutex_unlock(&h->lock);
 	s7d_hdmi_audio_hpd(h);
 	if (READ_ONCE(h->hpd_enabled))
-		s7d_hdmi_report_hpd(h, s7d_hdmi_detect(&h->bridge));
+		s7d_hdmi_report_hpd(h, false, false);
 }
 
 static bool s7d_hdmi_scdc_active(struct s7d_hdmi *h, u8 config)
@@ -1749,8 +1835,7 @@ static irqreturn_t s7d_hdmi_irq(int irq, void *data)
 			mod_delayed_work(system_wq, &h->hpd_recovery, HZ);
 	}
 	if (READ_ONCE(h->hpd_enabled))
-		s7d_hdmi_report_hpd(h, ret < 0 ? connector_status_unknown :
-				    s7d_hdmi_detect(&h->bridge));
+		s7d_hdmi_report_hpd(h, ret < 0, false);
 	return IRQ_HANDLED;
 }
 
@@ -1899,6 +1984,7 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	h->dev = dev;
 	mutex_init(&h->lock);
+	mutex_init(&h->hpd_lock);
 	mutex_init(&h->audio_callback_lock);
 	INIT_WORK(&h->audio_notify, s7d_hdmi_audio_notify);
 	h->audio_muted = true;
@@ -2113,9 +2199,9 @@ static int s7d_hdmi_resume(struct device *dev)
 	WRITE_ONCE(h->hpd_masked, false);
 	mutex_unlock(&h->lock);
 	enable_irq(h->irq);
-	/* The sink may have changed while asleep. */
+	/* The sink may have changed while asleep: report it unconditionally. */
 	if (READ_ONCE(h->hpd_enabled))
-		s7d_hdmi_report_hpd(h, s7d_hdmi_detect(&h->bridge));
+		s7d_hdmi_report_hpd(h, false, true);
 	return 0;
 }
 
