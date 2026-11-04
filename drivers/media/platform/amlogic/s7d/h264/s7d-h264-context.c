@@ -21,6 +21,7 @@
 #define H264_SLICE_DONE		1U
 #define H264_PICTURE_DONE		2U
 #define H264_CONFIG_REQUEST	0x11U
+#define H264_CONFIG_DONE		0xf2U
 #define H264_ACTION_DECODE_START	0xffU
 
 struct s7d_h264_slice_context {
@@ -66,6 +67,8 @@ struct s7d_h264_context {
 	bool slice_valid;
 	bool completion_pending;
 	bool park_confirmed;
+	/* The buffer counts the firmware waits for after F2 are not written yet. */
+	bool counts_pending;
 	bool faulted;
 };
 
@@ -435,9 +438,6 @@ int s7d_h264_context_set_sequence(struct s7d_h264_context *context,
 	ret = s7d_context_cache(map, width);
 	if (ret)
 		goto fault;
-	ret = s7d_context_write(map, DOS_REG(0x09c0), counts);
-	if (ret)
-		goto fault;
 	ret = s7d_context_status(map, H264_CONFIG_REQUEST);
 	if (ret)
 		goto fault;
@@ -447,9 +447,31 @@ int s7d_h264_context_set_sequence(struct s7d_h264_context *context,
 	context->nal_control = nal;
 	context->cache_width = width;
 	context->sequence_known = true;
+	context->counts_pending = true;
 	return 0;
 fault:
 	context->faulted = true;
+	return ret;
+}
+
+int s7d_h264_context_start_sequence(struct s7d_h264_context *context,
+				    struct regmap *map)
+{
+	int ret;
+
+	if (!map)
+		return -EINVAL;
+	if (context->faulted)
+		return -EIO;
+	if (!context->sequence_known || !context->counts_pending)
+		return -ESTALE;
+	ret = s7d_context_status(map, H264_CONFIG_DONE);
+	if (ret)
+		return ret;
+	context->counts_pending = false;
+	ret = s7d_context_write(map, DOS_REG(0x09c0), context->buffer_counts);
+	if (ret)
+		context->faulted = true;
 	return ret;
 }
 

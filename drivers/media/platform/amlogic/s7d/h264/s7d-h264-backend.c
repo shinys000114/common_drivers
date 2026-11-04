@@ -671,7 +671,10 @@ static int backend_capture_setup(struct s7d_h264_backend *backend)
 	if (ret)
 		return ret;
 	backend->config_waiting = false;
-	return backend_ack(backend, S7D_H264_CONFIG_REQUEST, H264_CONFIG_DONE);
+	ret = backend_ack(backend, S7D_H264_CONFIG_REQUEST, H264_CONFIG_DONE);
+	if (ret)
+		return ret;
+	return s7d_h264_context_start_sequence(backend->context, decoder->map);
 }
 
 static int backend_slice_identity(struct s7d_h264_backend *backend)

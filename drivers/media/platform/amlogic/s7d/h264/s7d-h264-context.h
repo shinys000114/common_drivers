@@ -46,6 +46,12 @@ int s7d_h264_context_set_sequence(struct s7d_h264_context *context,
 				  const struct s7d_codec_layout *layout,
 				  u32 config_scratch1, u32 mv_slots,
 				  u32 capture_slots);
+/*
+ * After F2: the buffer counts let the firmware go on to the first slice,
+ * which it may report at once, so the host acknowledges the request first.
+ */
+int s7d_h264_context_start_sequence(struct s7d_h264_context *context,
+				    struct regmap *map);
 /* An SPS at an IDR with the same layout and buffer counts, while parked. */
 int s7d_h264_context_adopt_sequence(struct s7d_h264_context *context,
 				    const struct s7d_h264_sps *sps);
