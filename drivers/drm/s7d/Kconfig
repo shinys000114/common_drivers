@@ -6,7 +6,6 @@ config DRM_S7D
 	depends on AMLOGIC_C5_DISPLAY_RESOURCES
 	depends on DRM && I2C && AMLOGIC_CPU_INFO
 	depends on DMA_CMA && REGMAP_MMIO
-	depends on !AMLOGIC_MEDIA_ENABLE
 	select PHY_MESON_S7D_HDMI
 	select RESET_S7D_VPU
 	select DRM_KMS_HELPER
@@ -54,10 +53,13 @@ config DRM_S7D
 	  Interlaced 1080i, 480i and 576i output takes linear OSD planes only.
 	  Supports S7D revision B, with TMDS up to 594 MHz. Takes over a firmware
 	  output when there is one; otherwise starts the display from reset.
-	  Do not enable with legacy media/display writers. System sleep, including
-	  deep sleep where firmware powers the display domain off, restores the
-	  output. Before the first commit, sleep is refused while a firmware
-	  output still runs.
+	  It can be built with the Amlogic media stack, whose video decoders
+	  keep working, but it owns the VPU, VPP, RDMA, VDIN1 and the HDMI
+	  transmitter: the vendor display, video output, VPU, RDMA, VDIN and
+	  HDMI TX device tree nodes must be disabled while its own nodes are
+	  enabled. System sleep, including deep sleep where firmware powers the
+	  display domain off, restores the output. Before the first commit,
+	  sleep is refused while a firmware output still runs.
 	  HDMI PCM uses SND_SOC_HDMI_CODEC with the Amlogic AXG sound card
 	  (SND_MESON_AXG_SOUND_CARD). Cold HDMI SRAM initialization is not
 	  supported.
