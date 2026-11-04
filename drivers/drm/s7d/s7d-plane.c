@@ -15,6 +15,7 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_plane_helper.h>
+#include <drm/drm_print.h>
 
 #include "s7d-plane.h"
 #include "s7d-crtc.h"
@@ -136,6 +137,50 @@ static int s7d_plane_round(struct drm_plane_state *base, bool video)
 	return drm_rect_visible(&base->dst) ? 0 : -EINVAL;
 }
 
+/*
+ * Whether the framebuffer itself gives the addresses that the video fetch
+ * reads. A frame whose addresses come from its decoder instead, as the vendor
+ * media path will give, is checked where those are taken; until that path
+ * exists every framebuffer does.
+ */
+static bool s7d_plane_own_layout(const struct drm_framebuffer *fb)
+{
+	return true;
+}
+
+/* Bytes from the start of plane @i to the end of its last pixel. */
+static u64 s7d_plane_extent(const struct drm_framebuffer *fb, unsigned int i)
+{
+	u32 width = drm_format_info_plane_width(fb->format, fb->width, i);
+	u32 height = drm_format_info_plane_height(fb->format, fb->height, i);
+
+	return (u64)fb->pitches[i] * (height - 1) + (u64)width * fb->format->cpp[i];
+}
+
+/*
+ * An NV12/NV21 framebuffer whose chroma plane overlaps the luma plane of
+ * the same buffer makes the video fetch read luma as chroma. A two-fd NV12
+ * import through Mesa GBM has given the chroma plane the luma plane's
+ * handle and offset. Refuse it, so that the compositor composites the frame
+ * instead of scanning out wrong colours.
+ */
+static int s7d_plane_check_chroma(const struct drm_framebuffer *fb)
+{
+	u64 luma = fb->offsets[0], chroma = fb->offsets[1];
+
+	if (!s7d_plane_own_layout(fb) || fb->modifier != DRM_FORMAT_MOD_LINEAR ||
+	    (fb->format->format != DRM_FORMAT_NV12 &&
+	     fb->format->format != DRM_FORMAT_NV21) ||
+	    fb->obj[1] != fb->obj[0])
+		return 0;
+	if (chroma >= luma + s7d_plane_extent(fb, 0) ||
+	    luma >= chroma + s7d_plane_extent(fb, 1))
+		return 0;
+	drm_dbg_atomic(fb->dev, "[FB:%u] chroma at %#x overlaps luma at %#x\n",
+		       fb->base.id, fb->offsets[1], fb->offsets[0]);
+	return -EINVAL;
+}
+
 static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base,
 			   const struct drm_crtc_state *crtc_state)
 {
@@ -210,6 +255,9 @@ static int s7d_plane_check(struct s7d_plane *plane, struct drm_plane_state *base
 		    (drm_rect_width(&base->src) >> 16 > 2048 ||
 		     drm_rect_height(&base->src) >> 16 > 1080))
 			return -EINVAL;
+		ret = s7d_plane_check_chroma(base->fb);
+		if (ret)
+			return ret;
 		ret = s7d_video_build_state(base->fb, &base->src, plane->dma_mask,
 					    &state->video);
 		/*
