@@ -580,11 +580,52 @@ static int backend_reconcile_config(struct s7d_h264_backend *backend,
 	return memcmp(&layout, &backend->layout, sizeof(layout)) ? -EBADMSG : 0;
 }
 
+/* The CAPTURE planes of @slot as VDEC addresses them. */
+static int backend_capture_planes(struct s7d_h264_backend *backend, u32 slot,
+				  struct s7d_h264_capture_plane planes[2])
+{
+	u32 i;
+	int ret;
+
+	for (i = 0; i < 2; i++) {
+		ret = s7d_codec_surface_dma(backend->capture[slot].surface, i,
+					   &planes[i].dma, &planes[i].bytes);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
+ * Program the canvases of every CAPTURE slot and the output format. They
+ * survive the reset between pictures, but another session's pictures program
+ * their own, so a session sets them again for each of its pictures, as the
+ * vendor's register context restore does.
+ */
+static int backend_program_captures(struct s7d_h264_backend *backend)
+{
+	struct s7d_h264_decoder *decoder = backend->decoder;
+	struct s7d_h264_capture_plane planes[2];
+	u32 i;
+	int ret;
+
+	lockdep_assert_held(&backend->transaction);
+	for (i = 0; i < backend->captures; i++) {
+		ret = backend_capture_planes(backend, i, planes);
+		if (ret)
+			return ret;
+		ret = s7d_h264_capture_program(decoder->map, &backend->layout, i, planes);
+		if (ret)
+			return ret;
+	}
+	return s7d_h264_capture_set_format(decoder->map, backend->layout.format);
+}
+
 static int backend_capture_setup(struct s7d_h264_backend *backend)
 {
 	struct s7d_h264_decoder *decoder = backend->decoder;
 	struct s7d_h264_capture_plane planes[2];
-	u32 i, j, slots = max(1U, backend->sequence.sps.max_num_ref_frames) + 1;
+	u32 i, slots = max(1U, backend->sequence.sps.max_num_ref_frames) + 1;
 	int ret;
 
 	lockdep_assert_held(&backend->transaction);
@@ -598,21 +639,15 @@ static int backend_capture_setup(struct s7d_h264_backend *backend)
 			return ret;
 	}
 	for (i = 0; i < backend->captures; i++) {
-		for (j = 0; j < 2; j++) {
-			ret = s7d_codec_surface_dma(backend->capture[i].surface, j,
-						   &planes[j].dma, &planes[j].bytes);
-			if (ret)
-				return ret;
-		}
+		ret = backend_capture_planes(backend, i, planes);
+		if (ret)
+			return ret;
 		ret = s7d_h264_build_capture_descriptor(&backend->layout, i, planes,
 						      &backend->descriptor[i]);
 		if (ret)
 			return ret;
-		ret = s7d_h264_capture_program(decoder->map, &backend->layout, i, planes);
-		if (ret)
-			return ret;
 	}
-	ret = s7d_h264_capture_set_format(decoder->map, backend->layout.format);
+	ret = backend_program_captures(backend);
 	if (ret)
 		return ret;
 	if (!backend->dpb) {
@@ -1023,6 +1058,8 @@ static int backend_restore(void *priv, struct regmap *map,
 		ret = -ESTALE;
 	if (!ret)
 		ret = s7d_h264_context_restore(backend->context, map, input, write, epoch, next);
+	if (!ret)
+		ret = backend_program_captures(backend);
 	if (!ret)
 		ret = s7d_h264_input_configure(backend->stream, next);
 	mutex_unlock(&backend->transaction);
