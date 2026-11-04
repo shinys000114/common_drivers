@@ -4,16 +4,21 @@
 #define __S7D_VENDOR_H
 
 #include <linux/atomic.h>
+#include <linux/hdmi.h>
 #include <linux/list.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+
+#include <drm/drm_modeset_helper_vtables.h>
 
 struct dentry;
 struct dma_fence;
 struct drm_connector;
 struct drm_crtc;
 struct drm_device;
+struct drm_display_info;
+struct drm_display_mode;
 struct drm_file;
 
 /*
@@ -43,6 +48,9 @@ struct s7d_vendor {
 	struct list_head node;
 	struct drm_crtc *crtc;
 	struct drm_connector *hdmi;
+	/* The HDMI connector helpers, renaming the modes the native ones probe. */
+	struct drm_connector_helper_funcs helpers;
+	int (*get_modes)(struct drm_connector *connector);
 	struct dentry *debugfs;
 	struct s7d_vendor_present present;
 	int card_minor;
@@ -62,6 +70,12 @@ static inline bool s7d_vendor_enabled(const struct drm_device *drm)
 }
 #endif
 
+/* An HDMI output format of a vendor attribute string. */
+struct s7d_vendor_attr {
+	enum hdmi_colorspace colorspace;
+	unsigned int bpc;
+};
+
 /* The vendor state of @drm, or NULL outside vendor mode. */
 struct s7d_vendor *s7d_vendor_find(const struct drm_device *drm);
 
@@ -76,6 +90,15 @@ int s7d_vendor_present_fence_ioctl(struct drm_device *drm, void *data, struct dr
 int s7d_vendor_mute_plane_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
 int s7d_vendor_vrr_range_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
 int s7d_vendor_connector_force_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+
+/* Vendor mode names and the mode test (s7d-vendor-modes.c). */
+void s7d_vendor_mode_name(const struct drm_display_mode *mode, char *name);
+void s7d_vendor_modes_init(struct s7d_vendor *v);
+void s7d_vendor_parse_attr(const char *text, struct s7d_vendor_attr *attr);
+bool s7d_vendor_attr_valid(const struct drm_display_info *info,
+			   const struct drm_display_mode *mode,
+			   const struct s7d_vendor_attr *attr);
+int s7d_vendor_testattr_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
 void s7d_vendor_present_init(struct s7d_vendor *v);
 void s7d_vendor_present_fini(struct s7d_vendor *v);
 
