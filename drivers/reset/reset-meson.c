@@ -21,6 +21,7 @@
 struct meson_reset_param {
 	int reg_count;
 	int level_offset;
+	int mask_offset;
 };
 
 struct meson_reset {
@@ -88,6 +89,30 @@ static const struct reset_control_ops meson_reset_ops = {
 	.deassert	= meson_reset_deassert,
 };
 
+#ifdef CONFIG_AMLOGIC_MODIFY
+/* A set MASK bit holds the line released whatever LEVEL says. */
+static int meson_reset_status(struct reset_controller_dev *rcdev,
+			      unsigned long id)
+{
+	struct meson_reset *data =
+		container_of(rcdev, struct meson_reset, rcdev);
+	unsigned int offset = (id / BITS_PER_REG) << 2;
+	u32 released;
+
+	released = readl(data->reg_base + data->param->level_offset + offset);
+	released |= readl(data->reg_base + data->param->mask_offset + offset);
+
+	return !(released & BIT(id % BITS_PER_REG));
+}
+
+static const struct reset_control_ops meson_reset_status_ops = {
+	.reset		= meson_reset_reset,
+	.assert		= meson_reset_assert,
+	.deassert	= meson_reset_deassert,
+	.status		= meson_reset_status,
+};
+#endif
+
 #ifndef CONFIG_AMLOGIC_ZAPPER_CUT
 static const struct meson_reset_param meson8b_param = {
 	.reg_count	= 8,
@@ -104,6 +129,7 @@ static const struct meson_reset_param meson_a1_param = {
 static const struct meson_reset_param meson_sc2_param = {
 	.reg_count	= 6,
 	.level_offset	= 0x40,
+	.mask_offset	= 0x80,
 };
 
 #ifndef CONFIG_AMLOGIC_ZAPPER_CUT
@@ -172,6 +198,10 @@ static int meson_reset_probe(struct platform_device *pdev)
 	data->rcdev.owner = THIS_MODULE;
 	data->rcdev.nr_resets = data->param->reg_count * BITS_PER_REG;
 	data->rcdev.ops = &meson_reset_ops;
+#ifdef CONFIG_AMLOGIC_MODIFY
+	if (data->param->mask_offset)
+		data->rcdev.ops = &meson_reset_status_ops;
+#endif
 	data->rcdev.of_node = pdev->dev.of_node;
 
 	return devm_reset_controller_register(&pdev->dev, &data->rcdev);
