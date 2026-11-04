@@ -8,8 +8,10 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/workqueue.h>
 
 #include "s7d-av1-input.h"
@@ -99,6 +101,10 @@ struct av1_backend {
 	bool execution_attempted;
 	bool drain_pending;
 	bool drain_notified;
+	/* A key frame was taken since the session began: decoding has a start. */
+	bool keyed;
+	/* The session's first picture runs next: it needs the sequence header. */
+	bool seed_sequence;
 	/* The CAPTURE buffers are bound as DPB picture memory. */
 	bool bound;
 	/* AM08C/AM10C: they hold the FBC header and body too. */
@@ -199,6 +205,85 @@ static const struct s7d_codec_resource_ops av1_resource_ops = {
 	.release = av1_release,
 };
 
+/*
+ * A stream that starts, or resumes after a seek, at an inter frame: drop the
+ * pictures up to the first key frame, the AV1 random access point, before the
+ * firmware sees them. Pictures that follow it in the TU decode as usual.
+ */
+static void av1_skip_to_key(struct av1_backend *backend)
+{
+	struct s7d_av1_tu *tu = &backend->tu;
+	u32 i;
+
+	lockdep_assert_held(&backend->lock);
+	if (backend->keyed)
+		return;
+	for (i = 0; i < tu->picture_count; i++)
+		if (!tu->picture[i].show_existing &&
+		    tu->picture[i].frame_type == S7D_AV1_KEY_FRAME)
+			break;
+	if (i == tu->picture_count) {
+		tu->picture_count = 0;
+		return;
+	}
+	backend->next_picture = i;
+	backend->keyed = true;
+	backend->seed_sequence = true;
+}
+
+/*
+ * The first picture of a session brings the sequence header to the firmware.
+ * A key frame without one in front (a stream that sent it once, at its
+ * start, or a key frame that is not the first picture of its TU) gets the
+ * stored one, after the temporal delimiter. *out is the caller's to free.
+ */
+static int av1_seed_sequence(struct av1_backend *backend, const u8 *data, u32 bytes,
+			     u8 **out, u32 *total)
+{
+	u32 offset = 0, insert = 0, header, size;
+	struct s7d_av1_obu obu;
+	u8 *buffer;
+	int ret;
+
+	*out = NULL;
+	while (offset < bytes) {
+		ret = s7d_av1_obu_next(data, bytes, offset, &obu);
+		if (ret)
+			return ret;
+		if (obu.type == S7D_AV1_OBU_SEQUENCE)
+			return 0;
+		if (obu.type == S7D_AV1_OBU_FRAME || obu.type == S7D_AV1_OBU_FRAME_HEADER)
+			break;
+		offset += obu.bytes;
+		if (obu.type == S7D_AV1_OBU_TEMPORAL_DELIMITER)
+			insert = offset;
+	}
+	/* OBU header with the size field, and the size in one or two leb128 bytes. */
+	header = backend->sequence_bytes < 0x80 ? 2 : 3;
+	if (!backend->sequence_bytes || backend->sequence_bytes >= 0x4000 ||
+	    check_add_overflow(bytes, header + backend->sequence_bytes, &size))
+		return -EINVAL;
+	if (size > AV1_INPUT_BYTES)
+		return -E2BIG;
+	buffer = kvmalloc(size, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+	memcpy(buffer, data, insert);
+	buffer[insert] = S7D_AV1_OBU_SEQUENCE << 3 | 0x02;
+	if (header == 2) {
+		buffer[insert + 1] = backend->sequence_bytes;
+	} else {
+		buffer[insert + 1] = (backend->sequence_bytes & 0x7f) | 0x80;
+		buffer[insert + 2] = backend->sequence_bytes >> 7;
+	}
+	memcpy(buffer + insert + header, backend->sequence_payload, backend->sequence_bytes);
+	memcpy(buffer + insert + header + backend->sequence_bytes, data + insert,
+	       bytes - insert);
+	*out = buffer;
+	*total = size;
+	return 0;
+}
+
 static int av1_metadata(struct av1_backend *backend)
 {
 	const u8 *data = s7d_codec_dma_cpu(backend->input.memory);
@@ -244,8 +329,11 @@ static int av1_metadata(struct av1_backend *backend)
 		if (ret)
 			return ret;
 	}
-	if (!payload && !backend->sequence_valid)
-		return -EPIPE;
+	/* Before any sequence header nothing decodes: skip the TU. */
+	if (!payload && !backend->sequence_valid) {
+		memset(&backend->tu, 0, sizeof(backend->tu));
+		return 1;
+	}
 	active = payload ? &sequence : &backend->sequence;
 	if (!picture) {
 		/* Headers only: take the sequence, decode nothing. */
@@ -259,6 +347,7 @@ static int av1_metadata(struct av1_backend *backend)
 			return ret;
 		for (i = 0; i < backend->tu.picture_count; i++)
 			backend->tu.picture[i].offset += start;
+		av1_skip_to_key(backend);
 	}
 	if (!payload)
 		return 0;
@@ -719,6 +808,7 @@ static void av1_work(struct work_struct *work)
 				};
 				u64 picture_token;
 				const u8 *data;
+				u8 *seeded = NULL;
 
 				if (backend->picture_token == U64_MAX) {
 					ret = -EOVERFLOW;
@@ -738,15 +828,25 @@ static void av1_work(struct work_struct *work)
 				if (backend->pending)
 					target.memory = &backend->slot_memory[backend->pending - 1];
 				picture_token = ++backend->picture_token;
-				data = s7d_codec_dma_cpu(backend->input.memory);
+				data = s7d_codec_dma_cpu(backend->input.memory) + offset;
+				if (backend->seed_sequence) {
+					ret = av1_seed_sequence(backend, data, bytes, &seeded,
+								&bytes);
+					if (ret)
+						goto failed;
+					if (seeded)
+						data = seeded;
+					backend->seed_sequence = false;
+				}
 				mutex_lock(&adapter->resources);
 				adapter->runner_closed = false;
 				mutex_unlock(&adapter->resources);
 				mutex_unlock(&backend->lock);
 				memset(&backend->result, 0, sizeof(backend->result));
 				ret = s7d_av1_runner_decode(adapter->runner, backend->session,
-					backend->lease_epoch, picture_token, data + offset, bytes,
+					backend->lease_epoch, picture_token, data, bytes,
 					backend->input.timestamp_ns, &target, &backend->result);
+				kvfree(seeded);
 				if (!ret)
 					ret = av1_decoded(backend);
 				mutex_lock(&backend->lock);
@@ -1247,6 +1347,8 @@ static int av1_reset(void *priv)
 		backend->execution_attempted = false;
 		backend->drain_pending = false;
 		backend->drain_notified = false;
+		backend->keyed = false;
+		backend->seed_sequence = false;
 		backend->closing = false;
 		backend->detached = false;
 		mutex_unlock(&backend->lock);

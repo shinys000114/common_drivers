@@ -37,6 +37,8 @@ struct s7d_av1_obu {
 struct s7d_av1_picture_span {
 	u32 offset;
 	u32 bytes;
+	/* frame_type of a decoded picture (enum s7d_av1_frame_type). */
+	u8 frame_type;
 	/* The frame header's show_existing_frame: no picture is decoded. */
 	bool show_existing;
 };

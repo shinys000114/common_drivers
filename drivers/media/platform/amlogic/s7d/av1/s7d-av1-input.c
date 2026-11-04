@@ -8,6 +8,7 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
+#include "s7d-av1-dpb.h"
 #include "s7d-av1-input.h"
 #include "s7d-av1-sequence.h"
 
@@ -111,6 +112,10 @@ int s7d_av1_split_tu(const u8 *data, size_t bytes,
 			show_existing = !sequence->reduced_still_picture_header &&
 				(data[obu.payload_offset] & 0x80);
 			next.picture[next.picture_count - 1].show_existing = show_existing;
+			/* frame_type follows show_existing_frame; still pictures are key frames. */
+			next.picture[next.picture_count - 1].frame_type =
+				sequence->reduced_still_picture_header ? S7D_AV1_KEY_FRAME :
+				(data[obu.payload_offset] >> 5) & 3;
 			if (show_existing && sequence->frame_id_numbers_present)
 				return -EOPNOTSUPP;
 			tiles = false;
