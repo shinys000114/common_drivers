@@ -95,6 +95,34 @@
 #define DMC_TIMEOUT_US		100000
 #define HEVC_RESPONSE_TIMEOUT_US	50000
 #define HEVC_IDLE_TIMEOUT_US	100000
+/*
+ * Sessions one engine runs at a time. Before it can grow, time slicing needs a
+ * lease per holder for the sequences and power-down on the last release.
+ */
+#define DOS_ENGINE_HOLDERS	1
+
+/*
+ * VDEC, the HEVC core and HCODEC each have their own power domain, clock,
+ * IRQ, reset and memory power registers, so each is leased on its own.
+ * Two registers carry disjoint bits of several engines: DOS_GCLK_EN0
+ * (VDEC [9:0], HCODEC [26:12]) and DMC_REQ_CTRL (VDEC bit 8, HCODEC bit 9).
+ * They are changed only with regmap_update_bits() and read back masked,
+ * so one engine never touches or checks another's bits.
+ */
+struct dos_engine {
+	/* Serializes this engine's lease, its sequences and the state below. */
+	struct mutex lock;
+	unsigned int holders;
+	bool local_access_ready;
+	bool prepared;
+	bool hevc_init_written;
+	bool halted;
+	bool started;
+	bool faulted;
+	bool error_reported;
+	bool release_failed;
+	bool release_pin;
+};
 
 struct s7d_codec_dos {
 	struct device *dev;
@@ -112,22 +140,14 @@ struct s7d_codec_dos {
 	void __iomem *base;
 	resource_size_t start;
 	resource_size_t size;
+	/* Taken before every engine lock, in index order, to see all engines. */
 	struct mutex lock;
 	int irq;
 	int hevc_irq;
 	int hcodec_irq;
-	enum s7d_codec_engine engine;
-	bool leased;
-	bool local_access_ready;
-	bool prepared;
-	bool hevc_init_written;
-	bool halted;
-	bool started;
-	bool faulted;
-	bool error_reported;
-	bool release_failed;
+	struct dos_engine eng[S7D_CODEC_ENGINES];
+	/* Set with every engine lock held; read under any of them. */
 	bool closing;
-	bool release_pin;
 };
 
 static const struct regmap_config dos_regmap_config = {
@@ -157,10 +177,29 @@ static int dos_vdec_engine_check(enum s7d_codec_engine engine)
 	return -EINVAL;
 }
 
-static int dos_lease_check(struct s7d_codec_dos *dos,
-			   enum s7d_codec_engine engine)
+/* Callers have checked @engine. */
+static struct dos_engine *dos_eng(struct s7d_codec_dos *dos,
+				  enum s7d_codec_engine engine)
 {
-	return dos->leased && dos->engine != engine ? -EBUSY : 0;
+	return &dos->eng[engine];
+}
+
+static void dos_lock_all(struct s7d_codec_dos *dos)
+{
+	unsigned int i;
+
+	mutex_lock(&dos->lock);
+	for (i = 0; i < ARRAY_SIZE(dos->eng); i++)
+		mutex_lock_nested(&dos->eng[i].lock, i);
+}
+
+static void dos_unlock_all(struct s7d_codec_dos *dos)
+{
+	unsigned int i;
+
+	for (i = ARRAY_SIZE(dos->eng); i; i--)
+		mutex_unlock(&dos->eng[i - 1].lock);
+	mutex_unlock(&dos->lock);
 }
 
 static struct clk *dos_engine_clk(struct s7d_codec_dos *dos,
@@ -216,11 +255,14 @@ static int dos_update(struct regmap *map, unsigned int reg, u32 mask, u32 val)
 	return ret ? ret : dos_check(map, reg, mask, val);
 }
 
+/* The HEVC sequences report their first failure per lease. */
 static int dos_report_error(struct s7d_codec_dos *dos, const char *stage,
 			    int result, int error)
 {
-	if (error && dos->engine == S7D_CODEC_ENGINE_HEVC && !dos->error_reported) {
-		dos->error_reported = true;
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
+
+	if (error && !e->error_reported) {
+		e->error_reported = true;
 		dev_err(dos->dev, "HEVC DOS %s result=%d error=%d\n", stage, result, error);
 	}
 	return error;
@@ -230,8 +272,10 @@ static int dos_report_io(struct s7d_codec_dos *dos, const char *stage,
 			 unsigned int reg, u32 mask, u32 want,
 			 u32 observed, bool observed_valid, int error)
 {
-	if (error && dos->engine == S7D_CODEC_ENGINE_HEVC && !dos->error_reported) {
-		dos->error_reported = true;
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
+
+	if (error && !e->error_reported) {
+		e->error_reported = true;
 		dev_err(dos->dev,
 			"HEVC DOS %s reg=%#x mask=%#x want=%#x observed=%#x valid=%u error=%d\n",
 			stage, reg, mask, want,
@@ -290,6 +334,7 @@ static int dos_hevc_read(struct s7d_codec_dos *dos, unsigned int reg, u32 *val)
 	return dos_report_io(dos, "read", reg, 0, 0, 0, false, ret);
 }
 
+/* DOS_SW_RESET0 resets VDEC only; the vendor pulses it while HEVC runs. */
 static int dos_reset(struct s7d_codec_dos *dos, u32 mask)
 {
 	u32 val;
@@ -321,6 +366,7 @@ static int dos_hcodec_block_locked(struct s7d_codec_dos *dos)
 	u32 val;
 	int ret;
 
+	/* HCODEC's bit of the shared DMC_REQ_CTRL, changed and checked masked. */
 	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_HCODEC_PORT, 0);
 	if (ret)
 		return ret;
@@ -359,6 +405,7 @@ static int dos_hcodec_prepare_access_locked(struct s7d_codec_dos *dos)
 	ret = dos_hcodec_block_locked(dos);
 	if (ret)
 		return ret;
+	/* HCODEC's gates in the shared DOS_GCLK_EN0. */
 	ret = dos_update(dos->map, DOS_GCLK_EN0, GENMASK(26, 12),
 			 GENMASK(26, 12));
 	if (ret)
@@ -391,31 +438,34 @@ static int dos_hevc_prepare_access_locked(struct s7d_codec_dos *dos)
 	return dos_hevc_write(dos, DOS_MEM_PD_HEVC, 0);
 }
 
-static int dos_prepare_access_locked(struct s7d_codec_dos *dos)
+static int dos_prepare_access_locked(struct s7d_codec_dos *dos,
+				     enum s7d_codec_engine engine)
 {
+	struct dos_engine *e = dos_eng(dos, engine);
 	int ret;
 
-	if (!dos->leased)
+	if (!e->holders)
 		return -EINVAL;
-	if (dos->local_access_ready)
+	if (e->local_access_ready)
 		return 0;
-	if (dos->faulted || dos->release_failed || dos->closing)
+	if (e->faulted || e->release_failed || dos->closing)
 		return -EIO;
-	if (dos->engine == S7D_CODEC_ENGINE_HCODEC) {
+	if (engine == S7D_CODEC_ENGINE_HCODEC) {
 		ret = dos_hcodec_prepare_access_locked(dos);
 		if (ret)
 			goto fault;
-		dos->local_access_ready = true;
+		e->local_access_ready = true;
 		return 0;
 	}
-	if (dos->engine == S7D_CODEC_ENGINE_HEVC) {
+	if (engine == S7D_CODEC_ENGINE_HEVC) {
 		ret = dos_hevc_prepare_access_locked(dos);
 		if (ret)
 			goto fault;
-		dos->local_access_ready = true;
+		e->local_access_ready = true;
 		return 0;
 	}
 	usleep_range(20, 30);
+	/* VDEC's gates in the shared DOS_GCLK_EN0. */
 	ret = dos_update(dos->map, DOS_GCLK_EN0, DOS_VDEC_GATES, DOS_VDEC_GATES);
 	if (ret)
 		goto fault;
@@ -436,11 +486,11 @@ static int dos_prepare_access_locked(struct s7d_codec_dos *dos)
 	ret = dos_write(dos->map, DOS_MEM_PD_VDEC, 0);
 	if (ret)
 		goto fault;
-	dos->local_access_ready = true;
+	e->local_access_ready = true;
 	return 0;
 fault:
-	dos->faulted = true;
-	dos->halted = false;
+	e->faulted = true;
+	e->halted = false;
 	return ret;
 }
 
@@ -475,10 +525,11 @@ static int dos_hcodec_stopped_locked(struct s7d_codec_dos *dos)
 
 static int dos_hcodec_halt_locked(struct s7d_codec_dos *dos)
 {
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HCODEC);
 	u32 val;
 	int ret;
 
-	dos->halted = false;
+	e->halted = false;
 	ret = dos_hcodec_block_locked(dos);
 	if (ret)
 		return ret;
@@ -514,19 +565,20 @@ static int dos_hcodec_halt_locked(struct s7d_codec_dos *dos)
 			DMC_HCODEC_PORT);
 	if (ret)
 		return ret;
-	dos->halted = true;
-	dos->prepared = false;
-	dos->started = false;
-	dos->faulted = false;
+	e->halted = true;
+	e->prepared = false;
+	e->started = false;
+	e->faulted = false;
 	return 0;
 }
 
 static int dos_hevc_halt_locked(struct s7d_codec_dos *dos)
 {
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
 	u32 val = 0;
 	int ret;
 
-	dos->halted = false;
+	e->halted = false;
 	ret = dos_hevc_write(dos, HEVC_MBOX0_MASK, 0);
 	if (ret)
 		return ret;
@@ -632,22 +684,20 @@ static int dos_hevc_halt_locked(struct s7d_codec_dos *dos)
 	ret = dos_hevc_check(dos, HEVC_AFIFO_CTRL, HEVC_AFIFO_BUSY, 0);
 	if (ret)
 		return ret;
-	dos->halted = true;
-	dos->prepared = false;
-	dos->hevc_init_written = false;
-	dos->started = false;
-	dos->faulted = false;
+	e->halted = true;
+	e->prepared = false;
+	e->hevc_init_written = false;
+	e->started = false;
+	e->faulted = false;
 	return 0;
 }
 
 static int dos_hevc_exec_check_locked(struct s7d_codec_dos *dos)
 {
-	int ret = dos_lease_check(dos, S7D_CODEC_ENGINE_HEVC);
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
 
-	if (ret)
-		return ret;
-	if (!dos->leased || !dos->local_access_ready || !dos->prepared ||
-	    dos->halted || dos->started || dos->faulted || dos->release_failed ||
+	if (!e->holders || !e->local_access_ready || !e->prepared ||
+	    e->halted || e->started || e->faulted || e->release_failed ||
 	    dos->closing)
 		return -EBUSY;
 	return 0;
@@ -704,7 +754,7 @@ static int dos_hevc_port_enable_locked(struct s7d_codec_dos *dos)
 	ret = dos_hevc_check(dos, HEVC_AFIFO_CTRL, HEVC_AFIFO_BUSY, 0);
 	if (ret)
 		return ret;
-	dos->halted = false;
+	dos_eng(dos, S7D_CODEC_ENGINE_HEVC)->halted = false;
 	return dos_hevc_update(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
 }
 
@@ -736,9 +786,10 @@ static int dos_hevc_cpu_reset_locked(struct s7d_codec_dos *dos)
 
 static int dos_hevc_start_locked(struct s7d_codec_dos *dos)
 {
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
 	int ret;
 
-	if (!dos->hevc_init_written)
+	if (!e->hevc_init_written)
 		return -EBUSY;
 	ret = dos_hevc_check(dos, HEVC_MBOX0_MASK, U32_MAX, 1);
 	if (ret)
@@ -757,7 +808,7 @@ static int dos_hevc_start_locked(struct s7d_codec_dos *dos)
 	ret = dos_hevc_check(dos, HEVC_AXI_CTRL, HEVC_AXI_STOP, 0);
 	if (ret)
 		return ret;
-	dos->started = true;
+	e->started = true;
 	ret = dos_hevc_cpu_reset_locked(dos);
 	if (ret)
 		return ret;
@@ -768,17 +819,19 @@ static int dos_hevc_start_locked(struct s7d_codec_dos *dos)
 	return dos_hevc_write_mpsr(dos, 1);
 }
 
-static int dos_halt_locked(struct s7d_codec_dos *dos)
+static int dos_halt_locked(struct s7d_codec_dos *dos,
+			   enum s7d_codec_engine engine)
 {
+	struct dos_engine *e = dos_eng(dos, engine);
 	u32 val;
 	int ret;
 
-	if (dos->engine == S7D_CODEC_ENGINE_HCODEC)
+	if (engine == S7D_CODEC_ENGINE_HCODEC)
 		return dos_hcodec_halt_locked(dos);
-	if (dos->engine == S7D_CODEC_ENGINE_HEVC)
+	if (engine == S7D_CODEC_ENGINE_HEVC)
 		return dos_hevc_halt_locked(dos);
 
-	dos->halted = false;
+	e->halted = false;
 	ret = dos_write(dos->map, DOS_MBOX1_MASK, 0);
 	if (ret)
 		return ret;
@@ -801,6 +854,7 @@ static int dos_halt_locked(struct s7d_codec_dos *dos)
 				      RESPONSE_TIMEOUT_US);
 	if (ret)
 		return ret;
+	/* VDEC's bit of the shared DMC_REQ_CTRL, changed and checked masked. */
 	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, 0);
 	if (ret)
 		return ret;
@@ -829,10 +883,10 @@ static int dos_halt_locked(struct s7d_codec_dos *dos)
 	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, 0);
 	if (ret)
 		return ret;
-	dos->halted = true;
-	dos->prepared = false;
-	dos->started = false;
-	dos->faulted = false;
+	e->halted = true;
+	e->prepared = false;
+	e->started = false;
+	e->faulted = false;
 	return 0;
 }
 
@@ -852,6 +906,7 @@ s7d_codec_dos_create(struct platform_device *pdev, struct module *owner)
 {
 	struct s7d_codec_dos *dos;
 	struct resource *res;
+	unsigned int i;
 	int ret;
 
 	if (!pdev || !of_device_is_compatible(pdev->dev.of_node,
@@ -866,6 +921,8 @@ s7d_codec_dos_create(struct platform_device *pdev, struct module *owner)
 	dos->dev = get_device(&pdev->dev);
 	dos->owner = owner;
 	mutex_init(&dos->lock);
+	for (i = 0; i < ARRAY_SIZE(dos->eng); i++)
+		mutex_init(&dos->eng[i].lock);
 	dos->irq = platform_get_irq_byname(pdev, "mailbox_1");
 	if (dos->irq < 0) {
 		ret = dos->irq;
@@ -995,6 +1052,7 @@ struct regmap *s7d_codec_dos_regmap(struct s7d_codec_dos *dos,
 static int dos_hold_rate(struct s7d_codec_dos *dos,
 			 enum s7d_codec_engine engine, unsigned long rate)
 {
+	struct dos_engine *e;
 	struct device *pd_dev;
 	struct clk *clk;
 	long rounded;
@@ -1002,8 +1060,10 @@ static int dos_hold_rate(struct s7d_codec_dos *dos,
 
 	if (ret)
 		return ret;
-	mutex_lock(&dos->lock);
-	if (dos->leased || dos->faulted || dos->release_failed || dos->closing) {
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	if (e->holders >= DOS_ENGINE_HOLDERS || e->faulted || e->release_failed ||
+	    dos->closing) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1034,11 +1094,10 @@ static int dos_hold_rate(struct s7d_codec_dos *dos,
 	ret = pm_runtime_resume_and_get(pd_dev);
 	if (ret < 0)
 		goto disable_vdec;
-	dos->leased = true;
-	dos->engine = engine;
-	dos->error_reported = false;
-	dos->local_access_ready = false;
-	dos->halted = false;
+	e->holders = 1;
+	e->error_reported = false;
+	e->local_access_ready = false;
+	e->halted = false;
 	ret = 0;
 	goto out;
 
@@ -1049,7 +1108,7 @@ disable_bus:
 put_rate:
 	clk_rate_exclusive_put(clk);
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
@@ -1068,18 +1127,19 @@ int s7d_codec_dos_jpeg_hold(struct s7d_codec_dos *dos)
 
 int s7d_codec_dos_jpeg_prepare(struct s7d_codec_dos *dos)
 {
-	int ret;
+	struct dos_engine *e;
+	int ret = dos_engine_check(S7D_CODEC_ENGINE_HCODEC);
 
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, S7D_CODEC_ENGINE_HCODEC);
 	if (ret)
-		goto out;
-	if (!dos->leased || dos->faulted || dos->release_failed || dos->closing ||
-	    dos->prepared) {
+		return ret;
+	e = dos_eng(dos, S7D_CODEC_ENGINE_HCODEC);
+	mutex_lock(&e->lock);
+	if (!e->holders || e->faulted || e->release_failed || dos->closing ||
+	    e->prepared) {
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = dos_prepare_access_locked(dos);
+	ret = dos_prepare_access_locked(dos, S7D_CODEC_ENGINE_HCODEC);
 	if (ret)
 		goto fault;
 	ret = dos_hcodec_halt_locked(dos);
@@ -1088,26 +1148,27 @@ int s7d_codec_dos_jpeg_prepare(struct s7d_codec_dos *dos)
 	ret = dos_write(dos->map, HCODEC_MMC_CTRL1, 0x32);
 	if (ret)
 		goto fault;
-	dos->prepared = true;
+	e->prepared = true;
 	goto out;
 fault:
-	dos->faulted = true;
-	dos->halted = false;
+	e->faulted = true;
+	e->halted = false;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_jpeg_port_enable(struct s7d_codec_dos *dos)
 {
-	int ret;
+	struct dos_engine *e;
+	int ret = dos_engine_check(S7D_CODEC_ENGINE_HCODEC);
 
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, S7D_CODEC_ENGINE_HCODEC);
 	if (ret)
-		goto out;
-	if (!dos->leased || !dos->prepared || !dos->halted || dos->faulted ||
-	    dos->release_failed || dos->closing) {
+		return ret;
+	e = dos_eng(dos, S7D_CODEC_ENGINE_HCODEC);
+	mutex_lock(&e->lock);
+	if (!e->holders || !e->prepared || !e->halted || e->faulted ||
+	    e->release_failed || dos->closing) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1121,29 +1182,30 @@ int s7d_codec_dos_jpeg_port_enable(struct s7d_codec_dos *dos)
 			DMC_HCODEC_PORT);
 	if (ret)
 		goto fault;
-	dos->halted = false;
+	e->halted = false;
 	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_HCODEC_PORT, DMC_HCODEC_PORT);
 	if (ret)
 		goto fault;
 	goto out;
 fault:
-	dos->faulted = true;
-	dos->halted = false;
+	e->faulted = true;
+	e->halted = false;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_jpeg_start(struct s7d_codec_dos *dos)
 {
-	int ret;
+	struct dos_engine *e;
+	int ret = dos_engine_check(S7D_CODEC_ENGINE_HCODEC);
 
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, S7D_CODEC_ENGINE_HCODEC);
 	if (ret)
-		goto out;
-	if (!dos->leased || !dos->prepared || dos->halted || dos->started ||
-	    dos->faulted || dos->release_failed || dos->closing) {
+		return ret;
+	e = dos_eng(dos, S7D_CODEC_ENGINE_HCODEC);
+	mutex_lock(&e->lock);
+	if (!e->holders || !e->prepared || e->halted || e->started ||
+	    e->faulted || e->release_failed || dos->closing) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1172,7 +1234,7 @@ int s7d_codec_dos_jpeg_start(struct s7d_codec_dos *dos)
 	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_HCODEC_PORT, DMC_HCODEC_PORT);
 	if (ret)
 		goto fault;
-	dos->started = true;
+	e->started = true;
 	ret = dos_hcodec_reset(dos, DOS_CPU_RESET);
 	if (ret)
 		goto fault;
@@ -1181,78 +1243,76 @@ int s7d_codec_dos_jpeg_start(struct s7d_codec_dos *dos)
 		goto fault;
 	goto out;
 fault:
-	dos->faulted = true;
+	e->faulted = true;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_prepare_access(struct s7d_codec_dos *dos,
 			       enum s7d_codec_engine engine)
 {
+	struct dos_engine *e;
 	int ret = dos_engine_check(engine);
 
 	if (ret)
 		return ret;
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, engine);
-	if (!ret)
-		ret = dos_prepare_access_locked(dos);
-	mutex_unlock(&dos->lock);
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	ret = dos_prepare_access_locked(dos, engine);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_prepare(struct s7d_codec_dos *dos,
 			  enum s7d_codec_engine engine)
 {
+	struct dos_engine *e;
 	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
 
 	if (ret)
 		return ret;
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, engine);
-	if (ret)
-		goto out;
-	if (!dos->leased || dos->faulted || dos->release_failed || dos->prepared) {
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	if (!e->holders || e->faulted || e->release_failed || e->prepared) {
 		ret = -EBUSY;
 		goto out;
 	}
-	dos->halted = false;
-	ret = dos_prepare_access_locked(dos);
+	e->halted = false;
+	ret = dos_prepare_access_locked(dos, engine);
 	if (ret)
 		goto fault;
-	ret = dos_halt_locked(dos);
+	ret = dos_halt_locked(dos, engine);
 	if (ret)
 		goto fault;
 	if (engine == S7D_CODEC_ENGINE_HEVC) {
-		dos->prepared = true;
+		e->prepared = true;
 		goto out;
 	}
 	ret = dos_pic_reset(dos);
 	if (ret)
 		goto fault;
-	dos->prepared = true;
+	e->prepared = true;
 	goto out;
 fault:
-	dos->faulted = true;
+	e->faulted = true;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_port_enable(struct s7d_codec_dos *dos,
 			      enum s7d_codec_engine engine)
 {
+	struct dos_engine *e;
 	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
 
 	if (ret)
 		return ret;
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, engine);
-	if (ret)
-		goto out;
-	if (!dos->leased || !dos->prepared || !dos->halted || dos->faulted ||
-	    dos->release_failed) {
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	if (!e->holders || !e->prepared || !e->halted || e->faulted ||
+	    e->release_failed) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1298,28 +1358,29 @@ int s7d_codec_dos_port_enable(struct s7d_codec_dos *dos,
 	ret = dos_check(dos->dmc, DMC_CHAN_STS, DMC_VDEC_PORT, DMC_VDEC_PORT);
 	if (ret)
 		goto fault;
-	dos->halted = false;
+	e->halted = false;
 	ret = dos_update(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, DMC_VDEC_PORT);
 	if (ret)
 		goto fault;
 	goto out;
 fault:
-	dos->faulted = true;
-	dos->halted = false;
+	e->faulted = true;
+	e->halted = false;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_hevc_init(struct s7d_codec_dos *dos)
 {
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
 	int ret;
 
-	mutex_lock(&dos->lock);
+	mutex_lock(&e->lock);
 	ret = dos_hevc_exec_check_locked(dos);
 	if (ret)
 		goto out;
-	if (dos->hevc_init_written) {
+	if (e->hevc_init_written) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1341,25 +1402,23 @@ int s7d_codec_dos_hevc_init(struct s7d_codec_dos *dos)
 	ret = dos_hevc_write_raw(dos, DOS_SW_RESET3, HEVC_IQIT_RESET);
 	if (ret)
 		goto fault;
-	dos->hevc_init_written = true;
+	e->hevc_init_written = true;
 	goto out;
 fault:
-	dos->faulted = true;
-	dos->halted = false;
+	e->faulted = true;
+	e->halted = false;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_hevc_irq_mask(struct s7d_codec_dos *dos, bool enable)
 {
-	int ret;
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
+	int ret = 0;
 
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, S7D_CODEC_ENGINE_HEVC);
-	if (ret)
-		goto out;
-	if (!dos->leased || !dos->local_access_ready || dos->release_failed) {
+	mutex_lock(&e->lock);
+	if (!e->holders || !e->local_access_ready || e->release_failed) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1367,7 +1426,7 @@ int s7d_codec_dos_hevc_irq_mask(struct s7d_codec_dos *dos, bool enable)
 		ret = dos_hevc_exec_check_locked(dos);
 		if (ret)
 			goto out;
-		if (!dos->hevc_init_written) {
+		if (!e->hevc_init_written) {
 			ret = -EBUSY;
 			goto out;
 		}
@@ -1383,22 +1442,23 @@ int s7d_codec_dos_hevc_irq_mask(struct s7d_codec_dos *dos, bool enable)
 		goto fault;
 	goto out;
 fault:
-	dos->faulted = true;
-	dos->halted = false;
+	e->faulted = true;
+	e->halted = false;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_hevc_input_enable(struct s7d_codec_dos *dos)
 {
+	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
 	int ret;
 
-	mutex_lock(&dos->lock);
+	mutex_lock(&e->lock);
 	ret = dos_hevc_exec_check_locked(dos);
 	if (ret)
 		goto out;
-	if (!dos->hevc_init_written) {
+	if (!e->hevc_init_written) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1428,52 +1488,50 @@ int s7d_codec_dos_hevc_input_enable(struct s7d_codec_dos *dos)
 		goto fault;
 	goto out;
 fault:
-	dos->faulted = true;
-	dos->halted = false;
+	e->faulted = true;
+	e->halted = false;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_halt(struct s7d_codec_dos *dos,
 		       enum s7d_codec_engine engine)
 {
+	struct dos_engine *e;
 	int ret = dos_engine_check(engine);
 
 	if (ret)
 		return ret;
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, engine);
-	if (ret)
-		goto out;
-	if (!dos->leased) {
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	if (!e->holders) {
 		ret = -EINVAL;
 		goto out;
 	}
-	ret = dos_prepare_access_locked(dos);
+	ret = dos_prepare_access_locked(dos, engine);
 	if (ret)
 		goto out;
-	ret = dos_halt_locked(dos);
+	ret = dos_halt_locked(dos, engine);
 	if (ret)
-		dos->faulted = true;
+		e->faulted = true;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_start(struct s7d_codec_dos *dos,
 			enum s7d_codec_engine engine)
 {
+	struct dos_engine *e;
 	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
 
 	if (ret)
 		return ret;
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, engine);
-	if (ret)
-		goto out;
-	if (!dos->leased || !dos->prepared || dos->halted || dos->started ||
-	    dos->faulted || dos->release_failed || dos->closing) {
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	if (!e->holders || !e->prepared || e->halted || e->started ||
+	    e->faulted || e->release_failed || dos->closing) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1516,7 +1574,7 @@ int s7d_codec_dos_start(struct s7d_codec_dos *dos,
 	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, DMC_VDEC_PORT);
 	if (ret)
 		goto fault;
-	dos->started = true;
+	e->started = true;
 	ret = dos_reset(dos, DOS_CPU_RESET);
 	if (ret)
 		goto fault;
@@ -1525,26 +1583,25 @@ int s7d_codec_dos_start(struct s7d_codec_dos *dos,
 		goto fault;
 	goto out;
 fault:
-	dos->faulted = true;
+	e->faulted = true;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
 int s7d_codec_dos_park(struct s7d_codec_dos *dos,
 		       enum s7d_codec_engine engine)
 {
+	struct dos_engine *e;
 	u32 val;
 	int ret = dos_vdec_engine_check(engine);
 
 	if (ret)
 		return ret;
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, engine);
-	if (ret)
-		goto out;
-	if (!dos->leased || !dos->prepared || dos->halted || !dos->started ||
-	    dos->faulted || dos->release_failed || dos->closing) {
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	if (!e->holders || !e->prepared || e->halted || !e->started ||
+	    e->faulted || e->release_failed || dos->closing) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1595,15 +1652,15 @@ int s7d_codec_dos_park(struct s7d_codec_dos *dos,
 	ret = dos_check(dos->dmc, DMC_REQ_CTRL, DMC_VDEC_PORT, 0);
 	if (ret)
 		goto fault;
-	dos->halted = true;
-	dos->prepared = false;
-	dos->started = false;
+	e->halted = true;
+	e->prepared = false;
+	e->started = false;
 	goto out;
 fault:
-	dos->faulted = true;
-	dos->halted = false;
+	e->faulted = true;
+	e->halted = false;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	return ret;
 }
 
@@ -1644,6 +1701,7 @@ static int dos_power_down_locked(struct s7d_codec_dos *dos,
 int s7d_codec_dos_release(struct s7d_codec_dos *dos,
 			  enum s7d_codec_engine engine)
 {
+	struct dos_engine *e;
 	struct device *pd_dev;
 	struct clk *clk;
 	bool drop_pin = false;
@@ -1651,17 +1709,15 @@ int s7d_codec_dos_release(struct s7d_codec_dos *dos,
 
 	if (ret)
 		return ret;
-	mutex_lock(&dos->lock);
-	ret = dos_lease_check(dos, engine);
-	if (ret)
-		goto out;
-	if (!dos->leased || !dos->halted || dos->faulted) {
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	if (!e->holders || !e->halted || e->faulted) {
 		ret = -EBUSY;
 		goto out;
 	}
 	ret = dos_power_down_locked(dos, engine);
 	if (ret) {
-		dos->faulted = true;
+		e->faulted = true;
 		goto out;
 	}
 	clk = dos_engine_clk(dos, engine);
@@ -1669,10 +1725,10 @@ int s7d_codec_dos_release(struct s7d_codec_dos *dos,
 	ret = pm_runtime_put_sync(pd_dev);
 	if (ret < 0) {
 		pm_runtime_get_noresume(pd_dev);
-		dos->release_failed = true;
-		if (!dos->release_pin) {
+		e->release_failed = true;
+		if (!e->release_pin) {
 			if (try_module_get(dos->owner))
-				dos->release_pin = true;
+				e->release_pin = true;
 			else
 				ret = -ESHUTDOWN;
 		}
@@ -1681,18 +1737,18 @@ int s7d_codec_dos_release(struct s7d_codec_dos *dos,
 	clk_disable_unprepare(clk);
 	clk_disable_unprepare(dos->bus_clk);
 	clk_rate_exclusive_put(clk);
-	dos->leased = false;
-	dos->local_access_ready = false;
-	dos->prepared = false;
-	dos->hevc_init_written = false;
-	dos->halted = false;
-	dos->started = false;
-	dos->release_failed = false;
-	drop_pin = dos->release_pin;
-	dos->release_pin = false;
+	e->holders = 0;
+	e->local_access_ready = false;
+	e->prepared = false;
+	e->hevc_init_written = false;
+	e->halted = false;
+	e->started = false;
+	e->release_failed = false;
+	drop_pin = e->release_pin;
+	e->release_pin = false;
 	ret = 0;
 out:
-	mutex_unlock(&dos->lock);
+	mutex_unlock(&e->lock);
 	if (drop_pin)
 		module_put(dos->owner);
 	return ret;
@@ -1700,41 +1756,77 @@ out:
 
 bool s7d_codec_dos_leased(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
 {
+	struct dos_engine *e;
 	bool leased;
 
-	mutex_lock(&dos->lock);
-	leased = dos->leased && dos->engine == engine;
-	mutex_unlock(&dos->lock);
+	if (dos_engine_check(engine))
+		return false;
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	leased = e->holders;
+	mutex_unlock(&e->lock);
 	return leased;
 }
 
 bool s7d_codec_dos_leased_by_other(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
 {
-	bool leased;
+	unsigned int i;
 
-	mutex_lock(&dos->lock);
-	leased = dos->leased && dos->engine != engine;
-	mutex_unlock(&dos->lock);
-	return leased;
+	for (i = 0; i < ARRAY_SIZE(dos->eng); i++)
+		if (i != engine && s7d_codec_dos_leased(dos, i))
+			return true;
+	return false;
+}
+
+int s7d_codec_dos_engine_state(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
+{
+	struct dos_engine *e;
+	int ret = dos_engine_check(engine);
+
+	if (ret)
+		return ret;
+	e = dos_eng(dos, engine);
+	mutex_lock(&e->lock);
+	if (e->faulted || e->release_failed)
+		ret = -EIO;
+	else if (e->holders >= DOS_ENGINE_HOLDERS)
+		ret = -EBUSY;
+	mutex_unlock(&e->lock);
+	return ret;
+}
+
+/* Any engine still held, prepared or faulted keeps the DOS from sleeping. */
+static bool dos_busy_locked(struct s7d_codec_dos *dos)
+{
+	struct dos_engine *e;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dos->eng); i++) {
+		e = &dos->eng[i];
+		if (e->holders || e->prepared || e->faulted || e->release_failed ||
+		    e->release_pin)
+			return true;
+	}
+	return false;
 }
 
 int s7d_codec_dos_suspend_check(struct s7d_codec_dos *dos)
 {
 	int ret;
 
-	mutex_lock(&dos->lock);
-	ret = dos->leased || dos->prepared || dos->faulted ||
-	      dos->release_failed ? -EBUSY : 0;
-	mutex_unlock(&dos->lock);
+	dos_lock_all(dos);
+	ret = dos_busy_locked(dos) ? -EBUSY : 0;
+	dos_unlock_all(dos);
 	return ret;
 }
 
 int s7d_codec_dos_destroy(struct s7d_codec_dos *dos)
 {
-	mutex_lock(&dos->lock);
-	if (dos->leased || dos->prepared || dos->faulted || dos->release_failed ||
-	    dos->release_pin) {
-		mutex_unlock(&dos->lock);
+	unsigned int i;
+
+	dos_lock_all(dos);
+	if (dos_busy_locked(dos)) {
+		dos_unlock_all(dos);
 		return -EBUSY;
 	}
 	dos->closing = true;
@@ -1751,7 +1843,10 @@ int s7d_codec_dos_destroy(struct s7d_codec_dos *dos)
 	clk_put(dos->hevc_clk);
 	clk_put(dos->vdec_clk);
 	clk_put(dos->bus_clk);
-	mutex_unlock(&dos->lock);
+	dos_unlock_all(dos);
+	for (i = 0; i < ARRAY_SIZE(dos->eng); i++)
+		mutex_destroy(&dos->eng[i].lock);
+	mutex_destroy(&dos->lock);
 	put_device(dos->dev);
 	kfree(dos);
 	return 0;

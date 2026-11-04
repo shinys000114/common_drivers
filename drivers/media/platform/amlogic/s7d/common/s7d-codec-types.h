@@ -10,6 +10,8 @@ enum s7d_codec_engine {
 	S7D_CODEC_ENGINE_HCODEC,
 };
 
+#define S7D_CODEC_ENGINES	(S7D_CODEC_ENGINE_HCODEC + 1)
+
 enum s7d_codec_frame_flags {
 	S7D_CODEC_FRAME_KEY = 1U << 0,
 	S7D_CODEC_FRAME_P = 1U << 1,

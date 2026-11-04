@@ -13,7 +13,12 @@ struct platform_device;
 struct regmap;
 struct s7d_codec_dos;
 
-/* The caller serializes lifetime and pins its module before using a lease. */
+/*
+ * VDEC, the HEVC core and HCODEC are leased on their own: a lease, its
+ * sequences and a fault concern only that engine, so sessions on different
+ * engines run at the same time. Each engine has one holder at a time.
+ * The caller serializes lifetime and pins its module before using a lease.
+ */
 struct s7d_codec_dos *
 s7d_codec_dos_create(struct platform_device *pdev, struct module *owner);
 /* The caller has freed its IRQ and drained all callbacks before destroy. */
@@ -57,10 +62,16 @@ int s7d_codec_dos_start(struct s7d_codec_dos *dos,
 /* A failure retains the lease and pins the owner until an explicit retry. */
 int s7d_codec_dos_release(struct s7d_codec_dos *dos,
 			  enum s7d_codec_engine engine);
-/* An open session of this engine holds the DOS; no other engine can be held. */
+/* An open session holds this engine. */
 bool s7d_codec_dos_leased(struct s7d_codec_dos *dos, enum s7d_codec_engine engine);
-/* An open session of any other engine holds the DOS. */
+/* An open session holds another engine. */
 bool s7d_codec_dos_leased_by_other(struct s7d_codec_dos *dos, enum s7d_codec_engine engine);
+/*
+ * Zero when the engine can take another session, -EBUSY while its holders
+ * use it up, -EIO after a fault or failed release left it unusable.
+ */
+int s7d_codec_dos_engine_state(struct s7d_codec_dos *dos, enum s7d_codec_engine engine);
+/* -EBUSY while any engine is held, prepared or faulted. */
 int s7d_codec_dos_suspend_check(struct s7d_codec_dos *dos);
 
 #endif
