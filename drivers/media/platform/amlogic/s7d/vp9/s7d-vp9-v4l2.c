@@ -109,6 +109,29 @@ static int vp9_metadata(struct vp9_backend *backend)
 	return 0;
 }
 
+/*
+ * A frame whose references the stream has not given: it starts or resumes
+ * (seek) at an inter frame, or a reference went missing. Drop it, and every
+ * frame after it up to the next key or intra-only frame, which are the VP9
+ * resume points. Returns true when that was the last frame of the packet.
+ */
+static bool vp9_drop_frame(struct vp9_backend *backend)
+{
+	lockdep_assert_held(&backend->lock);
+	s7d_vp9_input_bank_resync(backend->bank);
+	backend->next_frame++;
+	return backend->next_frame >= backend->packet.count;
+}
+
+static void vp9_packet_done(struct vp9_backend *backend, u64 token)
+{
+	lockdep_assert_held(&backend->lock);
+	backend->input_pending = false;
+	backend->last_completed = token;
+	memset(&backend->packet, 0, sizeof(backend->packet));
+	backend->next_frame = 0;
+}
+
 static int vp9_notify_sequence(struct vp9_backend *backend, bool *cancelled)
 {
 	int ret;
@@ -181,6 +204,20 @@ static void vp9_work(struct work_struct *work)
 		if (backend->input_pending && !backend->preflight) {
 			token = backend->input.token;
 			ret = vp9_metadata(backend);
+			if (ret == -ENODATA) {
+				if (!vp9_drop_frame(backend)) {
+					mutex_unlock(&backend->lock);
+					continue;
+				}
+				/* Nothing to decode in this packet: return it, no CAPTURE. */
+				if (token == backend->initial_token)
+					backend->initial_complete = true;
+				vp9_packet_done(backend, token);
+				mutex_unlock(&backend->lock);
+				if (vp9_complete_input(backend, token, 0))
+					return;
+				continue;
+			}
 			if (ret)
 				goto failed;
 			backend->preflight = true;
@@ -242,10 +279,7 @@ static void vp9_work(struct work_struct *work)
 				mutex_unlock(&backend->lock);
 				continue;
 			}
-			backend->input_pending = false;
-			backend->last_completed = token;
-			memset(&backend->packet, 0, sizeof(backend->packet));
-			backend->next_frame = 0;
+			vp9_packet_done(backend, token);
 			mutex_unlock(&backend->lock);
 			if (vp9_complete_input(backend, token, 0))
 				return;

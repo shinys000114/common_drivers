@@ -143,6 +143,14 @@ void s7d_vp9_input_bank_destroy(struct s7d_vp9_input_bank *bank)
 		kfree(bank);
 }
 
+void s7d_vp9_input_bank_resync(struct s7d_vp9_input_bank *bank)
+{
+	if (IS_ERR_OR_NULL(bank))
+		return;
+	memset(bank->reference, 0, sizeof(bank->reference));
+	bank->valid = false;
+}
+
 int s7d_vp9_input_prepare(const struct s7d_vp9_input_bank *bank,
 			 const u8 *data, size_t bytes, struct s7d_vp9_input **out)
 {

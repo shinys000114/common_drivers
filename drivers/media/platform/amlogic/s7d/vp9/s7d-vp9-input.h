@@ -38,6 +38,11 @@ u32 s7d_vp9_input_capacity(u32 width, u32 height);
 /* Caller serializes the bank and keeps it alive until all inputs are released. */
 struct s7d_vp9_input_bank *s7d_vp9_input_bank_create(void);
 void s7d_vp9_input_bank_destroy(struct s7d_vp9_input_bank *bank);
+/*
+ * Forget every reference: only a key frame or an intra-only frame decodes
+ * next, the others fail to prepare with -ENODATA.
+ */
+void s7d_vp9_input_bank_resync(struct s7d_vp9_input_bank *bank);
 /* Profile 0/2 single frame; failed prepare changes neither bank nor out. */
 int s7d_vp9_input_prepare(const struct s7d_vp9_input_bank *bank,
 			 const u8 *data, size_t bytes, struct s7d_vp9_input **out);
