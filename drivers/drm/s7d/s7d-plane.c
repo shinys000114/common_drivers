@@ -88,6 +88,16 @@ MODULE_PARM_DESC(yuv_primary,
 		 "With the vendor interface, offer NV12/NV21 on the primary plane (default: false)");
 
 /*
+ * The vendor driver has no cursor plane, and vendor userspace built for the
+ * default OSD order writes zpos 65 plus its plane index to every OSD plane,
+ * which the fixed cursor zpos refuses. Such a profile clears this.
+ */
+static bool vendor_cursor = true;
+module_param(vendor_cursor, bool, 0444);
+MODULE_PARM_DESC(vendor_cursor,
+		 "With the vendor interface, create the cursor plane (default: true)");
+
+/*
  * GFCD decodes only what Mali AFBCD cannot read, XBGR8888 AFBC and AFRC,
  * unless the GFCD primary policy also takes ABGR8888 inside its FHD/148.5 MHz
  * envelope. With no fallback, the GFCD checks reject the first two outside it.
@@ -572,6 +582,11 @@ enum s7d_plane_slot s7d_plane_slot(const struct drm_plane *plane)
 bool s7d_plane_is_primary(const struct drm_plane *plane)
 {
 	return s7d_plane_is_native(plane) && s7d_plane_slot(plane) == S7D_PLANE_PRIMARY;
+}
+
+bool s7d_plane_has_cursor(const struct drm_device *drm)
+{
+	return vendor_cursor || !s7d_vendor_props_active(drm);
 }
 
 void s7d_plane_set_vendor_props(struct drm_plane *plane, const struct s7d_vendor_props *props)

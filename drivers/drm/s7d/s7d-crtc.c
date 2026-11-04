@@ -1660,8 +1660,8 @@ struct drm_crtc *s7d_crtc_create(struct drm_device *drm, struct drm_plane *prima
 	int ret;
 
 	if (!s7d_plane_is_primary(primary) || primary->dev != drm ||
-	    !s7d_plane_is_native(cursor) || cursor->dev != drm ||
-	    s7d_plane_slot(cursor) != S7D_PLANE_CURSOR ||
+	    (cursor && (!s7d_plane_is_native(cursor) || cursor->dev != drm ||
+			s7d_plane_slot(cursor) != S7D_PLANE_CURSOR)) ||
 	    !scanout || !scanout->rdma || !ops || !ops->check || !ops->acquire || !ops->prepare ||
 	    !ops->start || !ops->submit || !ops->stop || !ops->release || !ops->enable_vblank ||
 	    !ops->disable_vblank || !ops->report_error)

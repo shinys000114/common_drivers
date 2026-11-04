@@ -74,6 +74,8 @@ bool s7d_plane_is_native(const struct drm_plane *plane);
 enum s7d_plane_slot s7d_plane_slot(const struct drm_plane *plane);
 bool s7d_plane_is_primary(const struct drm_plane *plane);
 bool s7d_plane_fence_pending(const struct drm_plane_state *state);
+/* Whether the display gets a cursor plane; vendor mode can go without one. */
+bool s7d_plane_has_cursor(const struct drm_device *drm);
 /* Hand the vendor plane properties to their owner; before the device registers. */
 void s7d_plane_set_vendor_props(struct drm_plane *plane, const struct s7d_vendor_props *props);
 

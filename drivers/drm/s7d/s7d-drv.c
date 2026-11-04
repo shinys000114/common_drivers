@@ -387,7 +387,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	struct s7d_vendor_objs objs;
 	struct s7d_vpu_link link;
 	struct s7d_vdin *vdin;
-	struct drm_plane *primary, *cursor, *overlay, *video, *video2;
+	struct drm_plane *primary, *cursor = NULL, *overlay, *video, *video2;
 	struct drm_device *drm;
 	struct s7d_drm *display;
 	u8 major, revision;
@@ -469,7 +469,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	}
 	/*
 	 * Vendor userspace takes OSD and video planes by their order; the vendor
-	 * driver has no cursor, so in vendor mode it comes after them.
+	 * driver has no cursor, so in vendor mode it comes after them, if at all.
 	 */
 	vendor_order = s7d_vendor_props_active(drm);
 	if (!vendor_order) {
@@ -499,7 +499,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 		ret = PTR_ERR(video2);
 		goto fini_vpu;
 	}
-	if (vendor_order) {
+	if (vendor_order && s7d_plane_has_cursor(drm)) {
 		cursor = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
 					  S7D_PLANE_CURSOR, false);
 		if (IS_ERR(cursor)) {
