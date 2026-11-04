@@ -17,6 +17,7 @@
 
 #include "s7d-codec-dos.h"
 #include "s7d-codec-firmware.h"
+#include "s7d-codec-memory.h"
 #include "s7d-hevc-engine.h"
 #include "s7d-v4l2-device.h"
 
@@ -43,6 +44,7 @@ struct s7d_vdec {
 	struct s7d_jpeg_v4l2 *jpeg_video;
 	struct module *tee_owner;
 	bool reserved_memory;
+	bool ledger;
 };
 
 static LIST_HEAD(s7d_vdec_failed);
@@ -122,7 +124,7 @@ put_node:
 	return ret;
 }
 
-static int s7d_vdec_attach_memory(struct device *dev)
+static int s7d_vdec_attach_memory(struct device *dev, size_t *size)
 {
 	struct device_node *pool;
 	struct reserved_mem *rmem;
@@ -145,6 +147,8 @@ static int s7d_vdec_attach_memory(struct device *dev)
 	    rmem->size - 1 > U32_MAX - rmem->base)
 		goto put_pool;
 	ret = of_reserved_mem_device_init_by_idx(dev, dev->of_node, index);
+	if (!ret)
+		*size = rmem->size;
 put_pool:
 	of_node_put(pool);
 	return ret;
@@ -214,6 +218,8 @@ static int s7d_vdec_release(struct s7d_vdec *vdec)
 			return ret;
 		vdec->dos = NULL;
 	}
+	if (vdec->ledger)
+		s7d_codec_ledger_detach(vdec->dev);
 	if (vdec->reserved_memory)
 		of_reserved_mem_device_release(vdec->dev);
 	module_put(vdec->tee_owner);
@@ -271,6 +277,7 @@ static int s7d_vdec_stop(struct s7d_vdec *vdec)
 static int s7d_vdec_probe(struct platform_device *pdev)
 {
 	struct s7d_vdec *vdec;
+	size_t pool;
 	int ret, cleanup;
 
 	if (s7d_vdec_probe_blocked(&pdev->dev))
@@ -288,10 +295,15 @@ static int s7d_vdec_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(vdec->dev, DMA_BIT_MASK(32));
 	if (ret)
 		goto fail;
-	ret = s7d_vdec_attach_memory(vdec->dev);
+	ret = s7d_vdec_attach_memory(vdec->dev, &pool);
 	if (ret)
 		goto fail;
 	vdec->reserved_memory = true;
+	/* Every engine allocates from this pool; admit sessions against it. */
+	ret = s7d_codec_ledger_attach(vdec->dev, pool);
+	if (ret)
+		goto fail;
+	vdec->ledger = true;
 	vdec->dos = s7d_codec_dos_create(pdev, THIS_MODULE);
 	if (IS_ERR(vdec->dos)) {
 		ret = PTR_ERR(vdec->dos);

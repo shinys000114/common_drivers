@@ -20,6 +20,7 @@
 #include <media/videobuf2-vmalloc.h>
 
 #include "s7d-codec-dos.h"
+#include "s7d-codec-memory.h"
 #include "s7d-codec-session.h"
 #include "s7d-jpeg-backend.h"
 #include "s7d-jpeg-v4l2.h"
@@ -45,6 +46,8 @@ struct s7d_jpeg_client {
 	u32 capture_sequence;
 	u32 quality;
 	int error;
+	/* The codec pool admitted for this client, under the device lock. */
+	struct s7d_codec_reservation pool;
 	bool output_streaming;
 	bool capture_streaming;
 	bool closing;
@@ -210,6 +213,22 @@ static int jpeg_taken(struct s7d_jpeg_client *ctx)
 	return ret == -EBUSY && ctx->session ? 0 : ret;
 }
 
+/*
+ * Admit the frame copies an encode takes in the codec pool every engine shares,
+ * -EBUSY when it cannot hold them beside the other clients. A raw format
+ * replaces the reservation; with @grow (buffers) a larger one is kept.
+ */
+static int jpeg_admit(struct s7d_jpeg_client *ctx,
+		      const struct v4l2_pix_format_mplane *output, bool grow)
+{
+	size_t bytes = s7d_jpeg_encoder_pool_bytes(output->width, output->height);
+
+	if (grow)
+		bytes = max(bytes, ctx->pool.bytes);
+	return s7d_codec_ledger_reserve(ctx->device->dev, &ctx->pool,
+					S7D_CODEC_ENGINE_HCODEC, bytes);
+}
+
 static int jpeg_set_format(struct file *file, void *priv, struct v4l2_format *format)
 {
 	struct s7d_jpeg_client *ctx = jpeg_client(priv);
@@ -227,6 +246,9 @@ static int jpeg_set_format(struct file *file, void *priv, struct v4l2_format *fo
 	if (ret)
 		return ret;
 	if (jpeg_output(format->type)) {
+		ret = jpeg_admit(ctx, &format->fmt.pix_mp, false);
+		if (ret)
+			return ret;
 		ctx->output = format->fmt.pix_mp;
 		jpeg_coded_format(ctx, &ctx->capture);
 	} else {
@@ -251,14 +273,22 @@ static int jpeg_get_format(struct file *file, void *priv, struct v4l2_format *fo
 static int jpeg_reqbufs(struct file *file, void *priv,
 			struct v4l2_requestbuffers *request)
 {
+	struct s7d_jpeg_client *ctx = jpeg_client(priv);
+	struct s7d_codec_reservation saved = ctx->pool;
+	bool admit = jpeg_output(request->type) && request->count;
 	int ret;
 
-	if (jpeg_output(request->type) && request->count) {
-		ret = jpeg_taken(jpeg_client(priv));
+	if (admit) {
+		ret = jpeg_taken(ctx);
+		if (!ret)
+			ret = jpeg_admit(ctx, &ctx->output, true);
 		if (ret)
 			return ret;
 	}
-	return v4l2_m2m_ioctl_reqbufs(file, priv, request);
+	ret = v4l2_m2m_ioctl_reqbufs(file, priv, request);
+	if (ret && admit)
+		s7d_codec_ledger_set(ctx->device->dev, &ctx->pool, &saved);
+	return ret;
 }
 
 static void jpeg_eos(struct s7d_jpeg_client *ctx)
@@ -706,9 +736,11 @@ static int jpeg_release(struct file *file)
 	v4l2_ctrl_handler_free(&ctx->controls);
 	file->private_data = NULL;
 	if (ret) {
+		/* Its frame copies may be retained with it. */
 		ctx->fh.m2m_ctx = NULL;
 		list_move_tail(&ctx->node, &device->quarantine);
 	} else {
+		s7d_codec_ledger_drop(device->dev, &ctx->pool);
 		list_del(&ctx->node);
 		kfree(ctx);
 	}

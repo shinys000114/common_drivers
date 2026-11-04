@@ -36,6 +36,8 @@ s7d_jpeg_encoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 			struct module *owner);
 struct s7d_codec_core *s7d_jpeg_encoder_core(struct s7d_jpeg_encoder *encoder);
 struct s7d_codec_dos *s7d_jpeg_encoder_dos(struct s7d_jpeg_encoder *encoder);
+/* Codec pool bytes encoding one @width x @height frame takes; zero if invalid. */
+size_t s7d_jpeg_encoder_pool_bytes(u32 width, u32 height);
 
 /*
  * Synchronous worker call; session is OPEN HCODEC on encoder_core. Initial

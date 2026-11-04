@@ -83,6 +83,7 @@ struct s7d_codec_surface {
 
 struct s7d_codec_dma {
 	struct list_head node;
+	struct s7d_codec_ledger *ledger;
 	void *cpu;
 	dma_addr_t dma;
 	size_t bytes;
@@ -134,6 +135,7 @@ static void s7d_session_release(struct kref *ref)
 	list_for_each_entry_safe(mem, mem_next, &session->allocations, node) {
 		list_del(&mem->node);
 		dma_free_coherent(core->dev, mem->bytes, mem->cpu, mem->dma);
+		s7d_codec_ledger_uncharge(mem->ledger, mem->bytes);
 		kfree(mem);
 	}
 	core->ops.release(core->priv, session->engine);
@@ -367,6 +369,7 @@ s7d_codec_dma_alloc(struct s7d_codec_session *session, size_t bytes)
 		goto free;
 	}
 	mem->bytes = bytes;
+	mem->ledger = s7d_codec_ledger_charge(core->dev, bytes);
 	list_add_tail(&mem->node, &session->allocations);
 	mutex_unlock(&core->lock);
 	return mem;

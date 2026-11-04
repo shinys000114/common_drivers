@@ -6,11 +6,48 @@
 
 #include <linux/types.h>
 
+#include "s7d-codec-types.h"
+
 struct device;
 struct dma_buf;
 struct page;
 struct s7d_codec_dma_copy_plane;
+struct s7d_codec_ledger;
 struct vb2_mem_ops;
+
+/*
+ * Every engine allocates from one codec CMA pool. A client reserves what its
+ * session may take when it sets its coded format; it is admitted only while
+ * the pool holds that beside the other clients' reservations, or beside what
+ * the device holds now when that is more. Fragmentation can still fail an
+ * admitted allocation, so a late -ENOMEM stays possible.
+ */
+struct s7d_codec_reservation {
+	enum s7d_codec_engine engine;
+	size_t bytes;
+};
+
+/* The platform owner names its pool once, before any client exists. */
+int s7d_codec_ledger_attach(struct device *dev, size_t pool_bytes);
+void s7d_codec_ledger_detach(struct device *dev);
+/*
+ * Replace @reservation with @bytes on @engine. Growing it is refused with
+ * -EBUSY when the pool cannot hold it; shrinking or keeping it never is.
+ * The caller serializes changes to one reservation.
+ */
+int s7d_codec_ledger_reserve(struct device *dev, struct s7d_codec_reservation *reservation,
+			     enum s7d_codec_engine engine, size_t bytes);
+/*
+ * Set @reservation without admission: to put back one saved before a failed
+ * change, to drop one (zero bytes), or to count an allocation already made.
+ */
+void s7d_codec_ledger_set(struct device *dev, struct s7d_codec_reservation *reservation,
+			  const struct s7d_codec_reservation *value);
+/* The client is gone or changes codec. */
+void s7d_codec_ledger_drop(struct device *dev, struct s7d_codec_reservation *reservation);
+/* Count an allocation of @bytes from @dev's pool; returns what to uncharge. */
+struct s7d_codec_ledger *s7d_codec_ledger_charge(struct device *dev, size_t bytes);
+void s7d_codec_ledger_uncharge(struct s7d_codec_ledger *ledger, size_t bytes);
 
 /*
  * Ordinary system pages below 4 GiB, mapped for the device, that only the

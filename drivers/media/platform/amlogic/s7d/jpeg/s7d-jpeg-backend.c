@@ -78,10 +78,28 @@ static int jpeg_check_stop(struct s7d_jpeg_encoder *encoder)
 		-ECANCELED : 0;
 }
 
+/* The input copy and scan buffer of a @width x @height frame. */
+static int jpeg_frame_bytes(u32 width, u32 height, u32 *input_bytes, u32 *scan_capacity)
+{
+	u32 y_bytes, bytes, mcus;
+
+	if (check_mul_overflow(ALIGN(width, 32), height, &y_bytes) ||
+	    check_add_overflow(y_bytes, y_bytes / 2, &bytes))
+		return -EOVERFLOW;
+	*input_bytes = bytes;
+	/* Six baseline blocks/MCU, each bounded by 1665 bits plus FF stuffing. */
+	mcus = DIV_ROUND_UP(width, 16) * DIV_ROUND_UP(height, 16);
+	if (check_mul_overflow(mcus, 6U * 420U, &bytes) ||
+	    check_add_overflow(bytes, 2U + PAGE_SIZE - 1, &bytes))
+		return -EOVERFLOW;
+	*scan_capacity = bytes & PAGE_MASK;
+	return 0;
+}
+
 static int jpeg_source_check(const struct s7d_jpeg_source *source,
 			     u32 *input_bytes, u32 *scan_capacity)
 {
-	u32 y_bytes, bytes, mcus;
+	int ret;
 
 	if (!source || !source->data || !input_bytes || !scan_capacity)
 		return -EINVAL;
@@ -93,19 +111,19 @@ static int jpeg_source_check(const struct s7d_jpeg_source *source,
 		return -ERANGE;
 	if (source->stride != ALIGN(source->width, 32))
 		return -EINVAL;
-	if (check_mul_overflow(source->stride, source->height, &y_bytes) ||
-	    check_add_overflow(y_bytes, y_bytes / 2, &bytes))
-		return -EOVERFLOW;
-	if (source->bytes < bytes)
-		return -ENOSPC;
-	*input_bytes = bytes;
-	/* Six baseline blocks/MCU, each bounded by 1665 bits plus FF stuffing. */
-	mcus = DIV_ROUND_UP(source->width, 16) * DIV_ROUND_UP(source->height, 16);
-	if (check_mul_overflow(mcus, 6U * 420U, &bytes) ||
-	    check_add_overflow(bytes, 2U + PAGE_SIZE - 1, &bytes))
-		return -EOVERFLOW;
-	*scan_capacity = bytes & PAGE_MASK;
-	return 0;
+	ret = jpeg_frame_bytes(source->width, source->height, input_bytes, scan_capacity);
+	if (ret)
+		return ret;
+	return source->bytes < *input_bytes ? -ENOSPC : 0;
+}
+
+size_t s7d_jpeg_encoder_pool_bytes(u32 width, u32 height)
+{
+	u32 input, scan;
+
+	if (jpeg_frame_bytes(width, height, &input, &scan))
+		return 0;
+	return PAGE_ALIGN(input) + scan;
 }
 
 static void jpeg_free_job(struct s7d_jpeg_encoder *encoder,

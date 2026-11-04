@@ -9,6 +9,9 @@
 #include <linux/err.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
+#include <linux/list.h>
+#include <linux/minmax.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/refcount.h>
@@ -16,6 +19,7 @@
 #include <linux/sched.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-memops.h>
 
@@ -24,6 +28,7 @@
 
 struct s7d_codec_memory {
 	struct device *dev;
+	struct s7d_codec_ledger *ledger;
 	void *cpu;
 	struct page *page;
 	dma_addr_t dma;
@@ -43,6 +48,7 @@ static void s7d_memory_put(void *priv)
 		return;
 	dma_resv_fini(&mem->resv);
 	dma_free_coherent(mem->dev, mem->bytes, mem->cpu, mem->dma);
+	s7d_codec_ledger_uncharge(mem->ledger, mem->bytes);
 	put_device(mem->dev);
 	kfree(mem);
 	module_put(THIS_MODULE);
@@ -88,6 +94,8 @@ static void *s7d_memory_alloc(struct vb2_buffer *vb, struct device *dev,
 	mem->handler.refcount = &mem->refs;
 	mem->handler.put = s7d_memory_put;
 	mem->handler.arg = mem;
+	/* Exported frames stay counted until the last importer drops them. */
+	mem->ledger = s7d_codec_ledger_charge(dev, bytes);
 	return mem;
 
 free_dma:
@@ -556,4 +564,188 @@ void s7d_codec_pages_destroy(struct s7d_codec_pages *set)
 	kvfree(set->page);
 	kvfree(set->dma);
 	memset(set, 0, sizeof(*set));
+}
+
+/* Room kept free in the pool for fragmentation. */
+#define S7D_CODEC_POOL_SLACK	SZ_16M
+
+struct s7d_codec_ledger {
+	struct list_head node;
+	struct kref ref;
+	/* A key only: the ledger may outlive the device's binding. */
+	struct device *dev;
+	spinlock_t lock;
+	size_t limit;
+	size_t used;
+	size_t reserved[S7D_CODEC_ENGINES];
+};
+
+static LIST_HEAD(s7d_codec_ledgers);
+static DEFINE_SPINLOCK(s7d_codec_ledgers_lock);
+
+static void ledger_free(struct kref *ref)
+{
+	kfree(container_of(ref, struct s7d_codec_ledger, ref));
+}
+
+static void ledger_put(struct s7d_codec_ledger *ledger)
+{
+	if (ledger)
+		kref_put(&ledger->ref, ledger_free);
+}
+
+static struct s7d_codec_ledger *ledger_get(struct device *dev)
+{
+	struct s7d_codec_ledger *ledger;
+
+	spin_lock(&s7d_codec_ledgers_lock);
+	list_for_each_entry(ledger, &s7d_codec_ledgers, node) {
+		if (ledger->dev == dev) {
+			kref_get(&ledger->ref);
+			spin_unlock(&s7d_codec_ledgers_lock);
+			return ledger;
+		}
+	}
+	spin_unlock(&s7d_codec_ledgers_lock);
+	return NULL;
+}
+
+int s7d_codec_ledger_attach(struct device *dev, size_t pool_bytes)
+{
+	struct s7d_codec_ledger *ledger, *other;
+
+	if (!dev || !pool_bytes)
+		return -EINVAL;
+	ledger = kzalloc(sizeof(*ledger), GFP_KERNEL);
+	if (!ledger)
+		return -ENOMEM;
+	kref_init(&ledger->ref);
+	spin_lock_init(&ledger->lock);
+	ledger->dev = dev;
+	ledger->limit = pool_bytes > S7D_CODEC_POOL_SLACK ?
+			pool_bytes - S7D_CODEC_POOL_SLACK : 0;
+	spin_lock(&s7d_codec_ledgers_lock);
+	list_for_each_entry(other, &s7d_codec_ledgers, node) {
+		if (other->dev == dev) {
+			spin_unlock(&s7d_codec_ledgers_lock);
+			kfree(ledger);
+			return -EBUSY;
+		}
+	}
+	list_add_tail(&ledger->node, &s7d_codec_ledgers);
+	spin_unlock(&s7d_codec_ledgers_lock);
+	return 0;
+}
+
+void s7d_codec_ledger_detach(struct device *dev)
+{
+	struct s7d_codec_ledger *ledger, *found = NULL;
+
+	spin_lock(&s7d_codec_ledgers_lock);
+	list_for_each_entry(ledger, &s7d_codec_ledgers, node) {
+		if (ledger->dev == dev) {
+			list_del(&ledger->node);
+			found = ledger;
+			break;
+		}
+	}
+	spin_unlock(&s7d_codec_ledgers_lock);
+	ledger_put(found);
+}
+
+/* The ledger lock is held. */
+static void ledger_move(struct s7d_codec_ledger *ledger,
+			struct s7d_codec_reservation *reservation,
+			const struct s7d_codec_reservation *value)
+{
+	ledger->reserved[reservation->engine] -= reservation->bytes;
+	ledger->reserved[value->engine] += value->bytes;
+	*reservation = *value;
+}
+
+int s7d_codec_ledger_reserve(struct device *dev, struct s7d_codec_reservation *reservation,
+			     enum s7d_codec_engine engine, size_t bytes)
+{
+	const struct s7d_codec_reservation value = { .engine = engine, .bytes = bytes };
+	size_t reserved[S7D_CODEC_ENGINES], others = 0, held, used, limit;
+	struct s7d_codec_ledger *ledger;
+	unsigned int i;
+	int ret = 0;
+
+	if (!reservation || engine >= S7D_CODEC_ENGINES)
+		return -EINVAL;
+	ledger = ledger_get(dev);
+	if (!ledger) {
+		*reservation = value;
+		return 0;
+	}
+	spin_lock(&ledger->lock);
+	for (i = 0; i < S7D_CODEC_ENGINES; i++)
+		others += ledger->reserved[i];
+	others -= reservation->bytes;
+	/* Frames that outlived their client, or a client past its estimate. */
+	held = ledger->used - min(ledger->used, reservation->bytes);
+	others = max(others, held);
+	limit = ledger->limit;
+	if (bytes > reservation->bytes && (bytes > limit || others > limit - bytes))
+		ret = -EBUSY;
+	else
+		ledger_move(ledger, reservation, &value);
+	for (i = 0; i < S7D_CODEC_ENGINES; i++)
+		reserved[i] = ledger->reserved[i];
+	used = ledger->used;
+	spin_unlock(&ledger->lock);
+	ledger_put(ledger);
+	dev_dbg(dev,
+		"codec pool: engine %u %s %zu KiB beside %zu KiB; reserved %zu/%zu/%zu KiB, held %zu of %zu KiB\n",
+		engine, ret ? "refused" : "reserved", bytes >> 10, others >> 10,
+		reserved[0] >> 10, reserved[1] >> 10, reserved[2] >> 10, used >> 10, limit >> 10);
+	return ret;
+}
+
+void s7d_codec_ledger_set(struct device *dev, struct s7d_codec_reservation *reservation,
+			  const struct s7d_codec_reservation *value)
+{
+	struct s7d_codec_ledger *ledger;
+
+	if (!reservation || !value || value->engine >= S7D_CODEC_ENGINES)
+		return;
+	ledger = ledger_get(dev);
+	if (!ledger) {
+		*reservation = *value;
+		return;
+	}
+	spin_lock(&ledger->lock);
+	ledger_move(ledger, reservation, value);
+	spin_unlock(&ledger->lock);
+	ledger_put(ledger);
+}
+
+void s7d_codec_ledger_drop(struct device *dev, struct s7d_codec_reservation *reservation)
+{
+	static const struct s7d_codec_reservation none;
+
+	s7d_codec_ledger_set(dev, reservation, &none);
+}
+
+struct s7d_codec_ledger *s7d_codec_ledger_charge(struct device *dev, size_t bytes)
+{
+	struct s7d_codec_ledger *ledger = ledger_get(dev);
+
+	if (ledger) {
+		spin_lock(&ledger->lock);
+		ledger->used += bytes;
+		spin_unlock(&ledger->lock);
+	}
+	return ledger;
+}
+
+void s7d_codec_ledger_uncharge(struct s7d_codec_ledger *ledger, size_t bytes)
+{
+	if (!ledger)
+		return;
+	spin_lock(&ledger->lock);
+	ledger->used -= min(ledger->used, bytes);
+	spin_unlock(&ledger->lock);
+	ledger_put(ledger);
 }

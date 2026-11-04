@@ -24,6 +24,12 @@
 #define S7D_OUTPUT_MIN_SIZE SZ_64K
 #define S7D_OUTPUT_DEFAULT_SIZE SZ_2M
 #define S7D_OUTPUT_MAX_SIZE SZ_16M
+/*
+ * CAPTURE frames a session takes from the codec pool as players allocate
+ * them: the DPB, the frames in flight and the client's own.
+ */
+#define S7D_POOL_FRAMES 10
+#define S7D_POOL_WORKSPACE SZ_4M
 
 /* How the client lays out each CAPTURE buffer; kept across source changes. */
 enum s7d_capture_mode {
@@ -78,6 +84,8 @@ struct s7d_v4l2_context {
 	struct v4l2_pix_format_mplane output;
 	struct v4l2_pix_format_mplane capture;
 	enum s7d_capture_mode capture_mode;
+	/* The codec pool admitted for this client; the queue lock serializes it. */
+	struct s7d_codec_reservation pool;
 	struct s7d_v4l2_buffer *surface[S7D_CODEC_MAX_CAPTURE_BUFFERS];
 	struct s7d_v4l2_buffer *active_input;
 	enum s7d_v4l2_state state;
@@ -365,6 +373,79 @@ static int s7d_placeholder(const struct s7d_v4l2_codec *codec,
 	width = clamp_t(u32, width, 64, codec->max_width);
 	height = clamp_t(u32, height, 64, codec->max_height);
 	return codec->default_layout(width, height, fourcc, layout);
+}
+
+/*
+ * Codec pool bytes a session of @codec decoding @output may take: @capture,
+ * or before CAPTURE is allocated S7D_POOL_FRAMES NV12 frames (the client picks
+ * FBC only later), one frame more for the motion vector and FBC header
+ * buffers, the bitstream staging and the workspaces.
+ */
+static size_t s7d_pool_bytes(const struct s7d_v4l2_codec *codec, u32 width, u32 height,
+			     const struct v4l2_pix_format_mplane *output, size_t capture)
+{
+	struct s7d_codec_layout layout;
+	size_t frame;
+
+	width = clamp_t(u32, width, 64, codec->max_width);
+	height = clamp_t(u32, height, 64, codec->max_height);
+	if (s7d_placeholder(codec, width, height, V4L2_PIX_FMT_NV12M, &layout))
+		frame = (size_t)ALIGN(width, S7D_CODEC_STORAGE_ALIGNMENT) *
+			ALIGN(height, S7D_CODEC_STORAGE_ALIGNMENT) * 3 / 2;
+	else
+		frame = layout.total_size;
+	if (!capture)
+		capture = S7D_POOL_FRAMES * frame;
+	return capture + frame + output->plane_fmt[0].sizeimage + codec->staging_headroom +
+	       S7D_POOL_WORKSPACE;
+}
+
+/*
+ * Admit the session this context sets up in the codec pool, -EBUSY when the
+ * pool cannot hold it beside the other clients, so players fall back to
+ * software before any frame. A new coded format replaces the reservation;
+ * with @grow (bitstream buffers) a larger one of the same engine is kept.
+ */
+static int s7d_pool_admit(struct s7d_v4l2_context *ctx,
+			  const struct v4l2_pix_format_mplane *output,
+			  u32 width, u32 height, bool grow)
+{
+	size_t bytes = s7d_pool_bytes(&ctx->codec, width, height, output, 0);
+
+	lockdep_assert_held(&ctx->queue_lock);
+	if (grow && ctx->pool.engine == ctx->codec.engine)
+		bytes = max(bytes, ctx->pool.bytes);
+	return s7d_codec_ledger_reserve(ctx->dev, &ctx->pool, ctx->codec.engine, bytes);
+}
+
+/* Once CAPTURE is allocated, its real size raises the estimate. */
+static void s7d_pool_account(struct s7d_v4l2_context *ctx)
+{
+	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	struct s7d_codec_reservation value = { .engine = ctx->codec.engine };
+	struct v4l2_pix_format_mplane output;
+	struct vb2_buffer *vb;
+	unsigned long flags;
+	size_t capture = 0;
+	unsigned int i, plane;
+
+	lockdep_assert_held(&ctx->queue_lock);
+	for (i = 0; i < q->max_num_buffers; i++) {
+		vb = vb2_get_buffer(q, i);
+		if (!vb)
+			continue;
+		for (plane = 0; plane < vb->num_planes; plane++)
+			capture += vb->planes[plane].length;
+	}
+	if (!capture)
+		return;
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	output = ctx->output;
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	value.bytes = s7d_pool_bytes(&ctx->codec, output.width, output.height, &output, capture);
+	if (ctx->pool.engine == value.engine)
+		value.bytes = max(value.bytes, ctx->pool.bytes);
+	s7d_codec_ledger_set(ctx->dev, &ctx->pool, &value);
 }
 
 int s7d_v4l2_validate_capture_pool(const struct s7d_codec_layout *layout,
@@ -670,13 +751,20 @@ enum s7d_codec_engine s7d_v4l2_engine(struct s7d_v4l2_context *ctx)
 
 int s7d_v4l2_set_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format)
 {
+	struct s7d_codec_reservation saved;
 	struct s7d_codec_layout placeholder;
 	struct vb2_queue *queue;
 	unsigned long flags;
+	u32 width = format->fmt.pix_mp.width, height = format->fmt.pix_mp.height;
 	int ret;
 
 	if (!s7d_output(format->type) && !s7d_capture(format->type))
 		return -EINVAL;
+	/* A client that does not know the coded size yet: plan for 1080p. */
+	if (!width || !height) {
+		width = 1920;
+		height = 1088;
+	}
 	mutex_lock(&ctx->queue_lock);
 	queue = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, format->type);
 	if (vb2_is_busy(queue) || (s7d_output(format->type) &&
@@ -702,9 +790,15 @@ int s7d_v4l2_set_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format
 	if (ret)
 		goto unlock;
 	if (s7d_output(format->type)) {
-		ret = s7d_clear_stream_locked(ctx);
+		saved = ctx->pool;
+		ret = s7d_pool_admit(ctx, &format->fmt.pix_mp, width, height, false);
 		if (ret)
 			goto unlock;
+		ret = s7d_clear_stream_locked(ctx);
+		if (ret) {
+			s7d_codec_ledger_set(ctx->dev, &ctx->pool, &saved);
+			goto unlock;
+		}
 	}
 	spin_lock_irqsave(&ctx->state_lock, flags);
 	if (s7d_output(format->type)) {
@@ -1090,19 +1184,35 @@ static int s7d_clear_stream_locked(struct s7d_v4l2_context *ctx)
 int s7d_v4l2_reqbufs(struct s7d_v4l2_context *ctx, struct file *file,
 		     struct v4l2_requestbuffers *request)
 {
+	struct s7d_codec_reservation saved = ctx->pool;
+	struct v4l2_pix_format_mplane output;
 	unsigned long flags;
-	bool clear;
+	bool clear, admit;
 	int ret;
 
 	lockdep_assert_held(&ctx->queue_lock);
 	if (!s7d_output(request->type) && !s7d_capture(request->type))
 		return -EINVAL;
 	clear = s7d_output(request->type) && !request->count;
+	admit = s7d_output(request->type) && request->count;
+	if (admit) {
+		spin_lock_irqsave(&ctx->state_lock, flags);
+		output = ctx->output;
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		ret = s7d_pool_admit(ctx, &output, output.width, output.height, true);
+		if (ret)
+			return ret;
+	}
 	ret = v4l2_m2m_reqbufs(file, ctx->fh.m2m_ctx, request);
-	if (ret)
+	if (ret) {
+		if (admit)
+			s7d_codec_ledger_set(ctx->dev, &ctx->pool, &saved);
 		return ret;
+	}
 	if (clear)
 		return s7d_clear_stream_locked(ctx);
+	if (s7d_capture(request->type) && request->count)
+		s7d_pool_account(ctx);
 	if (s7d_capture(request->type) && !request->count) {
 		spin_lock_irqsave(&ctx->state_lock, flags);
 		ctx->capture_layout_retained = false;
@@ -2820,6 +2930,8 @@ int s7d_v4l2_context_rebind(struct s7d_v4l2_context *ctx, struct s7d_codec_core 
 	ctx->codec = *codec;
 	ctx->ops = *ops;
 	ctx->backend = backend;
+	/* The coded format the next S_FMT sets admits the new codec. */
+	s7d_codec_ledger_drop(ctx->dev, &ctx->pool);
 	s7d_v4l2_codec_try_output(codec, &ctx->output);
 	ctx->layout = layout;
 	ctx->sequence_valid = false;
@@ -2857,6 +2969,7 @@ int s7d_v4l2_context_destroy(struct s7d_v4l2_context *ctx)
 	v4l2_fh_del(&ctx->fh);
 	v4l2_fh_exit(&ctx->fh);
 	v4l2_ctrl_handler_free(&ctx->controls);
+	s7d_codec_ledger_drop(ctx->dev, &ctx->pool);
 	put_device(ctx->dev);
 	kfree(ctx);
 	return ret;
