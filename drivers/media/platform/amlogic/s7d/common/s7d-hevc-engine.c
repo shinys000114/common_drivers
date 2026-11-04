@@ -14,19 +14,32 @@
 #include "s7d-codec-session.h"
 #include "s7d-hevc-engine.h"
 
+/*
+ * Sessions of the HEVC core that may be bound at once: each HEVC, VP9 or AV1
+ * session binds once, and they take turns on the core.
+ */
+#define S7D_HEVC_ENGINE_BINDINGS	4
+
+struct engine_binding {
+	struct s7d_hevc_irq_cookie cookie;
+	struct s7d_hevc_irq_ops ops;
+	void *priv;
+	u64 last_token;
+	/* Its job left the core in an unknown state: it stays bound. */
+	bool quarantined;
+};
+
 struct s7d_hevc_engine {
 	struct device *dev;
 	struct module *owner;
 	struct mutex control; /* Binding and Linux IRQ lifetime. */
 	spinlock_t lock; /* Cookies and callback visibility to IRQ handlers. */
-	struct s7d_hevc_irq_ops ops;
-	void *priv;
-	struct s7d_hevc_irq_cookie active;
+	struct engine_binding binding[S7D_HEVC_ENGINE_BINDINGS];
+	/* The binding whose job runs on the core: the one the IRQ goes to. */
+	struct engine_binding *armed;
 	struct s7d_hevc_irq_cookie pending;
 	u64 serial;
-	u64 last_token;
 	int irq;
-	bool armed;
 	bool enabled;
 	bool pending_valid;
 	bool joined;
@@ -39,6 +52,28 @@ static bool same_job(const struct s7d_hevc_irq_cookie *a,
 {
 	return a->session == b->session && a->binding == b->binding &&
 		a->lease_epoch == b->lease_epoch && a->input_token == b->input_token;
+}
+
+static struct engine_binding *engine_find(struct s7d_hevc_engine *engine, u64 binding)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&engine->control);
+	for (i = 0; i < ARRAY_SIZE(engine->binding); i++)
+		if (binding && engine->binding[i].cookie.binding == binding)
+			return &engine->binding[i];
+	return NULL;
+}
+
+static bool engine_bound(struct s7d_hevc_engine *engine)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&engine->control);
+	for (i = 0; i < ARRAY_SIZE(engine->binding); i++)
+		if (engine->binding[i].cookie.binding)
+			return true;
+	return false;
 }
 
 static irqreturn_t engine_irq(int irq, void *data)
@@ -55,15 +90,15 @@ static irqreturn_t engine_irq(int irq, void *data)
 		spin_unlock_irqrestore(&engine->lock, flags);
 		return IRQ_HANDLED;
 	}
-	cookie = engine->active;
-	ops = engine->ops;
-	priv = engine->priv;
+	cookie = engine->armed->cookie;
+	ops = engine->armed->ops;
+	priv = engine->armed->priv;
 	spin_unlock_irqrestore(&engine->lock, flags);
 	ret = ops.irq(priv, &cookie);
 	if (ret != IRQ_WAKE_THREAD)
 		return ret;
 	spin_lock_irqsave(&engine->lock, flags);
-	if (engine->armed && !engine->faulted && same_job(&cookie, &engine->active)) {
+	if (engine->armed && !engine->faulted && same_job(&cookie, &engine->armed->cookie)) {
 		engine->pending = cookie;
 		engine->pending_valid = true;
 	} else {
@@ -83,13 +118,13 @@ static irqreturn_t engine_irq_thread(int irq, void *data)
 
 	spin_lock_irqsave(&engine->lock, flags);
 	if (!engine->armed || engine->faulted || !engine->pending_valid ||
-	    !same_job(&engine->pending, &engine->active)) {
+	    !same_job(&engine->pending, &engine->armed->cookie)) {
 		spin_unlock_irqrestore(&engine->lock, flags);
 		return IRQ_HANDLED;
 	}
 	cookie = engine->pending;
-	ops = engine->ops;
-	priv = engine->priv;
+	ops = engine->armed->ops;
+	priv = engine->armed->priv;
 	engine->pending_valid = false;
 	spin_unlock_irqrestore(&engine->lock, flags);
 	return ops.thread(priv, &cookie);
@@ -136,7 +171,9 @@ int s7d_hevc_engine_bind(struct s7d_hevc_engine *engine,
 			struct s7d_codec_session *session, u64 lease_epoch,
 			const struct s7d_hevc_irq_ops *ops, void *priv, u64 *binding)
 {
+	struct engine_binding *entry = NULL;
 	unsigned long flags;
+	unsigned int i;
 	int ret = 0;
 
 	if (!binding)
@@ -150,7 +187,10 @@ int s7d_hevc_engine_bind(struct s7d_hevc_engine *engine,
 		ret = -ESHUTDOWN;
 		goto out;
 	}
-	if (engine->active.binding) {
+	for (i = 0; i < ARRAY_SIZE(engine->binding) && !entry; i++)
+		if (!engine->binding[i].cookie.binding)
+			entry = &engine->binding[i];
+	if (!entry) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -164,14 +204,14 @@ int s7d_hevc_engine_bind(struct s7d_hevc_engine *engine,
 	}
 	s7d_codec_session_get(session);
 	spin_lock_irqsave(&engine->lock, flags);
-	engine->ops = *ops;
-	engine->priv = priv;
-	engine->active = (struct s7d_hevc_irq_cookie) {
+	entry->ops = *ops;
+	entry->priv = priv;
+	entry->cookie = (struct s7d_hevc_irq_cookie) {
 		.session = session, .binding = ++engine->serial,
 		.lease_epoch = lease_epoch,
 	};
-	engine->last_token = 0;
-	*binding = engine->active.binding;
+	entry->last_token = 0;
+	*binding = entry->cookie.binding;
 	spin_unlock_irqrestore(&engine->lock, flags);
 out:
 	mutex_unlock(&engine->control);
@@ -180,25 +220,28 @@ out:
 
 int s7d_hevc_engine_arm(struct s7d_hevc_engine *engine, u64 binding, u64 token)
 {
+	struct engine_binding *entry;
 	unsigned long flags;
 	int ret = 0;
 
 	if (!engine || !binding || !token)
 		return -EINVAL;
 	mutex_lock(&engine->control);
+	entry = engine_find(engine, binding);
 	if (engine->closing || engine->faulted)
 		ret = -ESHUTDOWN;
-	else if (engine->active.binding != binding || token <= engine->last_token)
+	else if (!entry || token <= entry->last_token)
 		ret = -ESTALE;
+	/* One job runs on the core at a time: the run token sees to that. */
 	else if (engine->armed || engine->enabled || !engine->joined)
 		ret = -EBUSY;
 	if (ret)
 		goto out;
 	spin_lock_irqsave(&engine->lock, flags);
-	engine->active.input_token = token;
-	engine->last_token = token;
+	entry->cookie.input_token = token;
+	entry->last_token = token;
 	engine->pending_valid = false;
-	engine->armed = true;
+	engine->armed = entry;
 	engine->enabled = true;
 	engine->joined = false;
 	spin_unlock_irqrestore(&engine->lock, flags);
@@ -214,7 +257,7 @@ static void engine_disarm_locked(struct s7d_hevc_engine *engine)
 	bool disable;
 
 	spin_lock_irqsave(&engine->lock, flags);
-	engine->armed = false;
+	engine->armed = NULL;
 	engine->pending_valid = false;
 	disable = engine->enabled;
 	engine->enabled = false;
@@ -229,14 +272,17 @@ static void engine_disarm_locked(struct s7d_hevc_engine *engine)
 
 int s7d_hevc_engine_disarm(struct s7d_hevc_engine *engine, u64 binding)
 {
+	struct engine_binding *entry;
 	int ret = 0;
 
 	if (!engine || !binding)
 		return -EINVAL;
 	mutex_lock(&engine->control);
-	if (engine->active.binding != binding)
+	entry = engine_find(engine, binding);
+	if (!entry)
 		ret = -ESTALE;
-	else
+	/* Another binding's job may run now; this one has no callback left. */
+	else if (engine->armed == entry)
 		engine_disarm_locked(engine);
 	mutex_unlock(&engine->control);
 	return ret;
@@ -244,18 +290,22 @@ int s7d_hevc_engine_disarm(struct s7d_hevc_engine *engine, u64 binding)
 
 int s7d_hevc_engine_quarantine(struct s7d_hevc_engine *engine, u64 binding)
 {
+	struct engine_binding *entry;
 	unsigned long flags;
 	int ret = 0;
 
 	if (!engine || !binding)
 		return -EINVAL;
 	mutex_lock(&engine->control);
-	if (engine->active.binding != binding) {
+	entry = engine_find(engine, binding);
+	if (!entry) {
 		ret = -ESTALE;
 		goto out;
 	}
+	/* The core's state is unknown: no binding takes its interrupt any more. */
 	engine_disarm_locked(engine);
 	spin_lock_irqsave(&engine->lock, flags);
+	entry->quarantined = true;
 	engine->faulted = true;
 	spin_unlock_irqrestore(&engine->lock, flags);
 out:
@@ -266,6 +316,7 @@ out:
 int s7d_hevc_engine_unbind(struct s7d_hevc_engine *engine, u64 binding)
 {
 	struct s7d_codec_session *session = NULL;
+	struct engine_binding *entry;
 	struct module *owner = NULL;
 	unsigned long flags;
 	int ret = 0;
@@ -273,18 +324,21 @@ int s7d_hevc_engine_unbind(struct s7d_hevc_engine *engine, u64 binding)
 	if (!engine || !binding)
 		return -EINVAL;
 	mutex_lock(&engine->control);
-	if (engine->active.binding != binding)
+	entry = engine_find(engine, binding);
+	if (!entry)
 		ret = -ESTALE;
-	else if (engine->faulted || engine->armed || engine->enabled || !engine->joined)
+	/*
+	 * Only the binding whose job broke the core stays: the others' jobs
+	 * ended disarmed and halted, and the core reads none of their DMA.
+	 */
+	else if (entry->quarantined || engine->armed == entry)
 		ret = -EBUSY;
 	if (ret)
 		goto out;
 	spin_lock_irqsave(&engine->lock, flags);
-	session = engine->active.session;
+	session = entry->cookie.session;
 	owner = engine->owner;
-	engine->active = (struct s7d_hevc_irq_cookie) { 0 };
-	engine->ops = (struct s7d_hevc_irq_ops) { 0 };
-	engine->priv = NULL;
+	*entry = (struct engine_binding) { };
 	spin_unlock_irqrestore(&engine->lock, flags);
 out:
 	mutex_unlock(&engine->control);
@@ -300,7 +354,7 @@ int s7d_hevc_engine_suspend_check(struct s7d_hevc_engine *engine)
 	int ret;
 
 	mutex_lock(&engine->control);
-	ret = engine->active.binding || engine->faulted || engine->closing ? -EBUSY : 0;
+	ret = engine_bound(engine) || engine->faulted || engine->closing ? -EBUSY : 0;
 	mutex_unlock(&engine->control);
 	return ret;
 }
@@ -312,7 +366,7 @@ int s7d_hevc_engine_destroy(struct s7d_hevc_engine *engine)
 	if (!engine)
 		return 0;
 	mutex_lock(&engine->control);
-	if (engine->active.binding || engine->faulted || engine->enabled || !engine->joined) {
+	if (engine_bound(engine) || engine->faulted || engine->enabled || !engine->joined) {
 		mutex_unlock(&engine->control);
 		return -EBUSY;
 	}
