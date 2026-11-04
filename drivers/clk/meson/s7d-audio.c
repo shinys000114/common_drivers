@@ -385,12 +385,20 @@ static int s7d_audio_spdif_b(struct device *dev, struct regmap *map,
 	return 0;
 }
 
-/* MCLK pad 1 drives GPIOD_4 from one of the internal MCLK generators. */
+/*
+ * MCLK pad 1 drives GPIOD_4 from one of the internal MCLK generators. A
+ * TDM interface can use the pad as its master clock: the rate it sets
+ * reaches the MCLK the pad selects, through the divider left as found.
+ */
 static int s7d_audio_mclk_pad1(struct device *dev, struct regmap *map,
 		struct clk_hw_onecell_data *clks)
 {
 	struct clk_regmap_mux_data mux = {
 		.offset = S7D_AUDIO_MCLK_PAD_CTRL0, .shift = 24, .mask = 7,
+	};
+	struct clk_regmap_div_data div = {
+		.offset = S7D_AUDIO_MCLK_PAD_CTRL0, .shift = 16, .width = 8,
+		.flags = CLK_DIVIDER_READ_ONLY,
 	};
 	struct clk_parent_data p[6];
 	struct clk_hw *hw;
@@ -399,12 +407,14 @@ static int s7d_audio_mclk_pad1(struct device *dev, struct regmap *map,
 	for (i = 0; i < ARRAY_SIZE(p); i++)
 		p[i] = (struct clk_parent_data) { .hw = clks->hws[CLKID_AUDIO_MCLK_A + i] };
 	hw = s7d_audio_register(dev, map, "mclk_pad1_sel", &clk_regmap_mux_ops,
-			&mux, sizeof(mux), p, ARRAY_SIZE(p), CLK_SET_RATE_NO_REPARENT);
+			&mux, sizeof(mux), p, ARRAY_SIZE(p),
+			CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT);
 	if (IS_ERR(hw))
 		return PTR_ERR(hw);
 	clks->hws[S7D_AUDIO_CLK_MCLK_PAD1_SEL] = hw;
-	p[0].hw = s7d_audio_div(dev, map, "mclk_pad1_div", hw, S7D_AUDIO_MCLK_PAD_CTRL0,
-				16, 8, 0);
+	p[0].hw = hw;
+	p[0].hw = s7d_audio_register(dev, map, "mclk_pad1_div", &clk_regmap_divider_ro_ops,
+			&div, sizeof(div), &p[0], 1, CLK_SET_RATE_PARENT);
 	hw = s7d_audio_gate(dev, map, "mclk_pad1", &p[0], S7D_AUDIO_MCLK_PAD_CTRL0, 31,
 			    CLK_SET_RATE_PARENT);
 	if (IS_ERR(hw))
