@@ -368,6 +368,92 @@ static int hevc_mcrcc_program(struct regmap *map,
 	return regmap_write(map, HEVCD_MCRCC_CTL1, 0xff0);
 }
 
+/* Vendor config_mpred_hw HEVC_MPRED_CTRL0; @segment: [2] new picture, [3] new tile. */
+static u32 hevc_mpred_ctrl0(const struct s7d_hevc_rpm *rpm, const struct s7d_hevc_sps *host,
+			    const struct s7d_hevc_slice_info *slice,
+			    const struct s7d_hevc_picture_plan *refs, u32 segment)
+{
+	u32 slice_type = refs->slice_type;
+
+	return slice_type | segment | BIT(9) | BIT(10) | BIT(13) |
+	       ((u32)slice->collocated_from_l0 << 7) |
+	       (refs->collocated_valid ? 0 : BIT(12)) |
+	       (slice_type == 2 ? 0 : BIT(11)) |
+	       (refs->temporal_mvp ? BIT(5) : 0) |
+	       (refs->low_delay ? BIT(6) : 0) |
+	       (host->log2_ctb_size << 16) | (3 << 20) |
+	       ((u32)rpm->word[RPM_MERGE_LEVEL] << 24);
+}
+
+static u32 hevc_mpred_ctrl1(const struct s7d_hevc_rpm *rpm)
+{
+	return (5 - rpm->word[RPM_FIVE_MINUS_MERGE]) |
+	       (2 << 4) | (3 << 8) | (5 << 12) | (36 << 16);
+}
+
+/* The slice's deblocking controls (DBLK_CFG9) and SAO across-slice bit (config_sao_hw). */
+static void hevc_loop_filter(const struct s7d_hevc_rpm *rpm, u32 *dblk9, u32 *sao_flags)
+{
+	u32 flags = rpm->word[RPM_MISC_FLAGS], cfg = 0, disabled, beta, tc, across;
+
+	disabled = !!(flags & BIT(7));
+	if ((flags & (BIT(4) | BIT(6))) == (BIT(4) | BIT(6))) {
+		beta = rpm->word[RPM_SLICE_BETA];
+		tc = rpm->word[RPM_SLICE_TC];
+	} else {
+		cfg = !!(flags & BIT(5)) << 2;
+		beta = rpm->word[RPM_PPS_BETA];
+		tc = rpm->word[RPM_PPS_TC];
+	}
+	if ((flags & (BIT(4) | BIT(6))) == (BIT(4) | BIT(6)))
+		cfg = disabled << 2;
+	if (!(cfg & BIT(2)))
+		cfg |= (beta & 0xf) << 3 | (tc & 0xf) << 7;
+	across = flags & BIT(3) && ((flags & (BIT(8) | BIT(9))) || !disabled) ?
+		 !!(flags & BIT(10)) : !!(flags & BIT(3));
+	*dblk9 = cfg | across << 1;
+	*sao_flags = across << 9;
+}
+
+/* [i] L0[i], [16 + i] L1[i] is long-term: no MV scaling (vendor config_mpred_hw). */
+static u32 hevc_long_term_refs(const struct s7d_hevc_picture_plan *refs)
+{
+	u32 i, mask = 0;
+
+	for (i = 0; i < refs->list_count[0]; i++)
+		if (refs->long_term_mask & BIT(refs->list[0][i].slot))
+			mask |= BIT(i);
+	for (i = 0; i < refs->list_count[1]; i++)
+		if (refs->long_term_mask & BIT(refs->list[1][i].slot))
+			mask |= BIT(16 + i);
+	return mask;
+}
+
+/* Hardware requires L0[n], L1[n] pairs even when both lists are disabled. */
+static int hevc_ref_pocs(struct regmap *map, const struct s7d_hevc_picture_plan *refs)
+{
+	u32 i;
+	int ret;
+
+	for (i = 0; i < 16; i++) {
+		ret = regmap_write(map, HEVC_MPRED_L0_REF_POC(i),
+				   i < refs->list_count[0] ? (u32)refs->list[0][i].poc : 0);
+		if (ret)
+			return ret;
+		ret = regmap_write(map, HEVC_MPRED_L1_REF_POC(i),
+				   i < refs->list_count[1] ? (u32)refs->list[1][i].poc : 0);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/* MV_MEM_UNIT of vendor config_mpred_hw: motion data bytes per CTB. */
+static u32 hevc_mv_unit(u32 ctb_size)
+{
+	return ctb_size == 64 ? 0x200 : ctb_size == 32 ? 0x80 : 0x20;
+}
+
 static int hevc_picture_program(struct regmap *map,
 				const struct s7d_hevc_workspace *ws,
 				const struct s7d_hevc_rpm *rpm,
@@ -397,13 +483,10 @@ static int hevc_picture_program(struct regmap *map,
 	u32 uv_bytes = double_write ? layout->size[1] : 0;
 	u32 body_bytes = s7d_hevc_fbc_body_bytes(geometry->coded_width,
 		geometry->coded_height, host->bit_depth_luma);
-	u32 slice_type = refs->slice_type;
-	u32 col_from_l0 = slice->collocated_from_l0;
 	u32 l0_count = refs->list_count[0];
 	u32 l1_count = refs->list_count[1];
 	u32 log2_ctb, pic_size, lcu_size, tile_size, sao_unit;
-	u32 mpred0, mpred1, dblk1, dblk9 = 0, sao_flags = 0, long_term = 0;
-	u32 flags, disabled, beta, tc, across;
+	u32 mpred0, mpred1, dblk1, dblk9, sao_flags, flags;
 	u32 i;
 	int ret;
 
@@ -413,46 +496,15 @@ static int hevc_picture_program(struct regmap *map,
 	tile_size = geometry->ctb_columns | (geometry->ctb_rows << 16);
 	sao_unit = (geometry->ctb_size == 16 ? 9 : geometry->ctb_size == 32 ? 14 : 24) << 4;
 	flags = rpm->word[RPM_MISC_FLAGS];
-	mpred0 = slice_type | BIT(2) | BIT(3) | BIT(9) | BIT(10) |
-		 BIT(13) | (col_from_l0 << 7) |
-		 (col_valid ? 0 : BIT(12)) |
-		 (slice_type == 2 ? 0 : BIT(11)) |
-		 (refs->temporal_mvp ? BIT(5) : 0) |
-		 (refs->low_delay ? BIT(6) : 0) |
-		 (log2_ctb << 16) | (3 << 20) |
-		 (rpm->word[RPM_MERGE_LEVEL] << 24);
-	mpred1 = (5 - rpm->word[RPM_FIVE_MINUS_MERGE]) |
-		 (2 << 4) | (3 << 8) | (5 << 12) | (36 << 16);
+	mpred0 = hevc_mpred_ctrl0(rpm, host, slice, refs, BIT(2) | BIT(3));
+	mpred1 = hevc_mpred_ctrl1(rpm);
 	/* Vendor consumes raw low QP/beta/tc bits; high-word ABI is undocumented. */
 	dblk1 = (geometry->ctb_size == 64 ? 0 : geometry->ctb_size == 32 ? 1 : 2) |
 		 ((flags & BIT(1) ? flags & BIT(0) : 0) << 3) |
 		 ((rpm->word[RPM_PPS_CB_QP] & 0x1f) << 4) |
 		 ((rpm->word[RPM_PPS_CR_QP] & 0x1f) << 9) |
 		 (geometry->coded_width <= 64 ? BIT(20) : 0);
-	disabled = !!(flags & BIT(7));
-	if ((flags & (BIT(4) | BIT(6))) == (BIT(4) | BIT(6))) {
-		beta = rpm->word[RPM_SLICE_BETA];
-		tc = rpm->word[RPM_SLICE_TC];
-	} else {
-		dblk9 = !!(flags & BIT(5)) << 2;
-		beta = rpm->word[RPM_PPS_BETA];
-		tc = rpm->word[RPM_PPS_TC];
-	}
-	if ((flags & (BIT(4) | BIT(6))) == (BIT(4) | BIT(6)))
-		dblk9 = disabled << 2;
-	if (!(dblk9 & BIT(2)))
-		dblk9 |= (beta & 0xf) << 3 | (tc & 0xf) << 7;
-	across = flags & BIT(3) && ((flags & (BIT(8) | BIT(9))) || !disabled) ?
-		 !!(flags & BIT(10)) : !!(flags & BIT(3));
-	dblk9 |= across << 1;
-	sao_flags = across << 9;
-	/* [i] L0[i], [16 + i] L1[i] is long-term: no MV scaling (vendor config_mpred_hw). */
-	for (i = 0; i < l0_count; i++)
-		if (refs->long_term_mask & BIT(refs->list[0][i].slot))
-			long_term |= BIT(i);
-	for (i = 0; i < l1_count; i++)
-		if (refs->long_term_mask & BIT(refs->list[1][i].slot))
-			long_term |= BIT(16 + i);
+	hevc_loop_filter(rpm, &dblk9, &sao_flags);
 	ret = regmap_write(map, HEVCD_MPP_ANC2AXI_TBL_CONF_ADDR, 6);
 	if (ret)
 		return ret;
@@ -534,7 +586,7 @@ static int hevc_picture_program(struct regmap *map,
 			{ HEVC_MPRED_TILE_START, 0 },
 			{ HEVC_MPRED_TILE_SIZE_LCU, tile_size },
 			{ HEVC_MPRED_REF_NUM, l0_count | (l1_count << 8) },
-			{ HEVC_MPRED_LT_REF, long_term },
+			{ HEVC_MPRED_LT_REF, hevc_long_term_refs(refs) },
 			{ HEVC_MPRED_REF_EN_L0, (1U << l0_count) - 1 },
 			{ HEVC_MPRED_REF_EN_L1, (1U << l1_count) - 1 },
 			{ HEVC_MPRED_CUR_POC, (u32)refs->poc },
@@ -550,17 +602,9 @@ static int hevc_picture_program(struct regmap *map,
 		if (ret)
 			return ret;
 	}
-	/* Hardware requires L0[n], L1[n] pairs even when both lists are disabled. */
-	for (i = 0; i < 16; i++) {
-		ret = regmap_write(map, HEVC_MPRED_L0_REF_POC(i),
-				   i < l0_count ? (u32)refs->list[0][i].poc : 0);
-		if (ret)
-			return ret;
-		ret = regmap_write(map, HEVC_MPRED_L1_REF_POC(i),
-				   i < l1_count ? (u32)refs->list[1][i].poc : 0);
-		if (ret)
-			return ret;
-	}
+	ret = hevc_ref_pocs(map, refs);
+	if (ret)
+		return ret;
 	{
 		const struct reg_sequence seq[] = {
 			{ HEVC_MPRED_ABV_START_ADDR, ws->mpred_above.address },
@@ -646,6 +690,128 @@ static int hevc_picture_program(struct regmap *map,
 	if (ret)
 		return ret;
 	return regmap_update_bits(map, HEVC_SAO_CTRL0, GENMASK(9, 8), sao_flags);
+}
+
+/*
+ * A later slice segment of the picture hevc_picture_program() set up: what
+ * vendor hevc_slice_segment_header_process() programs for a slice with
+ * new_pic 0 (config_mc_buffer, config_mcrcc_axi_hw, config_mpred_hw and
+ * config_sao_hw). The picture-level tables, the MV write pointer and the
+ * deblocking picture setup stay as the first segment left them.
+ */
+static int hevc_slice_program(struct regmap *map,
+			      const struct s7d_hevc_rpm *rpm,
+			      const struct s7d_hevc_sps *host,
+			      const struct s7d_codec_layout *layout,
+			      const struct s7d_hevc_geometry *geometry,
+			      const struct s7d_hevc_picture_buffers *buffers,
+			      const struct s7d_hevc_slice_info *slice,
+			      const struct s7d_hevc_picture_plan *refs)
+{
+	u32 slot = refs->current_slot;
+	const struct s7d_hevc_surface *surface = &buffers->surface[slot];
+	const struct s7d_hevc_dma_region *write_mv = &buffers->mv[slot];
+	bool col_valid = refs->collocated_valid;
+	const struct s7d_hevc_dma_region *read_mv = col_valid ?
+		&buffers->mv[refs->collocated.slot] : write_mv;
+	bool compressed = buffers->compressed;
+	bool double_write = !compressed || !buffers->fbc_only;
+	u32 y = double_write ? surface->address[0] : U32_MAX;
+	u32 uv = double_write ? surface->address[1] : U32_MAX;
+	u32 y_bytes = double_write ? layout->size[0] : 0;
+	u32 uv_bytes = double_write ? layout->size[1] : 0;
+	u32 l0_count = refs->list_count[0];
+	u32 l1_count = refs->list_count[1];
+	u32 pic_size = geometry->coded_width | (geometry->coded_height << 16);
+	u32 lcu_size = (geometry->ctb_columns - 1) | ((geometry->ctb_rows - 1) << 16);
+	u32 tile_size = geometry->ctb_columns | (geometry->ctb_rows << 16);
+	u32 dblk9, sao_flags;
+	int ret;
+
+	hevc_loop_filter(rpm, &dblk9, &sao_flags);
+	ret = hevc_mc_program(map, refs, compressed);
+	if (ret)
+		return ret;
+	ret = hevc_mcrcc_program(map, refs, compressed);
+	if (ret)
+		return ret;
+	{
+		const struct reg_sequence seq[] = {
+			{ HEVC_MPRED_MV_WR_START_ADDR, write_mv->address },
+			{ HEVC_MPRED_MV_RD_START_ADDR, read_mv->address },
+			{ HEVC_MPRED_MV_WR_ROW_JUMP, 0 },
+			{ HEVC_MPRED_MV_RD_ROW_JUMP, 0 },
+			{ HEVC_MPRED_CTRL0, hevc_mpred_ctrl0(rpm, host, slice, refs, 0) },
+			{ HEVC_MPRED_CTRL1, hevc_mpred_ctrl1(rpm) },
+			{ HEVC_MPRED_PIC_SIZE, pic_size },
+			{ HEVC_MPRED_PIC_SIZE_LCU, lcu_size },
+			{ HEVC_MPRED_TILE_START, 0 },
+			{ HEVC_MPRED_TILE_SIZE_LCU, tile_size },
+			{ HEVC_MPRED_REF_NUM, l0_count | (l1_count << 8) },
+			{ HEVC_MPRED_LT_REF, hevc_long_term_refs(refs) },
+			{ HEVC_MPRED_REF_EN_L0, (1U << l0_count) - 1 },
+			{ HEVC_MPRED_REF_EN_L1, (1U << l1_count) - 1 },
+			{ HEVC_MPRED_CUR_POC, (u32)refs->poc },
+		};
+
+		ret = hevc_write_many(map, seq, ARRAY_SIZE(seq));
+	}
+	if (!ret && col_valid)
+		ret = regmap_write(map, HEVC_MPRED_COL_POC, (u32)refs->collocated.poc);
+	if (!ret)
+		ret = hevc_ref_pocs(map, refs);
+	/* The collocated motion of this slice's first CTB; writes continue. */
+	if (!ret)
+		ret = regmap_write(map, HEVC_MPRED_MV_RPTR, read_mv->address +
+				   slice->slice_address * hevc_mv_unit(geometry->ctb_size));
+	if (!ret)
+		ret = regmap_write(map, HEVC_MPRED_MV_RD_END_ADDR,
+				   read_mv->address + read_mv->bytes);
+	if (!ret)
+		ret = regmap_update_bits(map, HEVC_SAO_CTRL0, 0xf, host->log2_ctb_size);
+	if (!ret)
+		ret = regmap_write(map, HEVC_SAO_PIC_SIZE, pic_size);
+	if (!ret)
+		ret = regmap_write(map, HEVC_SAO_PIC_SIZE_LCU, lcu_size);
+	if (ret)
+		return ret;
+	if (compressed) {
+		ret = regmap_write(map, HEVC_SAO_CTRL26, 0);
+		if (!ret)
+			ret = regmap_update_bits(map, HEVC_SAO_CTRL5,
+				GENMASK(23, 16) | BIT(9),
+				host->bit_depth_luma == 8 ? BIT(9) : 0);
+		if (!ret)
+			ret = regmap_write(map, HEVC_CM_BODY_START_ADDR, 0);
+		if (!ret)
+			ret = regmap_write(map, HEVC_CM_HEADER_START_ADDR, surface->header);
+	} else {
+		ret = regmap_update_bits(map, HEVC_SAO_CTRL5, GENMASK(23, 16), 0);
+	}
+	if (ret)
+		return ret;
+	{
+		const struct reg_sequence seq[] = {
+			{ HEVC_SAO_Y_START_ADDR, y },
+			{ HEVC_SAO_Y_LENGTH, y_bytes },
+			{ HEVC_SAO_C_START_ADDR, uv },
+			{ HEVC_SAO_C_LENGTH, uv_bytes },
+			{ HEVC_SAO_Y_WPTR, y },
+			{ HEVC_SAO_C_WPTR, uv },
+		};
+
+		ret = hevc_write_many(map, seq, ARRAY_SIZE(seq));
+	}
+	if (!ret)
+		ret = regmap_update_bits(map, HEVC_SAO_CTRL1, 0xfff3,
+					 !compressed ? 0x8ff1 : double_write ? 0x8ff0 : 0x8ff2);
+	if (!ret)
+		ret = regmap_update_bits(map, HEVCD_IPP_AXIIF_CONFIG, 0x133f, 0x20f);
+	if (!ret)
+		ret = regmap_write(map, HEVC_DBLK_CFG9, dblk9);
+	if (!ret)
+		ret = regmap_update_bits(map, HEVC_SAO_CTRL0, GENMASK(9, 8), sao_flags);
+	return ret;
 }
 
 static bool hevc_overlaps(u32 address, u32 bytes, u32 other, u32 other_bytes)
@@ -827,6 +993,48 @@ static int hevc_references_check(const struct s7d_hevc_slice_info *slice,
 	return 0;
 }
 
+/* RPM fields the register programming takes as they are. */
+static int hevc_rpm_program_check(const struct s7d_hevc_rpm *rpm)
+{
+	if (rpm->word[RPM_MERGE_LEVEL] > 7 ||
+	    rpm->word[RPM_FIVE_MINUS_MERGE] > 4 ||
+	    rpm->word[RPM_MISC_FLAGS] & ~GENMASK(10, 0))
+		return -EPROTO;
+	return 0;
+}
+
+int s7d_hevc_slice_configure(struct regmap *map,
+			     const struct s7d_hevc_rpm *rpm,
+			     const struct s7d_hevc_sps *host,
+			     const struct s7d_codec_layout *layout,
+			     const struct s7d_hevc_picture_buffers *buffers,
+			     const struct s7d_hevc_slice_info *slice,
+			     const struct s7d_hevc_picture_plan *plan)
+{
+	struct s7d_hevc_geometry geometry;
+	struct s7d_hevc_slice_info checked;
+	int ret;
+
+	if (!map || !rpm || !host || !layout || !buffers || !buffers->surface ||
+	    !buffers->mv || !slice || !plan)
+		return -EINVAL;
+	ret = s7d_hevc_rpm_check_sequence(rpm, host, &geometry);
+	if (!ret)
+		ret = s7d_hevc_rpm_decode_slice(rpm, host, slice, &checked);
+	if (!ret)
+		ret = hevc_rpm_program_check(rpm);
+	if (ret)
+		return ret;
+	if (checked.first_slice || !checked.slice_address ||
+	    checked.slice_address >= geometry.ctb_count ||
+	    layout->format != S7D_CODEC_CAPTURE_NV12M || buffers->count != plan->slot_count)
+		return -EPROTO;
+	ret = hevc_references_check(&checked, plan, buffers->count);
+	if (ret)
+		return ret;
+	return hevc_slice_program(map, rpm, host, layout, &geometry, buffers, &checked, plan);
+}
+
 int s7d_hevc_picture_configure(struct regmap *map,
 			       const struct s7d_hevc_workspace *ws,
 			       const struct s7d_hevc_rpm *rpm,
@@ -858,10 +1066,9 @@ int s7d_hevc_picture_configure(struct regmap *map,
 		return ret;
 	if (memcmp(layout, &expected, sizeof(expected)))
 		return -ESTALE;
-	if (rpm->word[RPM_MERGE_LEVEL] > 7 ||
-	    rpm->word[RPM_FIVE_MINUS_MERGE] > 4 ||
-	    rpm->word[RPM_MISC_FLAGS] & ~GENMASK(10, 0))
-		return -EPROTO;
+	ret = hevc_rpm_program_check(rpm);
+	if (ret)
+		return ret;
 	ret = hevc_buffers_check(ws, layout, host, &geometry, buffers);
 	if (ret)
 		return ret;

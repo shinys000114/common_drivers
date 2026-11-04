@@ -234,6 +234,13 @@ int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 	return 0;
 }
 
+bool s7d_hevc_rpm_same_segment(const struct s7d_hevc_rpm *rpm,
+			       const struct s7d_hevc_slice_info *cpu)
+{
+	return rpm->word[RPM_FIRST_SLICE] == cpu->first_slice &&
+	       rpm->word[RPM_SLICE_ADDRESS] == cpu->slice_address;
+}
+
 int s7d_hevc_rpm_parse(const void *snapshot, size_t bytes,
 		       bool efficiency_mode, struct s7d_hevc_rpm *rpm)
 {
@@ -318,8 +325,8 @@ int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
 	    word[RPM_CROP_FLAG] > 1 || word[RPM_MIN_CB_MINUS3] > 3 ||
 	    word[RPM_CTB_DIFF] > 3 || word[RPM_POC_LOG2_MINUS4] > 12)
 		return -EPROTO;
-	if (word[RPM_FIRST_SLICE] != 1 || word[RPM_DEPENDENT_SLICE] ||
-	    word[RPM_SLICE_ADDRESS] || !word[RPM_TEMPORAL_ID_PLUS1] ||
+	/* Which slice segment it is, the slice check compares with the CPU parse. */
+	if (word[RPM_DEPENDENT_SLICE] || !word[RPM_TEMPORAL_ID_PLUS1] ||
 	    word[RPM_TEMPORAL_ID_PLUS1] > host->max_sub_layers ||
 	    word[RPM_TILES] || word[RPM_TILE_COLUMNS_MINUS1] || word[RPM_TILE_ROWS_MINUS1] ||
 	    (word[RPM_BIT_DEPTH] & 0xff) != (((host->bit_depth_chroma - 8) << 4) |

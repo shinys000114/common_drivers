@@ -53,6 +53,10 @@ struct s7d_hevc_picture_plan {
 	/* Of retain_mask, the long-term references after this picture. */
 	u32 long_term_mask;
 	u32 drop_output_mask;
+	/* RefPicSetStCurrBefore, StCurrAfter and LtCurr; every slice's lists. */
+	u32 curr_count[3];
+	struct s7d_hevc_picture_ref curr[3][S7D_HEVC_RPS_ENTRIES];
+	/* Those of the planned slice segment. */
 	u32 list_count[2];
 	struct s7d_hevc_picture_ref list[2][S7D_HEVC_RPS_ENTRIES];
 	struct s7d_hevc_picture_ref collocated;
@@ -133,6 +137,10 @@ int s7d_hevc_dpb_plan(const struct s7d_hevc_dpb *dpb,
 		      const struct s7d_hevc_slice_info *slice,
 		      const struct s7d_hevc_picture_metadata *metadata,
 		      u32 queued_slot_mask, struct s7d_hevc_picture_plan *plan);
+/* A later slice segment of the active picture: the active plan with its lists; @plan undefined on failure. */
+int s7d_hevc_dpb_slice_plan(const struct s7d_hevc_dpb *dpb,
+			    const struct s7d_hevc_slice_info *slice,
+			    struct s7d_hevc_picture_plan *plan);
 /* Current surface acquired/pinned and reference mappings live; before MMIO. */
 int s7d_hevc_dpb_begin(struct s7d_hevc_dpb *dpb,
 		       const struct s7d_hevc_picture_plan *plan, u64 write_token);

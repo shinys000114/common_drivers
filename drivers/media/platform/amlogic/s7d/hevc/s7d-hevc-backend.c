@@ -68,6 +68,7 @@ struct s7d_hevc_first_failure {
 	const char *stage;
 	int error;
 	u32 status;
+	u32 rpm_segment;
 	bool snapshot_valid;
 	bool status_valid;
 	bool rpm_valid;
@@ -85,7 +86,15 @@ struct s7d_hevc_job {
 	struct s7d_hevc_input_plan input;
 	struct s7d_hevc_slice_info host_slice;
 	struct s7d_hevc_slice_info slice;
+	/* Every segment the CPU parsed; the input lives through the decode call. */
+	const struct s7d_hevc_slice_info *host_slices;
+	u32 slice_count;
+	/* The later segment at its header pause, and its lists. */
+	struct s7d_hevc_slice_info segment;
+	struct s7d_hevc_picture_plan segment_plan;
 	struct s7d_hevc_rpm rpm;
+	/* The slice segment whose header the RPM holds. */
+	u32 rpm_segment;
 	struct s7d_hevc_geometry geometry;
 	struct s7d_hevc_picture_plan picture;
 	struct s7d_hevc_picture_metadata metadata;
@@ -219,7 +228,7 @@ static int hevc_check_done(const struct s7d_hevc_geometry *geometry,
 	if (!geometry->ctb_count || !done->max_shift_bytes)
 		return -EINVAL;
 	if (done->status != S7D_HEVC_PICTURE_DATA_DONE || !done->header_armed ||
-	    done->accepted_headers != 1)
+	    !done->expected_headers || done->accepted_headers != done->expected_headers)
 		return -EPROTO;
 	if (done->error_latched || (done->shift_status & BIT(15)) ||
 	    (done->parser_lcu_start & GENMASK(23, 0)) != geometry->ctb_count - 1 ||
@@ -250,8 +259,10 @@ static void hevc_latch_failure_locked(struct s7d_hevc_job *job, const char *stag
 		.snapshot_valid = job->snapshot_valid, .rpm_valid = rpm_valid,
 		.data = data,
 	};
-	if (rpm_valid)
+	if (rpm_valid) {
 		job->failure.rpm = job->rpm;
+		job->failure.rpm_segment = job->rpm_segment;
+	}
 }
 
 static int hevc_header_failure(struct s7d_hevc_decoder *decoder,
@@ -519,6 +530,92 @@ static u32 hevc_idle_slots(struct s7d_hevc_decoder *decoder, u32 mask)
 	return idle;
 }
 
+/*
+ * A later slice segment header (vendor hevc_slice_segment_header_process with
+ * new_pic 0): checked against the CPU parse, its own reference lists
+ * programmed, then the firmware resumes as for the first.
+ */
+static int hevc_next_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *job,
+			    bool *cancelled)
+{
+	struct s7d_hevc_picture_buffers buffers = {
+		.count = decoder->captures, .surface = decoder->surface, .mv = decoder->mv,
+		.compressed = decoder->compressed, .fbc_only = decoder->fbc_only,
+		.scattered = decoder->scattered,
+	};
+	u8 raw[S7D_HEVC_RPM_BYTES];
+	const char *stage = "segment-status";
+	u32 status = 0, lmem;
+	bool status_valid = false, rpm_valid = false, data = false;
+	int ret;
+
+	/* The firmware found a slice the CPU parse did not. */
+	if (job->headers >= job->slice_count || !job->header_armed || !job->dpb_begun)
+		return hevc_header_failure(decoder, job, "header-repeated",
+			-EOPNOTSUPP, status, status_valid, job->rpm_valid, true);
+	ret = regmap_read(decoder->map, HEVC_STATUS, &status);
+	status_valid = !ret;
+	if (!ret && status != S7D_HEVC_SLICE_HEADER_DONE)
+		ret = -ESTALE;
+	if (!ret) {
+		stage = "segment-lmem";
+		ret = regmap_read(decoder->map, HEVC_LMEM_DMA_CONTROL, &lmem);
+	}
+	if (!ret && (lmem & BIT(15)))
+		ret = -EBUSY;
+	if (!ret) {
+		dma_rmb();
+		stage = "segment-rpm";
+		ret = s7d_hevc_context_snapshot_rpm(job->context, raw, sizeof(raw));
+	}
+	if (!ret)
+		ret = s7d_hevc_rpm_parse(raw, sizeof(raw), true, &job->rpm);
+	if (!ret) {
+		rpm_valid = true;
+		job->rpm_segment = job->headers;
+		stage = "segment-slice";
+		ret = s7d_hevc_rpm_decode_slice(&job->rpm, &decoder->sps,
+						&job->host_slices[job->headers], &job->segment);
+		/*
+		 * At the segment the CPU parsed, a contradiction is a parser
+		 * disagreement; at another one, the firmware lost its place in
+		 * damaged slice data.
+		 */
+		data = hevc_rpm_data_error(ret) ||
+		       !s7d_hevc_rpm_same_segment(&job->rpm, &job->host_slices[job->headers]);
+	}
+	if (!ret) {
+		stage = "segment-plan";
+		ret = s7d_hevc_dpb_slice_plan(decoder->dpb, &job->segment, &job->segment_plan);
+		data = hevc_plan_data_error(ret);
+	}
+	if (ret)
+		return hevc_header_failure(decoder, job, stage, ret,
+			status, status_valid, rpm_valid, data);
+	ret = s7d_hevc_slice_configure(decoder->map, &job->rpm, &decoder->sps,
+				       &decoder->layout, &buffers, &job->segment,
+				       &job->segment_plan);
+	if (!ret)
+		ret = regmap_update_bits(decoder->map, HEVC_WAIT_FLAG, BIT(1), BIT(1));
+	if (!ret) {
+		ret = hevc_check_stop(decoder);
+		*cancelled = ret == -ECANCELED;
+	}
+	if (!ret)
+		ret = regmap_read(decoder->map, HEVC_STATUS, &status);
+	if (!ret && status != S7D_HEVC_SLICE_HEADER_DONE)
+		ret = -ESTALE;
+	if (ret)
+		return ret;
+	dma_wmb();
+	ret = regmap_write(decoder->map, HEVC_STATUS, 0x05);
+	if (!ret)
+		ret = regmap_write(decoder->map, HEVC_CPU_INTERRUPT, 4);
+	if (!ret)
+		job->headers++;
+	return ret;
+}
+
 static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *job,
 			bool *cancelled)
 {
@@ -536,10 +633,8 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 	int ret;
 
 	*cancelled = false;
-	/* The firmware found a slice the CPU parse did not. */
 	if (job->headers || job->header_armed)
-		return hevc_header_failure(decoder, job, "header-repeated",
-			-EOPNOTSUPP, status, status_valid, rpm_valid, true);
+		return hevc_next_header(decoder, job, cancelled);
 	ret = regmap_read(decoder->map, HEVC_STATUS, &status);
 	status_valid = !ret;
 	if (!ret && status != S7D_HEVC_SLICE_HEADER_DONE)
@@ -743,6 +838,7 @@ static irqreturn_t hevc_irq_thread(void *data, const struct s7d_hevc_irq_cookie 
 		.shift_byte_count = snapshot.shift_bytes,
 		.max_shift_bytes = job->input.max_shift_bytes,
 		.accepted_headers = job->headers,
+		.expected_headers = job->slice_count,
 		.header_armed = job->header_armed,
 	};
 	ret = hevc_check_done(&job->geometry, &done);
@@ -1300,7 +1396,8 @@ static int hevc_joined_error(struct s7d_hevc_decoder *decoder,
 		.shift_status = job->snapshot.shift_status,
 		.shift_byte_count = job->snapshot.shift_bytes,
 		.max_shift_bytes = job->input.max_shift_bytes,
-		.accepted_headers = job->headers, .header_armed = job->header_armed,
+		.accepted_headers = job->headers, .expected_headers = job->slice_count,
+		.header_armed = job->header_armed,
 	};
 	return hevc_check_done(&job->geometry, &done);
 }
@@ -1446,7 +1543,7 @@ static void hevc_report_failure(struct s7d_hevc_decoder *decoder,
 			failure.status_valid, failure.status, failure.rpm_valid);
 		if (failure.rpm_valid)
 			s7d_hevc_rpm_report(decoder->dev, &failure.rpm,
-				&decoder->sps, &job->host_slice);
+				&decoder->sps, &job->host_slices[failure.rpm_segment]);
 	}
 	dev_err(decoder->dev,
 		"HEVC input token=%llu start=%#x end=%#x read=%#x write=%#x decode=%u max-shift=%u\n",
@@ -1527,7 +1624,7 @@ static void hevc_report_drop(struct s7d_hevc_decoder *decoder,
 	if (failure->rpm_valid && !decoder->drop_reported) {
 		decoder->drop_reported = true;
 		s7d_hevc_rpm_report(decoder->dev, &failure->rpm, &decoder->sps,
-				    &job->host_slice);
+				    &job->host_slices[failure->rpm_segment]);
 	}
 }
 
@@ -1565,7 +1662,8 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 
 	if (!decoder || !session || !input || !input->data || !input->bytes ||
 	    !input_token || !timestamp_meta || !result ||
-	    input->kind != S7D_HEVC_INPUT_PICTURE)
+	    input->kind != S7D_HEVC_INPUT_PICTURE || !input->slices ||
+	    !input->slice_count || input->slice_count > S7D_HEVC_MAX_SLICES)
 		return -EINVAL;
 	*result = (struct s7d_hevc_decode_result) { };
 	mutex_lock(&decoder->control);
@@ -1595,6 +1693,8 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	job->session = session;
 	job->context = decoder->context;
 	job->host_slice = input->slice;
+	job->host_slices = input->slices;
+	job->slice_count = input->slice_count;
 	job->lease_epoch = decoder->epoch;
 	job->metadata = (struct s7d_hevc_picture_metadata) {
 		.input_token = input_token, .timestamp_ns = timestamp_ns,

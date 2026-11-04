@@ -49,6 +49,8 @@ struct s7d_hevc_picture_done {
 	/* Fresh frame counter, reset to zero; includes checked transport padding. */
 	u32 max_shift_bytes;
 	u32 accepted_headers;
+	/* Slice segments the CPU parse found in the access unit. */
+	u32 expected_headers;
 	bool header_armed;
 	bool error_latched;
 };
@@ -59,6 +61,9 @@ int s7d_hevc_rpm_parse(const void *snapshot, size_t bytes,
 int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
 			       const struct s7d_hevc_sps *host,
 			       struct s7d_hevc_geometry *geometry);
+/* Whether the RPM holds the header of slice segment @cpu, not another one's. */
+bool s7d_hevc_rpm_same_segment(const struct s7d_hevc_rpm *rpm,
+			       const struct s7d_hevc_slice_info *cpu);
 /* Paused immutable RPM, checked against the original CPU-parsed picture. */
 int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 			     const struct s7d_hevc_sps *host,

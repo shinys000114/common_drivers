@@ -13,7 +13,8 @@
 #define HEVC_VPS_COUNT 16U
 #define HEVC_SPS_COUNT 8U
 #define HEVC_PPS_COUNT 64U
-#define HEVC_NAL_COUNT 64U
+/* Parameter sets, SEI and the slice segments of one picture. */
+#define HEVC_NAL_COUNT (S7D_HEVC_MAX_SLICES + 64U)
 #define HEVC_MAX_SUB_LAYERS 7U
 
 struct hevc_bits {
@@ -54,6 +55,10 @@ struct s7d_hevc_input {
 	struct hevc_parameter *vps_update[HEVC_VPS_COUNT];
 	struct hevc_parameter *sps_update[HEVC_SPS_COUNT];
 	struct hevc_parameter *pps_update[HEVC_PPS_COUNT];
+	/* Slice segments after the first, from slices[1]; slices[0] at the end. */
+	struct s7d_hevc_slice_info *slices;
+	u32 slice_count;
+	u32 slice_capacity;
 	u8 *parameter[3];
 	size_t parameter_bytes[3];
 	u8 *data;
@@ -496,21 +501,23 @@ static size_t hevc_escaped_header_bytes(const u8 *nal, size_t bytes,
 	return i;
 }
 
+/* @slice is the picture's first slice segment or one after it (7.3.6.1). */
 static int hevc_slice_parse(struct hevc_bits *b,
 			    const u8 *nal, size_t bytes,
-			    struct s7d_hevc_input *input)
+			    struct s7d_hevc_input *input, struct s7d_hevc_slice_info *slice)
 {
-	struct s7d_hevc_slice_info *slice = &input->view.slice;
 	const struct s7d_hevc_sequence *sequence = &input->sequence;
 	const struct s7d_hevc_sps *sps = &sequence->sps;
 	const struct s7d_hevc_pps *pps = &input->pps;
 	struct s7d_hevc_st_rps rps = { };
-	u32 i, list, index, total = 0, bits = 0;
+	u32 i, list, index, total = 0, bits = 0, entry_points = 0;
+	u32 columns = DIV_ROUND_UP(sps->coded_width, 1U << sps->log2_ctb_size);
 	u32 rows = DIV_ROUND_UP(sps->coded_height, 1U << sps->log2_ctb_size);
 	s32 qp;
+	bool first = slice == &input->view.slice;
 	bool sao_luma = false, sao_chroma = false, disabled = pps->deblocking_disabled;
 	u64 offsets = 0;
-	size_t escaped;
+	size_t escaped, rbsp;
 
 	/* Every sub-layer is decoded; an IRAP belongs to sub-layer 0. */
 	if (slice->temporal_id_plus1 > sps->max_sub_layers ||
@@ -521,8 +528,17 @@ static int hevc_slice_parse(struct hevc_bits *b,
 		slice->no_output_of_prior_pics = hevc_get(b, 1);
 	if (hevc_ue(b, HEVC_PPS_COUNT - 1) != pps->pps_id)
 		return b->error ?: -EBADMSG;
-	if (!slice->first_slice)
-		return b->error ?: -EOPNOTSUPP;
+	/* A picture without its first segment, or a second picture in the buffer. */
+	if (slice->first_slice != first)
+		return b->error ?: (first ? -EBADMSG : -EOPNOTSUPP);
+	if (!first) {
+		while ((1U << bits) < columns * rows)
+			bits++;
+		slice->slice_address = hevc_get(b, bits);
+		if (slice->slice_address >= columns * rows)
+			return b->error ?: -EBADMSG;
+		bits = 0;
+	}
 	for (i = 0; i < pps->extra_slice_header_bits; i++)
 		if (hevc_get(b, 1))
 			return b->error ?: -EOPNOTSUPP;
@@ -628,10 +644,10 @@ static int hevc_slice_parse(struct hevc_bits *b,
 	if (pps->loop_filter_across_slices && (sao_luma || sao_chroma || !disabled))
 		hevc_get(b, 1);
 	if (pps->entropy_coding_sync) {
-		input->view.entry_points = hevc_ue(b, rows - 1);
-		if (input->view.entry_points) {
+		entry_points = hevc_ue(b, rows - 1);
+		if (entry_points) {
 			bits = hevc_ue(b, 31) + 1;
-			for (i = 0; i < input->view.entry_points; i++)
+			for (i = 0; i < entry_points; i++)
 				offsets += (u64)hevc_get(b, bits) + 1;
 		}
 	}
@@ -647,12 +663,80 @@ static int hevc_slice_parse(struct hevc_bits *b,
 			b->error = -EBADMSG;
 	if (b->error)
 		return b->error;
-	input->view.header_rbsp_bytes = b->bit / 8;
-	input->view.cabac_rbsp_bytes = b->bytes - b->bit / 8;
+	rbsp = b->bytes - b->bit / 8;
 	escaped = hevc_escaped_header_bytes(nal, bytes, b->bit / 8);
-	if (!input->view.cabac_rbsp_bytes || escaped >= bytes || offsets >= bytes - escaped)
+	if (!rbsp || escaped >= bytes || offsets >= bytes - escaped)
 		return -EBADMSG;
+	if (first) {
+		input->view.header_rbsp_bytes = b->bit / 8;
+		input->view.entry_points = entry_points;
+		input->view.cabac_rbsp_bytes = rbsp;
+	}
 	/* CABAC payload and firmware weight execution are not decoded here. */
+	return 0;
+}
+
+/* What 7.4.7.1 keeps equal in all slice segment headers of a picture. */
+static bool hevc_same_picture(const struct s7d_hevc_slice_info *a,
+			      const struct s7d_hevc_slice_info *b)
+{
+	u32 i;
+
+	if (a->nal_type != b->nal_type || a->temporal_id_plus1 != b->temporal_id_plus1 ||
+	    a->poc_lsb != b->poc_lsb || a->pic_output_flag != b->pic_output_flag ||
+	    a->no_output_of_prior_pics != b->no_output_of_prior_pics ||
+	    a->temporal_mvp != b->temporal_mvp || a->rps_count != b->rps_count)
+		return false;
+	for (i = 0; i < a->rps_count; i++) {
+		const struct s7d_hevc_rps_entry *x = &a->rps[i], *y = &b->rps[i];
+
+		if (x->delta_poc != y->delta_poc || x->used != y->used ||
+		    x->long_term != y->long_term || x->msb_present != y->msb_present ||
+		    x->lt_poc_lsb != y->lt_poc_lsb || x->lt_msb_cycle != y->lt_msb_cycle)
+			return false;
+	}
+	return true;
+}
+
+/* A later slice segment of the open picture: its next CTBs, the same RPS. */
+static int hevc_next_slice(struct s7d_hevc_input *input, const u8 *nal, size_t bytes,
+			   struct hevc_bits *bits)
+{
+	const struct s7d_hevc_slice_info *previous;
+	struct s7d_hevc_slice_info *slice;
+	int ret;
+
+	if (!input->slice_count)
+		input->slice_count = 1;
+	if (input->slice_count == S7D_HEVC_MAX_SLICES)
+		return -E2BIG;
+	if (input->slice_count >= input->slice_capacity) {
+		u32 capacity = min(max(2 * input->slice_capacity, 8U), S7D_HEVC_MAX_SLICES);
+		struct s7d_hevc_slice_info *next;
+
+		next = kvmalloc_array(capacity, sizeof(*next), GFP_KERNEL);
+		if (!next)
+			return -ENOMEM;
+		if (input->slices)
+			memcpy(next + 1, input->slices + 1,
+			       sizeof(*next) * (input->slice_count - 1));
+		kvfree(input->slices);
+		input->slices = next;
+		input->slice_capacity = capacity;
+	}
+	previous = input->slice_count == 1 ? &input->view.slice :
+		   &input->slices[input->slice_count - 1];
+	slice = &input->slices[input->slice_count];
+	*slice = (struct s7d_hevc_slice_info) {
+		.nal_type = (nal[0] >> 1) & 63, .temporal_id_plus1 = nal[1] & 7,
+	};
+	ret = hevc_slice_parse(bits, nal, bytes, input, slice);
+	if (ret)
+		return ret;
+	if (slice->slice_address <= previous->slice_address ||
+	    !hevc_same_picture(&input->view.slice, slice))
+		return -EBADMSG;
+	input->slice_count++;
 	return 0;
 }
 
@@ -817,7 +901,7 @@ static int hevc_select_parameters(const struct s7d_hevc_input_bank *bank,
 	}
 	input->view.sequence = &input->sequence;
 	input->view.pps = &input->pps;
-	return hevc_slice_parse(bits, nal, bytes, input);
+	return hevc_slice_parse(bits, nal, bytes, input, &input->view.slice);
 }
 
 /*
@@ -997,7 +1081,7 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 			if (dropped) {
 				ret = 0;
 			} else if (picture) {
-				ret = -EOPNOTSUPP;
+				ret = hevc_next_slice(input, nal, end - start, &bits);
 			} else {
 				input->view.slice.nal_type = type;
 				input->view.slice.temporal_id_plus1 = nal[1] & 7;
@@ -1056,6 +1140,18 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 	input->view.bytes = kept;
 	input->view.kind = picture ? S7D_HEVC_INPUT_PICTURE : S7D_HEVC_INPUT_HEADERS;
 	input->view.slice.parameter_epoch = input->selected_epoch;
+	if (input->slices) {
+		input->slices[0] = input->view.slice;
+		for (nals = 1; nals < input->slice_count; nals++) {
+			input->slices[nals].parameter_epoch = input->selected_epoch;
+			input->slices[nals].follows_eos = input->view.slice.follows_eos;
+		}
+		input->view.slices = input->slices;
+		input->view.slice_count = input->slice_count;
+	} else if (picture) {
+		input->view.slices = &input->view.slice;
+		input->view.slice_count = 1;
+	}
 	*out = input;
 	return 0;
 failed:
@@ -1144,6 +1240,7 @@ void s7d_hevc_input_release(struct s7d_hevc_input *input)
 		hevc_parameter_free(input->pps_update[i]);
 	for (i = 0; i < 3; i++)
 		kvfree(input->parameter[i]);
+	kvfree(input->slices);
 	kvfree(input->data);
 	kvfree(input);
 }

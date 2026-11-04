@@ -7,6 +7,8 @@
 #include "s7d-hevc-sequence.h"
 
 #define S7D_HEVC_RPS_ENTRIES 16U
+/* MaxSliceSegmentsPerPicture of level 6.2, as the vendor's 6.x limit. */
+#define S7D_HEVC_MAX_SLICES 600U
 #define S7D_HEVC_PARAMETER_BYTES (64U * 1024U)
 /* The largest input buffer, S7D_HEVC_INPUT_MAX_BYTES; the context checks the stream size. */
 #define S7D_HEVC_AU_MAX_BYTES (6U * 1024U * 1024U)
@@ -86,7 +88,11 @@ struct s7d_hevc_input_result {
 	enum s7d_hevc_input_kind kind;
 	const struct s7d_hevc_sequence *sequence;
 	const struct s7d_hevc_pps *pps;
+	/* The first slice segment; slices[0] is the same. */
 	struct s7d_hevc_slice_info slice;
+	/* Every slice segment of the picture, in decoding order. */
+	const struct s7d_hevc_slice_info *slices;
+	u32 slice_count;
 	u32 header_rbsp_bytes;
 	u32 entry_points;
 	u32 cabac_rbsp_bytes;

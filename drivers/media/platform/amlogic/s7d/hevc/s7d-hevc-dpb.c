@@ -182,12 +182,34 @@ int s7d_hevc_dpb_init(struct s7d_hevc_dpb *dpb,
 	return 0;
 }
 
+/* What each slice segment may choose: its type and reference lists. */
+static int hevc_slice_type_check(const struct s7d_hevc_slice_info *slice)
+{
+	if (slice->slice_type > 2 || slice->active[0] > S7D_HEVC_RPS_ENTRIES ||
+	    slice->active[1] > S7D_HEVC_RPS_ENTRIES)
+		return -EINVAL;
+	if (hevc_irap(slice->nal_type) && slice->slice_type != 2)
+		return -EBADMSG;
+	if (slice->slice_type == 2) {
+		if (slice->active[0] || slice->active[1] ||
+		    slice->modification[0] || slice->modification[1])
+			return -EBADMSG;
+	} else if (!slice->active[0] ||
+		   (slice->slice_type == 0 && !slice->active[1]) ||
+		   (slice->slice_type == 1 &&
+		    (slice->active[1] || slice->modification[1]))) {
+		return -EBADMSG;
+	}
+	return 0;
+}
+
 static int hevc_slice_check(const struct s7d_hevc_dpb *dpb,
 			   const struct s7d_hevc_slice_info *slice)
 {
 	s32 last_negative = 0, last_positive = 0;
 	bool positive = false;
 	u32 i;
+	int ret;
 
 	if (!slice || slice->slice_type > 2 ||
 	    !slice->temporal_id_plus1 || slice->temporal_id_plus1 > dpb->max_sub_layers ||
@@ -205,20 +227,11 @@ static int hevc_slice_check(const struct s7d_hevc_dpb *dpb,
 		return -EBADMSG;
 	if (slice->rps_count >= dpb->max_dec_pic_buffering)
 		return -EINVAL;
-	if (hevc_irap(slice->nal_type) && slice->slice_type != 2)
-		return -EBADMSG;
 	if (!hevc_irap(slice->nal_type) && slice->no_output_of_prior_pics)
 		return -EBADMSG;
-	if (slice->slice_type == 2) {
-		if (slice->active[0] || slice->active[1] ||
-		    slice->modification[0] || slice->modification[1])
-			return -EBADMSG;
-	} else if (!slice->active[0] ||
-		   (slice->slice_type == 0 && !slice->active[1]) ||
-		   (slice->slice_type == 1 &&
-		    (slice->active[1] || slice->modification[1]))) {
-		return -EBADMSG;
-	}
+	ret = hevc_slice_type_check(slice);
+	if (ret)
+		return ret;
 	if (hevc_idr(slice->nal_type) &&
 	    (slice->rps_count || slice->poc_lsb || slice->temporal_mvp))
 		return -EBADMSG;
@@ -392,10 +405,9 @@ static int hevc_reference_plan(const struct s7d_hevc_dpb *dpb,
 			       const struct s7d_hevc_slice_info *slice,
 			       struct s7d_hevc_picture_plan *plan)
 {
-	struct s7d_hevc_picture_ref before[S7D_HEVC_RPS_ENTRIES];
-	struct s7d_hevc_picture_ref after[S7D_HEVC_RPS_ENTRIES];
-	struct s7d_hevc_picture_ref lt[S7D_HEVC_RPS_ENTRIES];
-	u32 nb = 0, na = 0, nl = 0, total, i, list;
+	struct s7d_hevc_picture_ref *before = plan->curr[0], *after = plan->curr[1];
+	struct s7d_hevc_picture_ref *lt = plan->curr[2];
+	u32 nb = 0, na = 0, nl = 0, i;
 
 	/* Long-term entries first: they may take a short-term picture (8.3.2). */
 	for (i = 0; i < slice->rps_count; i++) {
@@ -461,7 +473,27 @@ static int hevc_reference_plan(const struct s7d_hevc_dpb *dpb,
 		else
 			after[na++] = ref;
 	}
-	total = nb + na + nl;
+	plan->curr_count[0] = nb;
+	plan->curr_count[1] = na;
+	plan->curr_count[2] = nl;
+	return 0;
+}
+
+/* RefPicList0/1 and the collocated picture of @slice (8.3.4, 7.4.7.1). */
+static int hevc_list_plan(const struct s7d_hevc_slice_info *slice,
+			  struct s7d_hevc_picture_plan *plan)
+{
+	const struct s7d_hevc_picture_ref *before = plan->curr[0], *after = plan->curr[1];
+	const struct s7d_hevc_picture_ref *lt = plan->curr[2];
+	u32 nb = plan->curr_count[0], na = plan->curr_count[1], nl = plan->curr_count[2];
+	u32 total = nb + na + nl, i, list;
+
+	plan->slice_type = slice->slice_type;
+	plan->list_count[0] = 0;
+	plan->list_count[1] = 0;
+	plan->collocated = (struct s7d_hevc_picture_ref) { .slot = S7D_HEVC_NO_SLOT };
+	plan->collocated_valid = false;
+	plan->low_delay = false;
 	if (slice->slice_type == 2)
 		return 0;
 	if (!total)
@@ -541,6 +573,8 @@ int s7d_hevc_dpb_plan(const struct s7d_hevc_dpb *dpb,
 		return 0;
 	}
 	ret = hevc_reference_plan(dpb, slice, &next);
+	if (!ret)
+		ret = hevc_list_plan(slice, &next);
 	if (ret)
 		return ret;
 	valid_mask = hevc_valid_mask(dpb);
@@ -581,6 +615,29 @@ int s7d_hevc_dpb_plan(const struct s7d_hevc_dpb *dpb,
 	next.current_slot = __ffs(available);
 	*plan = next;
 	return 0;
+}
+
+int s7d_hevc_dpb_slice_plan(const struct s7d_hevc_dpb *dpb,
+			    const struct s7d_hevc_slice_info *slice,
+			    struct s7d_hevc_picture_plan *plan)
+{
+	int ret = hevc_state_check(dpb);
+
+	if (ret)
+		return ret;
+	if (!slice || !plan)
+		return -EINVAL;
+	if (!dpb->active)
+		return -EBUSY;
+	if (slice->parameter_epoch != dpb->parameter_epoch)
+		return -ESTALE;
+	if (slice->first_slice || !slice->slice_address)
+		return -EBADMSG;
+	ret = hevc_slice_type_check(slice);
+	if (ret)
+		return ret;
+	*plan = dpb->active_plan;
+	return hevc_list_plan(slice, plan);
 }
 
 static int hevc_plan_check(const struct s7d_hevc_dpb *dpb,

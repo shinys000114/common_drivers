@@ -65,6 +65,14 @@ int s7d_hevc_picture_configure(struct regmap *map,
 			       const struct s7d_hevc_slice_info *slice,
 			       const struct s7d_hevc_picture_plan *plan);
 
+/* A later slice segment of that picture, at its header pause; @plan from the DPB. */
+int s7d_hevc_slice_configure(struct regmap *map,
+			     const struct s7d_hevc_rpm *rpm,
+			     const struct s7d_hevc_sps *host,
+			     const struct s7d_codec_layout *layout,
+			     const struct s7d_hevc_picture_buffers *buffers,
+			     const struct s7d_hevc_slice_info *slice,
+			     const struct s7d_hevc_picture_plan *plan);
 /* Any MMIO error may leave partial programming: caller must prove DOS halt. */
 
 #endif
