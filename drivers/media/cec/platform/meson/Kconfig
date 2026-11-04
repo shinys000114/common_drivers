@@ -13,7 +13,8 @@ config CEC_MESON_S7D
 	  reset and pinctrl resources. For deep suspend and power off the
 	  controller is handed to the AOCPU firmware, which wakes the system
 	  when the TV selects this source. Through s2idle the controller
-	  keeps receiving and wakes the system for the same messages.
+	  keeps receiving and wakes the system for the same messages. The
+	  device's power/wakeup attribute turns both wake paths off.
 
 config CEC_MESON_S7D_AOCPU
 	bool "Pass CEC identity and wake messages to the S7D AOCPU"

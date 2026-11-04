@@ -571,7 +571,10 @@ static void s7d_cec_handoff(struct s7d_cec *cec)
 	u32 config = 0, address = 0;
 
 	if (phys_addr != CEC_PHYS_ADDR_INVALID) {
-		config = AO_CEC_ON | AO_CEC_AUTO_POWER_ON;
+		/* Like s2idle, power/wakeup decides whether the TV powers us on. */
+		config = AO_CEC_ON;
+		if (device_may_wakeup(cec->dev))
+			config |= AO_CEC_AUTO_POWER_ON;
 		address = FIELD_PREP(AO_CEC_PHYS_ADDR, phys_addr) |
 			  FIELD_PREP(AO_CEC_LOG_ADDR, la->log_addr[0]) |
 			  FIELD_PREP(AO_CEC_DEV_TYPE, la->primary_device_type[0]);
