@@ -86,6 +86,8 @@ struct s7d_hdmi_state {
 	bool hdmi;
 	bool scdc;
 	bool high_tmds;
+	/* The vendor AV mute of the commit */
+	bool avmute;
 	bool valid;
 };
 
@@ -789,6 +791,9 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 	ret = s7d_hdmi_write_checked(h, h->core, CORE_TPI_SC, 0x89, state->hdmi ? 1 : 0);
 	if (ret || !state->hdmi)
 		return ret;
+	/* From both GCP bits clear: Clear_AVMUTE, or Set_AVMUTE for a vendor mute */
+	if (state->avmute)
+		return regmap_update_bits(h->core, CORE_TPI_SC, BIT(3), BIT(3));
 	return s7d_hdmi_write_checked(h, h->core, CORE_TPI_SC, BIT(7), BIT(7));
 }
 
@@ -1580,6 +1585,7 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 {
 	struct s7d_hdmi_state *state = to_s7d_hdmi_state(base);
 	struct drm_connector *connector = conn_state->connector;
+	const struct s7d_vendor_conn_values *vendor_values;
 	struct hdmi_avi_infoframe avi;
 	struct hdmi_vendor_infoframe vendor;
 	struct hdmi_drm_infoframe hdr;
@@ -1613,6 +1619,8 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 		s7d_vendor_props_take_request(conn_state);
 	s7d_vendor_props_set_output(conn_state, attr.space, attr.depth,
 				    s7d_hdmi_mode_fractional(&state->mode));
+	vendor_values = s7d_vendor_props_conn(conn_state);
+	state->avmute = vendor_values && vendor_values->avmute;
 	state->hdmi = connector->display_info.is_hdmi;
 	state->scdc = state->hdmi && connector->display_info.hdmi.scdc.supported;
 	state->high_tmds = state->output.high_tmds;
@@ -1893,6 +1901,43 @@ static const struct drm_bridge_funcs s7d_hdmi_bridge_funcs = {
 	.hpd_enable = s7d_hdmi_hpd_enable,
 	.hpd_disable = s7d_hdmi_hpd_disable,
 };
+
+/* As the vendor: both GCP bits clear, then Set_AVMUTE (3) or Clear_AVMUTE (7) */
+static int s7d_hdmi_avmute(struct s7d_hdmi *h, bool mute)
+{
+	unsigned int bit = mute ? BIT(3) : BIT(7);
+	int ret;
+
+	ret = regmap_update_bits(h->core, CORE_TPI_SC, BIT(7) | BIT(3), 0);
+	return ret ?: regmap_update_bits(h->core, CORE_TPI_SC, bit, bit);
+}
+
+void s7d_hdmi_commit_vendor(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
+{
+	const struct s7d_vendor_conn_values *before, *after;
+	struct drm_connector_state *old, *new;
+	struct drm_connector *connector;
+	struct drm_bridge *bridge;
+	struct s7d_hdmi *h;
+	int i;
+
+	for_each_oldnew_connector_in_state(atomic, connector, old, new, i) {
+		before = s7d_vendor_props_conn(old);
+		after = s7d_vendor_props_conn(new);
+		if (new->crtc != crtc || !new->best_encoder || !before || !after)
+			continue;
+		bridge = drm_bridge_chain_get_first_bridge(new->best_encoder);
+		if (!bridge || bridge->funcs != &s7d_hdmi_bridge_funcs)
+			continue;
+		h = to_s7d_hdmi(bridge);
+		/* Only on a configured link; the next one starts from the state. */
+		mutex_lock(&h->lock);
+		if (h->prepared && before->avmute != after->avmute &&
+		    s7d_hdmi_avmute(h, after->avmute))
+			dev_warn(h->dev, "HDMI AV mute %d failed\n", after->avmute);
+		mutex_unlock(&h->lock);
+	}
+}
 
 int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link)
 {

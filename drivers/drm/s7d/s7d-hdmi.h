@@ -10,6 +10,7 @@
 struct drm_atomic_state;
 struct drm_bridge;
 struct drm_connector;
+struct drm_crtc;
 struct drm_display_info;
 struct drm_display_mode;
 struct platform_driver;
@@ -25,6 +26,13 @@ int s7d_hdmi_connector_atomic_check(struct drm_connector *connector,
  */
 bool s7d_hdmi_vendor_format_valid(struct drm_connector *connector,
 				  const struct drm_display_mode *mode, u8 space, u8 depth);
+/*
+ * Commit tail, from the flush of @crtc without a modeset, with no driver lock
+ * held: apply what the commit changes in the vendor settings of the HDMI
+ * connectors on @crtc, the AV mute as GCP Set_AVMUTE or Clear_AVMUTE. A
+ * modeset sends them with the link setup.
+ */
+void s7d_hdmi_commit_vendor(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
 
 /* Whether the transmitter and the sink carry @mode with @encoding; no hardware access. */
 enum drm_mode_status s7d_hdmi_link_valid(const struct drm_display_info *info,

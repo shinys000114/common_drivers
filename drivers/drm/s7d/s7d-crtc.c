@@ -23,6 +23,7 @@
 #include "s7d-crtc.h"
 #include "s7d-afbc-engine.h"
 #include "s7d-gamma.h"
+#include "s7d-hdmi.h"
 #include "s7d-hooks.h"
 #include "s7d-plane.h"
 #include "s7d-vendor-props.h"
@@ -1267,6 +1268,7 @@ static void s7d_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_state
 	if (ret)
 		goto fail;
 	mutex_unlock(&c->mutex);
+	s7d_hdmi_commit_vendor(crtc, atomic);
 	return;
 fail:
 	s7d_crtc_fail(c, ret, &state->base);
