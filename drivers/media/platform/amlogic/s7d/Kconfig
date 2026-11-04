@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Hardkernel Co., Ltd.
 
 config VIDEO_AMLOGIC_S7D
-	tristate "Amlogic S7D stateful H.264 decoder"
+	tristate "Amlogic S7D stateful video decoder"
 	depends on ARM64 && OF && VIDEO_DEV
 	depends on COMMON_CLK && PM && PM_GENERIC_DOMAINS && RESET_CONTROLLER
 	depends on DMA_CMA && OF_RESERVED_MEM
@@ -12,10 +12,14 @@ config VIDEO_AMLOGIC_S7D
 	select V4L2_MEM2MEM_DEV
 	select VIDEOBUF2_VMALLOC
 	help
-	  Standard V4L2 memory-to-memory interface for the S7D VDEC engine.
-	  The initial H.264 path uses the Amlogic TEE firmware service,
-	  vmalloc input and 32-bit coherent capture buffers on the codec DMA
-	  device.
+	  Standard stateful V4L2 memory-to-memory decoder node for the S7D
+	  DOS codec engines. It always decodes H.264 (progressive High
+	  profile up to 4096x2304 at 30 frames per second) on the VDEC
+	  engine; the options below add codecs on the HEVC engine and the
+	  JPEG encoder on HCODEC. The codec firmware is loaded through the
+	  Amlogic TEE service. Each engine runs one session at a time, and
+	  different engines run at the same time: an H.264 decode, a decode
+	  on the HEVC engine and a JPEG encode can share the DOS.
 
 config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
 	bool "Amlogic S7D HEVC decoder"
@@ -27,9 +31,8 @@ config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
 	  It takes progressive Main and Main10 4:2:0 streams up to 4096x2304
 	  at 60 frames per second, including resolution changes, and returns
 	  8-bit NV12 or NV12M frames or Amlogic FBC frames of the stream's
-	  depth. Tiles, dependent slices and long-term references are not
-	  supported. The node runs one decoder session at a time and shares
-	  the DOS with the JPEG encoder.
+	  depth, with several slices, tiles, dependent slices, long-term
+	  references and temporal sub-layers.
 
 config VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL
 	bool "Amlogic S7D VP9 decoder"
@@ -44,8 +47,7 @@ config VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL
 	  or NV12M frames or Amlogic FBC frames of the stream's depth. The
 	  frame size, depth and colour may change at a key frame (dynamic
 	  resolution change), not between inter frames: reference scaling is
-	  not supported. The node runs one decoder session at a time and
-	  shares the DOS with the JPEG encoder.
+	  not supported.
 
 config VIDEO_AMLOGIC_S7D_HEVC_ENGINE
 	bool
@@ -66,8 +68,6 @@ config VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL
 	  supported. Streams with film grain decode, but without the grain:
 	  the decoder outputs the picture before grain synthesis, which the
 	  vendor applies only at scanout. Super-resolution is not supported.
-	  The node runs one decoder session at a time and shares the DOS with
-	  the JPEG encoder.
 
 config VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL
 	bool "Amlogic S7D JPEG encoder"
@@ -76,7 +76,6 @@ config VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL
 	help
 	  Register an additional standard V4L2 memory-to-memory JPEG encoder
 	  on the HCODEC engine. It takes contiguous NV12 or NV21 frames from
-	  16x16 up to 1920x1080 through MMAP buffers and produces baseline
-	  8-bit 4:2:0 JPEG with the standard compression quality control.
-	  The encoder shares the DOS with the video decoders, so it cannot
-	  start streaming while a decoder session is active.
+	  16x16 up to 1920x1080 through MMAP or DMABUF buffers and produces
+	  baseline 8-bit 4:2:0 JPEG with the standard compression quality
+	  control. It runs while the video decoders are decoding.
