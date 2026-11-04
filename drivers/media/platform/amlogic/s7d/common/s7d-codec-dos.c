@@ -1788,7 +1788,8 @@ int s7d_codec_dos_park(struct s7d_codec_lease *lease)
 	ret = dos_check(dos->map, DOS_MBOX1_MASK, U32_MAX, 0);
 	if (ret)
 		goto fault;
-	ret = dos_check(dos->map, DOS_MPSR, U32_MAX, 0);
+	/* A CPU stopped while it waits for the host keeps status bits set. */
+	ret = dos_check(dos->map, DOS_MPSR, DOS_MPSR_RUN, 0);
 	if (ret)
 		goto fault;
 	ret = dos_check(dos->map, DOS_CPSR, U32_MAX, 0);

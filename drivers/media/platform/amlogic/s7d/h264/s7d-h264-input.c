@@ -23,6 +23,7 @@
 
 #define DOS_REG(word)			((word) * 4)
 #define VDEC_MPSR			DOS_REG(0x0301)
+#define VDEC_MPSR_RUN			BIT(0)
 #define VDEC_CPSR			DOS_REG(0x0321)
 #define VDEC_MBOX1_MASK			DOS_REG(0x0076)
 #define H264_RESERVED_BITS		DOS_REG(0x09c1)
@@ -1950,7 +1951,9 @@ static int input_check_parked(struct s7d_h264_input *input)
 		ret = regmap_read(input->map, regs[i], &value);
 		if (ret)
 			return ret;
-		if (i == ARRAY_SIZE(regs) - 1 ? value & FIFO_ENABLE : value)
+		/* Stopped while it waits for the host, the CPU keeps status bits. */
+		if (regs[i] == VDEC_MPSR ? value & VDEC_MPSR_RUN :
+		    regs[i] == VLD_CONTROL ? value & FIFO_ENABLE : value)
 			return -EBUSY;
 	}
 	return 0;
