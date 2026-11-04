@@ -15,6 +15,8 @@
 
 struct drm_crtc;
 struct drm_crtc_state;
+struct drm_plane;
+struct drm_plane_state;
 struct drm_property;
 struct s7d_vendor_props;
 
@@ -43,6 +45,13 @@ int s7d_vendor_props_crtc_get(const struct s7d_vendor_props *vp, struct drm_crtc
 int s7d_vendor_props_crtc_set(const struct s7d_vendor_props *vp, struct drm_crtc *crtc,
 			      struct drm_crtc_state *state,
 			      struct drm_property *property, u64 val);
+/* Atomic property hooks of the planes; @vp is NULL without vendor properties. */
+int s7d_vendor_props_plane_get(const struct s7d_vendor_props *vp, struct drm_plane *plane,
+			       const struct drm_plane_state *state,
+			       struct drm_property *property, u64 *val);
+int s7d_vendor_props_plane_set(const struct s7d_vendor_props *vp, struct drm_plane *plane,
+			       struct drm_plane_state *state,
+			       struct drm_property *property, u64 val);
 #else
 static inline int s7d_vendor_props_crtc_get(const struct s7d_vendor_props *vp,
 					    struct drm_crtc *crtc,
@@ -56,6 +65,22 @@ static inline int s7d_vendor_props_crtc_set(const struct s7d_vendor_props *vp,
 					    struct drm_crtc *crtc,
 					    struct drm_crtc_state *state,
 					    struct drm_property *property, u64 val)
+{
+	return -EINVAL;
+}
+
+static inline int s7d_vendor_props_plane_get(const struct s7d_vendor_props *vp,
+					     struct drm_plane *plane,
+					     const struct drm_plane_state *state,
+					     struct drm_property *property, u64 *val)
+{
+	return -EINVAL;
+}
+
+static inline int s7d_vendor_props_plane_set(const struct s7d_vendor_props *vp,
+					     struct drm_plane *plane,
+					     struct drm_plane_state *state,
+					     struct drm_property *property, u64 val)
 {
 	return -EINVAL;
 }

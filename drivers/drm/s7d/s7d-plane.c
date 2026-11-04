@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
+#include <linux/dma-fence-unwrap.h>
 #include <linux/dma-resv.h>
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
@@ -20,6 +21,7 @@
 #include "s7d-plane.h"
 #include "s7d-crtc.h"
 #include "s7d-fb.h"
+#include "s7d-vendor-props.h"
 #include "s7d-video-scaler.h"
 
 struct s7d_plane {
@@ -28,6 +30,8 @@ struct s7d_plane {
 	enum s7d_plane_slot slot;
 	/* Latched at creation; atomic checks never read the parameter. */
 	bool gfcd_primary;
+	/* Set before registration, in vendor mode only. */
+	const struct s7d_vendor_props *vendor;
 };
 
 /*
@@ -86,6 +90,10 @@ static bool s7d_plane_gfcd(const struct s7d_plane *plane,
 static void s7d_plane_destroy_state(struct drm_plane *plane,
 				    struct drm_plane_state *state)
 {
+	struct s7d_plane_vendor *vendor = &to_s7d_plane_state(state)->vendor;
+
+	drm_property_blob_put(vendor->palette);
+	dma_fence_put(vendor->async_in_fence);
 	__drm_atomic_helper_plane_destroy_state(state);
 	kfree(to_s7d_plane_state(state));
 }
@@ -110,7 +118,36 @@ static struct drm_plane_state *s7d_plane_duplicate_state(struct drm_plane *plane
 	if (!state)
 		return NULL;
 	__drm_atomic_helper_plane_duplicate_state(plane, &state->base);
+	if (state->vendor.palette)
+		drm_property_blob_get(state->vendor.palette);
+	state->vendor.async_in_fence = NULL;
+	state->vendor.signal_format = 0;
 	return &state->base;
+}
+
+/*
+ * The vendor driver hands ASYNC_IN_FENCE_FD of a plain commit to the video
+ * path, which shows the frame once it signals: wait for it as for IN_FENCE_FD.
+ */
+static int s7d_plane_take_async_fence(struct drm_plane_state *base)
+{
+	struct s7d_plane_vendor *vendor = &to_s7d_plane_state(base)->vendor;
+	struct dma_fence *fence;
+
+	if (!vendor->async_in_fence)
+		return 0;
+	if (base->fence) {
+		fence = dma_fence_unwrap_merge(base->fence, vendor->async_in_fence);
+		if (!fence)
+			return -ENOMEM;
+		dma_fence_put(base->fence);
+		dma_fence_put(vendor->async_in_fence);
+	} else {
+		fence = vendor->async_in_fence;
+	}
+	base->fence = fence;
+	vendor->async_in_fence = NULL;
+	return 0;
 }
 
 /*
@@ -359,7 +396,11 @@ static int s7d_plane_atomic_check(struct drm_plane *plane,
 {
 	struct drm_plane_state *state = drm_atomic_get_new_plane_state(atomic, plane);
 	struct drm_crtc_state *crtc_state = NULL;
+	int ret;
 
+	ret = s7d_plane_take_async_fence(state);
+	if (ret)
+		return ret;
 	if (state->crtc) {
 		crtc_state = drm_atomic_get_crtc_state(atomic, state->crtc);
 		if (IS_ERR(crtc_state))
@@ -395,12 +436,30 @@ static bool s7d_vd1_format_mod_supported(struct drm_plane *plane,
 	return modifier == DRM_FORMAT_MOD_LINEAR;
 }
 
+static int s7d_plane_atomic_get_property(struct drm_plane *plane,
+					 const struct drm_plane_state *state,
+					 struct drm_property *property, uint64_t *val)
+{
+	return s7d_vendor_props_plane_get(container_of(plane, struct s7d_plane, base)->vendor,
+					  plane, state, property, val);
+}
+
+static int s7d_plane_atomic_set_property(struct drm_plane *plane,
+					 struct drm_plane_state *state,
+					 struct drm_property *property, uint64_t val)
+{
+	return s7d_vendor_props_plane_set(container_of(plane, struct s7d_plane, base)->vendor,
+					  plane, state, property, val);
+}
+
 static const struct drm_plane_funcs s7d_vd1_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.reset = s7d_plane_reset,
 	.atomic_duplicate_state = s7d_plane_duplicate_state,
 	.atomic_destroy_state = s7d_plane_destroy_state,
+	.atomic_get_property = s7d_plane_atomic_get_property,
+	.atomic_set_property = s7d_plane_atomic_set_property,
 	.format_mod_supported = s7d_vd1_format_mod_supported,
 };
 
@@ -410,6 +469,8 @@ static const struct drm_plane_funcs s7d_plane_funcs = {
 	.reset = s7d_plane_reset,
 	.atomic_duplicate_state = s7d_plane_duplicate_state,
 	.atomic_destroy_state = s7d_plane_destroy_state,
+	.atomic_get_property = s7d_plane_atomic_get_property,
+	.atomic_set_property = s7d_plane_atomic_set_property,
 	.format_mod_supported = s7d_plane_format_mod_supported,
 };
 
@@ -419,6 +480,8 @@ static const struct drm_plane_funcs s7d_rgb_plane_funcs = {
 	.reset = s7d_plane_reset,
 	.atomic_duplicate_state = s7d_plane_duplicate_state,
 	.atomic_destroy_state = s7d_plane_destroy_state,
+	.atomic_get_property = s7d_plane_atomic_get_property,
+	.atomic_set_property = s7d_plane_atomic_set_property,
 	.format_mod_supported = s7d_rgb_format_mod_supported,
 };
 
@@ -486,6 +549,11 @@ enum s7d_plane_slot s7d_plane_slot(const struct drm_plane *plane)
 bool s7d_plane_is_primary(const struct drm_plane *plane)
 {
 	return s7d_plane_is_native(plane) && s7d_plane_slot(plane) == S7D_PLANE_PRIMARY;
+}
+
+void s7d_plane_set_vendor_props(struct drm_plane *plane, const struct s7d_vendor_props *props)
+{
+	container_of(plane, struct s7d_plane, base)->vendor = props;
 }
 
 struct drm_plane *s7d_plane_create(struct drm_device *drm,

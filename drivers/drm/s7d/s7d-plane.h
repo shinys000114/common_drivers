@@ -25,6 +25,24 @@ static inline enum s7d_plane_slot s7d_plane_afbc_slot(unsigned int surface)
 	return surface ? S7D_PLANE_RGB : S7D_PLANE_PRIMARY;
 }
 
+struct dma_fence;
+struct drm_property_blob;
+struct s7d_vendor_props;
+
+/*
+ * Values of the vendor plane properties (s7d-vendor-props.c), zero without
+ * them. Only ASYNC_IN_FENCE_FD changes the commit: atomic check turns it into
+ * the plane fence.
+ */
+struct s7d_plane_vendor {
+	struct drm_property_blob *palette;
+	struct dma_fence *async_in_fence;
+	u32 dimming;
+	bool occupied;
+	/* As in the vendor driver, signal_format holds for the commit that sets it. */
+	u8 signal_format;
+};
+
 struct s7d_plane_state {
 	struct drm_plane_state base;
 	struct s7d_osd_layer layer;
@@ -36,6 +54,7 @@ struct s7d_plane_state {
 	bool video_valid;
 	bool afbc_valid;
 	bool gfcd_valid;
+	struct s7d_plane_vendor vendor;
 };
 
 static inline struct s7d_plane_state *
@@ -55,5 +74,7 @@ bool s7d_plane_is_native(const struct drm_plane *plane);
 enum s7d_plane_slot s7d_plane_slot(const struct drm_plane *plane);
 bool s7d_plane_is_primary(const struct drm_plane *plane);
 bool s7d_plane_fence_pending(const struct drm_plane_state *state);
+/* Hand the vendor plane properties to their owner; before the device registers. */
+void s7d_plane_set_vendor_props(struct drm_plane *plane, const struct s7d_vendor_props *props);
 
 #endif
