@@ -1410,10 +1410,11 @@ static int program_video2_pps(struct s7d_vpu *v,
 	for (direction = 0; direction < 3; direction++) {
 		if (!pps->coefficients[direction])
 			continue;
-		writel(direction == 2 ? BIT(8) | BIT(7) : direction << 8,
-		       v->regs + 0x3943 * 4);
+		writel(s7d_video2_coef_index(direction),
+		       v->regs + S7D_VIDEO2_PPS_COEF_IDX * 4);
 		for (phase = 0; phase < S7D_FILTER_PHASES; phase++)
-			writel(pps->coefficients[direction][phase], v->regs + 0x3944 * 4);
+			writel(pps->coefficients[direction][phase],
+			       v->regs + S7D_VIDEO2_PPS_COEF_DATA * 4);
 	}
 	return vpu_update(v, pps->control.reg, pps->control.mask, pps->control.value);
 }

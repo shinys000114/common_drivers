@@ -3,12 +3,17 @@
 #include <linux/bits.h>
 #include <linux/errno.h>
 #include <linux/limits.h>
+#include <linux/kernel.h>
 #include <linux/math64.h>
 
 #include "s7d-video2-scaler.h"
 #include "s7d-filter.h"
 
 #define SET(r, m, v) { .reg = (r), .mask = (m), .value = (v) }
+
+#define VD2_PPS_CONTROL		0x3958
+#define VD2_PPS_CONTROL_MASK	(BIT(24) | GENMASK(22, 15) | BIT(12) | \
+				 GENMASK(11, 8) | GENMASK(5, 4) | GENMASK(2, 0))
 
 static const u32 *s7d_video2_filter(u64 step, u32 *bank)
 {
@@ -58,8 +63,7 @@ int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 			SET(0x395d, U32_MAX, 0x48f80000),
 			SET(0x395f, GENMASK(15, 0), 0x48f8),
 		},
-		.control = SET(0x3958, BIT(24) | GENMASK(22, 15) | BIT(12) |
-			       GENMASK(11, 8) | GENMASK(5, 4) | GENMASK(2, 0),
+		.control = SET(VD2_PPS_CONTROL, VD2_PPS_CONTROL_MASK,
 			       BIT(24) | BIT(16) | BIT(15) | 4),
 	};
 	u32 h_end, v_end, ratio, offset, skip, phase, bank;
@@ -126,5 +130,37 @@ int s7d_video2_scaler_build(u32 width, u32 height, u32 output_w, u32 output_h,
 		next.control.value = (next.control.value & ~GENMASK(2, 0)) | bank;
 	}
 	*out = next;
+	return 0;
+}
+
+int s7d_video2_scaler_build_live(const struct s7d_video2_pps_state *pps,
+				 struct s7d_rdma_live *live)
+{
+	unsigned int i, direction, phase;
+
+	if (!pps || !live || (pps->control.reg && pps->control.reg != VD2_PPS_CONTROL))
+		return -EINVAL;
+	/* Close the PPS before its geometry changes; a disabled VD2 leaves it closed. */
+	s7d_rdma_live_add(live, VD2_PPS_CONTROL, VD2_PPS_CONTROL_MASK, 0);
+	if (!pps->control.reg)
+		return 0;
+	for (i = 0; i < S7D_VIDEO2_PPS_SETUP_REG_COUNT; i++) {
+		const struct s7d_video_scaler_reg *s = &pps->setup[i];
+
+		/* The input size is written whole, as the VD2 update list does. */
+		s7d_rdma_live_add(live, s->reg, s->reg == 0x1df0 ? U32_MAX : s->mask,
+				  s->value);
+	}
+	/* As the vendor does at vsync: index, then the auto-incrementing table. */
+	for (direction = 0; direction < ARRAY_SIZE(pps->coefficients); direction++) {
+		if (!pps->coefficients[direction])
+			continue;
+		s7d_rdma_live_add(live, S7D_VIDEO2_PPS_COEF_IDX, U32_MAX,
+				  s7d_video2_coef_index(direction));
+		for (phase = 0; phase < S7D_FILTER_PHASES; phase++)
+			s7d_rdma_live_add(live, S7D_VIDEO2_PPS_COEF_DATA, U32_MAX,
+					  pps->coefficients[direction][phase]);
+	}
+	s7d_rdma_live_add(live, pps->control.reg, pps->control.mask, pps->control.value);
 	return 0;
 }

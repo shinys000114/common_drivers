@@ -71,6 +71,7 @@ struct s7d_crtc_state {
 	bool afbc_decode_only;
 	bool afbc_replay_compatible;
 	bool video_scaler_live;
+	bool video2_scaler_live;
 };
 
 static inline struct s7d_crtc_state *

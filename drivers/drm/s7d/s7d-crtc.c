@@ -93,6 +93,7 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->afbc_decode_only = false;
 	state->afbc_replay_compatible = false;
 	state->video_scaler_live = false;
+	state->video2_scaler_live = false;
 	state->live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	return &state->base;
@@ -237,13 +238,6 @@ static void s7d_crtc_check_video_update(struct s7d_crtc_state *state,
 		&state->video, &state->csc, &state->postblend);
 	s7d_crtc_snapshot_video(&state->buffers.video2, state->buffers.fb[S7D_PLANE_VIDEO2],
 		&state->video2, &state->csc2, &state->postblend);
-	/* VD2 coefficients and geometry are prepared while stopped. */
-	if (old && old->valid && old->base.active &&
-	    (state->video2.scaler.src_width != old->video2.scaler.src_width ||
-	     state->video2.scaler.src_height != old->video2.scaler.src_height ||
-	     state->video2.scaler.dst_width != old->video2.scaler.dst_width ||
-	     state->video2.scaler.dst_height != old->video2.scaler.dst_height))
-		state->base.mode_changed = true;
 	if (old && old->valid && old->base.active &&
 	    ((state->buffers.afbc.plan.surface_mask &&
 	      (state->buffers.video.fb || state->buffers.video2.fb)) ||
@@ -305,12 +299,24 @@ static int s7d_crtc_check_afbc_video(const struct s7d_crtc_state *state)
 static int s7d_crtc_build_live(const struct s7d_crtc_state *state,
 			       struct s7d_rdma_live *live)
 {
-	if (state->video_scaler_live)
-		return s7d_video_scaler_build_live(&state->video.scaler, live);
+	int ret;
+
+	if (state->video_scaler_live) {
+		ret = s7d_video_scaler_build_live(&state->video.scaler, live);
+		if (ret)
+			return ret;
+	}
+	if (state->video2_scaler_live) {
+		ret = s7d_video2_scaler_build_live(&state->video2_pps, live);
+		if (ret)
+			return ret;
+	}
 	return 0;
 }
 
-static_assert(S7D_CRTC_LIVE_REG_COUNT >= S7D_VIDEO_SCALER_LIVE_COUNT);
+/* Both video scalers always fit. */
+static_assert(S7D_CRTC_LIVE_REG_COUNT >=
+	      S7D_VIDEO_SCALER_LIVE_COUNT + S7D_VIDEO2_SCALER_LIVE_COUNT);
 
 /*
  * Count the live scaler writes. A set that does not fit in the RDMA table
@@ -328,6 +334,7 @@ static int s7d_crtc_check_live(struct s7d_crtc_state *state)
 	if (live.count > S7D_CRTC_LIVE_REG_COUNT) {
 		state->base.mode_changed = true;
 		state->video_scaler_live = false;
+		state->video2_scaler_live = false;
 		return 0;
 	}
 	state->live_count = live.count;
@@ -403,7 +410,7 @@ static int s7d_crtc_build_update(struct s7d_crtc_state *state,
 		int ret;
 
 		/* A rescaled video also rewrites its pipeline words. */
-		if (state->video_scaler_live &&
+		if ((state->video_scaler_live || state->video2_scaler_live) &&
 		    (state->video_unchanged || state->video_address_only))
 			return -EINVAL;
 		ret = s7d_crtc_build_live(state, &live);
@@ -584,6 +591,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->afbc_decode_only = false;
 	state->afbc_replay_compatible = false;
 	state->video_scaler_live = false;
+	state->video2_scaler_live = false;
 	state->live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	state->buffers = (struct s7d_scanout_buffers) {0};
@@ -784,16 +792,27 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		video2 ? &video2_dst : NULL, video_hold, &state->video2);
 	if (ret)
 		return ret;
-	if (old && old->active &&
-	    memcmp(to_s7d_crtc_state(old)->video2.setup, state->video2.setup,
-		   sizeof(state->video2.setup)))
-		base->mode_changed = true;
 	if (video2) {
 		ret = s7d_video2_scaler_build(state->video2.scaler.src_width,
 			state->video2.scaler.src_height, state->video2.scaler.dst_width,
 			state->video2.scaler.dst_height, &state->video2_pps);
 		if (ret)
 			return ret;
+	}
+	if (old && old->active) {
+		const struct s7d_crtc_state *before = to_s7d_crtc_state(old);
+
+		/*
+		 * A disabled VD2 keeps the MIF setup of an enabled NV12/NV21 one,
+		 * so it starts, stops and rescales at vblank; another setup
+		 * prepares while stopped.
+		 */
+		if (memcmp(before->video2.setup, state->video2.setup,
+			   sizeof(state->video2.setup)))
+			base->mode_changed = true;
+		else if (memcmp(&before->video2_pps, &state->video2_pps,
+				sizeof(state->video2_pps)))
+			state->video2_scaler_live = true;
 	}
 	/* Entry, owner, layout and alpha-route changes require stopped preparation. */
 	if (old && old->active) {

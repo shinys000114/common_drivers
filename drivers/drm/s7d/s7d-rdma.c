@@ -17,6 +17,7 @@
 #include "s7d-gfcd.h"
 #include "s7d-csc.h"
 #include "s7d-osd-pipeline.h"
+#include "s7d-video2-scaler.h"
 
 #define RDMA_START		0x1102
 #define RDMA_END		0x1103
@@ -306,6 +307,15 @@ static bool display_write_valid(u32 reg, u32 value)
 	case 0x1da4:
 	case 0x1da6:
 		return !(value & ~0x1fff1fffU);
+	/* VD2 PPS geometry and control, merged with the running values at submit. */
+	case 0x3945 ... 0x395f:
+		return true;
+	/* The VD2 filter RAM: a direction index, then any table word. */
+	case S7D_VIDEO2_PPS_COEF_IDX:
+		return value == s7d_video2_coef_index(0) || value == s7d_video2_coef_index(1) ||
+		       value == s7d_video2_coef_index(2);
+	case S7D_VIDEO2_PPS_COEF_DATA:
+		return true;
 	case 0x1d01:
 		return value >= 2 && value <= 4096 && !(value & BIT(0));
 	case 0x1d02:
