@@ -1,0 +1,61 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+#
+# Usage: odroidc5-cec-standby [/dev/cecN]
+#
+# Suspend the system when the TV (logical address 0) sends <Standby> to
+# this device or to all. A TV may send <Standby> more than once, and a
+# copy that is read only after resume must not suspend the system again.
+# cec-ctl --verbose prints each message's receive time on CLOCK_MONOTONIC,
+# which stops while the system sleeps, so a <Standby> received within
+# CEC_STANDBY_HOLDOFF seconds (default 10) of the one that suspended the
+# system is ignored.
+
+set -u
+
+dev=${1:-/dev/cec0}
+holdoff=$(( ${CEC_STANDBY_HOLDOFF:-10} * 1000 ))
+last=
+pending=
+
+standby()
+{
+	local ms
+
+	if ! [[ $1 =~ Rx\ Timestamp:\ ([0-9]+)\.([0-9]+)s ]]; then
+		echo "no receive time for <Standby>; ignored" >&2
+		return
+	fi
+	ms=${BASH_REMATCH[2]}00
+	ms=$(( 10#${BASH_REMATCH[1]} * 1000 + 10#${ms:0:3} ))
+	if [ -n "$last" ] && [ "$ms" -lt $(( last + holdoff )) ]; then
+		return
+	fi
+	last=$ms
+	echo "TV went to standby; suspending"
+	systemctl suspend || echo "suspend request failed" >&2
+}
+
+while IFS= read -r line; do
+	# Details of a message follow it on lines that start with a tab.
+	if [ -n "$pending" ]; then
+		case $line in
+		$'\t'*"Rx Timestamp: "*)
+			pending=
+			standby "$line"
+			continue
+			;;
+		$'\t'*)
+			continue
+			;;
+		esac
+		pending=
+		echo "no receive time for <Standby>; ignored" >&2
+	fi
+	case $line in
+	"Received from "*" (0 to "*"): STANDBY"*)
+		pending=1
+		;;
+	esac
+done < <(stdbuf -oL cec-ctl --device="$dev" --skip-info --monitor --verbose)

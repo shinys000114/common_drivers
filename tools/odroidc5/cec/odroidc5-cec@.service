@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+#
+# Claim a playback logical address named ODROID-C5. 70-odroidc5-cec.rules
+# starts this for the S7D adapter. The kernel keeps the claim across HPD
+# changes and sleep, and claims again when the physical address returns,
+# so one run per boot is enough. Do not clear the claim on stop: power off
+# hands it to the AOCPU so that the TV can power the board on.
+
+[Unit]
+Description=HDMI CEC playback device on %I
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/cec-ctl --device=/dev/%I --skip-info --playback --osd-name=ODROID-C5

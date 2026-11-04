@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+#
+# Configure the native S7D CEC adapter once it appears, and give systemd
+# a device unit for it.
+
+ACTION=="remove", GOTO="odroidc5_cec_end"
+SUBSYSTEM=="cec", KERNEL=="cec[0-9]*", DRIVERS=="s7d-cecb", TAG+="systemd", ENV{SYSTEMD_WANTS}+="odroidc5-cec@%k.service"
+LABEL="odroidc5_cec_end"
