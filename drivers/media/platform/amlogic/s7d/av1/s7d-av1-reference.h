@@ -32,7 +32,13 @@ struct s7d_av1_reference_backing {
 	bool scattered;
 };
 
+/* Film grain parameter words of a picture, as HEVC_FGS_DATA holds them. */
+#define S7D_AV1_GRAIN_WORDS 39U
+
 struct s7d_av1_reference_state {
+	/* The picture's film grain parameters, for frames that load them. */
+	u32 grain[S7D_AV1_GRAIN_WORDS];
+	bool grain_valid;
 	s8 ref_delta[8];
 	s8 mode_delta[2];
 	u16 seg_lf_y[8];
@@ -137,6 +143,14 @@ int s7d_av1_references_output_committed(struct s7d_av1_references *references,
  */
 int s7d_av1_references_unbind(struct s7d_av1_references *references,
 			      u64 cookies[S7D_AV1_DPB_MAX_SLOTS], u32 *count);
+/*
+ * During a run: the film grain parameters of reference slot @index (the
+ * frame header's film_grain_params_ref_idx). -ENODATA when that picture has
+ * none; -EBADMSG when the prepared frame to decode does not refer to it.
+ */
+int s7d_av1_references_grain(const struct s7d_av1_references *references,
+			     u64 lease_epoch, u64 input_token, u32 index,
+			     u32 words[S7D_AV1_GRAIN_WORDS]);
 int s7d_av1_references_parser_words(const struct s7d_av1_references *references,
 				    u64 lease_epoch,
 				    u32 words[S7D_AV1_PARSER_REFERENCE_WORDS]);

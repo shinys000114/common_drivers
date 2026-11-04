@@ -290,7 +290,6 @@ int s7d_av1_admit_sequence(const struct s7d_av1_sequence *sequence)
 	    (sequence->bit_depth != 8 && sequence->bit_depth != 10) ||
 	    sequence->monochrome || !sequence->subsampling_x ||
 	    !sequence->subsampling_y || sequence->enable_superres ||
-	    sequence->film_grain_params_present ||
 	    sequence->max_frame_width > 4096 ||
 	    sequence->max_frame_height > 2304 ||
 	    (sequence->op[0].idc && sequence->op[0].idc != 0x101) ||

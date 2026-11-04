@@ -63,9 +63,11 @@ config VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL
 	  FBC frames of the stream's depth. A new sequence header or a key
 	  frame of another size, also one below the sequence maximum, changes
 	  the resolution dynamically; an inter frame of another size is not
-	  supported. Film grain and super-resolution are not supported. The
-	  node runs one decoder session at a time and shares the DOS with the
-	  JPEG encoder.
+	  supported. Streams with film grain decode, but without the grain:
+	  the decoder outputs the picture before grain synthesis, which the
+	  vendor applies only at scanout. Super-resolution is not supported.
+	  The node runs one decoder session at a time and shares the DOS with
+	  the JPEG encoder.
 
 config VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL
 	bool "Amlogic S7D JPEG encoder"

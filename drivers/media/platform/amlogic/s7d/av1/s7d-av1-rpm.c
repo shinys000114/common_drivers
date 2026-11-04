@@ -49,7 +49,10 @@ int s7d_av1_rpm_check_sequence(const struct s7d_av1_rpm *rpm,
 	     (w[94] >> 8) != sequence->transfer_characteristics ||
 	     (w[94] & 0xff) != sequence->matrix_coefficients))
 		return -EPROTO;
-	if (w[98] || w[99])
+	/* film_grain_present_flag, then the OBU temporal and spatial ids. */
+	if (w[98] && !sequence->film_grain_params_present)
+		return -EPROTO;
+	if (w[99])
 		return -EOPNOTSUPP;
 	return 0;
 }

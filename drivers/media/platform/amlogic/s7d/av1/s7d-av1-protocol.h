@@ -4,8 +4,11 @@
 #ifndef S7D_AV1_PROTOCOL_H
 #define S7D_AV1_PROTOCOL_H
 
+#include <linux/bits.h>
+
 #include "s7d-hevc-engine.h"
 #include "s7d-av1-dma-context.h"
+#include "s7d-av1-reference.h"
 #include "s7d-av1-rpm.h"
 
 enum s7d_av1_firmware_status {
@@ -80,7 +83,16 @@ int s7d_av1_protocol_init(struct regmap *map,
 int s7d_av1_protocol_start(struct regmap *map,
 			   const struct s7d_av1_workspace *workspace,
 			   const struct s7d_av1_input_plan *input, u32 decode_count);
-int s7d_av1_protocol_fgs_read_ack(struct regmap *map);
+/* SCRATCH 11 at an FGS_REQUEST pause: bit 11 asks to load, bits 10:8 name the reference. */
+#define S7D_AV1_FGS_LOAD BIT(11)
+#define S7D_AV1_FGS_REFERENCE(request) (((request) >> 8) & 7)
+int s7d_av1_protocol_fgs_request(struct regmap *map, u32 *request);
+/* The current frame's film grain parameters, as vav1.c read_film_grain_reg. */
+int s7d_av1_protocol_fgs_save(struct regmap *map, u32 words[S7D_AV1_GRAIN_WORDS]);
+/* Load a reference's parameters and start the grain unit (config_film_grain_reg). */
+int s7d_av1_protocol_fgs_load(struct regmap *map, const u32 words[S7D_AV1_GRAIN_WORDS]);
+/* Let the firmware go on after an FGS_REQUEST. */
+int s7d_av1_protocol_fgs_continue(struct regmap *map);
 int s7d_av1_protocol_irq_snapshot(struct regmap *map,
 				  struct s7d_av1_irq_snapshot *snapshot);
 int s7d_av1_execution_begin(struct s7d_av1_execution *execution,

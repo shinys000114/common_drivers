@@ -32,6 +32,8 @@ struct av1_header_job {
 	struct completion wake;
 	u8 *source;
 	u8 sequence_payload[S7D_AV1_SEQUENCE_MAX_BYTES];
+	/* Film grain parameters the firmware gave or took for this picture. */
+	u32 grain[S7D_AV1_GRAIN_WORDS];
 	u64 epoch;
 	u64 token;
 	u64 firmware_epoch;
@@ -47,6 +49,7 @@ struct av1_header_job {
 	bool show_existing;
 	bool staged;
 	bool finished;
+	bool grain_valid;
 };
 
 struct s7d_av1_runner {
@@ -176,6 +179,50 @@ static int runner_configure_picture(struct s7d_av1_runner *runner,
 	return ret;
 }
 
+/*
+ * FGS_REQUEST: the firmware gives the film grain parameters it parsed, or,
+ * for a frame that takes them from a reference (update_grain 0), asks for
+ * those, as vav1.c read_film_grain_reg/config_film_grain_reg. Each picture
+ * keeps its parameters with its DPB slot. The decoded picture carries no
+ * grain either way: the vendor adds it at scanout.
+ */
+static int runner_film_grain(struct s7d_av1_runner *runner, struct av1_header_job *job)
+{
+	u32 request, index;
+	int ret;
+
+	if (job->execution.phase == S7D_AV1_EXECUTION_DECODE &&
+	    (!job->decode || !job->picture_ready || job->show_existing))
+		return -EOPNOTSUPP;
+	ret = s7d_av1_protocol_fgs_request(runner->map, &request);
+	if (ret)
+		return ret;
+	if (!job->result.sequence.film_grain_params_present) {
+		if (request & S7D_AV1_FGS_LOAD)
+			return -EOPNOTSUPP;
+	} else if (!(request & S7D_AV1_FGS_LOAD)) {
+		if (job->decode) {
+			ret = s7d_av1_protocol_fgs_save(runner->map, job->grain);
+			job->grain_valid = !ret;
+		}
+	} else {
+		if (!job->decode)
+			return -EOPNOTSUPP;
+		index = S7D_AV1_FGS_REFERENCE(request);
+		ret = s7d_av1_references_grain(runner->references, job->epoch, job->token,
+					       index, job->grain);
+		if (!ret) {
+			ret = s7d_av1_protocol_fgs_load(runner->map, job->grain);
+			job->grain_valid = !ret;
+		} else if (ret == -ENODATA || ret == -EBADMSG) {
+			/* The vendor goes on without them too: only the grain is lost. */
+			dev_dbg(runner->dev, "AV1 film grain of reference %u: %d\n", index, ret);
+			ret = 0;
+		}
+	}
+	return ret ?: s7d_av1_protocol_fgs_continue(runner->map);
+}
+
 static bool runner_cookie(const struct s7d_av1_runner *runner,
 			  const struct av1_header_job *job,
 			  const struct s7d_hevc_irq_cookie *cookie)
@@ -238,12 +285,7 @@ static irqreturn_t av1_thread(void *priv, const struct s7d_hevc_irq_cookie *cook
 	if (event == S7D_AV1_EVENT_NONE)
 		goto out;
 	if (event == S7D_AV1_EVENT_FGS_READ) {
-		if (job->result.sequence.film_grain_params_present ||
-		    (job->execution.phase == S7D_AV1_EXECUTION_DECODE &&
-		     (!job->decode || !job->picture_ready || job->show_existing)))
-			ret = -EOPNOTSUPP;
-		else
-			ret = s7d_av1_protocol_fgs_read_ack(runner->map);
+		ret = runner_film_grain(runner, job);
 		if (!ret)
 			goto out;
 		goto finished;
@@ -735,6 +777,11 @@ stop:
 			ret = s7d_av1_execution_picture_complete(&job->execution, true);
 		if (!ret && (!job->picture_done || !job->execution.input_consumed))
 			ret = -EBADMSG;
+		/* The slot keeps the decoded picture's film grain parameters. */
+		if (!ret && job->grain_valid && job->picture_ready && !job->show_existing) {
+			memcpy(job->picture.state->grain, job->grain, sizeof(job->grain));
+			job->picture.state->grain_valid = true;
+		}
 		finish = s7d_av1_references_finish(runner->references, lease_epoch,
 			input_token, 0, true, !ret && job->picture_done, job->body_pages);
 		if (finish)

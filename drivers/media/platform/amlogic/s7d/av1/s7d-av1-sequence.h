@@ -81,7 +81,10 @@ struct s7d_av1_sequence {
 /* Sequence OBU payload, including trailing bits; failure preserves output. */
 int s7d_av1_parse_sequence(const u8 *payload, size_t bytes,
 			   struct s7d_av1_sequence *sequence);
-/* Initial NV12, Main profile, layer-zero admission; frame syntax is separate. */
+/*
+ * Initial NV12, Main profile, layer-zero admission; frame syntax is separate.
+ * Film grain is accepted, but the pictures come out without it.
+ */
 int s7d_av1_admit_sequence(const struct s7d_av1_sequence *sequence);
 /*
  * Both decode a stream the same way: they differ at most in timing, levels

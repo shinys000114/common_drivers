@@ -653,6 +653,35 @@ int s7d_av1_references_unbind(struct s7d_av1_references *references,
 	return 0;
 }
 
+int s7d_av1_references_grain(const struct s7d_av1_references *references,
+			     u64 lease_epoch, u64 input_token, u32 index,
+			     u32 words[S7D_AV1_GRAIN_WORDS])
+{
+	const struct s7d_av1_dpb_plan *plan;
+	u32 slot, i;
+
+	if (IS_ERR_OR_NULL(references) || !words || index >= S7D_AV1_DPB_REFERENCES)
+		return -EINVAL;
+	if (references->lease_epoch != lease_epoch || references->input_token != input_token)
+		return -ESTALE;
+	if (!references->running)
+		return -EBUSY;
+	/* As vav1.c config_film_grain_reg: one of the decoded frame's references. */
+	if (references->prepared && references->dpb.pending.decode) {
+		plan = &references->dpb.pending;
+		for (i = 0; i < S7D_AV1_DPB_FRAME_REFERENCES; i++)
+			if (plan->remap[i] == index)
+				break;
+		if (i == S7D_AV1_DPB_FRAME_REFERENCES)
+			return -EBADMSG;
+	}
+	slot = references->dpb.map[index];
+	if (slot >= S7D_AV1_DPB_MAX_SLOTS || !references->state[slot].grain_valid)
+		return -ENODATA;
+	memcpy(words, references->state[slot].grain, sizeof(references->state[slot].grain));
+	return 0;
+}
+
 int s7d_av1_references_parser_words(const struct s7d_av1_references *references,
 				    u64 lease_epoch,
 				    u32 words[S7D_AV1_PARSER_REFERENCE_WORDS])

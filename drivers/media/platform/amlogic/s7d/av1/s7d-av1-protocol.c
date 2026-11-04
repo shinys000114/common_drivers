@@ -14,6 +14,9 @@
 #define MAILBOX_CLEAR HREG(0x3071)
 #define SHIFT_BYTES HREG(0x310d)
 #define MMU_STATUS HREG(0x3639)
+#define FGS_INDEX HREG(0x3660)
+#define FGS_DATA HREG(0x3661)
+#define FGS_CTRL HREG(0x3662)
 #define AV1_DECODE_SLICE 5U
 #define AV1_SEARCH_HEAD 6U
 #define AV1_ACTION_DONE 0xffU
@@ -194,18 +197,47 @@ int s7d_av1_protocol_start(struct regmap *map,
 	return ret;
 }
 
-int s7d_av1_protocol_fgs_read_ack(struct regmap *map)
+int s7d_av1_protocol_fgs_request(struct regmap *map, u32 *request)
 {
-	u32 request;
+	if (!map || !request)
+		return -EINVAL;
+	return regmap_read(map, SCRATCH(11), request);
+}
+
+int s7d_av1_protocol_fgs_save(struct regmap *map, u32 words[S7D_AV1_GRAIN_WORDS])
+{
+	u32 i;
+	int ret;
+
+	if (!map || !words)
+		return -EINVAL;
+	ret = regmap_write(map, FGS_INDEX, 0);
+	for (i = 0; !ret && i < S7D_AV1_GRAIN_WORDS; i++)
+		ret = regmap_read(map, FGS_DATA, &words[i]);
+	return ret;
+}
+
+int s7d_av1_protocol_fgs_load(struct regmap *map, const u32 words[S7D_AV1_GRAIN_WORDS])
+{
+	u32 i;
+	int ret;
+
+	if (!map || !words)
+		return -EINVAL;
+	ret = regmap_write(map, FGS_INDEX, 0);
+	for (i = 0; !ret && i < S7D_AV1_GRAIN_WORDS; i++)
+		ret = regmap_write(map, FGS_DATA, words[i]);
+	if (!ret)
+		ret = regmap_update_bits(map, FGS_CTRL, BIT(0), BIT(0));
+	return ret;
+}
+
+int s7d_av1_protocol_fgs_continue(struct regmap *map)
+{
 	int ret;
 
 	if (!map)
 		return -EINVAL;
-	ret = regmap_read(map, SCRATCH(11), &request);
-	if (ret)
-		return ret;
-	if (request & BIT(11))
-		return -EOPNOTSUPP;
 	ret = regmap_write(map, SCRATCH(11), S7D_AV1_FGS_CONTINUE);
 	if (!ret)
 		ret = regmap_write(map, SCRATCH(0), S7D_AV1_FGS_CONTINUE);
@@ -338,10 +370,14 @@ int s7d_av1_execution_receive(struct s7d_av1_execution *e,
 		next = s->status == S7D_AV1_EOS ? S7D_AV1_EVENT_EOS : S7D_AV1_EVENT_INPUT;
 		break;
 	case S7D_AV1_FGS_REQUEST:
+		/*
+		 * Film grain parameters come while the firmware parses a frame
+		 * header (searching) or decodes its picture, and, as with the
+		 * vendor driver, any time it searches after one.
+		 */
 		if (!e->sequence_seen ||
 		    (e->phase != S7D_AV1_EXECUTION_SEARCH &&
 		     e->phase != S7D_AV1_EXECUTION_DECODE) ||
-		    (e->phase == S7D_AV1_EXECUTION_SEARCH && e->headers_seen) ||
 		    (e->phase == S7D_AV1_EXECUTION_DECODE &&
 		     (e->headers_seen != 1 || e->pictures_done || e->show_existing)))
 			ret = -EOPNOTSUPP;
