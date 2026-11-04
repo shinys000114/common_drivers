@@ -104,8 +104,10 @@ properties:
     maxItems: 2
     description: |
       A dedicated reusable shared-dma-pool for scanout allocations. An optional
-      second region records the firmware framebuffer reservation, which remains
-      reserved and is not returned to the allocator by this driver.
+      second region is the firmware framebuffer reservation holding the boot
+      logo. Once the first modeset has stopped a firmware scanout seen reading
+      it, a mapped region goes back to the page allocator, so nothing else may
+      use it.
 
   memory-region-names:
     minItems: 1
