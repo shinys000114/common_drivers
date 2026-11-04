@@ -14,6 +14,8 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
 
+#include <uapi/amlogic/drm/meson_drm.h>
+
 #include "s7d-gem.h"
 #include "s7d-hooks.h"
 #include "s7d-vendor.h"
@@ -28,12 +30,41 @@ MODULE_PARM_DESC(vendor_uapi,
 static DEFINE_MUTEX(s7d_vendor_list_lock);
 static LIST_HEAD(s7d_vendor_list);
 
+/* Numbers and flags of the vendor aml_drm ioctl table. */
+static const struct drm_ioctl_desc s7d_vendor_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(MESON_GEM_CREATE, s7d_vendor_gem_create_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(MESON_RMFB, s7d_vendor_rmfb_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(MESON_DMABUF_EXPORT_SYNC_FILE, s7d_vendor_export_sync_file_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(MESON_PRIME_HANDLE_TO_FD, s7d_vendor_prime_handle_to_fd_ioctl,
+			  DRM_RENDER_ALLOW),
+};
+
+/* The vendor ADDFB2 takes the core arguments; its own formats are not offered. */
+static unsigned int s7d_vendor_ioctl_cmd(unsigned int cmd)
+{
+	return cmd == DRM_IOCTL_MESON_ADDFB2 ? DRM_IOCTL_MODE_ADDFB2 : cmd;
+}
+
+static long s7d_vendor_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	return drm_ioctl(filp, s7d_vendor_ioctl_cmd(cmd), arg);
+}
+
+#ifdef CONFIG_COMPAT
+static long s7d_vendor_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	return drm_compat_ioctl(filp, s7d_vendor_ioctl_cmd(cmd), arg);
+}
+#else
+#define s7d_vendor_compat_ioctl NULL
+#endif
+
 static const struct file_operations s7d_vendor_fops = {
 	.owner = THIS_MODULE,
 	.open = drm_open,
 	.release = drm_release,
-	.unlocked_ioctl = drm_ioctl,
-	.compat_ioctl = drm_compat_ioctl,
+	.unlocked_ioctl = s7d_vendor_ioctl,
+	.compat_ioctl = s7d_vendor_compat_ioctl,
 	.poll = drm_poll,
 	.read = drm_read,
 	.llseek = noop_llseek,
@@ -45,6 +76,8 @@ static const struct file_operations s7d_vendor_fops = {
 /* The vendor aml_drm identity, with the buffer handling of the native driver. */
 static const struct drm_driver s7d_vendor_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_RENDER,
+	.ioctls = s7d_vendor_ioctls,
+	.num_ioctls = ARRAY_SIZE(s7d_vendor_ioctls),
 	.fops = &s7d_vendor_fops,
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(s7d_gem_dumb_create),
 	.name = "meson",

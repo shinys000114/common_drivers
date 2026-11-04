@@ -10,6 +10,7 @@ struct dentry;
 struct drm_connector;
 struct drm_crtc;
 struct drm_device;
+struct drm_file;
 
 /*
  * Vendor DRM interface state of one display in vendor mode. Allocated with
@@ -38,5 +39,13 @@ static inline bool s7d_vendor_enabled(const struct drm_device *drm)
 
 /* The vendor state of @drm, or NULL outside vendor mode. */
 struct s7d_vendor *s7d_vendor_find(const struct drm_device *drm);
+
+/* Vendor ioctls (s7d-vendor-ioctl.c). */
+int s7d_vendor_gem_create_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int s7d_vendor_rmfb_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int s7d_vendor_export_sync_file_ioctl(struct drm_device *drm, void *data,
+				      struct drm_file *file);
+int s7d_vendor_prime_handle_to_fd_ioctl(struct drm_device *drm, void *data,
+					struct drm_file *file);
 
 #endif
