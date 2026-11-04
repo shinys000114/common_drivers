@@ -748,7 +748,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 	if (!ret)
 		ret = s7d_codec_dos_port_enable(runner->lease);
 	if (!ret)
-		ret = s7d_codec_firmware_load(runner->dev, S7D_CODEC_ENGINE_HEVC,
+		ret = s7d_codec_firmware_load(runner->dev, runner->lease,
 					     S7D_CODEC_FIRMWARE_AV1_MMU);
 	job->result.firmware_loaded = !ret;
 	if (!ret)

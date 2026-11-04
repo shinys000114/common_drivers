@@ -8,6 +8,7 @@
 
 struct device;
 struct module;
+struct s7d_codec_lease;
 struct s7d_codec_session;
 struct s7d_codec_firmware_owner;
 struct s7d_codec_firmware_job;
@@ -69,19 +70,25 @@ int s7d_codec_firmware_job_join_result(struct s7d_codec_firmware_job *job,
 void s7d_codec_firmware_job_release_custody(struct s7d_codec_firmware_job *job);
 
 /*
- * Caller holds a powered, idle engine; zero acknowledges only the TEE load.
- * Loads from different engines run one at a time.
+ * Caller runs a powered, idle engine with @lease; zero acknowledges only the
+ * TEE load. Loads from different engines run one at a time.
  * HEVC runtime captures SCRATCH_8 after success under that same lease. Its
  * opaque TEE-supplied value is never a kernel DMA allocation. The selected
  * post-load IQIT and normal CPU-start resets remain within that load sequence.
- * HEVC reloads after full halt/reset. VP9 may retain a successful image across
- * the selected per-job block/pipeline reset within one powered, exclusive
- * lease; the backend retains probability, segmentation, SWAP and MV backing. Both
- * reload after power loss, firmware replacement, lease change or load failure.
+ * HEVC and AV1 load after every full halt/reset. The VP9 image survives the
+ * per-picture block/pipeline reset, so it is not loaded again while the engine
+ * still holds it from an earlier load by any session; the backend retains its
+ * probability, segmentation, SWAP and MV backing. Any other image's load, a
+ * power-up, a fault or a failed load make the next VP9 picture load again.
  * On failure, retain references until DOS halt proves idle.
  */
-int s7d_codec_firmware_load(struct device *dev, enum s7d_codec_engine engine,
+int s7d_codec_firmware_load(struct device *dev, struct s7d_codec_lease *lease,
 			    enum s7d_codec_firmware firmware);
+/* The engine @lease runs holds @firmware from an earlier load, and keeps it. */
+bool s7d_codec_firmware_resident(struct s7d_codec_lease *lease,
+				 enum s7d_codec_firmware firmware);
+/* The runner's picture failed: whatever the engine holds is loaded again. */
+void s7d_codec_firmware_forget(struct s7d_codec_lease *lease);
 
 /*
  * Set the engine's DMC access policy to nonsecure. The TEE reprograms the DMC

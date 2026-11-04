@@ -132,6 +132,8 @@ struct dos_engine {
 	bool error_reported;
 	bool release_failed;
 	bool release_pin;
+	/* The loader's tag of the image in the instruction memory, 0 for unknown. */
+	u32 resident;
 };
 
 struct s7d_codec_dos {
@@ -1157,6 +1159,7 @@ static int dos_hold_rate(struct s7d_codec_dos *dos,
 	e->error_reported = false;
 	e->local_access_ready = false;
 	e->halted = false;
+	e->resident = 0;
 	lease->dos = dos;
 	lease->engine = engine;
 	INIT_LIST_HEAD(&lease->queue);
@@ -1849,6 +1852,7 @@ int s7d_codec_dos_release(struct s7d_codec_lease *lease)
 	e->holders = 0;
 	dos_set_runner(e, NULL);
 	lease->held = false;
+	e->resident = 0;
 	e->local_access_ready = false;
 	e->prepared = false;
 	e->hevc_init_written = false;
@@ -1973,6 +1977,37 @@ bool s7d_codec_dos_run_contended(struct s7d_codec_lease *lease)
 	contended = e->runner == lease && !list_empty(&e->queue);
 	spin_unlock(&e->run_lock);
 	return contended;
+}
+
+u32 s7d_codec_dos_resident(struct s7d_codec_lease *lease)
+{
+	struct dos_engine *e;
+	u32 tag = 0;
+
+	if (dos_lease_engine(lease, &e))
+		return 0;
+	mutex_lock(&e->lock);
+	/* A fault leaves the instruction memory unknown, as does a power-up. */
+	if (dos_runs(e, lease) && e->local_access_ready && !e->faulted && !e->release_failed)
+		tag = e->resident;
+	mutex_unlock(&e->lock);
+	return tag;
+}
+
+int s7d_codec_dos_set_resident(struct s7d_codec_lease *lease, u32 tag)
+{
+	struct dos_engine *e;
+	int ret = dos_lease_engine(lease, &e);
+
+	if (ret)
+		return ret;
+	mutex_lock(&e->lock);
+	if (dos_runs(e, lease))
+		e->resident = tag;
+	else
+		ret = -EBUSY;
+	mutex_unlock(&e->lock);
+	return ret;
 }
 
 int s7d_codec_dos_engine_state(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)

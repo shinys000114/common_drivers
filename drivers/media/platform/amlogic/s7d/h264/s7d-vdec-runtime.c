@@ -614,7 +614,7 @@ int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 	ret = runtime_preload_locked(runtime, session, &custody, cancelled);
 	if (ret)
 		goto fail;
-	ret = s7d_codec_firmware_load(runtime->dev, S7D_CODEC_ENGINE_VDEC,
+	ret = s7d_codec_firmware_load(runtime->dev, &runtime->lease,
 				      S7D_CODEC_FIRMWARE_H264_MH264);
 	if (ret) {
 		s7d_codec_firmware_invalidate(runtime->firmware);
@@ -1076,7 +1076,7 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 	ret = runtime_preload_locked(runtime, session, &custody, cancelled);
 	if (ret)
 		goto fail;
-	ret = s7d_codec_firmware_load(runtime->dev, S7D_CODEC_ENGINE_VDEC,
+	ret = s7d_codec_firmware_load(runtime->dev, &runtime->lease,
 				      S7D_CODEC_FIRMWARE_H264_MH264);
 	if (ret) {
 		s7d_codec_firmware_invalidate(runtime->firmware);

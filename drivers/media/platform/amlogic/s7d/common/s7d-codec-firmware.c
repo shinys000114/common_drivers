@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 
+#include "s7d-codec-dos.h"
 #include "s7d-codec-firmware.h"
 #include "s7d-codec-session.h"
 
@@ -32,6 +33,8 @@ struct s7d_codec_firmware_image {
 	u32 tee_id;
 	u32 tee_core;
 	bool swap;
+	/* Usable after the per-picture halt: no load while the engine holds it. */
+	bool resident;
 	const char *name;
 };
 
@@ -51,7 +54,7 @@ static const struct s7d_codec_firmware_image s7d_codec_firmware_images[] = {
 	},
 	[S7D_CODEC_FIRMWARE_VP9] = {
 		.engine = S7D_CODEC_ENGINE_HEVC, .tee_id = S7D_TEE_FW_VP9_MMU,
-		.tee_core = S7D_TEE_CORE_HEVC, .name = "VP9",
+		.tee_core = S7D_TEE_CORE_HEVC, .resident = true, .name = "VP9",
 	},
 	[S7D_CODEC_FIRMWARE_JPEG_ENC] = {
 		.engine = S7D_CODEC_ENGINE_HCODEC, .tee_id = S7D_TEE_FW_JPEG_ENC,
@@ -283,16 +286,47 @@ int s7d_codec_firmware_set_policy(struct device *dev, enum s7d_codec_engine engi
 	return 0;
 }
 
-int s7d_codec_firmware_load(struct device *dev, enum s7d_codec_engine engine,
+/* The engine's residency tag of an image: never 0, which means unknown. */
+static u32 firmware_tag(enum s7d_codec_firmware firmware)
+{
+	return (u32)firmware + 1;
+}
+
+bool s7d_codec_firmware_resident(struct s7d_codec_lease *lease,
+				 enum s7d_codec_firmware firmware)
+{
+	const struct s7d_codec_firmware_image *image;
+
+	if (!lease)
+		return false;
+	image = firmware_image(lease->engine, firmware);
+	return image && image->resident &&
+	       s7d_codec_dos_resident(lease) == firmware_tag(firmware);
+}
+
+void s7d_codec_firmware_forget(struct s7d_codec_lease *lease)
+{
+	if (lease)
+		s7d_codec_dos_set_resident(lease, 0);
+}
+
+int s7d_codec_firmware_load(struct device *dev, struct s7d_codec_lease *lease,
 			    enum s7d_codec_firmware firmware)
 {
-	const struct s7d_codec_firmware_image *image = firmware_image(engine, firmware);
+	const struct s7d_codec_firmware_image *image;
 	int ret;
 
-	if (!dev)
+	if (!dev || !lease)
 		return -EINVAL;
+	image = firmware_image(lease->engine, firmware);
 	if (!image || !tee_enabled())
 		return -EOPNOTSUPP;
+	if (s7d_codec_firmware_resident(lease, firmware))
+		return 0;
+	/* Whatever the load leaves behind is unknown until it succeeds. */
+	ret = s7d_codec_dos_set_resident(lease, 0);
+	if (ret)
+		return ret;
 	mutex_lock(&s7d_codec_tee_lock);
 	if (image->swap)
 		ret = tee_load_video_fw_swap(image->tee_id, image->tee_core, true);
@@ -303,7 +337,7 @@ int s7d_codec_firmware_load(struct device *dev, enum s7d_codec_engine engine,
 		dev_err(dev, "%s firmware load failed, TEE status %#x\n", image->name, (u32)ret);
 		return -EIO;
 	}
-	return 0;
+	return s7d_codec_dos_set_resident(lease, firmware_tag(firmware));
 }
 
 int s7d_codec_firmware_prepare_for_engine(struct s7d_codec_firmware_owner *owner,

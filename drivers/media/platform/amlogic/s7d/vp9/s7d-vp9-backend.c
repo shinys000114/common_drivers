@@ -152,7 +152,6 @@ struct s7d_vp9_decoder {
 	u32 body_pages;
 	struct s7d_codec_pages body[S7D_VP9_FBC_SLOTS];
 	struct s7d_codec_pages spare;
-	bool firmware_loaded;
 	bool context_ready;
 	bool irq_accept;
 	bool stopping;
@@ -642,7 +641,6 @@ static int vp9_hold(void *priv, enum s7d_codec_engine engine)
 		decoder->lease_active = true;
 		decoder->quiesced = false;
 		decoder->stopping = false;
-		decoder->firmware_loaded = false;
 		decoder->firmware_epoch = 0;
 		decoder->failure = 0;
 	}
@@ -680,7 +678,6 @@ static int vp9_quiesce(void *priv, enum s7d_codec_engine engine)
 	ret = vp9_halt_run(decoder);
 	if (!ret)
 		ret = vp9_unbind_locked(decoder);
-	decoder->firmware_loaded = false;
 	mutex_unlock(&decoder->control);
 	return ret;
 }
@@ -888,7 +885,8 @@ static int vp9_preload(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 	bool cancelled = false, queued;
 	int ret;
 
-	if (decoder->firmware_loaded)
+	/* Loaded already, by this session or another one. */
+	if (s7d_codec_firmware_resident(&decoder->lease, S7D_CODEC_FIRMWARE_VP9))
 		return 0;
 	if (!decoder->firmware_epoch) {
 		ret = s7d_codec_firmware_next_epoch(decoder->firmware, &decoder->firmware_epoch);
@@ -1356,11 +1354,11 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 		stage = "firmware-preload";
 		ret = vp9_preload(decoder, job);
 	}
-	if (!ret && !decoder->firmware_loaded) {
+	/* The core keeps the image of the last VP9 load until another one. */
+	if (!ret) {
 		stage = "firmware-load";
-		ret = s7d_codec_firmware_load(decoder->dev, S7D_CODEC_ENGINE_HEVC,
+		ret = s7d_codec_firmware_load(decoder->dev, &decoder->lease,
 					      S7D_CODEC_FIRMWARE_VP9);
-		decoder->firmware_loaded = !ret;
 		load_failed = ret;
 	}
 	if (!ret)
@@ -1388,6 +1386,9 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 	}
 stop:
 	halted = vp9_halt_locked(decoder);
+	/* After a failed picture, the next one loads the image again. */
+	if (ret || halted)
+		s7d_codec_firmware_forget(&decoder->lease);
 	/* Halted: the next session's picture may run while this one is finished. */
 	ended = s7d_codec_dos_run_end(&decoder->lease);
 	if (!halted && ended)
@@ -1449,7 +1450,6 @@ stop:
 		result->corrupt = corrupt && !result->cancelled;
 		if (!result->cancelled && !result->corrupt)
 			decoder->failure = ret;
-		decoder->firmware_loaded = false;
 		/* The owner is shared by every codec; only a failed TEE load concerns it. */
 		if (load_failed)
 			s7d_codec_firmware_invalidate(decoder->firmware);
@@ -1465,7 +1465,6 @@ retained:
 	job->bank = NULL;
 	job->prepared = NULL;
 	decoder->failure = ret;
-	decoder->firmware_loaded = false;
 	if (load_failed)
 		s7d_codec_firmware_invalidate(decoder->firmware);
 completed:
@@ -1562,7 +1561,6 @@ int s7d_vp9_decoder_stream_close(struct s7d_vp9_decoder *decoder,
 	memset(decoder->fbc_index, VP9_NO_FBC, sizeof(decoder->fbc_index));
 	memset(decoder->surface, 0, sizeof(decoder->surface));
 	memset(decoder->content_token, 0, sizeof(decoder->content_token));
-	decoder->firmware_loaded = false;
 	memset(&decoder->dpb, 0, sizeof(decoder->dpb));
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->captures = 0;

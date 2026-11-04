@@ -95,6 +95,13 @@ void s7d_codec_dos_run_wake(struct s7d_codec_lease *lease);
 /* @lease runs its engine and another lease waits for it. */
 bool s7d_codec_dos_run_contended(struct s7d_codec_lease *lease);
 /*
+ * The firmware image the engine's instruction memory holds, by a nonzero tag
+ * the loader chooses; 0 when unknown: after a power-up or a fault, and until
+ * a load sets it. The runner of the engine asks and sets it.
+ */
+u32 s7d_codec_dos_resident(struct s7d_codec_lease *lease);
+int s7d_codec_dos_set_resident(struct s7d_codec_lease *lease, u32 tag);
+/*
  * Zero when the engine can take another session, -EBUSY while its holders
  * use it up, -EIO after a fault or failed release left it unusable.
  */

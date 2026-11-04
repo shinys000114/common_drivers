@@ -638,7 +638,7 @@ int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 	if (ret)
 		goto stop;
 	if (!encoder->firmware_loaded) {
-		ret = s7d_codec_firmware_load(encoder->dev, S7D_CODEC_ENGINE_HCODEC,
+		ret = s7d_codec_firmware_load(encoder->dev, &encoder->lease,
 					      S7D_CODEC_FIRMWARE_JPEG_ENC);
 		if (ret) {
 			s7d_codec_firmware_invalidate(encoder->firmware);

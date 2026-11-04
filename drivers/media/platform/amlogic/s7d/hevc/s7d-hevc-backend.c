@@ -1858,7 +1858,7 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	}
 	if (!ret) {
 		stage = "firmware-load";
-		ret = s7d_codec_firmware_load(decoder->dev, S7D_CODEC_ENGINE_HEVC,
+		ret = s7d_codec_firmware_load(decoder->dev, &decoder->lease,
 					      hevc_firmware(decoder));
 		/*
 		 * The owner is shared by every codec; only a failed TEE load concerns
