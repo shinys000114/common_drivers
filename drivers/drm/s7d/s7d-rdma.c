@@ -31,6 +31,7 @@
 #define RDMA_CONFIG		(3 << 4 | 3 << 2)
 #define RDMA_TABLE_BYTES	SZ_4K
 #define RDMA_MAX_ENTRIES	(RDMA_TABLE_BYTES / sizeof(struct s7d_rdma_entry))
+static_assert(S7D_RDMA_UPDATE_MAX_ENTRIES == RDMA_MAX_ENTRIES - S7D_RDMA_AFBC_LOOP_ENTRIES);
 #define AFBC_CLEAR		0x3a02
 #define AFBC_COMMAND		0x3a05
 

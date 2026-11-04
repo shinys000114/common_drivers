@@ -107,7 +107,7 @@ struct s7d_vpu {
 	u32 osd_scaler_route_saved;
 	bool osd_scaler_route_owned;
 	u32 safa_444_saved[2];
-	/* Update list with live SAFA values merged, staged under frame_lock. */
+	/* Update list with live scaler values merged, staged under frame_lock. */
 	struct s7d_rdma_entry live_update[S7D_CRTC_UPDATE_REG_COUNT];
 	bool safa_444_owned;
 	u16 flip_start;

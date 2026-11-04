@@ -591,21 +591,21 @@ static int s7d_vpu_afbc_cancel(void *data, u64 generation)
 }
 
 /*
- * Merge the live SAFA writes into the bits each register holds now. The output
- * runs and only preparation or these lists write those registers.
+ * Merge the live scaler writes into the bits each register holds now. The
+ * output runs and only preparation or these lists write those registers.
  */
 static const struct s7d_rdma_entry *
-s7d_vpu_merge_scaler_live(struct s7d_vpu *v, const struct s7d_crtc_state *state)
+s7d_vpu_merge_live(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 {
 	unsigned int i;
 
 	lockdep_assert_held(&v->frame_lock);
-	if (!state->scaler_live_count)
+	if (!state->live_count)
 		return state->update;
 	memcpy(v->live_update, state->update, state->update_count * sizeof(*state->update));
-	for (i = 0; i < state->scaler_live_count; i++) {
-		struct s7d_rdma_entry *e = &v->live_update[state->scaler_live_first + i];
-		u32 mask = state->scaler_live_mask[i];
+	for (i = 0; i < state->live_count; i++) {
+		struct s7d_rdma_entry *e = &v->live_update[state->live_first + i];
+		u32 mask = state->live_mask[i];
 		u32 reg = le32_to_cpu(e->reg);
 
 		if (mask != U32_MAX)
@@ -641,7 +641,7 @@ static int s7d_vpu_submit(void *data, const struct s7d_crtc_state *state)
 		goto out;
 	}
 	ret = s7d_scanout_submit_staged(&v->scanout, &state->buffers,
-		s7d_vpu_merge_scaler_live(v, state),
+		s7d_vpu_merge_live(v, state),
 		state->update_count, state->video_unchanged, state->video_address_only,
 		state->afbc_unchanged,
 		transaction,
