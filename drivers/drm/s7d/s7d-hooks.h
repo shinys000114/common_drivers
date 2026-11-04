@@ -165,9 +165,7 @@ static inline void s7d_vendor_pm(struct drm_device *drm, bool resume)
  * worker. @mode points into the new CRTC state and is valid for the call
  * only: copy what is kept. Not called again before s7d_ext_mode_clear().
  */
-static inline void s7d_ext_mode_set(struct drm_crtc *crtc, const struct drm_display_mode *mode)
-{
-}
+void s7d_ext_mode_set(struct drm_crtc *crtc, const struct drm_display_mode *mode);
 
 /*
  * s7d_crtc_stop() (s7d-crtc.c): first step, before vblank is turned off,
@@ -176,8 +174,6 @@ static inline void s7d_ext_mode_set(struct drm_crtc *crtc, const struct drm_disp
  * the error recovery work (system workqueue) after a fault or timeout, and
  * unbind or shutdown. The output may have faulted; the VPU is still clocked.
  */
-static inline void s7d_ext_mode_clear(struct drm_crtc *crtc)
-{
-}
+void s7d_ext_mode_clear(struct drm_crtc *crtc);
 
 #endif
