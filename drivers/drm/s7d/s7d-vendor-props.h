@@ -13,12 +13,40 @@
 
 #include "s7d-hooks.h"
 
+struct drm_connector;
+struct drm_connector_state;
 struct drm_crtc;
 struct drm_crtc_state;
 struct drm_plane;
 struct drm_plane_state;
 struct drm_property;
 struct s7d_vendor_props;
+
+/*
+ * Values of the vendor HDMI connector properties, carried by the connector
+ * state in vendor mode only.
+ */
+struct s7d_vendor_conn_values {
+	u32 hdr_priority;
+	/* Last color_space (HDMI_COLORSPACE_*) and color_depth (bits) written */
+	u8 color_space;
+	u8 color_depth;
+	/* What the last modeset sent, as color_space and color_depth read it */
+	u8 output_space;
+	u8 output_depth;
+	u8 allm;
+	u8 scan_info;
+	/* color_space or color_depth asked for an output format */
+	bool request;
+	/* The output runs a CEA rate divided by 1.001. */
+	bool fractional;
+	/* A mode was set since the connector reset. */
+	bool used;
+	/* As in the vendor driver, these hold for the commit that sets them. */
+	bool avmute;
+	bool depth_written;
+	bool update;
+};
 
 /*
  * Create the properties of the vendor DRM interface on @objs and attach them,
@@ -52,6 +80,23 @@ int s7d_vendor_props_plane_get(const struct s7d_vendor_props *vp, struct drm_pla
 int s7d_vendor_props_plane_set(const struct s7d_vendor_props *vp, struct drm_plane *plane,
 			       struct drm_plane_state *state,
 			       struct drm_property *property, u64 val);
+
+/* The vendor values of an HDMI connector state, or NULL outside vendor mode. */
+const struct s7d_vendor_conn_values *
+s7d_vendor_props_conn(const struct drm_connector_state *state);
+/*
+ * HDMI atomic check: record the format (HDMI_COLORSPACE_*, bits per component)
+ * and rate an active output takes in @state, for the vendor properties.
+ */
+void s7d_vendor_props_set_output(struct drm_connector_state *state, u8 color_space,
+				 u8 depth, bool fractional);
+/* color_space and color_depth as read from @state: RGB 8-bit by default */
+void s7d_vendor_props_attr(const struct drm_connector_state *state, u8 *color_space,
+			   u8 *depth);
+/* meson.crtc.hdr_policy of @state */
+u8 s7d_vendor_props_hdr_policy(const struct drm_crtc_state *state);
+/* The sink accepts ALLM in the HDMI Forum VSIF. */
+bool s7d_vendor_props_sink_allm(struct drm_connector *connector);
 #else
 static inline int s7d_vendor_props_crtc_get(const struct s7d_vendor_props *vp,
 					    struct drm_crtc *crtc,
@@ -83,6 +128,34 @@ static inline int s7d_vendor_props_plane_set(const struct s7d_vendor_props *vp,
 					     struct drm_property *property, u64 val)
 {
 	return -EINVAL;
+}
+
+static inline const struct s7d_vendor_conn_values *
+s7d_vendor_props_conn(const struct drm_connector_state *state)
+{
+	return NULL;
+}
+
+static inline void s7d_vendor_props_set_output(struct drm_connector_state *state,
+					       u8 color_space, u8 depth, bool fractional)
+{
+}
+
+static inline void s7d_vendor_props_attr(const struct drm_connector_state *state,
+					 u8 *color_space, u8 *depth)
+{
+	*color_space = 0;
+	*depth = 8;
+}
+
+static inline u8 s7d_vendor_props_hdr_policy(const struct drm_crtc_state *state)
+{
+	return 0;
+}
+
+static inline bool s7d_vendor_props_sink_allm(struct drm_connector *connector)
+{
+	return false;
 }
 #endif
 
