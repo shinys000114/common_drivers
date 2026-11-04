@@ -128,6 +128,10 @@ struct s7d_hdmi {
 	bool audio_spdif;
 	bool eld_valid;
 	int audio_error;
+	/* Between the PM prepare and complete phases of system sleep */
+	bool sleeping;
+	/* Sleep cut a stream off; accept it back until the link is up. */
+	bool audio_resume;
 	/* Serializes callback registration against notification. */
 	struct mutex audio_callback_lock;
 	hdmi_codec_plugged_cb audio_plugged;
@@ -319,6 +323,7 @@ static int s7d_hdmi_audio_hw_params(struct device *dev, void *data,
 				  struct hdmi_codec_params *params)
 {
 	struct s7d_hdmi *h = data;
+	bool resume;
 	int ret;
 
 	if ((fmt->fmt != HDMI_I2S && fmt->fmt != HDMI_SPDIF) ||
@@ -329,7 +334,13 @@ static int s7d_hdmi_audio_hw_params(struct device *dev, void *data,
 	     fmt->bit_fmt != SNDRV_PCM_FORMAT_S32_LE))
 		return -EINVAL;
 	mutex_lock(&h->lock);
-	if (!h->eld_valid || !h->prepared || !h->phy_on) {
+	/*
+	 * The sound card resumes a stream that sleep cut off when its own
+	 * turn comes, which may be before the display enables the link.
+	 */
+	resume = h->audio_resume;
+	h->audio_resume = false;
+	if (!h->eld_valid || (!resume && (!h->prepared || !h->phy_on))) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -353,8 +364,14 @@ static int s7d_hdmi_audio_hw_params(struct device *dev, void *data,
 	h->audio_spdif = fmt->fmt == HDMI_SPDIF;
 	h->audio_error = 0;
 	h->audio_muted = true;
-	ret = s7d_hdmi_audio_apply(h);
-	h->audio_valid = !ret;
+	if (h->prepared && h->phy_on) {
+		ret = s7d_hdmi_audio_apply(h);
+		h->audio_valid = !ret;
+	} else {
+		/* The link enable applies them, as it does after a modeset. */
+		h->audio_valid = false;
+		ret = 0;
+	}
 	if (ret) {
 		clk_disable_unprepare(h->audio_clk);
 		h->audio_clock_on = false;
@@ -379,7 +396,8 @@ static int s7d_hdmi_audio_set_mute(struct device *dev, void *data, bool mute, in
 		ret = h->audio_error;
 	else if (h->prepared && h->audio_valid)
 		ret = s7d_hdmi_audio_mute(h->core, mute);
-	else if (!mute)
+	/* Without the link, the next link enable unmutes held parameters. */
+	else if (!mute && !h->audio_clock_on)
 		ret = -ENODEV;
 	if (ret && h->audio_valid) {
 		h->audio_error = ret;
@@ -396,6 +414,7 @@ static void s7d_hdmi_audio_shutdown(struct device *dev, void *data)
 	int ret;
 
 	mutex_lock(&h->lock);
+	h->audio_resume = h->sleeping && h->audio_clock_on;
 	h->audio_valid = false;
 	h->audio_muted = true;
 	s7d_hdmi_audio_infoframe(h, NULL);
@@ -1512,6 +1531,8 @@ static void s7d_hdmi_enable(struct drm_bridge *bridge, struct drm_bridge_state *
 			mod_delayed_work(system_wq, &h->scdc_check, HZ);
 		h->audio_error = 0;
 		h->audio_valid = false;
+		/* With the link up, a resuming stream needs no exception. */
+		h->audio_resume = false;
 		if (h->audio_clock_on && h->eld_valid) {
 			if (s7d_hdmi_audio_supported(h->eld, &h->audio_params))
 				h->audio_valid = !s7d_hdmi_audio_apply(h);
@@ -2074,7 +2095,37 @@ static int s7d_hdmi_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(s7d_hdmi_pm_ops, s7d_hdmi_suspend, s7d_hdmi_resume);
+/*
+ * Prepare runs before any device suspends and complete after all have
+ * resumed: a stream the sound card cuts off in between is cut off by
+ * sleep, wherever the card is in the suspend order.
+ */
+static int s7d_hdmi_pm_prepare(struct device *dev)
+{
+	struct s7d_hdmi *h = dev_get_drvdata(dev);
+
+	mutex_lock(&h->lock);
+	h->sleeping = true;
+	/* Only a stream that this sleep cuts off may come back early. */
+	h->audio_resume = false;
+	mutex_unlock(&h->lock);
+	return 0;
+}
+
+static void s7d_hdmi_pm_complete(struct device *dev)
+{
+	struct s7d_hdmi *h = dev_get_drvdata(dev);
+
+	mutex_lock(&h->lock);
+	h->sleeping = false;
+	mutex_unlock(&h->lock);
+}
+
+static const struct dev_pm_ops s7d_hdmi_pm_ops = {
+	.prepare = pm_sleep_ptr(s7d_hdmi_pm_prepare),
+	.complete = pm_sleep_ptr(s7d_hdmi_pm_complete),
+	SYSTEM_SLEEP_PM_OPS(s7d_hdmi_suspend, s7d_hdmi_resume)
+};
 
 /* The display, a consumer through its device link, has already unbound. */
 static void s7d_hdmi_remove(struct platform_device *pdev)
