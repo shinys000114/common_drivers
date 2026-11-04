@@ -3,7 +3,6 @@
 #include <linux/bits.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
-#include <linux/string.h>
 
 #include <asm/byteorder.h>
 
@@ -157,13 +156,4 @@ int s7d_postblend_build_state(u32 width, u32 height,
 		},
 	};
 	return 0;
-}
-
-bool s7d_postblend_needs_modeset(const struct s7d_postblend_state *before,
-				 const struct s7d_postblend_state *after)
-{
-	return ((le32_to_cpu(before->regs[11].value) |
-		 le32_to_cpu(after->regs[11].value)) & GENMASK(11, 8)) &&
-		memcmp(&before->regs[11], &after->regs[11],
-		       4 * sizeof(before->regs[0]));
 }

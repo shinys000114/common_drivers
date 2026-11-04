@@ -916,10 +916,6 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 					&state->postblend);
 	if (ret)
 		return ret;
-	if (old && old->active &&
-	    s7d_postblend_needs_modeset(&to_s7d_crtc_state(old)->postblend,
-				       &state->postblend))
-		base->mode_changed = true;
 	s7d_crtc_check_video_update(state, old ? to_s7d_crtc_state(old) : NULL);
 	s7d_crtc_check_dependencies(crtc, atomic, state);
 	/* A connector submission matters only if it changed the output plan. */

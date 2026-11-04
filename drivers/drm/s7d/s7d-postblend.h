@@ -29,7 +29,4 @@ int s7d_postblend_build_state(u32 width, u32 height,
 			     const struct drm_rect *video2_dst,
 			     struct s7d_postblend_state *state);
 
-bool s7d_postblend_needs_modeset(const struct s7d_postblend_state *before,
-				 const struct s7d_postblend_state *after);
-
 #endif
