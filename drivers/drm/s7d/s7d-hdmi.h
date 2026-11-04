@@ -29,8 +29,9 @@ bool s7d_hdmi_vendor_format_valid(struct drm_connector *connector,
 /*
  * Commit tail, from the flush of @crtc without a modeset, with no driver lock
  * held: apply what the commit changes in the vendor settings of the HDMI
- * connectors on @crtc, the AV mute as GCP Set_AVMUTE or Clear_AVMUTE. A
- * modeset sends them with the link setup.
+ * connectors on @crtc, the AV mute as GCP Set_AVMUTE or Clear_AVMUTE and
+ * ALLM and scan information in the InfoFrames. A modeset sends them with the
+ * link setup.
  */
 void s7d_hdmi_commit_vendor(struct drm_crtc *crtc, struct drm_atomic_state *atomic);
 

@@ -1562,8 +1562,9 @@ static u32 *s7d_hdmi_input_bus_fmts(struct drm_bridge *bridge,
 	return formats;
 }
 
+/* @infoframes: the AVI and vendor InfoFrames may change on the running link. */
 static bool s7d_hdmi_link_same(const struct s7d_hdmi_state *a,
-			       const struct s7d_hdmi_state *b)
+			       const struct s7d_hdmi_state *b, bool infoframes)
 {
 	if (!a || !b || !a->valid || !b->valid || a->hdmi != b->hdmi ||
 	    a->scdc != b->scdc || a->high_tmds != b->high_tmds)
@@ -1571,12 +1572,30 @@ static bool s7d_hdmi_link_same(const struct s7d_hdmi_state *a,
 	if (!a->hdmi)
 		return true;
 	if (a->vendor_len > sizeof(a->vendor) || b->vendor_len > sizeof(b->vendor) ||
-	    a->vendor_len != b->vendor_len || a->hdr_len > sizeof(a->hdr) ||
-	    b->hdr_len > sizeof(b->hdr) || a->hdr_len != b->hdr_len)
+	    a->hdr_len > sizeof(a->hdr) || b->hdr_len > sizeof(b->hdr) ||
+	    a->hdr_len != b->hdr_len || memcmp(a->hdr, b->hdr, a->hdr_len))
 		return false;
-	return !memcmp(a->avi, b->avi, sizeof(a->avi)) &&
-		!memcmp(a->vendor, b->vendor, a->vendor_len) &&
-		!memcmp(a->hdr, b->hdr, a->hdr_len);
+	return infoframes || (a->vendor_len == b->vendor_len &&
+			      !memcmp(a->avi, b->avi, sizeof(a->avi)) &&
+			      !memcmp(a->vendor, b->vendor, a->vendor_len));
+}
+
+/* The HDMI Forum VSIF with ALLM set: header, checksum, OUI, version 1, flags */
+static u8 s7d_hdmi_pack_allm(u8 *buffer)
+{
+	static const u8 frame[] = {
+		HDMI_INFOFRAME_TYPE_VENDOR, 1, 5, 0,
+		HDMI_FORUM_IEEE_OUI & 0xff, (HDMI_FORUM_IEEE_OUI >> 8) & 0xff,
+		HDMI_FORUM_IEEE_OUI >> 16, 1, BIT(1),
+	};
+	unsigned int i;
+	u8 sum = 0;
+
+	memcpy(buffer, frame, sizeof(frame));
+	for (i = 0; i < sizeof(frame); i++)
+		sum += frame[i];
+	buffer[3] = -sum;
+	return sizeof(frame);
 }
 
 static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_state *base,
@@ -1585,11 +1604,12 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 {
 	struct s7d_hdmi_state *state = to_s7d_hdmi_state(base);
 	struct drm_connector *connector = conn_state->connector;
-	const struct s7d_vendor_conn_values *vendor_values;
+	const struct s7d_vendor_conn_values *vendor_values, *old_values;
 	struct hdmi_avi_infoframe avi;
 	struct hdmi_vendor_infoframe vendor;
 	struct hdmi_drm_infoframe hdr;
 	struct s7d_hdmi_attr attr;
+	bool allm, live;
 	int ret;
 
 	state->valid = false;
@@ -1626,6 +1646,10 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 	state->high_tmds = state->output.high_tmds;
 	state->vendor_len = 0;
 	state->hdr_len = 0;
+	/* ALLM only to a sink that takes it, like vendor userspace checks allm_cap */
+	allm = state->hdmi && vendor_values && vendor_values->allm == 1 &&
+		connector->display_info.has_hdmi_infoframe &&
+		s7d_vendor_props_sink_allm(connector);
 	conn_state->hdmi.is_limited_range = state->output.rgb_limited;
 	conn_state->hdmi.output_bpc = state->output.bpc;
 	conn_state->hdmi.tmds_char_rate = div_u64(state->output.rate.tmds_numerator,
@@ -1659,6 +1683,24 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 					HDMI_COLORIMETRY_ITU_709 : HDMI_COLORIMETRY_ITU_601;
 		}
 		drm_hdmi_avi_infoframe_content_type(&avi, conn_state);
+		/*
+		 * With "future" the vendor driver picks from the EDID video
+		 * capability block, starting from underscan. Keep the helper's
+		 * underscan rather than send the reserved code.
+		 */
+		if (vendor_values && vendor_values->scan_info != HDMI_SCAN_MODE_RESERVED)
+			avi.scan_mode = vendor_values->scan_info;
+		if (allm) {
+			/*
+			 * The HDMI Forum VSIF replaces the HDMI 1.4 one, so the AVI
+			 * carries the VIC of a 4K mode; ALLM replaces the content
+			 * type, as the vendor sends them.
+			 */
+			if (!avi.video_code)
+				avi.video_code = drm_match_cea_mode(&state->mode);
+			avi.itc = false;
+			avi.content_type = HDMI_CONTENT_TYPE_GRAPHICS;
+		}
 		ret = hdmi_avi_infoframe_pack(&avi, state->avi, sizeof(state->avi));
 		if (ret < 0)
 			return ret;
@@ -1683,7 +1725,9 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 			conn_state->hdmi.infoframes.hdr_drm.set = true;
 		}
 	}
-	if (state->hdmi && connector->display_info.has_hdmi_infoframe) {
+	if (allm) {
+		state->vendor_len = s7d_hdmi_pack_allm(state->vendor);
+	} else if (state->hdmi && connector->display_info.has_hdmi_infoframe) {
 		ret = drm_hdmi_vendor_infoframe_from_display_mode(&vendor, connector, &state->mode);
 		if (ret)
 			return ret;
@@ -1695,6 +1739,16 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 		conn_state->hdmi.infoframes.hdmi.set = true;
 	}
 	state->valid = true;
+	/*
+	 * As the vendor driver, a new ALLM or scan information goes out on the
+	 * running link: the CRTC flush sends the InfoFrames of a commit without
+	 * a modeset.
+	 */
+	old_values = s7d_vendor_props_conn(drm_atomic_get_old_connector_state(crtc_state->state,
+									    connector));
+	live = vendor_values && old_values && !drm_atomic_crtc_needs_modeset(crtc_state) &&
+		(old_values->allm != vendor_values->allm ||
+		 old_values->scan_info != vendor_values->scan_info);
 	/* Copy the checked plan before prepare; VPU applies it before PHY/start. */
 	{
 		struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(crtc_state->state,
@@ -1704,7 +1758,8 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 
 		if (old && old->active &&
 		    (!s7d_hdmi_output_same(&to_s7d_crtc_state(old)->output, &state->output) ||
-		     !old_bridge || !s7d_hdmi_link_same(to_s7d_hdmi_state(old_bridge), state)))
+		     !old_bridge ||
+		     !s7d_hdmi_link_same(to_s7d_hdmi_state(old_bridge), state, live)))
 			crtc_state->mode_changed = true;
 	}
 	to_s7d_crtc_state(crtc_state)->output = state->output;
@@ -1912,9 +1967,38 @@ static int s7d_hdmi_avmute(struct s7d_hdmi *h, bool mute)
 	return ret ?: regmap_update_bits(h->core, CORE_TPI_SC, bit, bit);
 }
 
+/*
+ * The vendor and AVI InfoFrames that a commit without a modeset changed, each
+ * TPI bank rewritten on the running link as the vendor driver does.
+ */
+static int s7d_hdmi_update_infoframes(struct s7d_hdmi *h, const struct s7d_hdmi_state *old,
+				      const struct s7d_hdmi_state *new)
+{
+	int ret = 0;
+
+	if (!old->valid || !new->valid || !old->hdmi || !new->hdmi ||
+	    old->vendor_len > sizeof(old->vendor) || new->vendor_len > sizeof(new->vendor))
+		return 0;
+	if (old->vendor_len != new->vendor_len ||
+	    memcmp(old->vendor, new->vendor, new->vendor_len)) {
+		if (new->vendor_len) {
+			ret = s7d_hdmi_packet(h, 5, new->vendor, new->vendor_len);
+		} else {
+			ret = core_write(h, CORE_INFO_SELECT, 5);
+			if (!ret)
+				ret = s7d_hdmi_write_checked(h, h->core, CORE_INFO_ENABLE,
+							     CORE_INFO_TRANSMIT, 0);
+		}
+	}
+	if (!ret && memcmp(old->avi, new->avi, sizeof(new->avi)))
+		ret = s7d_hdmi_packet(h, 0, new->avi, sizeof(new->avi));
+	return ret;
+}
+
 void s7d_hdmi_commit_vendor(struct drm_crtc *crtc, struct drm_atomic_state *atomic)
 {
 	const struct s7d_vendor_conn_values *before, *after;
+	struct drm_bridge_state *old_bridge, *new_bridge;
 	struct drm_connector_state *old, *new;
 	struct drm_connector *connector;
 	struct drm_bridge *bridge;
@@ -1930,11 +2014,17 @@ void s7d_hdmi_commit_vendor(struct drm_crtc *crtc, struct drm_atomic_state *atom
 		if (!bridge || bridge->funcs != &s7d_hdmi_bridge_funcs)
 			continue;
 		h = to_s7d_hdmi(bridge);
+		old_bridge = drm_atomic_get_old_bridge_state(atomic, bridge);
+		new_bridge = drm_atomic_get_new_bridge_state(atomic, bridge);
 		/* Only on a configured link; the next one starts from the state. */
 		mutex_lock(&h->lock);
 		if (h->prepared && before->avmute != after->avmute &&
 		    s7d_hdmi_avmute(h, after->avmute))
 			dev_warn(h->dev, "HDMI AV mute %d failed\n", after->avmute);
+		if (h->prepared && old_bridge && new_bridge &&
+		    s7d_hdmi_update_infoframes(h, to_s7d_hdmi_state(old_bridge),
+					       to_s7d_hdmi_state(new_bridge)))
+			dev_warn(h->dev, "HDMI InfoFrame update failed\n");
 		mutex_unlock(&h->lock);
 	}
 }
