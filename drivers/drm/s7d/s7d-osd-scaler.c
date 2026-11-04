@@ -5,6 +5,7 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
+#include <linux/string.h>
 
 #include "s7d-osd-scaler.h"
 #include "s7d-filter.h"
@@ -142,28 +143,71 @@ static int scaler_write(void __iomem *vcbus, u32 reg, u32 mask, u32 value,
 	return -EIO;
 }
 
-static void scaler_coefficients(void __iomem *vcbus, u32 index_reg, u32 data_reg,
-				const struct s7d_osd_scaler_state *s)
+static const u32 scaler_base[] = { 0x1dc0, 0x3d00 };
+static const u32 scaler_coef_index[] = { 0x1dcc, 0x3d18 };
+static const u32 scaler_div_alpha[] = { 0x1dbf, 0x3d38 };
+#define SCALER_V_MASK	(GENMASK(25, 19) | GENMASK(17, 16) | GENMASK(14, 11) | \
+			 GENMASK(9, 8) | GENMASK(6, 0))
+#define SCALER_H_MASK	(GENMASK(22, 19) | GENMASK(17, 16) | GENMASK(14, 11) | \
+			 GENMASK(9, 8) | GENMASK(6, 0))
+
+struct scaler_reg {
+	u32 reg, mask, value;
+};
+
+#define SCALER_SETTING_COUNT 10
+
+/* Geometry, phases, dummy data and alpha division of an enabled scaler. */
+static void scaler_settings(unsigned int index, const struct s7d_osd_scaler_state *s,
+			    struct scaler_reg out[SCALER_SETTING_COUNT])
+{
+	const u32 r = scaler_base[index];
+	const struct scaler_reg settings[SCALER_SETTING_COUNT] = {
+		{ r + 9, 0x1fff1fff, s->input_size },
+		{ r + 10, 0x0fff0fff, s->output_h },
+		{ r + 11, 0x0fff0fff, s->output_v },
+		{ r, GENMASK(27, 0), s->v_phase_step },
+		{ r + 1, U32_MAX, s->v_init_phase },
+		{ r + 3, GENMASK(27, 0), s->h_phase_step },
+		{ r + 4, U32_MAX, 0 },
+		{ r + 6, 0xff77, 0 },
+		{ r + 7, U32_MAX, 0x80808080 },
+		{ scaler_div_alpha[index], BIT(7) | GENMASK(5, 4) | GENMASK(2, 0), 0xb1 },
+	};
+
+	memcpy(out, settings, sizeof(settings));
+}
+
+/* The vertical and horizontal filter tables of an enabled scaler. */
+static void scaler_tables(const struct s7d_osd_scaler_state *s, const u32 *tables[2])
 {
 	u32 input_w = (s->input_size >> 16) + 1;
 	u32 input_h = (s->input_size & 0xffff) + 1;
-	const u32 *coefficients[2] = { NULL, NULL };
-	unsigned int direction, phase;
 
+	tables[0] = s7d_filter_bilinear;
+	tables[1] = s7d_filter_bilinear;
 	if (input_w > S7D_OSD_SCALER_LINEBUFFER) {
-		coefficients[0] = s7d_filter_bilinear_2point;
+		tables[0] = s7d_filter_bilinear_2point;
 	} else if (s->output_h < 720 &&
 		   (input_w > s->output_h + 1 || input_h > s->output_v + 1)) {
-		coefficients[0] = input_h > s->output_v + 1 ?
+		tables[0] = input_h > s->output_v + 1 ?
 			s7d_filter_triangle : s7d_filter_bicubic;
-		coefficients[1] = input_w > s->output_h + 1 ?
+		tables[1] = input_w > s->output_h + 1 ?
 			s7d_filter_triangle : s7d_filter_bicubic;
 	}
+}
+
+static void scaler_coefficients(void __iomem *vcbus, u32 index_reg, u32 data_reg,
+				const struct s7d_osd_scaler_state *s)
+{
+	const u32 *tables[2];
+	unsigned int direction, phase;
+
+	scaler_tables(s, tables);
 	for (direction = 0; direction < 2; direction++) {
 		writel(direction << 8, vcbus + index_reg * 4);
 		for (phase = 0; phase < S7D_FILTER_PHASES; phase++)
-			writel(coefficients[direction] ? coefficients[direction][phase] :
-			       s7d_filter_bilinear[phase], vcbus + data_reg * 4);
+			writel(tables[direction][phase], vcbus + data_reg * 4);
 	}
 	writel(0, vcbus + index_reg * 4);
 }
@@ -171,13 +215,6 @@ static void scaler_coefficients(void __iomem *vcbus, u32 index_reg, u32 data_reg
 int s7d_osd_scaler_setup(void __iomem *vcbus,
 			 const struct s7d_osd_scaler_state states[2], u32 *failed_reg)
 {
-	const u32 base[] = { 0x1dc0, 0x3d00 };
-	const u32 coef_index[] = { 0x1dcc, 0x3d18 };
-	const u32 div_alpha[] = { 0x1dbf, 0x3d38 };
-	const u32 v_mask = GENMASK(25, 19) | GENMASK(17, 16) |
-		GENMASK(14, 11) | GENMASK(9, 8) | GENMASK(6, 0);
-	const u32 h_mask = GENMASK(22, 19) | GENMASK(17, 16) |
-		GENMASK(14, 11) | GENMASK(9, 8) | GENMASK(6, 0);
 	unsigned int index, i;
 	int ret;
 
@@ -211,21 +248,8 @@ int s7d_osd_scaler_setup(void __iomem *vcbus,
 		return ret;
 	for (index = 0; index < 2; index++) {
 		const struct s7d_osd_scaler_state *s = &states[index];
-		const u32 r = base[index];
-		const struct {
-			u32 reg, mask, value;
-		} settings[] = {
-			{ r + 9, 0x1fff1fff, s->input_size },
-			{ r + 10, 0x0fff0fff, s->output_h },
-			{ r + 11, 0x0fff0fff, s->output_v },
-			{ r, GENMASK(27, 0), s->v_phase_step },
-			{ r + 1, U32_MAX, s->v_init_phase },
-			{ r + 3, GENMASK(27, 0), s->h_phase_step },
-			{ r + 4, U32_MAX, 0 },
-			{ r + 6, 0xff77, 0 },
-			{ r + 7, U32_MAX, 0x80808080 },
-			{ div_alpha[index], BIT(7) | GENMASK(5, 4) | GENMASK(2, 0), 0xb1 },
-		};
+		const u32 r = scaler_base[index];
+		struct scaler_reg settings[SCALER_SETTING_COUNT];
 
 		ret = scaler_write(vcbus, r + 8, GENMASK(13, 2), 0, failed_reg);
 		if (!ret)
@@ -236,21 +260,67 @@ int s7d_osd_scaler_setup(void __iomem *vcbus,
 			return ret;
 		if (!s->enabled)
 			continue;
+		scaler_settings(index, s, settings);
 		for (i = 0; i < ARRAY_SIZE(settings); i++) {
 			ret = scaler_write(vcbus, settings[i].reg, settings[i].mask,
 					   settings[i].value, failed_reg);
 			if (ret)
 				return ret;
 		}
-		scaler_coefficients(vcbus, coef_index[index], coef_index[index] + 1, s);
-		ret = scaler_write(vcbus, r + 2, v_mask, s->v_control, failed_reg);
+		scaler_coefficients(vcbus, scaler_coef_index[index],
+				    scaler_coef_index[index] + 1, s);
+		ret = scaler_write(vcbus, r + 2, SCALER_V_MASK, s->v_control, failed_reg);
 		if (!ret)
-			ret = scaler_write(vcbus, r + 5, h_mask, s->h_control, failed_reg);
+			ret = scaler_write(vcbus, r + 5, SCALER_H_MASK, s->h_control, failed_reg);
 		if (!ret)
 			ret = scaler_write(vcbus, r + 8, GENMASK(13, 2), BIT(3) | BIT(2),
 					   failed_reg);
 		if (ret)
 			return ret;
 	}
+	return 0;
+}
+
+static_assert(S7D_OSD_SCALER_LIVE_COUNT ==
+	      3 + SCALER_SETTING_COUNT + 2 * (S7D_FILTER_PHASES + 1) + 1 + 3);
+
+int s7d_osd_scaler_build_live(unsigned int index, const struct s7d_osd_scaler_state *old,
+			      const struct s7d_osd_scaler_state *state,
+			      struct s7d_rdma_live *live)
+{
+	const u32 *before[2] = { NULL, NULL }, *after[2];
+	struct scaler_reg settings[SCALER_SETTING_COUNT];
+	unsigned int i, direction, phase;
+	u32 r, coef;
+
+	if (index > 1 || !old || !state || !live)
+		return -EINVAL;
+	r = scaler_base[index];
+	coef = scaler_coef_index[index];
+	/* The stopped preparation order: off, geometry, filters, then on. */
+	s7d_rdma_live_add(live, r + 8, GENMASK(13, 2), 0);
+	s7d_rdma_live_add(live, r + 2, BIT(24) | BIT(23), 0);
+	s7d_rdma_live_add(live, r + 5, BIT(22), 0);
+	if (!state->enabled)
+		return 0;
+	scaler_settings(index, state, settings);
+	for (i = 0; i < ARRAY_SIZE(settings); i++)
+		s7d_rdma_live_add(live, settings[i].reg, settings[i].mask, settings[i].value);
+	scaler_tables(state, after);
+	if (old->enabled)
+		scaler_tables(old, before);
+	/* The filter RAM keeps what a running scaler loaded; reload it for new tables. */
+	if (!old->enabled || before[0] != after[0] || before[1] != after[1]) {
+		for (direction = 0; direction < 2; direction++) {
+			s7d_rdma_live_add(live, coef, U32_MAX, direction << 8);
+			for (phase = 0; phase < S7D_FILTER_PHASES; phase++)
+				s7d_rdma_live_add(live, coef + 1, U32_MAX,
+						  after[direction][phase]);
+		}
+		s7d_rdma_live_add(live, coef, U32_MAX, 0);
+	}
+	s7d_rdma_live_add(live, r + 2, SCALER_V_MASK, state->v_control);
+	s7d_rdma_live_add(live, r + 5, SCALER_H_MASK, state->h_control);
+	s7d_rdma_live_add(live, r + 8, GENMASK(13, 2), BIT(3) | BIT(2));
 	return 0;
 }

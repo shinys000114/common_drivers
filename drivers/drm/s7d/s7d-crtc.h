@@ -72,6 +72,8 @@ struct s7d_crtc_state {
 	bool afbc_replay_compatible;
 	bool video_scaler_live;
 	bool video2_scaler_live;
+	/* OSD1 (bit 0) and OSD2 (bit 1) scalers changing at vblank. */
+	u8 osd_scaler_live;
 };
 
 static inline struct s7d_crtc_state *

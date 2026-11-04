@@ -94,6 +94,7 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->afbc_replay_compatible = false;
 	state->video_scaler_live = false;
 	state->video2_scaler_live = false;
+	state->osd_scaler_live = 0;
 	state->live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	return &state->base;
@@ -295,10 +296,19 @@ static int s7d_crtc_check_afbc_video(const struct s7d_crtc_state *state)
 	return 0;
 }
 
+/* OSD index scans out through Mali AFBCD or GFCD. */
+static bool s7d_crtc_osd_compressed(const struct s7d_crtc_state *state, unsigned int index)
+{
+	return (state->buffers.afbc.plan.surface_mask & BIT(index)) ||
+		(!index && state->buffers.gfcd.fb);
+}
+
 /* Live scaler writes, in the order a stopped preparation programs the scalers. */
 static int s7d_crtc_build_live(const struct s7d_crtc_state *state,
+			       const struct s7d_crtc_state *old,
 			       struct s7d_rdma_live *live)
 {
+	unsigned int i;
 	int ret;
 
 	if (state->video_scaler_live) {
@@ -308,6 +318,16 @@ static int s7d_crtc_build_live(const struct s7d_crtc_state *state,
 	}
 	if (state->video2_scaler_live) {
 		ret = s7d_video2_scaler_build_live(&state->video2_pps, live);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < ARRAY_SIZE(state->osd.scalers); i++) {
+		if (!(state->osd_scaler_live & BIT(i)))
+			continue;
+		if (!old)
+			return -EINVAL;
+		ret = s7d_osd_scaler_build_live(i, &old->osd.scalers[i],
+						&state->osd.scalers[i], live);
 		if (ret)
 			return ret;
 	}
@@ -322,19 +342,21 @@ static_assert(S7D_CRTC_LIVE_REG_COUNT >=
  * Count the live scaler writes. A set that does not fit in the RDMA table
  * beside the rest of the update is prepared while stopped instead.
  */
-static int s7d_crtc_check_live(struct s7d_crtc_state *state)
+static int s7d_crtc_check_live(struct s7d_crtc_state *state,
+			       const struct s7d_crtc_state *old)
 {
 	struct s7d_rdma_live live = {0};
 	int ret;
 
 	state->live_count = 0;
-	ret = s7d_crtc_build_live(state, &live);
+	ret = s7d_crtc_build_live(state, old, &live);
 	if (ret)
 		return ret;
 	if (live.count > S7D_CRTC_LIVE_REG_COUNT) {
 		state->base.mode_changed = true;
 		state->video_scaler_live = false;
 		state->video2_scaler_live = false;
+		state->osd_scaler_live = 0;
 		return 0;
 	}
 	state->live_count = live.count;
@@ -413,7 +435,7 @@ static int s7d_crtc_build_update(struct s7d_crtc_state *state,
 		if ((state->video_scaler_live || state->video2_scaler_live) &&
 		    (state->video_unchanged || state->video_address_only))
 			return -EINVAL;
-		ret = s7d_crtc_build_live(state, &live);
+		ret = s7d_crtc_build_live(state, old, &live);
 		if (ret)
 			return ret;
 		if (live.count != state->live_count)
@@ -592,6 +614,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->afbc_replay_compatible = false;
 	state->video_scaler_live = false;
 	state->video2_scaler_live = false;
+	state->osd_scaler_live = 0;
 	state->live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	state->buffers = (struct s7d_scanout_buffers) {0};
@@ -849,13 +872,26 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	ret = s7d_display_check_resources(&state->resources);
 	if (ret)
 		return ret;
-	if (old && old->active &&
-	    (!s7d_osd_scaler_same(&state->osd.scalers[0],
-				 &to_s7d_crtc_state(old)->osd.scalers[0]) ||
-	     !s7d_osd_scaler_same(&state->osd.scalers[1],
-				 &to_s7d_crtc_state(old)->osd.scalers[1])))
-		base->mode_changed = true;
-	ret = s7d_crtc_check_live(state);
+	if (old && old->active) {
+		const struct s7d_crtc_state *before = to_s7d_crtc_state(old);
+		unsigned int i;
+
+		/*
+		 * A linear layer on a progressive output rescales at vblank.
+		 * The graphics decoders and field scaling prepare while stopped.
+		 */
+		for (i = 0; i < ARRAY_SIZE(state->osd.scalers); i++) {
+			if (s7d_osd_scaler_same(&state->osd.scalers[i],
+						&before->osd.scalers[i]))
+				continue;
+			if (interlace || s7d_crtc_osd_compressed(state, i) ||
+			    s7d_crtc_osd_compressed(before, i))
+				base->mode_changed = true;
+			else
+				state->osd_scaler_live |= BIT(i);
+		}
+	}
+	ret = s7d_crtc_check_live(state, old ? to_s7d_crtc_state(old) : NULL);
 	if (ret)
 		return ret;
 	/* A fault requires a full disable/enable or link-recovery modeset. */

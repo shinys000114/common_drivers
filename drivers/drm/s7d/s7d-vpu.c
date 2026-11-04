@@ -1291,9 +1291,11 @@ static int program_osd_scaler(struct s7d_vpu *v,
 {
 	if (v->osd_scaler_route_owned)
 		return -EIO;
-	if (!states[0].enabled && !states[1].enabled)
-		return 0;
-	/* prepare() has verified stop and holds the VPU/clock references. */
+	/*
+	 * Own the route and set both scalers up even unscaled, so a scaler can
+	 * start at vblank. prepare() has verified stop and holds the VPU/clock
+	 * references.
+	 */
 	v->osd_scaler_route_saved = vpu_read(v, OSD_SCALE_CTRL) & GENMASK(2, 0);
 	/* Own it before setup: a partial write failure must also be restored. */
 	v->osd_scaler_route_owned = true;
