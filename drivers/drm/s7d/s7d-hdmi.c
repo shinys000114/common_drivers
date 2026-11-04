@@ -132,6 +132,8 @@ struct s7d_hdmi {
 	struct mutex audio_callback_lock;
 	hdmi_codec_plugged_cb audio_plugged;
 	struct device *codec_dev;
+	/* The codec is going away: report nothing more to its jack. */
+	bool audio_detached;
 	struct work_struct audio_notify;
 	struct drm_connector *connector;
 	struct cec_notifier *cec_notifier;
@@ -244,10 +246,25 @@ static void s7d_hdmi_audio_notify(struct work_struct *work)
 	bool plugged;
 
 	mutex_lock(&h->audio_callback_lock);
-	plugged = !s7d_hdmi_audio_get_eld(h->dev, h, eld, sizeof(eld));
-	if (h->audio_plugged)
+	if (h->audio_plugged && !h->audio_detached) {
+		plugged = !s7d_hdmi_audio_get_eld(h->dev, h, eld, sizeof(eld));
 		h->audio_plugged(h->codec_dev, plugged);
+	}
 	mutex_unlock(&h->audio_callback_lock);
+}
+
+/*
+ * hdmi-codec reports what the TX tells it to its card's jack until the
+ * card unhooks it, which happens only after ALSA has started tearing the
+ * jack down. Stop reporting, and wait for a report in flight, before the
+ * codec goes away.
+ */
+static void s7d_hdmi_audio_detach(struct s7d_hdmi *h)
+{
+	mutex_lock(&h->audio_callback_lock);
+	h->audio_detached = true;
+	mutex_unlock(&h->audio_callback_lock);
+	cancel_work_sync(&h->audio_notify);
 }
 
 static int s7d_hdmi_audio_hook(struct device *dev, void *data,
@@ -1994,7 +2011,8 @@ static int s7d_hdmi_probe(struct platform_device *pdev)
 	enable_irq(h->irq);
 	return 0;
 remove_ddc:
-	cancel_work_sync(&h->audio_notify);
+	/* devres takes a registered codec away after this returns. */
+	s7d_hdmi_audio_detach(h);
 	s7d_hdmi_ddc_unregister(&h->ddc);
 disable_video:
 	if (h->video_on)
@@ -2065,15 +2083,17 @@ static void s7d_hdmi_remove(struct platform_device *pdev)
 	int ret;
 
 	drm_bridge_remove(&h->bridge);
-	/* The audio codec still reaches the TX while it goes away. */
-	devm_release_action(&pdev->dev, s7d_hdmi_codec_unregister, h);
 	mutex_lock(&h->lock);
 	WRITE_ONCE(h->stopping, true);
 	WRITE_ONCE(h->hpd_enabled, false);
 	mutex_unlock(&h->lock);
+	/* HPD queues jack reports: stop it before the last flush. */
 	disable_irq(h->irq);
 	cancel_delayed_work_sync(&h->hpd_recovery);
 	cancel_delayed_work_sync(&h->scdc_check);
+	s7d_hdmi_audio_detach(h);
+	/* The audio codec still reaches the TX while it goes away. */
+	devm_release_action(&pdev->dev, s7d_hdmi_codec_unregister, h);
 	ret = s7d_hdmi_quiesce(h);
 	if (ret)
 		dev_err(&pdev->dev, "TX did not stop: %d\n", ret);
