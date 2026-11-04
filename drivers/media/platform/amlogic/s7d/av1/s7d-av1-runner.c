@@ -67,6 +67,9 @@ struct s7d_av1_runner {
 	u8 sequence_payload[S7D_AV1_SEQUENCE_MAX_BYTES];
 	u32 sequence_bytes;
 	u32 decode_count;
+	/* The session's frame size, which its references are laid out for. */
+	u32 frame_width;
+	u32 frame_height;
 	u64 epoch;
 	u64 binding;
 	u64 firmware_epoch;
@@ -115,8 +118,8 @@ static int runner_configure_picture(struct s7d_av1_runner *runner,
 	int ret;
 
 	if (!header->frame.show_existing &&
-	    (header->frame.width != sequence->max_frame_width ||
-	     header->frame.height != sequence->max_frame_height))
+	    (header->frame.width != runner->frame_width ||
+	     header->frame.height != runner->frame_height))
 		return -EOPNOTSUPP;
 	ret = s7d_av1_references_prepare(runner->references, job->epoch, job->token,
 					header, &metadata, &job->picture);
@@ -142,6 +145,8 @@ static int runner_configure_picture(struct s7d_av1_runner *runner,
 		.backing_count = job->picture.count,
 		.state = job->picture.state,
 		.primary = job->picture.primary,
+		.frame_width = runner->frame_width,
+		.frame_height = runner->frame_height,
 	};
 	ret = s7d_av1_reference_layout(header->frame.width, header->frame.height,
 		sequence->bit_depth, sequence->use_128x128_superblock ? 128 : 64, &layout);
@@ -466,9 +471,8 @@ static int runner_sequence(struct s7d_av1_runner *runner, const u8 *data,
 			return -EPIPE;
 		job->result.sequence = runner->sequence;
 	} else if (runner->sequence_valid &&
-		   (runner->sequence_bytes != job->sequence_bytes ||
-		    memcmp(runner->sequence_payload, job->sequence_payload,
-			   job->sequence_bytes))) {
+		   !s7d_av1_sequence_same_coding(&runner->sequence, &job->result.sequence)) {
+		/* A new coding needs a new session, which the caller starts. */
 		return -EPIPE;
 	}
 	return 0;
@@ -563,7 +567,14 @@ static int runner_run(struct s7d_av1_runner *runner,
 		goto unlock;
 	}
 	if (job->decode && runner->references &&
-	    s7d_av1_references_fbc(runner->references) != target->fbc) {
+	    (s7d_av1_references_fbc(runner->references) != target->fbc ||
+	     target->width != runner->frame_width || target->height != runner->frame_height)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (job->decode && (!target->width || !target->height ||
+			    target->width > job->result.sequence.max_frame_width ||
+			    target->height > job->result.sequence.max_frame_height)) {
 		ret = -EINVAL;
 		goto unlock;
 	}
@@ -621,14 +632,21 @@ static int runner_run(struct s7d_av1_runner *runner,
 		runner->context_ready = true;
 	}
 	if (job->decode && !runner->references) {
+		/* The references take the session's frame size, not the maximum. */
+		struct s7d_av1_sequence limits = job->result.sequence;
+
+		limits.max_frame_width = target->width;
+		limits.max_frame_height = target->height;
 		runner->references = s7d_av1_references_create(runner->dev, session,
 			s7d_av1_dma_context_workspace(runner->context),
-			&job->result.sequence, lease_epoch, 0, true, target->fbc);
+			&limits, lease_epoch, 0, true, target->fbc);
 		if (IS_ERR(runner->references)) {
 			ret = PTR_ERR(runner->references);
 			runner->references = NULL;
 			goto stop;
 		}
+		runner->frame_width = target->width;
+		runner->frame_height = target->height;
 	}
 	ret = s7d_av1_dma_context_stage(runner->context, job->source, bytes, lease_epoch,
 				       input_token, &job->input);
@@ -871,6 +889,8 @@ int s7d_av1_runner_close(struct s7d_av1_runner *runner,
 		runner->sequence_valid = false;
 		runner->sequence_bytes = 0;
 		runner->decode_count = 0;
+		runner->frame_width = 0;
+		runner->frame_height = 0;
 	}
 out:
 	mutex_unlock(&runner->control);

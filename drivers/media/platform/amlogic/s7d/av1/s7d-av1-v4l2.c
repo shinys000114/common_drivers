@@ -3,6 +3,7 @@
 
 #include <asm/barrier.h>
 #include <asm/byteorder.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/list.h>
@@ -35,6 +36,9 @@
  */
 #define AV1_CAPTURE_CURRENT	2U
 #define AV1_CAPTURE_MINIMUM	(S7D_AV1_DPB_REFERENCES + AV1_CAPTURE_CURRENT)
+
+/* Waits of 1-2 ms for the frontend to finish a CAPTURE setup before a change. */
+#define AV1_CHANGE_RETRIES	10U
 
 /* What the decoder does with a CAPTURE buffer. */
 enum av1_bind_state {
@@ -75,6 +79,19 @@ struct av1_backend {
 	struct s7d_av1_sequence sequence;
 	u8 sequence_payload[S7D_AV1_SEQUENCE_MAX_BYTES];
 	u32 sequence_bytes;
+	/*
+	 * A key frame of a new layout or sequence, held until the frontend has
+	 * stopped the session and set up CAPTURE again; the TU bytes live in
+	 * held_input meanwhile, as the staging goes with the session.
+	 */
+	struct s7d_v4l2_reconfigure change;
+	struct s7d_codec_layout next_layout;
+	struct s7d_av1_sequence next_sequence;
+	u8 next_payload[S7D_AV1_SEQUENCE_MAX_BYTES];
+	u32 next_bytes;
+	void *held_input;
+	u64 change_epoch;
+	u32 change_retries;
 	struct s7d_av1_decode_result result;
 	u64 lease_epoch;
 	u64 generation;
@@ -105,6 +122,10 @@ struct av1_backend {
 	bool keyed;
 	/* The session's first picture runs next: it needs the sequence header. */
 	bool seed_sequence;
+	/* The TU starts with a key frame that needs a new CAPTURE layout. */
+	bool change_needed;
+	bool change_pending;
+	bool change_stopped;
 	/* The CAPTURE buffers are bound as DPB picture memory. */
 	bool bound;
 	/* AM08C/AM10C: they hold the FBC header and body too. */
@@ -284,16 +305,100 @@ static int av1_seed_sequence(struct av1_backend *backend, const u8 *data, u32 by
 	return 0;
 }
 
+/* CAPTURE for frames of this size; references and pictures sit in its buffers. */
+static int av1_layout(const struct s7d_av1_sequence *sequence, u32 width, u32 height,
+		      struct s7d_codec_layout *out)
+{
+	struct s7d_codec_colour colour = { };
+	struct s7d_codec_layout layout;
+	int ret;
+
+	if (width < 64 || height < 64 || width > AV1_MAX_WIDTH || height > AV1_MAX_HEIGHT ||
+	    ((width | height) & 1))
+		return -EOPNOTSUPP;
+	ret = s7d_v4l2_default_nv12_layout(width, height, V4L2_PIX_FMT_NV12M, &layout);
+	if (ret)
+		return ret;
+	/* The CAPTURE NV12 double write stays 8-bit; the depth selects the FBC format. */
+	layout.bit_depth = sequence->bit_depth;
+	/* Every format: the references and the decoded picture sit in CAPTURE buffers. */
+	layout.dpb_limit = S7D_AV1_DPB_REFERENCES;
+	layout.dpb_slots = S7D_AV1_DPB_REFERENCES;
+	layout.current_slots = AV1_CAPTURE_CURRENT;
+	layout.extra_surfaces = 0;
+	layout.min_capture_buffers = AV1_CAPTURE_MINIMUM;
+	ret = s7d_codec_validate_layout(&layout);
+	if (ret)
+		return ret;
+	colour.flags = S7D_CODEC_COLOUR_SIGNAL_PRESENT;
+	if (sequence->color_range)
+		colour.flags |= S7D_CODEC_COLOUR_FULL_RANGE;
+	if (sequence->color_description_present) {
+		colour.flags |= S7D_CODEC_COLOUR_DESCRIPTION_PRESENT;
+		colour.primaries = sequence->color_primaries;
+		colour.transfer = sequence->transfer_characteristics;
+		colour.matrix = sequence->matrix_coefficients;
+	}
+	ret = s7d_codec_resolve_colour(&colour, width, height, &layout.colourimetry);
+	if (!ret)
+		*out = layout;
+	return ret;
+}
+
+/*
+ * The frame size of the key frame the TU decodes first, which may be below
+ * the sequence maximum (frame_size_override_flag); -ENOENT when the TU
+ * starts with another picture. A header this cannot read gives the maximum:
+ * the firmware checks the size of every picture again.
+ */
+static int av1_key_size(struct av1_backend *backend, const u8 *data,
+			const struct s7d_av1_sequence *sequence, u32 *width, u32 *height)
+{
+	const struct s7d_av1_picture_span *span;
+	struct s7d_av1_obu obu;
+	u32 offset, end;
+
+	lockdep_assert_held(&backend->lock);
+	if (backend->next_picture >= backend->tu.picture_count)
+		return -ENOENT;
+	span = &backend->tu.picture[backend->next_picture];
+	if (span->show_existing || span->frame_type != S7D_AV1_KEY_FRAME)
+		return -ENOENT;
+	*width = sequence->max_frame_width;
+	*height = sequence->max_frame_height;
+	end = span->offset + span->bytes;
+	for (offset = span->offset; offset < end; offset += obu.bytes) {
+		if (s7d_av1_obu_next(data, end, offset, &obu))
+			break;
+		if (obu.type == S7D_AV1_OBU_FRAME || obu.type == S7D_AV1_OBU_FRAME_HEADER) {
+			s7d_av1_parse_intra_size(data + obu.payload_offset, obu.payload_bytes,
+						 sequence, width, height);
+			break;
+		}
+	}
+	return 0;
+}
+
+static void av1_take_sequence(struct av1_backend *backend,
+			      const struct s7d_av1_sequence *sequence,
+			      const u8 *payload, u32 bytes)
+{
+	backend->sequence = *sequence;
+	memcpy(backend->sequence_payload, payload, bytes);
+	backend->sequence_bytes = bytes;
+	backend->sequence_valid = true;
+}
+
 static int av1_metadata(struct av1_backend *backend)
 {
 	const u8 *data = s7d_codec_dma_cpu(backend->input.memory);
 	const struct s7d_av1_sequence *active;
 	const u8 *payload = NULL;
 	struct s7d_av1_sequence sequence;
+	struct s7d_codec_layout layout;
 	struct s7d_av1_obu obu;
-	struct s7d_codec_colour colour = { };
-	u32 offset = 0, payload_bytes = 0, start = 0, i;
-	bool picture = false;
+	u32 offset = 0, payload_bytes = 0, start = 0, width, height, i;
+	bool picture = false, key, change;
 	int ret;
 
 	lockdep_assert_held(&backend->lock);
@@ -328,6 +433,11 @@ static int av1_metadata(struct av1_backend *backend)
 			ret = s7d_av1_admit_sequence(&sequence);
 		if (ret)
 			return ret;
+		if (sequence.max_frame_width < 64 || sequence.max_frame_height < 64 ||
+		    sequence.max_frame_width > AV1_MAX_WIDTH ||
+		    sequence.max_frame_height > AV1_MAX_HEIGHT ||
+		    ((sequence.max_frame_width | sequence.max_frame_height) & 1))
+			return -EOPNOTSUPP;
 	}
 	/* Before any sequence header nothing decodes: skip the TU. */
 	if (!payload && !backend->sequence_valid) {
@@ -349,50 +459,63 @@ static int av1_metadata(struct av1_backend *backend)
 			backend->tu.picture[i].offset += start;
 		av1_skip_to_key(backend);
 	}
-	if (!payload)
-		return 0;
-	if (sequence.max_frame_width < 64 || sequence.max_frame_height < 64 ||
-	    sequence.max_frame_width > AV1_MAX_WIDTH ||
-	    sequence.max_frame_height > AV1_MAX_HEIGHT ||
-	    ((sequence.max_frame_width | sequence.max_frame_height) & 1))
-		return -EOPNOTSUPP;
-	if (backend->sequence_valid)
-		return backend->sequence_bytes != payload_bytes ||
-			memcmp(payload, backend->sequence_payload, payload_bytes) ? -EOPNOTSUPP : 0;
-	ret = s7d_v4l2_default_nv12_layout(sequence.max_frame_width,
-					sequence.max_frame_height,
-					V4L2_PIX_FMT_NV12M, &backend->layout);
-	if (ret)
-		return ret;
-	/* The CAPTURE NV12 double write stays 8-bit; the depth selects the FBC format. */
-	backend->layout.bit_depth = sequence.bit_depth;
-	/* Every format: the references and the decoded picture sit in CAPTURE buffers. */
-	backend->layout.dpb_limit = S7D_AV1_DPB_REFERENCES;
-	backend->layout.dpb_slots = S7D_AV1_DPB_REFERENCES;
-	backend->layout.current_slots = AV1_CAPTURE_CURRENT;
-	backend->layout.extra_surfaces = 0;
-	backend->layout.min_capture_buffers = AV1_CAPTURE_MINIMUM;
-	ret = s7d_codec_validate_layout(&backend->layout);
-	if (ret)
-		return ret;
-	colour.flags = S7D_CODEC_COLOUR_SIGNAL_PRESENT;
-	if (sequence.color_range)
-		colour.flags |= S7D_CODEC_COLOUR_FULL_RANGE;
-	if (sequence.color_description_present) {
-		colour.flags |= S7D_CODEC_COLOUR_DESCRIPTION_PRESENT;
-		colour.primaries = sequence.color_primaries;
-		colour.transfer = sequence.transfer_characteristics;
-		colour.matrix = sequence.matrix_coefficients;
+	/* A key frame sets the CAPTURE size, which may be below the maximum. */
+	key = !av1_key_size(backend, data, active, &width, &height);
+	if (!key) {
+		width = active->max_frame_width;
+		height = active->max_frame_height;
 	}
-	ret = s7d_codec_resolve_colour(&colour, sequence.max_frame_width,
-				     sequence.max_frame_height, &backend->layout.colourimetry);
-	if (ret)
+	if (!backend->sequence_valid) {
+		ret = av1_layout(active, width, height, &backend->layout);
+		if (!ret)
+			av1_take_sequence(backend, active, payload, payload_bytes);
 		return ret;
-	backend->sequence = sequence;
-	memcpy(backend->sequence_payload, payload, payload_bytes);
-	backend->sequence_bytes = payload_bytes;
-	backend->sequence_valid = true;
+	}
+	/* A sequence header that changes the coding is followed by a key frame. */
+	change = payload && !s7d_av1_sequence_same_coding(&backend->sequence, &sequence);
+	if (change && !key)
+		return -EOPNOTSUPP;
+	if (key) {
+		ret = av1_layout(active, width, height, &layout);
+		if (ret)
+			return ret;
+		change |= !!memcmp(&layout, &backend->layout, sizeof(layout));
+	}
+	if (!change) {
+		/* The same coding: keep the newest copy for a later session start. */
+		if (payload)
+			av1_take_sequence(backend, active, payload, payload_bytes);
+		return 0;
+	}
+	/* Pictures before the key frame would belong to the old layout. */
+	if (backend->next_picture)
+		return -EOPNOTSUPP;
+	backend->next_sequence = *active;
+	if (payload)
+		memcpy(backend->next_payload, payload, payload_bytes);
+	else
+		memcpy(backend->next_payload, backend->sequence_payload, backend->sequence_bytes);
+	backend->next_bytes = payload ? payload_bytes : backend->sequence_bytes;
+	backend->next_layout = layout;
+	backend->change_needed = true;
 	return 0;
+}
+
+static int av1_notify_change(struct av1_backend *backend, bool *cancelled)
+{
+	int ret;
+
+	*cancelled = false;
+	mutex_lock(&backend->notifications);
+	if (backend->frontend && !READ_ONCE(backend->closing)) {
+		ret = s7d_v4l2_reconfigure_result(backend->frontend, &backend->next_layout,
+						 &backend->change, cancelled);
+	} else {
+		*cancelled = true;
+		ret = -ECANCELED;
+	}
+	mutex_unlock(&backend->notifications);
+	return ret;
 }
 
 static int av1_notify_sequence(struct av1_backend *backend, bool *cancelled)
@@ -800,10 +923,55 @@ static void av1_work(struct work_struct *work)
 		}
 		if (backend->input_pending && backend->preflight && backend->captures) {
 			token = backend->input.token;
+			if (backend->change_needed && !backend->output_pending) {
+				/*
+				 * Before its first picture: the frontend returns the
+				 * frames decoded so far, marks the last one, stops the
+				 * session and restores it with new CAPTURE buffers.
+				 */
+				if (backend->change_epoch == U64_MAX) {
+					ret = -EOVERFLOW;
+					goto failed;
+				}
+				backend->change = (struct s7d_v4l2_reconfigure) {
+					.epoch = ++backend->change_epoch,
+					.input_token = token,
+					.generation = backend->generation,
+				};
+				backend->change_needed = false;
+				backend->change_pending = true;
+				backend->capture_blocked = true;
+				mutex_unlock(&backend->lock);
+				ret = av1_notify_change(backend, &cancelled);
+				mutex_lock(&backend->lock);
+				/*
+				 * CAPTURE set up just now, before any picture: the
+				 * frontend marks it ready right after capture_start.
+				 */
+				if (ret == -ESTALE && !cancelled && !backend->closing &&
+				    !backend->execution_attempted &&
+				    backend->change_retries < AV1_CHANGE_RETRIES) {
+					backend->change_retries++;
+					backend->change_pending = false;
+					backend->change_needed = true;
+					backend->capture_blocked = false;
+					mutex_unlock(&backend->lock);
+					usleep_range(1000, 2000);
+					continue;
+				}
+				if (ret) {
+					if (cancelled && backend->closing)
+						goto unlock;
+					goto failed;
+				}
+				goto unlock;
+			}
 			if (!backend->output_pending) {
 				u32 offset = backend->tu.picture[backend->next_picture].offset;
 				u32 bytes = backend->tu.picture[backend->next_picture].bytes;
 				struct s7d_av1_decode_target target = {
+					.width = backend->layout.coded_width,
+					.height = backend->layout.coded_height,
 					.fbc = backend->fbc,
 				};
 				u64 picture_token;
@@ -1187,7 +1355,9 @@ static int av1_capture_queue(void *priv, struct s7d_codec_surface *surface,
 	int ret = -ESTALE;
 
 	mutex_lock(&backend->lock);
-	if (backend->closing || backend->failure || backend->capture_blocked) {
+	/* Before the frontend stops for a new layout, old buffers still come back. */
+	if (backend->closing || backend->failure ||
+	    (backend->capture_blocked && !backend->change_pending)) {
 		ret = backend->failure ? backend->failure : -ESHUTDOWN;
 		goto out;
 	}
@@ -1307,6 +1477,68 @@ static int av1_release_epoch(struct av1_backend *backend)
 	return 0;
 }
 
+static void av1_change_forget(struct av1_backend *backend)
+{
+	lockdep_assert_held(&backend->lock);
+	kvfree(backend->held_input);
+	backend->held_input = NULL;
+	memset(&backend->change, 0, sizeof(backend->change));
+	memset(&backend->next_layout, 0, sizeof(backend->next_layout));
+	memset(&backend->next_sequence, 0, sizeof(backend->next_sequence));
+	backend->next_bytes = 0;
+	backend->change_retries = 0;
+	backend->change_needed = false;
+	backend->change_pending = false;
+	backend->change_stopped = false;
+}
+
+/*
+ * The stopped session took every CAPTURE binding with it. For a resolution
+ * change the held TU, its tokens and the change stay.
+ */
+static void av1_clear_epoch(struct av1_backend *backend, bool keep_change)
+{
+	lockdep_assert_held(&backend->lock);
+	if (keep_change) {
+		backend->input.memory = NULL;
+	} else {
+		memset(&backend->input, 0, sizeof(backend->input));
+		memset(&backend->tu, 0, sizeof(backend->tu));
+		backend->initial_token = 0;
+		backend->last_submitted = 0;
+		backend->last_completed = 0;
+		backend->picture_token = 0;
+		backend->next_picture = 0;
+		backend->frame_sequence = 0;
+		backend->input_pending = false;
+		backend->preflight = false;
+		backend->initial_complete = false;
+		backend->capture_blocked = false;
+		av1_change_forget(backend);
+	}
+	memset(&backend->drain, 0, sizeof(backend->drain));
+	memset(&backend->result, 0, sizeof(backend->result));
+	memset(backend->capture, 0, sizeof(backend->capture));
+	memset(backend->bind, 0, sizeof(backend->bind));
+	memset(backend->slot_memory, 0, sizeof(backend->slot_memory));
+	backend->pending = 0;
+	backend->bound = false;
+	backend->fbc = false;
+	backend->lease_epoch = 0;
+	backend->generation = 0;
+	backend->captures = 0;
+	backend->failure = 0;
+	backend->stop_error = 0;
+	backend->output_pending = false;
+	backend->execution_attempted = false;
+	backend->drain_pending = false;
+	backend->drain_notified = false;
+	backend->keyed = false;
+	backend->seed_sequence = false;
+	backend->closing = false;
+	backend->detached = false;
+}
+
 static int av1_reset(void *priv)
 {
 	struct av1_backend *backend = priv;
@@ -1317,42 +1549,128 @@ static int av1_reset(void *priv)
 	ret = adapter->closing ? -ESHUTDOWN : av1_release_epoch(backend);
 	if (!ret) {
 		mutex_lock(&backend->lock);
-		memset(&backend->input, 0, sizeof(backend->input));
-		memset(&backend->tu, 0, sizeof(backend->tu));
-		memset(&backend->drain, 0, sizeof(backend->drain));
-		memset(&backend->result, 0, sizeof(backend->result));
-		memset(backend->capture, 0, sizeof(backend->capture));
-		/* The stopped session took every CAPTURE binding with it. */
-		memset(backend->bind, 0, sizeof(backend->bind));
-		memset(backend->slot_memory, 0, sizeof(backend->slot_memory));
-		backend->pending = 0;
-		backend->bound = false;
-		backend->fbc = false;
-		backend->lease_epoch = 0;
-		backend->generation = 0;
-		backend->initial_token = 0;
-		backend->last_submitted = 0;
-		backend->last_completed = 0;
-		backend->picture_token = 0;
-		backend->next_picture = 0;
-		backend->captures = 0;
-		backend->frame_sequence = 0;
-		backend->failure = 0;
-		backend->stop_error = 0;
-		backend->input_pending = false;
-		backend->preflight = false;
-		backend->initial_complete = false;
-		backend->output_pending = false;
-		backend->capture_blocked = false;
-		backend->execution_attempted = false;
-		backend->drain_pending = false;
-		backend->drain_notified = false;
-		backend->keyed = false;
-		backend->seed_sequence = false;
-		backend->closing = false;
-		backend->detached = false;
+		av1_clear_epoch(backend, false);
 		mutex_unlock(&backend->lock);
 	}
+	mutex_unlock(&adapter->clients);
+	return ret;
+}
+
+static bool av1_change_matches(struct av1_backend *backend,
+			       const struct s7d_v4l2_reconfigure *change)
+{
+	lockdep_assert_held(&backend->lock);
+	return change && change->epoch && backend->change_pending &&
+	       change->epoch == backend->change.epoch &&
+	       change->input_token == backend->change.input_token &&
+	       change->generation == backend->change.generation;
+}
+
+static int av1_change_stop_check(struct av1_backend *backend,
+				 const struct s7d_v4l2_reconfigure *change)
+{
+	lockdep_assert_held(&backend->lock);
+	if (backend->closing || backend->failure)
+		return backend->failure ? backend->failure : -ESHUTDOWN;
+	if (!av1_change_matches(backend, change) || backend->change_stopped ||
+	    !backend->session || !backend->input_pending || !backend->preflight ||
+	    !backend->capture_blocked || !backend->captures || backend->output_pending ||
+	    backend->drain_pending || backend->next_picture ||
+	    change->generation != backend->generation ||
+	    change->input_token != backend->input.token)
+		return -ESTALE;
+	return 0;
+}
+
+/*
+ * The frontend stops for a key frame of a new layout. Every frame decoded
+ * before it went out when it was decoded; pictures the DPB still hides die
+ * with the key frame. Keep the TU, end the session.
+ */
+static int av1_reconfigure_stop(void *priv, const struct s7d_v4l2_reconfigure *change)
+{
+	struct av1_backend *backend = priv;
+	struct s7d_av1_v4l2 *adapter = backend->adapter;
+	void *held;
+	int ret;
+
+	mutex_lock(&adapter->clients);
+	mutex_lock(&backend->lock);
+	ret = adapter->closing ? -ESHUTDOWN : av1_change_stop_check(backend, change);
+	mutex_unlock(&backend->lock);
+	if (ret)
+		goto out;
+	cancel_work_sync(&backend->work);
+	mutex_lock(&backend->notifications);
+	mutex_unlock(&backend->notifications);
+	mutex_lock(&backend->lock);
+	ret = av1_change_stop_check(backend, change);
+	mutex_unlock(&backend->lock);
+	if (ret)
+		goto out;
+	held = kvmemdup(s7d_codec_dma_cpu(backend->input.memory), backend->input.bytes,
+			GFP_KERNEL);
+	if (!held) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	av1_detach(backend);
+	ret = av1_release_epoch(backend);
+	if (ret) {
+		kvfree(held);
+		goto out;
+	}
+	mutex_lock(&backend->lock);
+	av1_clear_epoch(backend, true);
+	backend->held_input = held;
+	backend->change_stopped = true;
+	mutex_unlock(&backend->lock);
+out:
+	mutex_unlock(&adapter->clients);
+	return ret;
+}
+
+static int av1_reconfigure_restore(void *priv, struct s7d_codec_session *session,
+				   struct s7d_v4l2_context *frontend,
+				   struct s7d_codec_dma *staging,
+				   const struct s7d_v4l2_reconfigure *change,
+				   u64 generation)
+{
+	struct av1_backend *backend = priv;
+	struct s7d_av1_v4l2 *adapter = backend->adapter;
+	int ret = 0;
+
+	mutex_lock(&adapter->clients);
+	mutex_lock(&backend->lock);
+	if (adapter->closing || backend->closing || backend->failure)
+		ret = backend->failure ? backend->failure : -ESHUTDOWN;
+	else if (!av1_change_matches(backend, change) || !backend->change_stopped ||
+		 backend->session || adapter->active || backend->captures ||
+		 !backend->input_pending || !backend->preflight || !backend->held_input ||
+		 !session || !frontend || !staging || generation <= change->generation ||
+		 s7d_codec_dma_size(staging) < backend->input.bytes)
+		ret = -ESTALE;
+	if (ret)
+		goto out;
+	s7d_codec_session_get(session);
+	backend->session = session;
+	backend->frontend = frontend;
+	mutex_lock(&adapter->resources);
+	backend->lease_epoch = adapter->lease_epoch;
+	mutex_unlock(&adapter->resources);
+	adapter->active = backend;
+	memcpy(s7d_codec_dma_cpu(staging), backend->held_input, backend->input.bytes);
+	backend->input.memory = staging;
+	av1_take_sequence(backend, &backend->next_sequence, backend->next_payload,
+			  backend->next_bytes);
+	backend->layout = backend->next_layout;
+	backend->sequence_notified = true;
+	/* The held key frame starts the new session, once CAPTURE is set up. */
+	backend->keyed = true;
+	backend->seed_sequence = true;
+	av1_change_forget(backend);
+out:
+	mutex_unlock(&backend->lock);
 	mutex_unlock(&adapter->clients);
 	return ret;
 }
@@ -1374,6 +1692,7 @@ static int av1_clear_stream(void *priv)
 		   work_busy(&backend->work)) {
 		ret = -EBUSY;
 	} else {
+		av1_change_forget(backend);
 		memset(&backend->layout, 0, sizeof(backend->layout));
 		memset(&backend->sequence, 0, sizeof(backend->sequence));
 		memset(backend->sequence_payload, 0, sizeof(backend->sequence_payload));
@@ -1398,6 +1717,8 @@ static const struct s7d_v4l2_backend_ops av1_ops = {
 	.detach = av1_detach,
 	.reset = av1_reset,
 	.clear_stream = av1_clear_stream,
+	.reconfigure_stop = av1_reconfigure_stop,
+	.reconfigure_restore = av1_reconfigure_restore,
 };
 
 static int av1_factory_ready(void *priv)
@@ -1450,6 +1771,9 @@ static void av1_factory_destroy(void *priv, void *instance)
 		return;
 	}
 	list_del(&backend->node);
+	mutex_lock(&backend->lock);
+	av1_change_forget(backend);
+	mutex_unlock(&backend->lock);
 	mutex_unlock(&adapter->clients);
 	module_put(adapter->owner);
 	kfree(backend);

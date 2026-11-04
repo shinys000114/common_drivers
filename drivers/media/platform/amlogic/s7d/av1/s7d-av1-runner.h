@@ -27,6 +27,12 @@ struct s7d_av1_header_result {
 
 /* Where a decoded picture goes; fixed for a session once the first picture ran. */
 struct s7d_av1_decode_target {
+	/*
+	 * The frame size CAPTURE is laid out for, at most the sequence maximum:
+	 * every picture of the session must have it.
+	 */
+	u32 width;
+	u32 height;
 	/* The caller memory also holds the FBC header and body (AM08C/AM10C). */
 	bool fbc;
 	/* This picture's CAPTURE memory; NULL for a show-existing frame. */

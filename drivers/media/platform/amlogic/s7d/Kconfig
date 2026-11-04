@@ -60,10 +60,12 @@ config VIDEO_AMLOGIC_S7D_AV1_EXPERIMENTAL
 	  It takes Main profile 8-bit and 10-bit 4:2:0 OBU streams up to
 	  4096x2304 at 60 frames per second, with up to 16 frames in a
 	  temporal unit, and returns 8-bit NV12 or NV12M frames or Amlogic
-	  FBC frames of the stream's depth. Film grain, super-resolution and
-	  frame size changes within a stream are not supported. The node runs
-	  one decoder session at a time and shares the DOS with the JPEG
-	  encoder.
+	  FBC frames of the stream's depth. A new sequence header or a key
+	  frame of another size, also one below the sequence maximum, changes
+	  the resolution dynamically; an inter frame of another size is not
+	  supported. Film grain and super-resolution are not supported. The
+	  node runs one decoder session at a time and shares the DOS with the
+	  JPEG encoder.
 
 config VIDEO_AMLOGIC_S7D_JPEG_EXPERIMENTAL
 	bool "Amlogic S7D JPEG encoder"

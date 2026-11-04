@@ -20,6 +20,12 @@ struct s7d_av1_picture_input {
 	const struct s7d_av1_reference_state *primary;
 	struct s7d_av1_region mmu_map;
 	u32 backing_count;
+	/*
+	 * The session's frame size, at most the sequence maximum: the backing
+	 * is laid out for it, and every picture has it.
+	 */
+	u32 frame_width;
+	u32 frame_height;
 };
 
 struct s7d_av1_hw_picture_plan {

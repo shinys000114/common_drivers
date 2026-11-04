@@ -67,9 +67,8 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 	u32 i, j, a, b, header_bytes, luma_bytes;
 	int ret;
 
-	ret = s7d_av1_reference_layout(input->sequence->max_frame_width,
-		input->sequence->max_frame_height, input->sequence->bit_depth,
-		superblock, &layout);
+	ret = s7d_av1_reference_layout(input->frame_width, input->frame_height,
+		input->sequence->bit_depth, superblock, &layout);
 	if (ret)
 		return ret;
 	/*
@@ -77,10 +76,9 @@ static int backing_validate(const struct s7d_av1_picture_input *input)
 	 * 64-aligned pitch over a 64-aligned height, as the vendor's CAPTURE
 	 * buffers; a slot with caller FBC (not scattered) may have none.
 	 */
-	header_bytes = DIV_ROUND_UP(input->sequence->max_frame_width, 32) *
-		DIV_ROUND_UP(input->sequence->max_frame_height, 32) * 32;
-	luma_bytes = ALIGN(input->sequence->max_frame_width, 64) *
-		ALIGN(input->sequence->max_frame_height, 64);
+	header_bytes = DIV_ROUND_UP(input->frame_width, 32) *
+		DIV_ROUND_UP(input->frame_height, 32) * 32;
+	luma_bytes = ALIGN(input->frame_width, 64) * ALIGN(input->frame_height, 64);
 	if (!region_valid(&input->mmu_map, SZ_4K, S7D_AV1_MMU_MAP_BYTES) ||
 	    overlap(&input->mmu_map, &ws->backing) ||
 	    overlap(&input->mmu_map, &ws->rpm) || overlap(&input->mmu_map, &ws->lmem))
@@ -158,8 +156,10 @@ static int picture_validate(const struct s7d_av1_picture_input *input)
 	    picture->id.slot >= input->backing_count ||
 	    !id_equal(&picture->id, &input->backing[picture->id.slot].id) ||
 	    !frame->width || !frame->height || frame->decode_width != frame->width ||
-	    frame->width > input->sequence->max_frame_width ||
-	    frame->height > input->sequence->max_frame_height ||
+	    !input->frame_width || !input->frame_height ||
+	    input->frame_width > input->sequence->max_frame_width ||
+	    input->frame_height > input->sequence->max_frame_height ||
+	    frame->width != input->frame_width || frame->height != input->frame_height ||
 	    frame->bit_depth != input->sequence->bit_depth ||
 	    picture->width != frame->width || picture->height != frame->height ||
 	    picture->decode_width != frame->decode_width ||

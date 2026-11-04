@@ -83,5 +83,18 @@ int s7d_av1_parse_sequence(const u8 *payload, size_t bytes,
 			   struct s7d_av1_sequence *sequence);
 /* Initial NV12, Main profile, layer-zero admission; frame syntax is separate. */
 int s7d_av1_admit_sequence(const struct s7d_av1_sequence *sequence);
+/*
+ * Both decode a stream the same way: they differ at most in timing, levels
+ * and the decoder model's delays, which no frame header or picture depends on.
+ */
+bool s7d_av1_sequence_same_coding(const struct s7d_av1_sequence *a,
+				  const struct s7d_av1_sequence *b);
+/*
+ * Frame size of a key or intra-only frame from its frame header OBU payload;
+ * -EOPNOTSUPP for any other frame. Failure leaves the output untouched.
+ */
+int s7d_av1_parse_intra_size(const u8 *payload, size_t bytes,
+			     const struct s7d_av1_sequence *sequence,
+			     u32 *width, u32 *height);
 
 #endif
