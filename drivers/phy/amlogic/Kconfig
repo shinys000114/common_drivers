@@ -2,9 +2,12 @@
 # Copyright (c) 2026 Hardkernel Co., Ltd.
 
 config PHY_MESON_S7D_HDMI
-	bool "Amlogic S7D HDMI analog PHY"
+	tristate "Amlogic S7D HDMI analog PHY"
 	depends on AMLOGIC_C5_DISPLAY_RESOURCES
 	select GENERIC_PHY
 	help
 	  Control the HDMI analog lanes through the S7D clock provider regmap,
 	  with CCF, reset and runtime PM consumers and firmware trim calibration.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called phy-meson-s7d-hdmi.
