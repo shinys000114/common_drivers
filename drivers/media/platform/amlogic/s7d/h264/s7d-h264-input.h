@@ -94,6 +94,8 @@ struct s7d_h264_input_observation {
 	u32 write_pointer;
 	u32 fifo_control;
 	u32 whole_bytes_consumed;
+	/* PIC_DATA_DONE with an error flag, an early last MB or input left over. */
+	bool damaged;
 };
 
 struct s7d_h264_input_return {
@@ -139,9 +141,12 @@ int s7d_h264_input_accept_headers(struct s7d_h264_input *input, u64 token,
 /* CPU-only HUNT completion; no firmware entry, park proof or terminal state. */
 int s7d_h264_input_accept_skip(struct s7d_h264_input *input, u64 token,
 			     struct s7d_h264_input_return *returned);
-/* HUNT sequence rejection before hardware entry; discard all draft changes. */
+/*
+ * Rejection of a picture the hardware has not seen. @keep_parameters takes its
+ * SPS and PPS into the bank; otherwise all draft changes are discarded.
+ */
 int s7d_h264_input_reject_picture(struct s7d_h264_input *input, u64 token,
-				int status,
+				int status, bool keep_parameters,
 				struct s7d_h264_input_return *returned);
 /* Error-only CPU cancellation; any hardware-active input remains retained. */
 int s7d_h264_input_cancel_preflight(struct s7d_h264_input *input, u64 token,
@@ -181,6 +186,8 @@ int s7d_h264_input_return_after_park(struct s7d_h264_input *input,
 				  struct s7d_vdec_runtime *runtime,
 				  u64 token, u64 write_token, u64 park_epoch,
 				  struct s7d_h264_input_return *returned);
+/* Between AUs: drop the one-shot prefix and look for the next IDR (HUNT). */
+int s7d_h264_input_resync(struct s7d_h264_input *input);
 /* This tracks the input cut; it never publishes LAST or a drain notification. */
 int s7d_h264_input_begin_drain(struct s7d_h264_input *input,
 			     const struct s7d_v4l2_drain *request);

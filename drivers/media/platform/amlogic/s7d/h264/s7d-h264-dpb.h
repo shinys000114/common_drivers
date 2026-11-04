@@ -148,6 +148,11 @@ int s7d_h264_dpb_picture_done(struct s7d_h264_dpb *dpb, u32 slot,
 /* Publishes completed pictures only; this is not a drain acknowledgment. */
 int s7d_h264_dpb_flush_output(struct s7d_h264_dpb *dpb);
 int s7d_h264_dpb_finish_sequence(struct s7d_h264_dpb *dpb, bool discard_prior);
+/*
+ * Between pictures, before decoding resumes at the next IDR: output what is
+ * decoded and drop every reference and the POC state.
+ */
+int s7d_h264_dpb_resync(struct s7d_h264_dpb *dpb);
 void s7d_h264_dpb_fail(struct s7d_h264_dpb *dpb, int error);
 /* Same caller transaction lock as mutators, with live DPB/session references. */
 int s7d_h264_dpb_get_state(const struct s7d_h264_dpb *dpb,

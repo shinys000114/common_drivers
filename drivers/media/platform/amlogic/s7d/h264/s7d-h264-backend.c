@@ -42,6 +42,8 @@
 #define H264_CONFIG_DONE		0xf2U
 #define H264_DECODE_NEWPICTURE	0xf3U
 #define H264_TIMEOUT_MS		2000U
+/* Starts in a row that fail again before one good picture end the session. */
+#define H264_MAX_RESYNCS		16U
 
 #define COMMAND_SUBMIT	BIT(0)
 #define COMMAND_PICTURE	BIT(1)
@@ -101,6 +103,7 @@ struct s7d_h264_backend {
 	u32 config_scratch1;
 	u32 captures;
 	u32 pictures;
+	u32 resyncs;
 	u32 sequence_poc_type;
 	u32 sequence_log2_frame_num;
 	u32 sequence_log2_poc_lsb;
@@ -191,6 +194,47 @@ static void backend_error(struct s7d_h264_backend *backend, int error)
 	if (backend->dpb)
 		s7d_h264_dpb_fail(backend->dpb, backend->failure);
 	backend_command(backend, COMMAND_ERROR);
+}
+
+/* Damage in the stream, as opposed to a driver, firmware or resource failure. */
+static bool backend_stream_error(int error)
+{
+	switch (error) {
+	case -EBADMSG:
+	case -ENOENT:
+	case -EOPNOTSUPP:
+	case -EOVERFLOW:
+	case -ERANGE:
+	case -EILSEQ:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * dev-decoder.rst: a picture that cannot be decoded is flagged and decoding
+ * goes on. Output what is decoded, drop the references and resume at the next
+ * IDR as after a seek. Only between pictures: the VDEC is parked or idle.
+ */
+static int backend_resync(struct s7d_h264_backend *backend, int error)
+{
+	int ret;
+
+	lockdep_assert_held(&backend->decoder->transaction);
+	if (backend->resyncs >= H264_MAX_RESYNCS)
+		return error;
+	ret = backend->dpb ? s7d_h264_dpb_resync(backend->dpb) : 0;
+	if (!ret)
+		ret = s7d_h264_input_resync(backend->stream);
+	if (ret)
+		return ret;
+	backend->resyncs++;
+	backend->hunting = true;
+	dev_warn_ratelimited(backend->decoder->dev,
+			     "H.264 picture error %d at input %llu, resuming at the next IDR\n",
+			     error, (unsigned long long)backend->input.token);
+	return 0;
 }
 
 static int backend_status(struct s7d_h264_decoder *decoder, u32 expected)
@@ -438,7 +482,8 @@ static int backend_hold_reconfigure(struct s7d_h264_backend *backend)
 	int ret;
 
 	lockdep_assert_held(&backend->decoder->transaction);
-	if (!backend->au.idr || backend->hunting || !backend->sequence_syntax_valid ||
+	if (!backend->au.idr || (backend->hunting && !backend->hw_entered) ||
+	    !backend->sequence_syntax_valid ||
 	    !backend->hardware_started || !backend->captures || !backend->generation ||
 	    backend->input_staging || backend->config_waiting || backend->slice_waiting ||
 	    backend->timeout_armed || backend->change_pending)
@@ -984,6 +1029,13 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 		ret = -ESTALE;
 	if (!ret && !backend->input_preflight) {
 		ret = s7d_h264_input_preflight(backend->stream, &backend->input, &preflight);
+		if (ret && !backend->hunting && backend_stream_error(ret)) {
+			/* HUNT skips the damaged AU, or takes it when it is an IDR. */
+			ret = backend_resync(backend, ret);
+			if (!ret)
+				ret = s7d_h264_input_preflight(backend->stream, &backend->input,
+							      &preflight);
+		}
 		if (!ret) {
 			backend->input_preflight = true;
 			backend->input_picture = preflight.kind == S7D_H264_INPUT_PICTURE;
@@ -999,14 +1051,25 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 			if (!ret && (!backend_same_sequence(backend, &backend->au) ||
 				     (backend->hunting && !backend->au.idr))) {
 				if (backend->hunting && !backend->hw_entered) {
+					/* After a start or seek the bank keeps its SPS. */
 					status = -EOPNOTSUPP;
 					ret = s7d_h264_input_reject_picture(backend->stream, token,
-								     status, &returned);
+								     status, false, &returned);
 					if (!ret && (returned.token != token || returned.status != status))
 						ret = -ESTALE;
 					completed = !ret;
 				} else if (backend_can_adopt(backend, &adopted)) {
 					ret = backend_adopt_sequence(backend, &adopted);
+				} else if (!backend->au.idr) {
+					/* A new sequence without its IDR: that IDR was lost. */
+					status = -EBADMSG;
+					ret = s7d_h264_input_reject_picture(backend->stream, token,
+								     status, true, &returned);
+					if (!ret && (returned.token != token || returned.status != status))
+						ret = -ESTALE;
+					completed = !ret;
+					if (!ret)
+						ret = backend_resync(backend, status);
 				} else {
 					ret = backend_hold_reconfigure(backend);
 					changed = !ret;
@@ -1017,8 +1080,7 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 			if (!ret && (returned.token != token || returned.status))
 				ret = -ESTALE;
 			completed = !ret;
-		} else if (!ret && preflight.kind == S7D_H264_INPUT_SKIP &&
-			   backend->hunting && !backend->hw_entered) {
+		} else if (!ret && preflight.kind == S7D_H264_INPUT_SKIP && backend->hunting) {
 			status = preflight.skip_status;
 			if (status > 0) {
 				ret = -EINVAL;
@@ -1111,7 +1173,8 @@ static int backend_complete_picture(struct s7d_h264_backend *backend, bool *canc
 	mutex_lock(&decoder->transaction);
 	ret = backend_operation_check(backend, cancelled);
 	if (!ret)
-		ret = s7d_h264_dpb_picture_done(backend->dpb, slot, write, 0);
+		ret = s7d_h264_dpb_picture_done(backend->dpb, slot, write,
+						observation.damaged ? S7D_CODEC_FRAME_ERROR : 0);
 	if (!ret) {
 		backend->pictures++;
 		ret = s7d_h264_context_confirm_park(backend->context, decoder->runtime,
@@ -1136,6 +1199,11 @@ static int backend_complete_picture(struct s7d_h264_backend *backend, bool *canc
 		backend->input_preflight = false;
 		backend->input_picture = false;
 		backend->input_staging = false;
+		/* The damaged picture goes out flagged; later ones wait for an IDR. */
+		if (observation.damaged)
+			ret = backend_resync(backend, -EILSEQ);
+		else
+			backend->resyncs = 0;
 	}
 	mutex_unlock(&decoder->transaction);
 	return ret ? ret : backend_notify_input(backend, input, 0, cancelled);
@@ -1724,6 +1792,7 @@ static int backend_reset_epoch(struct s7d_h264_backend *backend, bool keep_chang
 	backend->config_scratch1 = 0;
 	backend->captures = 0;
 	backend->pictures = 0;
+	backend->resyncs = 0;
 	backend->commands = 0;
 	backend->timeout_deadline = 0;
 	backend->failure = 0;

@@ -1595,7 +1595,8 @@ static int s7d_h264_au_validate(struct s7d_h264_au_parser *parser,
 				ret = au_raw_replace(parser, draft, true, sps_id,
 						     data + prefix.header,
 						     payload_end - prefix.header);
-			if (parser->hunting && (ret == -EINVAL || ret == -ERANGE))
+			/* An SPS no layout fits is a stream error, not a caller one. */
+			if (ret == -EINVAL || ret == -ERANGE)
 				ret = -EBADMSG;
 			if (!ret && !parser->hunting && !draft->preflight.sequence_ready) {
 				draft->preflight.sps = draft->cache.sps[sps_id].sps;
@@ -1790,6 +1791,8 @@ struct s7d_h264_input {
 	bool enabled;
 	bool faulted;
 	bool picture_ready;
+	/* The firmware finished the picture early or flagged an error. */
+	bool picture_damaged;
 	bool terminal;
 	bool draining;
 };
@@ -2484,7 +2487,7 @@ int s7d_h264_input_accept_skip(struct s7d_h264_input *input, u64 token,
 }
 
 int s7d_h264_input_reject_picture(struct s7d_h264_input *input, u64 token,
-				int status,
+				int status, bool keep_parameters,
 				struct s7d_h264_input_return *returned)
 {
 	struct s7d_h264_au_parser *parser;
@@ -2494,14 +2497,20 @@ int s7d_h264_input_reject_picture(struct s7d_h264_input *input, u64 token,
 	if (ret || !returned)
 		return ret ? ret : -EINVAL;
 	parser = input->au_parser;
-	if (!parser->hunting || input->terminal || input->hw_prepared ||
-	    input->configured || input->enabled || status >= 0 ||
+	if (input->terminal || input->configured || input->enabled || status >= 0 ||
 	    parser->pending->preflight.kind != S7D_H264_INPUT_PICTURE)
 		return -EINVAL;
 	next.token = token;
 	next.timestamp_ns = input->buffer.timestamp_ns;
 	next.status = status;
-	s7d_h264_au_discard(parser);
+	/* The AU parsed cleanly: its SPS and PPS may stand, as for a skipped AU. */
+	if (keep_parameters) {
+		ret = s7d_h264_au_commit(parser);
+		if (ret)
+			return ret;
+	} else {
+		s7d_h264_au_discard(parser);
+	}
 	kvfree(parser->prefix);
 	parser->prefix = NULL;
 	parser->prefix_bytes = 0;
@@ -2710,6 +2719,7 @@ int s7d_h264_input_observe(struct s7d_h264_input *input, u64 token,
 	next.token = token;
 	next.timestamp_ns = input->buffer.timestamp_ns;
 	next.whole_bytes_consumed = input->plan.decode_bytes - DIV_ROUND_UP(bits, 8);
+	next.damaged = false;
 	*observation = next;
 	return 0;
 }
@@ -2882,6 +2892,11 @@ int s7d_h264_input_confirm_config(struct s7d_h264_input *input, u64 token,
 	return 0;
 }
 
+/*
+ * A geometry other than the configured one is a fault. An error flag, an early
+ * last macroblock or an unconsumed tail marks a damaged picture: the firmware
+ * finished it and waits as after any picture.
+ */
 static int input_picture_readback(struct s7d_h264_input *input, u64 token,
 				  struct s7d_h264_input_observation *picture)
 {
@@ -2916,14 +2931,12 @@ static int input_picture_readback(struct s7d_h264_input *input, u64 token,
 	if (!mb_width && mb_total)
 		mb_width = 256;
 	if (!expected_width || !expected_height || expected_width > 256 ||
-	    expected_height > 256 || error || mb_width != expected_width ||
-	    mb_total != expected_width * expected_height ||
-	    (position & 0xff) != expected_height - 1 ||
-	    ((position >> 8) & 0xff) != expected_width - 1)
+	    expected_height > 256 || mb_width != expected_width ||
+	    mb_total != expected_width * expected_height)
 		return -EBADMSG;
-	ret = input_tail_check(input, &second);
-	if (ret)
-		return ret;
+	second.damaged = error || (position & 0xff) != expected_height - 1 ||
+			 ((position >> 8) & 0xff) != expected_width - 1 ||
+			 input_tail_check(input, &second);
 	*picture = second;
 	return 0;
 }
@@ -2937,7 +2950,8 @@ int s7d_h264_input_confirm_picture(struct s7d_h264_input *input, u64 token,
 		return ret ? ret : -EINVAL;
 	if (input->picture_ready)
 		return -EALREADY;
-	if (input->confirmed_slices != input->au.slice_count ||
+	/* A picture the firmware ended before its last slice is damaged. */
+	if (!input->confirmed_slices || input->confirmed_slices > input->au.slice_count ||
 	    input->write_token != write_token)
 		return -ESTALE;
 	ret = input_picture_readback(input, token, &input->picture);
@@ -2947,6 +2961,8 @@ int s7d_h264_input_confirm_picture(struct s7d_h264_input *input, u64 token,
 		return ret;
 	}
 	input->picture_ready = true;
+	input->picture_damaged = input->picture.damaged ||
+				 input->confirmed_slices != input->au.slice_count;
 	return 0;
 }
 
@@ -2967,8 +2983,10 @@ int s7d_h264_input_get_picture(struct s7d_h264_input *input,
 	ret = input_picture_readback(input, token, &fresh);
 	if (ret)
 		return ret;
-	if (fresh.remaining_bits != input->picture.remaining_bits)
+	if (fresh.remaining_bits != input->picture.remaining_bits ||
+	    fresh.damaged != input->picture.damaged)
 		return -ESTALE;
+	fresh.damaged = input->picture_damaged;
 	*picture = fresh;
 	return 0;
 }
@@ -2981,6 +2999,7 @@ static void input_clear(struct s7d_h264_input *input)
 	input->enabled = false;
 	input->faulted = false;
 	input->picture_ready = false;
+	input->picture_damaged = false;
 	input->confirmed_slices = 0;
 	input->write_token = 0;
 	memset(&input->buffer, 0, sizeof(input->buffer));
@@ -3021,6 +3040,28 @@ int s7d_h264_input_return_after_park(struct s7d_h264_input *input,
 	input->last_park_epoch = park_epoch;
 	input_clear(input);
 	*returned = next;
+	return 0;
+}
+
+int s7d_h264_input_resync(struct s7d_h264_input *input)
+{
+	struct s7d_h264_au_parser *parser;
+
+	if (IS_ERR_OR_NULL(input))
+		return -EINVAL;
+	if (input->terminal)
+		return -ESHUTDOWN;
+	if (input->active || input->preflight_ready || input->faulted)
+		return -EBUSY;
+	parser = input->au_parser;
+	if (parser->pending)
+		return -EBUSY;
+	/* The bank keeps every accepted SPS/PPS; HUNT replays them at the next start. */
+	kvfree(parser->prefix);
+	parser->prefix = NULL;
+	parser->prefix_bytes = 0;
+	parser->prefix_nals = 0;
+	parser->hunting = true;
 	return 0;
 }
 

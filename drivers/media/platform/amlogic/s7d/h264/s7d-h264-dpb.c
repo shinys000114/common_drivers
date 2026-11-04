@@ -839,10 +839,6 @@ int s7d_h264_dpb_picture_done(struct s7d_h264_dpb *dpb, u32 slot,
 	ret = s7d_codec_surface_written(dpb->bindings[slot].surface, write_token);
 	if (ret)
 		goto failed;
-	if (flags & S7D_CODEC_FRAME_ERROR) {
-		ret = -EILSEQ;
-		goto failed;
-	}
 	picture = &dpb->pictures[slot];
 	/* Finish the old POC epoch before publishing IDR/MMCO5's reset picture. */
 	if (dpb->current_slice.idr || dpb->marking.reset_poc) {
@@ -907,6 +903,46 @@ int s7d_h264_dpb_flush_output(struct s7d_h264_dpb *dpb)
 	 */
 	else
 		dpb->output_started = false;
+	return ret;
+}
+
+int s7d_h264_dpb_resync(struct s7d_h264_dpb *dpb)
+{
+	u32 i;
+	int ret;
+
+	if (!dpb)
+		return -EINVAL;
+	if (dpb->failed)
+		return dpb->failed;
+	if (dpb->active_slot >= 0)
+		return -EBUSY;
+	/* What is decoded goes out now, in POC order, not after the next IDR. */
+	dpb->output_started = false;
+	ret = output_pictures(dpb, true);
+	if (ret)
+		goto failed;
+	for (i = 0; i < dpb->count; i++) {
+		struct s7d_h264_picture *picture = &dpb->pictures[i];
+
+		picture->reference = false;
+		picture->long_term_index = -1;
+		if (picture->mv_slot >= 0) {
+			dpb->mv_used[picture->mv_slot] = false;
+			picture->mv_slot = -1;
+		}
+	}
+	ret = reclaim_pictures(dpb);
+	if (ret)
+		goto failed;
+	memset(&dpb->marking, 0, sizeof(dpb->marking));
+	memset(&dpb->previous, 0, sizeof(dpb->previous));
+	memset(&dpb->next, 0, sizeof(dpb->next));
+	dpb->max_long_term_index = -1;
+	dpb->output_started = false;
+	return 0;
+failed:
+	dpb->failed = ret;
 	return ret;
 }
 
