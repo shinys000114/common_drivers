@@ -1013,6 +1013,9 @@ s7d_codec_dos_create(struct platform_device *pdev, struct module *owner)
 	/* HEVC, VP9 and AV1 sessions take turns on the HEVC core picture by picture. */
 	dos->eng[S7D_CODEC_ENGINE_HEVC].shared = true;
 	dos->eng[S7D_CODEC_ENGINE_HEVC].slots = S7D_CODEC_HEVC_SESSIONS;
+	/* H.264 sessions take turns on VDEC the same way. */
+	dos->eng[S7D_CODEC_ENGINE_VDEC].shared = true;
+	dos->eng[S7D_CODEC_ENGINE_VDEC].slots = S7D_CODEC_VDEC_SESSIONS;
 	dos->irq = platform_get_irq_byname(pdev, "mailbox_1");
 	if (dos->irq < 0) {
 		ret = dos->irq;

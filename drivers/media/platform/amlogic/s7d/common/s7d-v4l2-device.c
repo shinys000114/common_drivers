@@ -107,8 +107,8 @@ s7d_output_entry(struct s7d_v4l2_device *device, u32 fourcc)
 }
 
 /*
- * VDEC (H.264) and HCODEC (the JPEG encoder) run one session each; the HEVC
- * core runs up to four HEVC, VP9 and AV1 sessions picture by picture. A
+ * VDEC runs up to four H.264 sessions and the HEVC core up to four HEVC, VP9
+ * and AV1 sessions, picture by picture; HCODEC (the JPEG encoder) runs one. A
  * client whose codec needs an engine with no session left is refused with
  * -EBUSY when it sets its coded format or allocates bitstream buffers, before
  * any frame, so players can fall back to software decoding instead of failing

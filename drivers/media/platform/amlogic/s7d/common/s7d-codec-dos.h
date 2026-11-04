@@ -17,12 +17,12 @@ struct s7d_codec_dos;
 /*
  * VDEC, the HEVC core and HCODEC are leased on their own: a lease, its
  * sequences and a fault concern only that engine, so sessions on different
- * engines run at the same time. VDEC and HCODEC have one holder at a time,
- * which runs them. The HEVC core has up to S7D_CODEC_HEVC_SESSIONS holders
- * that take turns: each runs the core's sequences only between run_begin and
- * run_end. The first holder powers an engine up and the last one powers it
- * down. The caller serializes lifetime and pins its module before using a
- * lease.
+ * engines run at the same time. HCODEC has one holder at a time, which runs
+ * it. VDEC and the HEVC core have up to S7D_CODEC_VDEC_SESSIONS and
+ * S7D_CODEC_HEVC_SESSIONS holders that take turns: each runs the engine's
+ * sequences only between run_begin and run_end. The first holder powers an
+ * engine up and the last one powers it down. The caller serializes lifetime
+ * and pins its module before using a lease.
  */
 struct s7d_codec_dos *
 s7d_codec_dos_create(struct platform_device *pdev, struct module *owner);

@@ -21,9 +21,10 @@
 
 /*
  * Open sessions of one codec core. The engine lease bounds the sessions of
- * each engine, and one codec may use them all: four on the HEVC core.
+ * each engine, and one codec may use them all: four on VDEC and on the HEVC
+ * core.
  */
-#define S7D_CODEC_CORE_SESSIONS	S7D_CODEC_HEVC_SESSIONS
+#define S7D_CODEC_CORE_SESSIONS	max(S7D_CODEC_HEVC_SESSIONS, S7D_CODEC_VDEC_SESSIONS)
 
 enum s7d_session_state {
 	S7D_SESSION_OPEN,

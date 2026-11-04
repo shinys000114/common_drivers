@@ -14,9 +14,11 @@ enum s7d_codec_engine {
 
 /*
  * Sessions the HEVC core takes, picture by picture: the datasheet's four
- * 1080p60 streams. VDEC and HCODEC take one each.
+ * 1080p60 streams. VDEC takes four H.264 sessions the same way, the pixel
+ * rate of its 4K30 limit as four 1080p30 streams. HCODEC takes one.
  */
 #define S7D_CODEC_HEVC_SESSIONS	4
+#define S7D_CODEC_VDEC_SESSIONS	4
 
 enum s7d_codec_frame_flags {
 	S7D_CODEC_FRAME_KEY = 1U << 0,
