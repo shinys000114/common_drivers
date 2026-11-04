@@ -2249,12 +2249,14 @@ retained:
 struct s7d_h264_decoder *
 s7d_h264_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 			struct s7d_codec_firmware_owner *borrowed_firmware,
+			struct s7d_vdec_engine *borrowed_engine,
 			struct module *owner)
 {
 	struct s7d_h264_decoder *decoder;
 	int ret;
 
-	if (!dev || IS_ERR_OR_NULL(borrowed_dos) || IS_ERR_OR_NULL(borrowed_firmware))
+	if (!dev || IS_ERR_OR_NULL(borrowed_dos) || IS_ERR_OR_NULL(borrowed_firmware) ||
+	    IS_ERR_OR_NULL(borrowed_engine))
 		return ERR_PTR(-EINVAL);
 #ifdef MODULE
 	if (owner != THIS_MODULE)
@@ -2285,8 +2287,9 @@ s7d_h264_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 		goto destroy_protocol;
 	}
 	decoder->runtime = s7d_vdec_runtime_create(dev, owner, borrowed_dos,
-						 borrowed_firmware, &runtime_ops,
-						 decoder, &decoder->transaction);
+						 borrowed_firmware, borrowed_engine,
+						 &runtime_ops, decoder,
+						 &decoder->transaction);
 	if (IS_ERR(decoder->runtime)) {
 		ret = PTR_ERR(decoder->runtime);
 		goto destroy_executor;

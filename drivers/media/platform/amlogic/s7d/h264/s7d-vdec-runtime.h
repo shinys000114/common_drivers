@@ -12,6 +12,7 @@ struct regmap;
 struct mutex;
 struct s7d_codec_dos;
 struct s7d_codec_firmware_owner;
+struct s7d_vdec_engine;
 struct s7d_vdec_runtime;
 struct s7d_h264_input;
 struct s7d_h264_dpb;
@@ -45,12 +46,16 @@ struct s7d_vdec_runtime_backend_ops {
 			       bool *cancelled);
 };
 
-/* DOS, shared firmware owner and backend storage outlive this borrower. */
+/*
+ * DOS, shared firmware owner, VDEC interrupt and backend storage outlive this
+ * borrower.
+ */
 /* Destroy the core and prevent new callbacks before destroying the runtime. */
 struct s7d_vdec_runtime *
 s7d_vdec_runtime_create(struct device *dev, struct module *owner,
 			struct s7d_codec_dos *dos,
 			struct s7d_codec_firmware_owner *borrowed_firmware,
+			struct s7d_vdec_engine *borrowed_engine,
 			const struct s7d_vdec_runtime_backend_ops *ops, void *priv,
 			struct mutex *transaction);
 int s7d_vdec_runtime_destroy(struct s7d_vdec_runtime *runtime);

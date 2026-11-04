@@ -19,6 +19,7 @@
 #include "s7d-codec-firmware.h"
 #include "s7d-codec-memory.h"
 #include "s7d-hevc-engine.h"
+#include "s7d-vdec-engine.h"
 #include "s7d-v4l2-device.h"
 
 #include "av1/s7d-av1-v4l2.h"
@@ -34,6 +35,8 @@ struct s7d_vdec {
 	struct s7d_codec_dos *dos;
 	struct s7d_codec_firmware_owner *firmware;
 	struct s7d_h264_decoder *decoder;
+	/* The VDEC interrupt, shared by the VDEC sessions. */
+	struct s7d_vdec_engine *vdec_engine;
 	/* One decoder node; the OUTPUT format picks the codec. */
 	struct s7d_v4l2_device *video;
 	struct s7d_hevc_v4l2 *hevc;
@@ -206,6 +209,12 @@ static int s7d_vdec_release(struct s7d_vdec *vdec)
 			return ret;
 		vdec->decoder = NULL;
 	}
+	if (vdec->vdec_engine) {
+		ret = s7d_vdec_engine_destroy(vdec->vdec_engine);
+		if (ret)
+			return ret;
+		vdec->vdec_engine = NULL;
+	}
 	if (vdec->firmware) {
 		ret = s7d_codec_firmware_destroy(vdec->firmware);
 		if (ret)
@@ -316,8 +325,14 @@ static int s7d_vdec_probe(struct platform_device *pdev)
 		vdec->firmware = NULL;
 		goto fail;
 	}
-	vdec->decoder = s7d_h264_decoder_create(vdec->dev, vdec->dos,
-						vdec->firmware, THIS_MODULE);
+	vdec->vdec_engine = s7d_vdec_engine_create(vdec->dev, vdec->dos, THIS_MODULE);
+	if (IS_ERR(vdec->vdec_engine)) {
+		ret = PTR_ERR(vdec->vdec_engine);
+		vdec->vdec_engine = NULL;
+		goto fail;
+	}
+	vdec->decoder = s7d_h264_decoder_create(vdec->dev, vdec->dos, vdec->firmware,
+						vdec->vdec_engine, THIS_MODULE);
 	if (IS_ERR(vdec->decoder)) {
 		ret = PTR_ERR(vdec->decoder);
 		vdec->decoder = NULL;

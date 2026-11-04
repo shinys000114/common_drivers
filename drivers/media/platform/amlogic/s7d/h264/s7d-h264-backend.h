@@ -10,12 +10,14 @@ struct s7d_codec_dos;
 struct s7d_codec_firmware_owner;
 struct s7d_codec_core;
 struct s7d_h264_decoder;
+struct s7d_vdec_engine;
 struct s7d_v4l2_backend_factory;
 
-/* DOS and shared firmware owner outlive the decoder and its runtime. */
+/* DOS, shared firmware owner and VDEC interrupt outlive the decoder and its runtime. */
 struct s7d_h264_decoder *
 s7d_h264_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 			struct s7d_codec_firmware_owner *borrowed_firmware,
+			struct s7d_vdec_engine *borrowed_engine,
 			struct module *owner);
 struct s7d_codec_core *s7d_h264_decoder_core(struct s7d_h264_decoder *decoder);
 const struct s7d_v4l2_backend_factory *
