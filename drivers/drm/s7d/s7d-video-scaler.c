@@ -389,35 +389,37 @@ int s7d_video_osd_scaler_check_mode(const struct s7d_video_scaler_state *video,
 }
 
 int s7d_video_scaler_build_live(const struct s7d_video_scaler_state *state,
-				struct s7d_video_scaler_reg out[S7D_VIDEO_SCALER_LIVE_COUNT])
+				struct s7d_rdma_live *live)
 {
-	unsigned int i, n = 0;
+	unsigned int i;
 
-	if (!state || !out || state->input444 ||
+	if (!state || !live || state->input444 ||
 	    state->setup_count > S7D_VIDEO_SCALER_SETUP_COUNT)
 		return -EINVAL;
 	if (!state->enabled) {
 		/* Back to the VPP setup defaults: SAFA off, preblend-to-VADJ1 bypass. */
-		out[n++] = (struct s7d_video_scaler_reg)SET(0x5000, BIT(0), 0);
-		out[n++] = (struct s7d_video_scaler_reg)SET(0x1d93, BIT(0), BIT(0));
-		return n;
+		s7d_rdma_live_add(live, 0x5000, BIT(0), 0);
+		s7d_rdma_live_add(live, 0x1d93, BIT(0), BIT(0));
+		return 0;
 	}
 	/* The stopped preparation order, minus the LUTs. */
-	out[n++] = (struct s7d_video_scaler_reg)SET(0x1d93, BIT(0), 0);
-	out[n++] = (struct s7d_video_scaler_reg)SET(0x1da4, 0x1fff1fff,
-		(state->dst_width << 16) | state->dst_height);
-	out[n++] = state->pre_scale;
+	s7d_rdma_live_add(live, 0x1d93, BIT(0), 0);
+	s7d_rdma_live_add(live, 0x1da4, 0x1fff1fff,
+			  (state->dst_width << 16) | state->dst_height);
+	s7d_rdma_live_add(live, state->pre_scale.reg, state->pre_scale.mask,
+			  state->pre_scale.value);
 	for (i = 0; i < state->setup_count; i++) {
-		out[n] = state->setup[i];
+		const struct s7d_video_scaler_reg *s = &state->setup[i];
+
 		/* The size register is written whole, without a readback merge. */
-		if (out[n].reg == 0x1da6)
-			out[n].mask = U32_MAX;
-		n++;
+		s7d_rdma_live_add(live, s->reg, s->reg == 0x1da6 ? U32_MAX : s->mask,
+				  s->value);
 	}
-	out[n++] = (struct s7d_video_scaler_reg)SET(0x1d20, U32_MAX,
-		(state->src_height << 16) | state->src_width);
-	out[n++] = state->control;
-	return n;
+	s7d_rdma_live_add(live, 0x1d20, U32_MAX,
+			  (state->src_height << 16) | state->src_width);
+	s7d_rdma_live_add(live, state->control.reg, state->control.mask,
+			  state->control.value);
+	return 0;
 }
 
 bool s7d_video_scaler_same_config(const struct s7d_video_scaler_state *a,

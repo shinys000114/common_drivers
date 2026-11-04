@@ -93,7 +93,7 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->afbc_decode_only = false;
 	state->afbc_replay_compatible = false;
 	state->video_scaler_live = false;
-	state->scaler_live_count = 0;
+	state->live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	return &state->base;
 }
@@ -301,6 +301,39 @@ static int s7d_crtc_check_afbc_video(const struct s7d_crtc_state *state)
 	return 0;
 }
 
+/* Live scaler writes, in the order a stopped preparation programs the scalers. */
+static int s7d_crtc_build_live(const struct s7d_crtc_state *state,
+			       struct s7d_rdma_live *live)
+{
+	if (state->video_scaler_live)
+		return s7d_video_scaler_build_live(&state->video.scaler, live);
+	return 0;
+}
+
+static_assert(S7D_CRTC_LIVE_REG_COUNT >= S7D_VIDEO_SCALER_LIVE_COUNT);
+
+/*
+ * Count the live scaler writes. A set that does not fit in the RDMA table
+ * beside the rest of the update is prepared while stopped instead.
+ */
+static int s7d_crtc_check_live(struct s7d_crtc_state *state)
+{
+	struct s7d_rdma_live live = {0};
+	int ret;
+
+	state->live_count = 0;
+	ret = s7d_crtc_build_live(state, &live);
+	if (ret)
+		return ret;
+	if (live.count > S7D_CRTC_LIVE_REG_COUNT) {
+		state->base.mode_changed = true;
+		state->video_scaler_live = false;
+		return 0;
+	}
+	state->live_count = live.count;
+	return 0;
+}
+
 static int s7d_crtc_build_update(struct s7d_crtc_state *state,
 				 const struct s7d_crtc_state *old)
 {
@@ -360,22 +393,28 @@ static int s7d_crtc_build_update(struct s7d_crtc_state *state,
 				.value = cpu_to_le32(csc->matrix[j].value),
 			};
 	}
-	if (state->video_scaler_live && old && old->valid && old->base.active &&
+	if (state->live_count && old && old->valid && old->base.active &&
 	    !drm_atomic_crtc_needs_modeset(&state->base)) {
-		struct s7d_video_scaler_reg live[S7D_VIDEO_SCALER_LIVE_COUNT];
-		int n = s7d_video_scaler_build_live(&state->video.scaler, live);
+		struct s7d_rdma_live live = {
+			.entries = state->update + count,
+			.masks = state->live_mask,
+			.limit = S7D_CRTC_LIVE_REG_COUNT,
+		};
+		int ret;
 
-		if (n < 0 || state->video_unchanged || state->video_address_only)
+		/* A rescaled video also rewrites its pipeline words. */
+		if (state->video_scaler_live &&
+		    (state->video_unchanged || state->video_address_only))
 			return -EINVAL;
-		state->scaler_live_first = count;
-		state->scaler_live_count = n;
-		for (i = 0; i < (unsigned int)n; i++) {
-			state->scaler_live_mask[i] = live[i].mask;
-			state->update[count++] = (struct s7d_rdma_entry) {
-				.reg = cpu_to_le32(live[i].reg),
-				.value = cpu_to_le32(live[i].value & live[i].mask),
-			};
-		}
+		ret = s7d_crtc_build_live(state, &live);
+		if (ret)
+			return ret;
+		if (live.count != state->live_count)
+			return -EINVAL;
+		state->live_first = count;
+		count += live.count;
+	} else {
+		state->live_count = 0;
 	}
 	memcpy(state->update + count, state->postblend.regs, sizeof(state->postblend.regs));
 	count += S7D_POSTBLEND_REG_COUNT;
@@ -458,7 +497,7 @@ static bool s7d_crtc_decode_only(const struct s7d_crtc_state *state,
 static bool s7d_crtc_replay_compatible(const struct s7d_crtc_state *state,
 				      const struct s7d_crtc_state *old)
 {
-	return state->input_captured && !state->scaler_live_count &&
+	return state->input_captured && !state->live_count &&
 		state->base.active && state->base.enable && old && old->valid &&
 		old->base.active && !drm_atomic_crtc_needs_modeset(&state->base) &&
 		/* The replayed list carries CTM and GAMMA_LUT changes. */
@@ -545,7 +584,7 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	state->afbc_decode_only = false;
 	state->afbc_replay_compatible = false;
 	state->video_scaler_live = false;
-	state->scaler_live_count = 0;
+	state->live_count = 0;
 	state->previous_afbc = (struct s7d_scanout_afbc) {0};
 	state->buffers = (struct s7d_scanout_buffers) {0};
 	state->resources = (struct s7d_display_resources) {0};
@@ -797,6 +836,9 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 	     !s7d_osd_scaler_same(&state->osd.scalers[1],
 				 &to_s7d_crtc_state(old)->osd.scalers[1])))
 		base->mode_changed = true;
+	ret = s7d_crtc_check_live(state);
+	if (ret)
+		return ret;
 	/* A fault requires a full disable/enable or link-recovery modeset. */
 	if (READ_ONCE(c->last_error) && !drm_atomic_crtc_needs_modeset(base))
 		return -EINVAL;

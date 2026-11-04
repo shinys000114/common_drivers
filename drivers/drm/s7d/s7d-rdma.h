@@ -3,8 +3,11 @@
 #ifndef __S7D_RDMA_H
 #define __S7D_RDMA_H
 
+#include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
+
+#include <asm/byteorder.h>
 
 struct device;
 struct reset_control;
@@ -15,6 +18,35 @@ struct s7d_rdma_entry {
 	__le32 reg;
 	__le32 value;
 };
+
+/* One 4 KiB table, less the AFBC loop entries the backend may add. */
+#define S7D_RDMA_UPDATE_MAX_ENTRIES \
+	(SZ_4K / sizeof(struct s7d_rdma_entry) - S7D_RDMA_AFBC_LOOP_ENTRIES)
+
+/*
+ * Masked writes that change a running output at vblank. Submit merges each
+ * value into the bits outside its mask that the register holds then; a
+ * U32_MAX mask writes the word without reading it, as index and data ports
+ * need. Builders only count while entries is NULL, and never write past
+ * limit, so a count above limit means the list did not fit.
+ */
+struct s7d_rdma_live {
+	struct s7d_rdma_entry *entries;
+	u32 *masks;
+	unsigned int count;
+	unsigned int limit;
+};
+
+static inline void s7d_rdma_live_add(struct s7d_rdma_live *live, u32 reg, u32 mask,
+				     u32 value)
+{
+	if (live->entries && live->count < live->limit) {
+		live->entries[live->count].reg = cpu_to_le32(reg);
+		live->entries[live->count].value = cpu_to_le32(value & mask);
+		live->masks[live->count] = mask;
+	}
+	live->count++;
+}
 
 struct s7d_rdma {
 	struct device *dev;

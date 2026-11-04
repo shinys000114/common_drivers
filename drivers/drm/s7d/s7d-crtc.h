@@ -18,10 +18,13 @@
 #include "s7d-video-pipeline.h"
 #include "s7d-vpp.h"
 
-#define S7D_CRTC_UPDATE_REG_COUNT (S7D_OSD_UPDATE_REG_COUNT + \
+/* The most a frame update writes besides the live scaler list. */
+#define S7D_CRTC_UPDATE_BASE_COUNT (S7D_OSD_UPDATE_REG_COUNT + \
 	2 * (S7D_VIDEO_UPDATE_REG_COUNT + S7D_CSC_MATRIX_REG_COUNT + 1) + \
-	S7D_POSTBLEND_REG_COUNT + 2 + S7D_VPP_POST2_UPDATE_COUNT + S7D_GAMMA_UPDATE_COUNT + \
-	S7D_VIDEO_SCALER_LIVE_COUNT)
+	S7D_POSTBLEND_REG_COUNT + 2 + S7D_VPP_POST2_UPDATE_COUNT + S7D_GAMMA_UPDATE_COUNT)
+#define S7D_CRTC_UPDATE_REG_COUNT S7D_RDMA_UPDATE_MAX_ENTRIES
+/* Room for live scaler writes; a commit needing more takes a modeset. */
+#define S7D_CRTC_LIVE_REG_COUNT (S7D_CRTC_UPDATE_REG_COUNT - S7D_CRTC_UPDATE_BASE_COUNT)
 
 struct s7d_writeback;
 
@@ -41,12 +44,12 @@ struct s7d_crtc_state {
 	struct s7d_rdma_entry update[S7D_CRTC_UPDATE_REG_COUNT];
 	unsigned int update_count;
 	/*
-	 * update[scaler_live_first..] moves the running VD1 SAFA; submit merges
-	 * each value into the register's current bits outside scaler_live_mask.
+	 * update[live_first..] moves running scalers; submit merges each value
+	 * into the register's current bits outside live_mask.
 	 */
-	unsigned int scaler_live_first;
-	unsigned int scaler_live_count;
-	u32 scaler_live_mask[S7D_VIDEO_SCALER_LIVE_COUNT];
+	unsigned int live_first;
+	unsigned int live_count;
+	u32 live_mask[S7D_CRTC_LIVE_REG_COUNT];
 	/* Borrowed from the checked atomic plane states until scanout takes refs. */
 	struct s7d_scanout_buffers buffers;
 	struct s7d_scanout_afbc previous_afbc;
