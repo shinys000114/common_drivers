@@ -4,6 +4,7 @@
 #include <linux/cache.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
+#include <linux/minmax.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
 #include <linux/poll.h>
@@ -95,6 +96,7 @@ struct s7d_v4l2_context {
 	u64 initial_token;
 	u64 drain_token;
 	u64 drain_epoch;
+	u64 early_stop_token;
 	u64 completion_epoch;
 	u64 last_dequeued_epoch;
 	u64 cancelled_input_token;
@@ -113,6 +115,7 @@ struct s7d_v4l2_context {
 	bool capture_layout_retained;
 	bool rebind_pending;
 	bool drain_requested;
+	bool early_stop;
 	bool last_pending;
 	bool last_completing;
 	bool retired;
@@ -849,23 +852,36 @@ __poll_t s7d_v4l2_poll(struct s7d_v4l2_context *ctx, struct file *file,
 	struct vb2_queue *capture = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
 	unsigned long flags;
 	__poll_t events;
-	bool initial;
+	bool initial, hunting, ended;
 
 	mutex_lock(&ctx->queue_lock);
 	events = v4l2_m2m_poll(file, ctx->fh.m2m_ctx, wait);
-	if ((events & (EPOLLERR | EPOLLPRI)) == (EPOLLERR | EPOLLPRI)) {
-		spin_lock_irqsave(&ctx->state_lock, flags);
-		initial = !ctx->retired && ctx->prepared && ctx->output_streaming &&
-			ctx->sequence_valid && !ctx->capture_streaming &&
-			ctx->state == S7D_V4L2_CAPTURE_SETUP &&
-			vb2_is_streaming(output) && !vb2_is_streaming(capture) &&
-			list_empty(&output->queued_list) &&
-			!output->error && !capture->error;
-		spin_unlock_irqrestore(&ctx->state_lock, flags);
-		/* Empty queues must not hide the initial metadata notification. */
-		if (initial)
-			events &= ~EPOLLERR;
-	}
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	initial = (events & (EPOLLERR | EPOLLPRI)) == (EPOLLERR | EPOLLPRI) &&
+		!ctx->retired && ctx->prepared && ctx->output_streaming &&
+		ctx->sequence_valid && !ctx->capture_streaming &&
+		ctx->state == S7D_V4L2_CAPTURE_SETUP &&
+		vb2_is_streaming(output) && !vb2_is_streaming(capture) &&
+		list_empty(&output->queued_list) &&
+		!output->error && !capture->error;
+	/* OUTPUT runs while CAPTURE waits for the first stream header. */
+	hunting = !ctx->retired && ctx->prepared && ctx->output_streaming &&
+		!ctx->sequence_valid && !ctx->capture_streaming &&
+		ctx->state == S7D_V4L2_INITIALIZING &&
+		vb2_is_streaming(output) && !vb2_is_streaming(capture) &&
+		!output->error && !capture->error;
+	ended = hunting && ctx->early_stop && !ctx->active_input &&
+		ctx->last_consumed_token >= ctx->early_stop_token;
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	/*
+	 * Empty queues must not hide the initial metadata notification, nor
+	 * end a stream whose header can still come with the next OUTPUT buffer.
+	 */
+	if (initial || hunting)
+		events &= ~EPOLLERR;
+	/* A stop with nothing decodable tells a client waiting for the header. */
+	if (ended)
+		events |= EPOLLIN | EPOLLRDNORM;
 	mutex_unlock(&ctx->queue_lock);
 	return events;
 }
@@ -945,6 +961,20 @@ static void s7d_device_run(void *priv)
 	unsigned long flags;
 
 	spin_lock_irqsave(&ctx->state_lock, flags);
+	/* A stop that came before CAPTURE streamed drains once decoding runs. */
+	if (ctx->early_stop && !ctx->retired && ctx->state == S7D_V4L2_DECODING &&
+	    ctx->capture_streaming && !ctx->change_pending && !ctx->initial_pending &&
+	    ctx->drain_epoch != U64_MAX) {
+		u64 token = max(ctx->early_stop_token, ctx->last_consumed_token);
+
+		if (ctx->active_input)
+			token = max(token, ctx->active_input->token);
+		ctx->early_stop = false;
+		ctx->drain_epoch++;
+		ctx->drain_token = token;
+		ctx->drain_requested = false;
+		ctx->state = S7D_V4L2_DRAINING;
+	}
 	if (!ctx->retired && !ctx->capture_stopping && ctx->prepared &&
 	    ctx->output_streaming && ctx->capture_streaming && ctx->sequence_valid &&
 	    ctx->rebind_pending && !ctx->change_pending && !ctx->initial_pending &&
@@ -1128,6 +1158,7 @@ static int s7d_reset(struct s7d_v4l2_context *ctx, bool capture_streaming)
 	ctx->initial_pending = false;
 	ctx->drain_token = 0;
 	ctx->drain_requested = false;
+	ctx->early_stop = false;
 	ctx->last_pending = false;
 	ctx->last_completing = false;
 	if (!capture_streaming)
@@ -1174,6 +1205,7 @@ static int s7d_clear_stream_locked(struct s7d_v4l2_context *ctx)
 	ctx->last_consumed_token = ctx->next_input_token;
 	ctx->drain_token = 0;
 	ctx->drain_requested = false;
+	ctx->early_stop = false;
 	ctx->last_pending = false;
 	ctx->last_completing = false;
 	ctx->last_dequeued_epoch = 0;
@@ -2695,7 +2727,7 @@ int s7d_v4l2_decoder_cmd(struct s7d_v4l2_context *ctx,
 			 struct v4l2_decoder_cmd *command)
 {
 	unsigned long flags;
-	bool resume = false, reconfigure = false;
+	bool resume = false, reconfigure = false, wake = false;
 	int ret = 0;
 
 	if (command->cmd != V4L2_DEC_CMD_START && command->cmd != V4L2_DEC_CMD_STOP)
@@ -2746,11 +2778,26 @@ int s7d_v4l2_decoder_cmd(struct s7d_v4l2_context *ctx,
 				ctx->drain_requested = false;
 				ctx->state = S7D_V4L2_DRAINING;
 			}
+		} else if (ctx->output_streaming && !ctx->capture_streaming &&
+			   (ctx->state == S7D_V4L2_INITIALIZING ||
+			    ctx->state == S7D_V4L2_CAPTURE_SETUP)) {
+			/*
+			 * The drain starts when CAPTURE decodes. If the buffers
+			 * queued before the stop are consumed without a header,
+			 * poll tells the client that none will come.
+			 */
+			ctx->early_stop = true;
+			ctx->early_stop_token = ctx->next_input_token;
+			wake = true;
 		}
 	} else if (ctx->state == S7D_V4L2_STOPPED) {
 		resume = true;
 	}
+	if (!ret && command->cmd == V4L2_DEC_CMD_START)
+		ctx->early_stop = false;
 	spin_unlock_irqrestore(&ctx->state_lock, flags);
+	if (wake)
+		wake_up_all(&ctx->fh.wait);
 	if (reconfigure)
 		ret = s7d_reconfigure_start(ctx);
 	if (resume) {
