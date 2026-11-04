@@ -891,9 +891,9 @@ static bool s7d_hdmi_y420_709(enum s7d_hdmi_output_encoding encoding)
 		encoding == S7D_HDMI_OUTPUT_709_Y42012;
 }
 
-static enum drm_mode_status s7d_hdmi_link_valid(const struct drm_display_info *info,
-						enum s7d_hdmi_output_encoding encoding,
-						const struct drm_display_mode *mode)
+enum drm_mode_status s7d_hdmi_link_valid(const struct drm_display_info *info,
+					 enum s7d_hdmi_output_encoding encoding,
+					 const struct drm_display_mode *mode)
 {
 	struct s7d_hdmi_output_state output;
 

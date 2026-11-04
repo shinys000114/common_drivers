@@ -3,14 +3,24 @@
 #ifndef __S7D_HDMI_H
 #define __S7D_HDMI_H
 
+#include <drm/drm_modes.h>
+
+#include "s7d-hdmi-output.h"
+
 struct drm_atomic_state;
 struct drm_bridge;
 struct drm_connector;
+struct drm_display_info;
 struct platform_driver;
 struct s7d_vpu_link;
 
 int s7d_hdmi_connector_atomic_check(struct drm_connector *connector,
 				  struct drm_atomic_state *atomic);
+
+/* Whether the transmitter and the sink carry @mode with @encoding; no hardware access. */
+enum drm_mode_status s7d_hdmi_link_valid(const struct drm_display_info *info,
+					 enum s7d_hdmi_output_encoding encoding,
+					 const struct drm_display_mode *mode);
 
 /* Obtain the native bridge's VPU handoff/prepare callbacks before attaching it. */
 extern struct platform_driver s7d_hdmi_driver;
