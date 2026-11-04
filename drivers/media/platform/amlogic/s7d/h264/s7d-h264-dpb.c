@@ -84,7 +84,7 @@ static int validate_slice(const struct s7d_h264_dpb *dpb,
 	    slice->mmco_count > S7D_H264_MMCO_SIZE ||
 	    slice->first_mb >= (dpb->layout.coded_width / 16U) *
 			      (dpb->layout.coded_height / 16U))
-		return -EINVAL;
+		return -EBADMSG;
 	if (slice->poc_type > 2)
 		return -EOPNOTSUPP;
 	if (slice->poc_type == 1 &&
@@ -904,6 +904,37 @@ int s7d_h264_dpb_flush_output(struct s7d_h264_dpb *dpb)
 	else
 		dpb->output_started = false;
 	return ret;
+}
+
+int s7d_h264_dpb_abort_picture(struct s7d_h264_dpb *dpb)
+{
+	struct s7d_h264_picture *picture;
+	int ret;
+
+	if (!dpb)
+		return -EINVAL;
+	if (dpb->failed)
+		return dpb->failed;
+	if (dpb->active_slot < 0)
+		return 0;
+	picture = &dpb->pictures[dpb->active_slot];
+	/* Not published: the surface goes back to the queue unwritten. */
+	ret = s7d_codec_surface_written(dpb->bindings[dpb->active_slot].surface,
+					picture->write_token);
+	if (!ret)
+		ret = s7d_codec_surface_discard(dpb->bindings[dpb->active_slot].surface,
+						picture->write_token);
+	if (ret) {
+		dpb->failed = ret;
+		return ret;
+	}
+	if (picture->mv_slot >= 0)
+		dpb->mv_used[picture->mv_slot] = false;
+	memset(picture, 0, sizeof(*picture));
+	picture->long_term_index = -1;
+	picture->mv_slot = -1;
+	dpb->active_slot = -1;
+	return 0;
 }
 
 int s7d_h264_dpb_resync(struct s7d_h264_dpb *dpb)

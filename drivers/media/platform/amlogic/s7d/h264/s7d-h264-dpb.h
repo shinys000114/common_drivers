@@ -148,6 +148,8 @@ int s7d_h264_dpb_picture_done(struct s7d_h264_dpb *dpb, u32 slot,
 /* Publishes completed pictures only; this is not a drain acknowledgment. */
 int s7d_h264_dpb_flush_output(struct s7d_h264_dpb *dpb);
 int s7d_h264_dpb_finish_sequence(struct s7d_h264_dpb *dpb, bool discard_prior);
+/* After the hardware stopped the active picture: drop it, unapplied. */
+int s7d_h264_dpb_abort_picture(struct s7d_h264_dpb *dpb);
 /*
  * Between pictures, before decoding resumes at the next IDR: output what is
  * decoded and drop every reference and the POC state.

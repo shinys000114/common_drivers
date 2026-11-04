@@ -34,6 +34,9 @@
 #define H264_WRRSP_DONE		0x14U
 #define H264_SEI_READY		0x53U
 #define H264_SEI_DONE		0x54U
+/* The firmware gave up on the picture: input ran out, a timer or a size limit. */
+#define H264_DECODE_BUFEMPTY	0x20U
+#define H264_DECODE_OVERSIZE	0x23U
 #define H264_SEARCH_HEAD		0xf0U
 /* Host commands are 0xf0 and above; the firmware answers below that. */
 #define H264_COMMAND_MIN		H264_SEARCH_HEAD
@@ -49,6 +52,7 @@
 #define COMMAND_PICTURE	BIT(1)
 #define COMMAND_DRAIN	BIT(2)
 #define COMMAND_ERROR	BIT(3)
+#define COMMAND_ABORT	BIT(4)
 
 struct s7d_h264_event {
 	u64 token;
@@ -110,6 +114,8 @@ struct s7d_h264_backend {
 	unsigned long commands;
 	unsigned long timeout_deadline;
 	int failure;
+	/* A picture error waiting for the executor to stop its AU. */
+	int abort_error;
 	bool closing;
 	bool dispatch_blocked;
 	bool event_pending;
@@ -259,6 +265,25 @@ static void backend_timeout_disarm(struct s7d_h264_backend *backend)
 	lockdep_assert_held(&backend->decoder->transaction);
 	backend->timeout_armed = false;
 	cancel_delayed_work(&backend->timeout_work);
+}
+
+/*
+ * A picture error while the firmware waits for the host: the executor stops
+ * the AU and parks again at the last picture, then decoding resumes at the
+ * next IDR. The first AU of an epoch has no park to go back to.
+ */
+static void backend_fail(struct s7d_h264_backend *backend, int error)
+{
+	lockdep_assert_held(&backend->decoder->transaction);
+	if (!backend_stream_error(error) || backend->failure || backend->abort_error ||
+	    !backend->park_epoch || !backend->hardware_started || !backend->input_staging) {
+		backend_error(backend, error);
+		return;
+	}
+	backend->abort_error = error;
+	WRITE_ONCE(backend->dispatch_blocked, true);
+	backend_timeout_disarm(backend);
+	backend_command(backend, COMMAND_ABORT);
 }
 
 static int backend_ack(struct s7d_h264_backend *backend, u32 expected, u32 action)
@@ -703,7 +728,7 @@ static void backend_protocol_work(struct work_struct *work)
 		if (backend->slice_waiting) {
 			ret = backend_slice(backend, true);
 			if (ret)
-				backend_error(backend, ret);
+				backend_fail(backend, ret);
 			mutex_unlock(&decoder->transaction);
 			return;
 		}
@@ -766,12 +791,13 @@ static void backend_protocol_work(struct work_struct *work)
 			ret = backend_ack(backend, H264_SEI_READY, H264_SEI_DONE);
 			break;
 		default:
-			ret = -EOPNOTSUPP;
+			ret = backend->event.status >= H264_DECODE_BUFEMPTY &&
+			      backend->event.status <= H264_DECODE_OVERSIZE ? -EILSEQ : -EPROTO;
 			break;
 		}
 processed:
 		if (ret)
-			backend_error(backend, ret);
+			backend_fail(backend, ret);
 		mutex_unlock(&decoder->transaction);
 		if (ret)
 			return;
@@ -1209,6 +1235,56 @@ static int backend_complete_picture(struct s7d_h264_backend *backend, bool *canc
 	return ret ? ret : backend_notify_input(backend, input, 0, cancelled);
 }
 
+static int backend_abort_picture(struct s7d_h264_backend *backend, bool *cancelled)
+{
+	struct s7d_h264_decoder *decoder = backend->decoder;
+	struct s7d_h264_input_return returned;
+	u64 input;
+	int ret, error;
+
+	mutex_lock(&decoder->transaction);
+	ret = backend_operation_check(backend, cancelled);
+	error = backend->abort_error;
+	input = backend->input.token;
+	if (!ret && (!error || !backend->input_pending || !backend->input_staging ||
+		     !backend->park_epoch))
+		ret = -ESTALE;
+	mutex_unlock(&decoder->transaction);
+	if (ret)
+		return ret;
+	ret = s7d_vdec_runtime_abort(decoder->runtime, backend->session,
+				     backend->previous_input, backend->previous_write,
+				     backend->park_epoch, cancelled);
+	if (ret)
+		return ret;
+	mutex_lock(&decoder->transaction);
+	ret = backend_operation_check(backend, cancelled);
+	if (!ret)
+		ret = s7d_h264_context_abort(backend->context, decoder->runtime,
+					     backend->previous_input, backend->previous_write,
+					     backend->park_epoch);
+	if (!ret && backend->dpb)
+		ret = s7d_h264_dpb_abort_picture(backend->dpb);
+	if (!ret)
+		ret = s7d_h264_input_return_after_abort(backend->stream, decoder->runtime,
+							input, error, &returned);
+	if (!ret && (returned.token != input || returned.status != error))
+		ret = -ESTALE;
+	if (!ret) {
+		memset(&backend->picture, 0, sizeof(backend->picture));
+		backend->abort_error = 0;
+		backend->config_waiting = false;
+		backend->slice_waiting = false;
+		backend->input_pending = false;
+		backend->input_preflight = false;
+		backend->input_picture = false;
+		backend->input_staging = false;
+		ret = backend_resync(backend, error);
+	}
+	mutex_unlock(&decoder->transaction);
+	return ret ? ret : backend_notify_input(backend, input, error, cancelled);
+}
+
 static int backend_complete_drain(struct s7d_h264_backend *backend, bool *cancelled)
 {
 	struct s7d_h264_decoder *decoder = backend->decoder;
@@ -1341,6 +1417,8 @@ static void backend_executor_work(struct work_struct *work)
 			ret = backend_complete_picture(backend, &cancelled);
 		else if (command == COMMAND_DRAIN)
 			ret = backend_complete_drain(backend, &cancelled);
+		else if (command == COMMAND_ABORT)
+			ret = backend_abort_picture(backend, &cancelled);
 		else
 			ret = -EINVAL;
 		if (ret && !cancelled) {
@@ -1796,6 +1874,7 @@ static int backend_reset_epoch(struct s7d_h264_backend *backend, bool keep_chang
 	backend->commands = 0;
 	backend->timeout_deadline = 0;
 	backend->failure = 0;
+	backend->abort_error = 0;
 	backend->dispatch_blocked = true;
 	backend->event_pending = false;
 	backend->input_pending = false;

@@ -565,6 +565,32 @@ int s7d_h264_context_confirm_park(struct s7d_h264_context *context,
 	return 0;
 }
 
+int s7d_h264_context_abort(struct s7d_h264_context *context,
+			   struct s7d_vdec_runtime *runtime, u64 input_token,
+			   u64 write_token, u64 park_epoch)
+{
+	int ret;
+
+	if (!runtime || !input_token || !write_token || !park_epoch)
+		return -EINVAL;
+	if (context->faulted)
+		return -EIO;
+	if (context->park_confirmed || context->completion_pending ||
+	    context->saved.input_token != input_token ||
+	    context->saved.write_token != write_token ||
+	    context->saved.park_epoch != park_epoch)
+		return -ESTALE;
+	ret = s7d_vdec_runtime_check_parked(runtime, context->session, input_token,
+					 write_token, park_epoch);
+	if (ret)
+		return ret;
+	/* The saved context is still the last picture's; restore it once more. */
+	context->write_token = 0;
+	context->slice_valid = false;
+	context->park_confirmed = true;
+	return 0;
+}
+
 int s7d_h264_context_restore(struct s7d_h264_context *context,
 			     struct regmap *map, u64 previous_input,
 			     u64 previous_write, u64 park_epoch,

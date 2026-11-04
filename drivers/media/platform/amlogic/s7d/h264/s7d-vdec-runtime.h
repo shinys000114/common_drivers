@@ -71,6 +71,14 @@ int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 			  struct s7d_h264_input *input, struct s7d_h264_dpb *dpb,
 			  u64 input_token, u64 write_token, u64 *park_epoch,
 			  bool *cancelled);
+/*
+ * Stop the running AU without completing it and park again at the picture it
+ * resumed from (identity given), so that the next resume restores that park.
+ * The firmware must be waiting for the host. Call without transaction held.
+ */
+int s7d_vdec_runtime_abort(struct s7d_vdec_runtime *runtime,
+			   struct s7d_codec_session *session, u64 input_token,
+			   u64 write_token, u64 park_epoch, bool *cancelled);
 int s7d_vdec_runtime_check_parked(struct s7d_vdec_runtime *runtime,
 				  struct s7d_codec_session *session,
 				  u64 input_token, u64 write_token, u64 park_epoch);

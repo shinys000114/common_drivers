@@ -1790,6 +1790,8 @@ struct s7d_h264_input {
 	bool configured;
 	bool enabled;
 	bool faulted;
+	/* The firmware's view of this AU differs from the host parse. */
+	bool rejected;
 	bool picture_ready;
 	/* The firmware finished the picture early or flagged an error. */
 	bool picture_damaged;
@@ -2607,7 +2609,7 @@ static int input_token_check(struct s7d_h264_input *input, u64 token)
 		return -EINVAL;
 	if (!input->active || input->buffer.token != token)
 		return -ESTALE;
-	return input->faulted ? -EIO : 0;
+	return input->faulted || input->rejected ? -EIO : 0;
 }
 
 int s7d_h264_input_configure(struct s7d_h264_input *input, u64 token)
@@ -2822,7 +2824,7 @@ int s7d_h264_input_confirm_slice(struct s7d_h264_input *input, u64 token,
 	     (slice->delta_poc[0] != au->delta_poc[0] ||
 	      slice->delta_poc[1] != au->delta_poc[1])) ||
 	    (ordinal && input->write_token != write_token)) {
-		input->faulted = true;
+		input->rejected = true;
 		return -EBADMSG;
 	}
 	input->write_token = write_token;
@@ -2955,11 +2957,12 @@ int s7d_h264_input_confirm_picture(struct s7d_h264_input *input, u64 token,
 	    input->write_token != write_token)
 		return -ESTALE;
 	ret = input_picture_readback(input, token, &input->picture);
-	if (ret) {
-		if (ret != -EAGAIN)
-			input->faulted = true;
+	if (ret == -EBADMSG)
+		input->rejected = true;
+	else if (ret && ret != -EAGAIN)
+		input->faulted = true;
+	if (ret)
 		return ret;
-	}
 	input->picture_ready = true;
 	input->picture_damaged = input->picture.damaged ||
 				 input->confirmed_slices != input->au.slice_count;
@@ -2998,6 +3001,7 @@ static void input_clear(struct s7d_h264_input *input)
 	input->configured = false;
 	input->enabled = false;
 	input->faulted = false;
+	input->rejected = false;
 	input->picture_ready = false;
 	input->picture_damaged = false;
 	input->confirmed_slices = 0;
@@ -3062,6 +3066,47 @@ int s7d_h264_input_resync(struct s7d_h264_input *input)
 	parser->prefix_bytes = 0;
 	parser->prefix_nals = 0;
 	parser->hunting = true;
+	return 0;
+}
+
+int s7d_h264_input_return_after_abort(struct s7d_h264_input *input,
+				      struct s7d_vdec_runtime *runtime,
+				      u64 token, int status,
+				      struct s7d_h264_input_return *returned)
+{
+	struct s7d_h264_input_return next;
+	int ret;
+
+	if (IS_ERR_OR_NULL(input) || IS_ERR_OR_NULL(runtime) || !returned || !token ||
+	    status >= 0)
+		return -EINVAL;
+	if (!input->active || input->buffer.token != token || !input->last_park_epoch)
+		return -ESTALE;
+	if (input->faulted)
+		return -EIO;
+	/* Parked again at the last completed picture, its FIFO stopped. */
+	ret = s7d_vdec_runtime_check_parked(runtime, input->session,
+					    input->last_completed_token,
+					    input->last_completed_write,
+					    input->last_park_epoch);
+	if (ret)
+		return ret;
+	ret = input_check_parked(input);
+	if (ret)
+		return ret;
+	next.token = token;
+	next.timestamp_ns = input->buffer.timestamp_ns;
+	next.status = status;
+	/*
+	 * The host parse of its SPS and PPS stands, as for a rejected AU; the
+	 * next resume point replays the ones it uses to the firmware.
+	 */
+	ret = s7d_h264_au_commit(input->au_parser);
+	if (ret)
+		return ret;
+	input->last_consumed_token = token;
+	input_clear(input);
+	*returned = next;
 	return 0;
 }
 

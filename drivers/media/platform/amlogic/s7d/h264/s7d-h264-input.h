@@ -188,6 +188,11 @@ int s7d_h264_input_return_after_park(struct s7d_h264_input *input,
 				  struct s7d_h264_input_return *returned);
 /* Between AUs: drop the one-shot prefix and look for the next IDR (HUNT). */
 int s7d_h264_input_resync(struct s7d_h264_input *input);
+/* After a runtime abort back to the last completed picture; error returns only. */
+int s7d_h264_input_return_after_abort(struct s7d_h264_input *input,
+				      struct s7d_vdec_runtime *runtime,
+				      u64 token, int status,
+				      struct s7d_h264_input_return *returned);
 /* This tracks the input cut; it never publishes LAST or a drain notification. */
 int s7d_h264_input_begin_drain(struct s7d_h264_input *input,
 			     const struct s7d_v4l2_drain *request);

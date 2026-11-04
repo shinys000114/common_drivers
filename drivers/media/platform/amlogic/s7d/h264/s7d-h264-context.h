@@ -62,6 +62,10 @@ int s7d_h264_context_confirm_park(struct s7d_h264_context *context,
 				  struct s7d_vdec_runtime *runtime,
 				  u64 input_token, u64 write_token,
 				  u64 park_epoch, u32 completed_pictures);
+/* The runtime parked again at the saved picture after aborting the next AU. */
+int s7d_h264_context_abort(struct s7d_h264_context *context,
+			   struct s7d_vdec_runtime *runtime, u64 input_token,
+			   u64 write_token, u64 park_epoch);
 /* TEE ack, parked CPU and pinned DPB/backing precede config-only restore. */
 int s7d_h264_context_restore(struct s7d_h264_context *context,
 			     struct regmap *map, u64 previous_input,
