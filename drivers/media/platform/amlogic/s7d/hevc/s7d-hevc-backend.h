@@ -21,6 +21,11 @@ struct s7d_hevc_decode_result {
 	u32 published_frames;
 	bool skipped;
 	bool cancelled;
+	/*
+	 * The returned error was the picture's: it was dropped, the core halted
+	 * and decoding goes on (from the next IRAP if it may be a reference).
+	 */
+	bool recovered;
 };
 
 /* The caller keeps DOS, firmware and engine owners alive until destroy succeeds. */
@@ -53,6 +58,12 @@ int s7d_hevc_decoder_drain(struct s7d_hevc_decoder *decoder,
 int s7d_hevc_decoder_finish_sequence(struct s7d_hevc_decoder *decoder,
 				    struct s7d_codec_session *session,
 				    u64 generation, bool discard);
+/*
+ * An access unit was refused before decoding, for @error: resume at the next
+ * IRAP. After too many losses in a row, decoding fails with @error.
+ */
+int s7d_hevc_decoder_resync(struct s7d_hevc_decoder *decoder,
+			    struct s7d_codec_session *session, int error);
 /* Before any AU execution, or after successful session_stop and joined work. */
 int s7d_hevc_decoder_stream_close(struct s7d_hevc_decoder *decoder,
 				 struct s7d_codec_session *session);

@@ -812,6 +812,23 @@ int s7d_hevc_dpb_finish_sequence(struct s7d_hevc_dpb *dpb, bool discard,
 }
 
 /*
+ * As at the start of the stream, pictures before the next IRAP are dropped
+ * (dev-decoder.rst). That IRAP starts a coded video sequence, so the
+ * pictures still waiting for output leave first, in order.
+ */
+int s7d_hevc_dpb_resync(struct s7d_hevc_dpb *dpb)
+{
+	int ret = hevc_state_check(dpb);
+
+	if (ret)
+		return ret;
+	if (dpb->active || dpb->retiring_mask || dpb->pending_reset_generation)
+		return -EBUSY;
+	dpb->poc.started = false;
+	return 0;
+}
+
+/*
  * A drain outputs pictures ahead of display order. Decoding resumes with all
  * state, so later pictures may precede those already out.
  */

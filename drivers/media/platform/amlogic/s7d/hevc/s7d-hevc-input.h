@@ -92,10 +92,14 @@ struct s7d_hevc_input;
 
 struct s7d_hevc_input_bank *s7d_hevc_input_bank_create(void);
 void s7d_hevc_input_bank_destroy(struct s7d_hevc_input_bank *bank);
-/* Caller serializes bank operations; failed prepare changes neither bank nor out. */
+/*
+ * Caller serializes bank operations; failed prepare changes neither bank nor
+ * out. On failure, @unsupported tells a VPS, SPS or PPS refused for what it
+ * holds, not for damage.
+ */
 int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 			   const u8 *annexb, size_t bytes,
-			   struct s7d_hevc_input **out);
+			   struct s7d_hevc_input **out, bool *unsupported);
 /* Commit only a successfully prepared input from the unchanged bank revision. */
 int s7d_hevc_input_commit(struct s7d_hevc_input_bank *bank,
 			  struct s7d_hevc_input *input);

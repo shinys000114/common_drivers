@@ -127,7 +127,21 @@ static bool hevc_layout_changed(const struct s7d_codec_layout *a,
 	       a->bit_depth != b->bit_depth;
 }
 
-static int hevc_metadata(struct hevc_backend *backend)
+/*
+ * What the CPU parse refuses in a damaged access unit: broken syntax, a size
+ * beyond the limits, or slices it cannot take, such as a second picture in
+ * the buffer. The decoder ends decoding after too many in a row.
+ */
+static bool hevc_damage_error(int error)
+{
+	return error == -EBADMSG || error == -E2BIG || error == -EOPNOTSUPP;
+}
+
+/*
+ * @fatal: not damage in the access unit, but a parameter set the decoder
+ * cannot follow or an internal fault.
+ */
+static int hevc_metadata(struct hevc_backend *backend, bool *fatal)
 {
 	struct s7d_hevc_input *prepared = NULL;
 	const struct s7d_hevc_input_result *view;
@@ -135,15 +149,19 @@ static int hevc_metadata(struct hevc_backend *backend)
 	const u8 *data = s7d_codec_dma_cpu(backend->input.memory);
 	size_t prefix, total;
 	u8 *au = NULL;
-	bool change = false;
+	bool change = false, unsupported = false;
 	int ret;
 
 	lockdep_assert_held(&backend->lock);
+	*fatal = true;
 	if (!backend->bank || backend->prepared || !data || !backend->input.bytes)
 		return -EINVAL;
-	ret = s7d_hevc_input_prepare(backend->bank, data, backend->input.bytes, &prepared);
-	if (ret)
+	ret = s7d_hevc_input_prepare(backend->bank, data, backend->input.bytes, &prepared,
+				     &unsupported);
+	if (ret) {
+		*fatal = unsupported || !hevc_damage_error(ret);
 		return ret;
+	}
 	view = s7d_hevc_input_view(prepared);
 	if (!view) {
 		ret = -EPROTO;
@@ -176,9 +194,11 @@ static int hevc_metadata(struct hevc_backend *backend)
 			goto failed;
 		}
 		prefix = s7d_hevc_input_prefix_bytes(prepared);
-		if (!prefix || check_add_overflow(prefix, view->bytes, &total) ||
-		    total > s7d_hevc_context_input_capacity(&view->sequence->sps)) {
-			ret = -E2BIG;
+		ret = -E2BIG;
+		if (!prefix || check_add_overflow(prefix, view->bytes, &total))
+			goto failed;
+		if (total > s7d_hevc_context_input_capacity(&view->sequence->sps)) {
+			*fatal = false;
 			goto failed;
 		}
 		au = kvmalloc(total, GFP_KERNEL);
@@ -268,14 +288,14 @@ static int hevc_notify_reconfigure(struct hevc_backend *backend, bool *cancelled
 }
 
 static int hevc_notify_input(struct hevc_backend *backend, u64 token, int status,
-			     bool *cancelled)
+			     bool fatal, bool *cancelled)
 {
 	int ret;
 
 	*cancelled = false;
 	mutex_lock(&backend->notifications);
 	if (backend->frontend && !READ_ONCE(backend->closing)) {
-		if (status)
+		if (fatal)
 			s7d_v4l2_error(backend->frontend, status);
 		ret = s7d_v4l2_input_done_result(backend->frontend, token, status, cancelled);
 	} else {
@@ -294,10 +314,12 @@ static void hevc_notify_error(struct hevc_backend *backend, int error)
 	mutex_unlock(&backend->notifications);
 }
 
-static int hevc_complete_input(struct hevc_backend *backend, u64 token, int status)
+/* A nonzero @status fails the OUTPUT buffer; a @fatal one fails the context. */
+static int hevc_complete_input(struct hevc_backend *backend, u64 token, int status,
+			       bool fatal)
 {
 	bool cancelled;
-	int ret = hevc_notify_input(backend, token, status, &cancelled);
+	int ret = hevc_notify_input(backend, token, status, fatal, &cancelled);
 
 	if (ret && !cancelled) {
 		mutex_lock(&backend->lock);
@@ -308,12 +330,39 @@ static int hevc_complete_input(struct hevc_backend *backend, u64 token, int stat
 	return ret;
 }
 
+static int hevc_refuse_input(struct hevc_backend *backend, u64 token, int error)
+{
+	bool bound;
+	int ret = 0;
+
+	lockdep_assert_held(&backend->lock);
+	bound = backend->decoder_bound;
+	backend->input_pending = false;
+	backend->last_completed = token;
+	hevc_input_release(backend);
+	mutex_unlock(&backend->lock);
+	dev_warn_ratelimited(backend->adapter->dev,
+			     "HEVC input %llu refused (%d), waiting for an IRAP\n",
+			     token, error);
+	if (bound)
+		ret = s7d_hevc_decoder_resync(backend->adapter->decoder, backend->session,
+					      error);
+	if (ret) {
+		mutex_lock(&backend->lock);
+		backend->failure = ret;
+		mutex_unlock(&backend->lock);
+		hevc_complete_input(backend, token, ret, true);
+		return ret;
+	}
+	return hevc_complete_input(backend, token, error, false);
+}
+
 static void hevc_work(struct work_struct *work)
 {
 	struct hevc_backend *backend = container_of(work, struct hevc_backend, work);
 	struct s7d_hevc_decode_result result;
 	u64 token = 0;
-	bool cancelled;
+	bool cancelled, fatal;
 	int ret;
 
 	for (;;) {
@@ -322,7 +371,17 @@ static void hevc_work(struct work_struct *work)
 			goto unlock;
 		if (backend->input_pending && !backend->preflight) {
 			token = backend->input.token;
-			ret = hevc_metadata(backend);
+			ret = hevc_metadata(backend, &fatal);
+			/*
+			 * Once decoding began, a damaged access unit fails only its
+			 * OUTPUT buffer and decoding resumes at the next IRAP
+			 * (dev-decoder.rst, Decoding).
+			 */
+			if (ret && !fatal && backend->execution_attempted) {
+				if (hevc_refuse_input(backend, token, ret))
+					return;
+				continue;
+			}
 			if (ret)
 				goto failed;
 			backend->preflight = true;
@@ -352,7 +411,7 @@ static void hevc_work(struct work_struct *work)
 			backend->last_completed = token;
 			hevc_input_release(backend);
 			mutex_unlock(&backend->lock);
-			if (hevc_complete_input(backend, token, 0))
+			if (hevc_complete_input(backend, token, 0, false))
 				return;
 			continue;
 		}
@@ -383,13 +442,15 @@ static void hevc_work(struct work_struct *work)
 			if (ret) {
 				if (result.cancelled && backend->closing)
 					goto unlock;
-				goto failed;
+				/* A dropped damaged picture fails only its OUTPUT buffer. */
+				if (!result.recovered)
+					goto failed;
 			}
 			backend->input_pending = false;
 			backend->last_completed = token;
 			hevc_input_release(backend);
 			mutex_unlock(&backend->lock);
-			if (hevc_complete_input(backend, token, 0))
+			if (hevc_complete_input(backend, token, ret, false))
 				return;
 			continue;
 		}
@@ -433,7 +494,7 @@ failed:
 		backend->input_pending = false;
 		hevc_input_release(backend);
 		mutex_unlock(&backend->lock);
-		hevc_complete_input(backend, token, ret);
+		hevc_complete_input(backend, token, ret, true);
 		return;
 	}
 }

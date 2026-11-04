@@ -811,7 +811,8 @@ void s7d_hevc_input_bank_destroy(struct s7d_hevc_input_bank *bank)
 }
 
 int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
-			   const u8 *annexb, size_t bytes, struct s7d_hevc_input **out)
+			   const u8 *annexb, size_t bytes, struct s7d_hevc_input **out,
+			   bool *unsupported)
 {
 	struct s7d_hevc_input *input;
 	size_t pos = 0, kept;
@@ -819,8 +820,9 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 	bool picture = false, dropped = false, eos;
 	int ret = 0;
 
-	if (IS_ERR_OR_NULL(bank) || !annexb || !bytes || !out)
+	if (IS_ERR_OR_NULL(bank) || !annexb || !bytes || !out || !unsupported)
 		return -EINVAL;
+	*unsupported = false;
 	eos = bank->end_of_sequence;
 	if (bytes > S7D_HEVC_AU_MAX_BYTES)
 		return -E2BIG;
@@ -900,6 +902,12 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 		if (type >= 32 && type <= 34) {
 			ret = picture ? -EOPNOTSUPP :
 				hevc_parameter_parse(bank, input, nal, end - start, type, &bits);
+			/*
+			 * Damage breaks the syntax. A complete set refused for its
+			 * values, even inconsistent ones, is unsupported content.
+			 */
+			*unsupported = !picture && ret && ret != -EBADMSG && ret != -E2BIG &&
+				       ret != -ENOMEM;
 		} else if (type == 0 || type == 1 || (type >= 6 && type <= 9) ||
 			   (type >= 16 && type <= 21)) {
 			if (dropped) {

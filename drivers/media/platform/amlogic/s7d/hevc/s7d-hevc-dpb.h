@@ -150,6 +150,8 @@ int s7d_hevc_dpb_abort(struct s7d_hevc_dpb *dpb, u64 plan_id,
 		       struct s7d_hevc_dpb_actions *actions);
 int s7d_hevc_dpb_finish_sequence(struct s7d_hevc_dpb *dpb, bool discard,
 				bool physical_idle, struct s7d_hevc_dpb_actions *actions);
+/* A picture was lost: drop the following ones until the next IRAP. */
+int s7d_hevc_dpb_resync(struct s7d_hevc_dpb *dpb);
 int s7d_hevc_dpb_reset(struct s7d_hevc_dpb *dpb, u64 new_generation,
 		       bool physical_idle, struct s7d_hevc_dpb_actions *actions);
 /* Acknowledge every action, including an empty reset, after real releases. */
