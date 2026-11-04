@@ -121,3 +121,18 @@ config DRM_S7D_VENDOR_UAPI
 	  userspace expects: driver name "meson" with a render node, and the
 	  vendor interfaces built on it. It is used by default;
 	  s7d_drm.vendor_uapi=0 registers the plain s7d-drm device instead.
+
+config DRM_S7D_AMLMEDIA
+	tristate "S7D display mode for the Amlogic media stack"
+	depends on DRM_S7D && AMLOGIC_MEDIA_MODULE && AMLOGIC_VOUT_SERVE
+	help
+	  Serve the S7D display mode to the Amlogic media stack (aml_media)
+	  as its video output information, so its video sink, A/V sync and
+	  /sys/class/video/device_resolution follow the running HDMI mode.
+	  Modes are set through DRM only: the server takes no vendor mode
+	  request, and announces a mode only while the output runs. It reaches
+	  aml_media only once the S7D display runs a mode, so it stays inert
+	  with the vendor display.
+	  Built as the module s7d-amlmedia, loaded after aml_media. Once it has
+	  served a mode, unloading it leaves its small mode record allocated,
+	  as aml_media keeps pointing at it.

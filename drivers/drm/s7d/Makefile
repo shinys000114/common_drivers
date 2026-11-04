@@ -49,3 +49,5 @@ s7d-drm-$(CONFIG_DRM_S7D_VENDOR_UAPI) += \
 	s7d-vendor-modes.o \
 	s7d-vendor-props.o \
 	s7d-vendor-sysfs.o
+
+obj-$(CONFIG_DRM_S7D_AMLMEDIA) += glue/
