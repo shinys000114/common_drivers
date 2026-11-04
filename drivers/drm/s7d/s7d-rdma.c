@@ -307,6 +307,18 @@ static bool display_write_valid(u32 reg, u32 value)
 	case 0x1da4:
 	case 0x1da6:
 		return !(value & ~0x1fff1fffU);
+	/* OSD scaler geometry and control, merged with the running values at submit. */
+	case 0x1dbf ... 0x1dcb:
+	case 0x3d00 ... 0x3d0b:
+	case 0x3d38:
+		return true;
+	/* The OSD filter RAMs: a direction index, then any table word. */
+	case 0x1dcc:
+	case 0x3d18:
+		return !value || value == BIT(8);
+	case 0x1dcd:
+	case 0x3d19:
+		return true;
 	/* VD2 PPS geometry and control, merged with the running values at submit. */
 	case 0x3945 ... 0x395f:
 		return true;

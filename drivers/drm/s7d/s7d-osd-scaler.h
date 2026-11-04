@@ -5,6 +5,9 @@
 
 #include <linux/types.h>
 
+#include "s7d-filter.h"
+#include "s7d-rdma.h"
+
 #define S7D_OSD_SCALER_MAX_UPSCALE 4
 #define S7D_OSD_SCALER_MAX_DOWNSCALE 2
 #define S7D_OSD_SCALER_LINEBUFFER 1920
@@ -35,5 +38,18 @@ int s7d_osd_scaler_check_mode(const struct s7d_osd_scaler_state states[2],
 /* Caller owns the VPU and has stopped all fetchers, VENCs and RDMA. */
 int s7d_osd_scaler_setup(void __iomem *vcbus,
 			 const struct s7d_osd_scaler_state states[2], u32 *failed_reg);
+
+/* Off, ten settings, both filter tables with their index writes, then on. */
+#define S7D_OSD_SCALER_LIVE_COUNT (3 + 10 + 2 * (S7D_FILTER_PHASES + 1) + 1 + 3)
+
+/*
+ * Add the masked writes, in the stopped preparation order, that move scaler
+ * index of a running progressive output from old to state. The filter
+ * tables are reloaded only when old did not use the same ones. The setup
+ * has owned the scaler route since the output was prepared.
+ */
+int s7d_osd_scaler_build_live(unsigned int index, const struct s7d_osd_scaler_state *old,
+			      const struct s7d_osd_scaler_state *state,
+			      struct s7d_rdma_live *live);
 
 #endif
