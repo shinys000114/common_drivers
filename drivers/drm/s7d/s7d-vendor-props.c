@@ -787,6 +787,18 @@ void s7d_vendor_props_set_output(struct drm_connector_state *state, u8 color_spa
 	v->fractional = fractional;
 }
 
+void s7d_vendor_props_take_request(struct drm_connector_state *state)
+{
+	struct s7d_vendor_conn_values *v;
+
+	if (!s7d_vendor_props_conn(state))
+		return;
+	v = &container_of(state, struct s7d_vendor_conn_state, base)->v;
+	v->link_request = v->request;
+	v->link_space = v->color_space;
+	v->link_depth = v->color_depth;
+}
+
 /* An output runs on @state: the HDMI atomic check sets output_bpc for it. */
 static bool s7d_vendor_conn_active(const struct drm_connector_state *state)
 {

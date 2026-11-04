@@ -35,6 +35,7 @@
 #include "s7d-hdmi-ddc.h"
 #include "s7d-hdmi-audio.h"
 #include "s7d-hooks.h"
+#include "s7d-vendor-props.h"
 #include "s7d-vpu.h"
 
 /* TOP offsets are bytes; core offsets address 8-bit registers. */
@@ -884,11 +885,20 @@ static const struct drm_edid *s7d_hdmi_get_edid(struct drm_bridge *bridge,
 	return NULL;
 }
 
-static bool s7d_hdmi_y420_709(enum s7d_hdmi_output_encoding encoding)
+static bool s7d_hdmi_ycc_709(enum s7d_hdmi_output_encoding encoding)
 {
-	return encoding == S7D_HDMI_OUTPUT_709_Y4208 ||
-		encoding == S7D_HDMI_OUTPUT_709_Y42010 ||
-		encoding == S7D_HDMI_OUTPUT_709_Y42012;
+	switch (encoding) {
+	case S7D_HDMI_OUTPUT_709_Y4448:
+	case S7D_HDMI_OUTPUT_709_Y44410:
+	case S7D_HDMI_OUTPUT_709_Y44412:
+	case S7D_HDMI_OUTPUT_709_Y4228:
+	case S7D_HDMI_OUTPUT_709_Y4208:
+	case S7D_HDMI_OUTPUT_709_Y42010:
+	case S7D_HDMI_OUTPUT_709_Y42012:
+		return true;
+	default:
+		return false;
+	}
 }
 
 enum drm_mode_status s7d_hdmi_link_valid(const struct drm_display_info *info,
@@ -1013,11 +1023,37 @@ static bool s7d_hdmi_rgb_limited(const struct drm_connector_state *state,
 	}
 }
 
+/*
+ * As the vendor driver, a color_depth write, even of the same value, takes a
+ * modeset in a commit that allows one, and UPDATE sets the output again. The
+ * format request waits for a modeset otherwise.
+ */
+static int s7d_hdmi_vendor_check(struct drm_atomic_state *atomic,
+				 const struct drm_connector_state *state,
+				 const struct s7d_vendor_conn_values *vendor)
+{
+	struct drm_crtc_state *crtc_state;
+
+	if (!atomic->allow_modeset || (!vendor->update && !vendor->depth_written))
+		return 0;
+	crtc_state = drm_atomic_get_crtc_state(atomic, state->crtc);
+	if (IS_ERR(crtc_state))
+		return PTR_ERR(crtc_state);
+	if (!crtc_state->active)
+		return 0;
+	if (vendor->update)
+		crtc_state->connectors_changed = true;
+	if (vendor->depth_written)
+		crtc_state->mode_changed = true;
+	return 0;
+}
+
 int s7d_hdmi_connector_atomic_check(struct drm_connector *connector,
 				  struct drm_atomic_state *atomic)
 {
 	struct drm_connector_state *old = drm_atomic_get_old_connector_state(atomic, connector);
 	struct drm_connector_state *state = drm_atomic_get_new_connector_state(atomic, connector);
+	const struct s7d_vendor_conn_values *vendor = s7d_vendor_props_conn(state);
 	struct drm_crtc_state *crtc_state, *old_crtc_state;
 	enum s7d_hdmi_output_encoding encoding;
 	bool content_changed = connector->display_info.is_hdmi &&
@@ -1027,6 +1063,11 @@ int s7d_hdmi_connector_atomic_check(struct drm_connector *connector,
 	bool y422;
 	int ret;
 
+	if (vendor && state->crtc) {
+		ret = s7d_hdmi_vendor_check(atomic, state, vendor);
+		if (ret)
+			return ret;
+	}
 	if (!state->crtc || (!content_changed && !range_changed && !hdr_changed &&
 			     old->colorspace == state->colorspace &&
 			     state->colorspace == DRM_MODE_COLORIMETRY_DEFAULT))
@@ -1039,6 +1080,12 @@ int s7d_hdmi_connector_atomic_check(struct drm_connector *connector,
 		crtc_state->connectors_changed = true;
 	if (!crtc_state->active)
 		return 0;
+	/* A vendor format request takes its own sampling and falls back instead. */
+	if (vendor && vendor->request) {
+		if (range_changed)
+			crtc_state->connectors_changed = true;
+		return 0;
+	}
 	ret = s7d_hdmi_requested_sampling(state, &encoding);
 	if (ret) {
 		/* Without 4:4:4/4:2:2, the bridge may still carry the intent as 4:2:0. */
@@ -1207,15 +1254,259 @@ adjust:
 	return 0;
 }
 
-/* Pixel repetition (480i/576i): no 4:2:2 and no dither, like the vendor. */
-static int s7d_hdmi_select_output(const struct drm_connector_state *conn_state,
-				  const struct drm_display_mode *mode,
+/* A vendor output format: HDMI_COLORSPACE_* and bits per component */
+struct s7d_hdmi_attr {
+	u8 space;
+	u8 depth;
+};
+
+/* The vendor order of preference: UHD at 50/60 Hz, then every other mode */
+static const struct s7d_hdmi_attr s7d_hdmi_uhd_attrs[] = {
+	{ HDMI_COLORSPACE_YUV420, 10 },
+	{ HDMI_COLORSPACE_YUV422, 12 },
+	{ HDMI_COLORSPACE_YUV420, 8 },
+	{ HDMI_COLORSPACE_YUV444, 8 },
+	{ HDMI_COLORSPACE_RGB, 8 },
+};
+
+static const struct s7d_hdmi_attr s7d_hdmi_other_attrs[] = {
+	{ HDMI_COLORSPACE_YUV444, 10 },
+	{ HDMI_COLORSPACE_YUV422, 12 },
+	{ HDMI_COLORSPACE_RGB, 10 },
+	{ HDMI_COLORSPACE_YUV444, 8 },
+	{ HDMI_COLORSPACE_RGB, 8 },
+};
+
+/*
+ * The encoding of a vendor format for this sink. YCbCr takes BT.601 below
+ * 720 lines and BT.709 above, unless Colorspace names one; any 4:2:2 depth
+ * is the 12-bit container. Deep colour needs the sink's deep colour modes
+ * and stays within max bpc.
+ */
+static int s7d_hdmi_vendor_encoding(const struct drm_connector_state *conn_state,
+				    const struct drm_display_mode *mode,
+				    struct s7d_hdmi_attr attr,
+				    enum s7d_hdmi_output_encoding *encoding)
+{
+	static const enum s7d_hdmi_output_encoding y444[3][2] = {
+		{ S7D_HDMI_OUTPUT_601_Y4448, S7D_HDMI_OUTPUT_709_Y4448 },
+		{ S7D_HDMI_OUTPUT_601_Y44410, S7D_HDMI_OUTPUT_709_Y44410 },
+		{ S7D_HDMI_OUTPUT_601_Y44412, S7D_HDMI_OUTPUT_709_Y44412 },
+	}, y420[3][2] = {
+		{ S7D_HDMI_OUTPUT_601_Y4208, S7D_HDMI_OUTPUT_709_Y4208 },
+		{ S7D_HDMI_OUTPUT_601_Y42010, S7D_HDMI_OUTPUT_709_Y42010 },
+		{ S7D_HDMI_OUTPUT_601_Y42012, S7D_HDMI_OUTPUT_709_Y42012 },
+	}, rgb[3] = {
+		S7D_HDMI_OUTPUT_RGB8, S7D_HDMI_OUTPUT_RGB10, S7D_HDMI_OUTPUT_RGB12,
+	};
+	const struct drm_display_info *info = &conn_state->connector->display_info;
+	unsigned int depth = attr.depth == 8 ? 0 : attr.depth == 10 ? 1 : 2;
+	bool bt709;
+
+	if ((attr.depth != 8 && attr.depth != 10 && attr.depth != 12) ||
+	    (attr.space != HDMI_COLORSPACE_RGB && !info->is_hdmi) ||
+	    (attr.space != HDMI_COLORSPACE_YUV420 && drm_mode_is_420_only(info, mode)))
+		return -EINVAL;
+	if (depth && attr.space != HDMI_COLORSPACE_YUV422 &&
+	    (!info->is_hdmi || attr.depth > conn_state->max_bpc ||
+	     (attr.space != HDMI_COLORSPACE_YUV420 && drm_match_cea_mode(mode) == 1)))
+		return -EINVAL;
+	switch (conn_state->colorspace) {
+	case DRM_MODE_COLORIMETRY_SMPTE_170M_YCC:
+		bt709 = false;
+		break;
+	case DRM_MODE_COLORIMETRY_BT709_YCC:
+	case DRM_MODE_COLORIMETRY_BT2020_RGB:
+	case DRM_MODE_COLORIMETRY_BT2020_YCC:
+		bt709 = true;
+		break;
+	default:
+		bt709 = mode->vdisplay >= 720;
+		break;
+	}
+	switch (attr.space) {
+	case HDMI_COLORSPACE_RGB:
+		if (depth && !(info->edid_hdmi_rgb444_dc_modes &
+			       (depth == 1 ? DRM_EDID_HDMI_DC_30 : DRM_EDID_HDMI_DC_36)))
+			return -EINVAL;
+		*encoding = rgb[depth];
+		return 0;
+	case HDMI_COLORSPACE_YUV444:
+		if (!(info->color_formats & DRM_COLOR_FORMAT_YCBCR444) ||
+		    (depth && !(info->edid_hdmi_ycbcr444_dc_modes &
+				(depth == 1 ? DRM_EDID_HDMI_DC_30 : DRM_EDID_HDMI_DC_36))))
+			return -EINVAL;
+		*encoding = y444[depth][bt709];
+		return 0;
+	case HDMI_COLORSPACE_YUV422:
+		if (!(info->color_formats & DRM_COLOR_FORMAT_YCBCR422))
+			return -EINVAL;
+		*encoding = bt709 ? S7D_HDMI_OUTPUT_709_Y4228 : S7D_HDMI_OUTPUT_601_Y4228;
+		return 0;
+	case HDMI_COLORSPACE_YUV420:
+		if (!drm_mode_is_420(info, mode) ||
+		    (depth && !(info->hdmi.y420_dc_modes &
+				(depth == 1 ? DRM_EDID_YCBCR420_DC_30 : DRM_EDID_YCBCR420_DC_36))))
+			return -EINVAL;
+		*encoding = y420[depth][bt709];
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+/* Build a vendor format with the range, BT.2020 and repetition of the commit. */
+static int s7d_hdmi_vendor_output(const struct drm_connector_state *conn_state,
+				  const struct drm_display_mode *mode, struct s7d_hdmi_attr attr,
 				  struct s7d_hdmi_output_state *output)
 {
-	int ret = __s7d_hdmi_select_output(conn_state, mode, output);
+	enum s7d_hdmi_output_encoding encoding;
+	struct s7d_hdmi_output_state next;
+	int ret;
 
-	return ret ?: s7d_hdmi_output_apply_repeat(output,
-						 mode->flags & DRM_MODE_FLAG_DBLCLK);
+	ret = s7d_hdmi_vendor_encoding(conn_state, mode, attr, &encoding);
+	if (!ret)
+		ret = s7d_hdmi_output_build(encoding, (unsigned long)s7d_mode_clock(mode) * 1000,
+					    24000000, &next);
+	if (!ret && !s7d_hdmi_sink_accepts_output(&conn_state->connector->display_info, &next))
+		ret = -EINVAL;
+	if (!ret)
+		ret = s7d_hdmi_output_apply_bt2020(&next, s7d_hdmi_bt2020(conn_state));
+	if (!ret && attr.space == HDMI_COLORSPACE_RGB)
+		ret = s7d_hdmi_output_apply_rgb_range(&next,
+						      s7d_hdmi_rgb_limited(conn_state, mode));
+	if (!ret)
+		ret = s7d_hdmi_output_apply_repeat(&next, mode->flags & DRM_MODE_FLAG_DBLCLK);
+	if (!ret)
+		*output = next;
+	return ret;
+}
+
+/*
+ * A vendor format request: the requested format when the sink and the link
+ * take it, else the first that fits in the vendor order, as the vendor driver
+ * picks one instead of failing the commit.
+ */
+static int s7d_hdmi_select_vendor(const struct drm_connector_state *conn_state,
+				  struct s7d_hdmi_attr request,
+				  const struct drm_display_mode *mode,
+				  struct s7d_hdmi_output_state *output, struct s7d_hdmi_attr *attr)
+{
+	bool uhd = mode->hdisplay >= 3840 && mode->vdisplay == 2160 &&
+		!(mode->flags & DRM_MODE_FLAG_INTERLACE) && drm_mode_vrefresh(mode) >= 50;
+	const struct s7d_hdmi_attr *list = uhd ? s7d_hdmi_uhd_attrs : s7d_hdmi_other_attrs;
+	unsigned int count = uhd ? ARRAY_SIZE(s7d_hdmi_uhd_attrs) :
+		ARRAY_SIZE(s7d_hdmi_other_attrs);
+	unsigned int i;
+
+	if (!s7d_hdmi_vendor_output(conn_state, mode, request, output)) {
+		*attr = request;
+		return 0;
+	}
+	for (i = 0; i < count; i++) {
+		if (!s7d_hdmi_vendor_output(conn_state, mode, list[i], output)) {
+			*attr = list[i];
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+
+/* The vendor format of an output; HDMI carries 4:2:2 in the 12-bit container. */
+static struct s7d_hdmi_attr s7d_hdmi_output_attr(const struct s7d_hdmi_output_state *output)
+{
+	struct s7d_hdmi_attr attr = { .space = HDMI_COLORSPACE_YUV444, .depth = output->bpc };
+
+	if (output->encoding == S7D_HDMI_OUTPUT_RGB8 || output->encoding == S7D_HDMI_OUTPUT_RGB10 ||
+	    output->encoding == S7D_HDMI_OUTPUT_RGB12) {
+		attr.space = HDMI_COLORSPACE_RGB;
+	} else if (s7d_hdmi_output_is_y422(output)) {
+		attr.space = HDMI_COLORSPACE_YUV422;
+		attr.depth = 12;
+	} else if (s7d_hdmi_output_is_y420(output)) {
+		attr.space = HDMI_COLORSPACE_YUV420;
+	}
+	return attr;
+}
+
+/*
+ * The vendor format request of a commit. As in the vendor driver, a modeset
+ * takes the one that color_space and color_depth hold; a commit without a
+ * modeset keeps the one the link runs, so that it leaves the output as it is.
+ */
+static bool s7d_hdmi_vendor_request(const struct drm_crtc_state *crtc_state,
+				    const struct drm_connector_state *conn_state,
+				    struct s7d_hdmi_attr *request)
+{
+	const struct s7d_vendor_conn_values *vendor = s7d_vendor_props_conn(conn_state);
+
+	if (!vendor)
+		return false;
+	if (drm_atomic_crtc_needs_modeset(crtc_state)) {
+		request->space = vendor->color_space;
+		request->depth = vendor->color_depth;
+		return vendor->request;
+	}
+	request->space = vendor->link_space;
+	request->depth = vendor->link_depth;
+	return vendor->link_request;
+}
+
+/*
+ * Pixel repetition (480i/576i): no 4:2:2 and no dither, like the vendor. A
+ * vendor format request that no format satisfies leaves the choice to the
+ * display. @attr gets the vendor format of the output.
+ */
+static int s7d_hdmi_select_output(const struct drm_crtc_state *crtc_state,
+				  const struct drm_connector_state *conn_state,
+				  struct s7d_hdmi_output_state *output,
+				  struct s7d_hdmi_attr *attr)
+{
+	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+	struct s7d_hdmi_attr request;
+	int ret;
+
+	if (s7d_hdmi_vendor_request(crtc_state, conn_state, &request) &&
+	    !s7d_hdmi_select_vendor(conn_state, request, mode, output, attr))
+		return 0;
+	ret = __s7d_hdmi_select_output(conn_state, mode, output);
+	if (!ret)
+		ret = s7d_hdmi_output_apply_repeat(output, mode->flags & DRM_MODE_FLAG_DBLCLK);
+	if (!ret)
+		*attr = s7d_hdmi_output_attr(output);
+	return ret;
+}
+
+bool s7d_hdmi_vendor_format_valid(struct drm_connector *connector,
+				  const struct drm_display_mode *mode, u8 space, u8 depth)
+{
+	const struct drm_connector_state state = {
+		.connector = connector,
+		.max_bpc = S7D_HDMI_MAX_BPC,
+		.colorspace = DRM_MODE_COLORIMETRY_DEFAULT,
+	};
+	struct s7d_hdmi_attr attr = { .space = space, .depth = depth };
+	struct s7d_hdmi_output_state output;
+	struct s7d_encp_state encp;
+
+	if (mode->clock > 594000 || mode->hdisplay > 4096 || mode->vdisplay > 2160 ||
+	    s7d_encp_build_state(mode, &encp) != MODE_OK)
+		return false;
+	return !s7d_hdmi_vendor_output(&state, mode, attr, &output);
+}
+
+/* A CEA rate divided by 1.001, as 59.94 Hz, is what FRAC_RATE_POLICY reports. */
+static bool s7d_hdmi_mode_fractional(const struct drm_display_mode *mode)
+{
+	u64 total = (u64)mode->htotal * mode->vtotal;
+	u64 rate, whole;
+
+	if (!total)
+		return false;
+	/* mHz, against the nearest whole rate times 1000/1001 */
+	rate = div64_u64((u64)mode->clock * 1000000, total);
+	whole = DIV_ROUND_CLOSEST_ULL(rate, 1000);
+	return rate % 1000 && abs_diff(rate * 1001, whole * 1000000) <= 2002;
 }
 
 static u32 *s7d_hdmi_output_bus_fmts(struct drm_bridge *bridge,
@@ -1242,6 +1533,7 @@ static u32 *s7d_hdmi_input_bus_fmts(struct drm_bridge *bridge,
 {
 	struct s7d_hdmi_output_state output;
 	enum s7d_hdmi_output_encoding encoding;
+	struct s7d_hdmi_attr attr;
 	u32 format, *formats;
 
 	*num_input_fmts = 0;
@@ -1253,8 +1545,7 @@ static u32 *s7d_hdmi_input_bus_fmts(struct drm_bridge *bridge,
 		format = encoding == S7D_HDMI_OUTPUT_RGB8 ?
 			MEDIA_BUS_FMT_RGB888_1X24 : MEDIA_BUS_FMT_YUV8_1X24;
 	} else {
-		if (s7d_hdmi_select_output(conn_state,
-					   &crtc_state->adjusted_mode, &output))
+		if (s7d_hdmi_select_output(crtc_state, conn_state, &output, &attr))
 			return NULL;
 		format = output.bus_format;
 	}
@@ -1292,6 +1583,7 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 	struct hdmi_avi_infoframe avi;
 	struct hdmi_vendor_infoframe vendor;
 	struct hdmi_drm_infoframe hdr;
+	struct s7d_hdmi_attr attr;
 	int ret;
 
 	state->valid = false;
@@ -1306,8 +1598,7 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 	if (s7d_hdmi_mode_valid(bridge, &connector->display_info,
 				&crtc_state->adjusted_mode) != MODE_OK)
 		return -EINVAL;
-	ret = s7d_hdmi_select_output(conn_state,
-				     &crtc_state->adjusted_mode, &state->output);
+	ret = s7d_hdmi_select_output(crtc_state, conn_state, &state->output, &attr);
 	if (ret)
 		return ret;
 	ret = s7d_hdmi_output_apply_ctm(&state->output,
@@ -1318,6 +1609,10 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 	    base->output_bus_cfg.format != MEDIA_BUS_FMT_FIXED)
 		return -EINVAL;
 	state->mode = crtc_state->adjusted_mode;
+	if (drm_atomic_crtc_needs_modeset(crtc_state))
+		s7d_vendor_props_take_request(conn_state);
+	s7d_vendor_props_set_output(conn_state, attr.space, attr.depth,
+				    s7d_hdmi_mode_fractional(&state->mode));
 	state->hdmi = connector->display_info.is_hdmi;
 	state->scdc = state->hdmi && connector->display_info.hdmi.scdc.supported;
 	state->high_tmds = state->output.high_tmds;
@@ -1347,9 +1642,12 @@ static int s7d_hdmi_atomic_check(struct drm_bridge *bridge, struct drm_bridge_st
 			avi.quantization_range = HDMI_QUANTIZATION_RANGE_DEFAULT;
 			avi.ycc_quantization_range = HDMI_YCC_QUANTIZATION_RANGE_LIMITED;
 			drm_hdmi_avi_infoframe_colorimetry(&avi, conn_state);
-			/* An RGB request carried as 4:2:0 states the matrix selected for it. */
+			/*
+			 * An RGB request carried as 4:2:0, or a vendor YCbCr
+			 * request, states the matrix selected for it.
+			 */
 			if (conn_state->colorspace == DRM_MODE_COLORIMETRY_DEFAULT)
-				avi.colorimetry = s7d_hdmi_y420_709(state->output.encoding) ?
+				avi.colorimetry = s7d_hdmi_ycc_709(state->output.encoding) ?
 					HDMI_COLORIMETRY_ITU_709 : HDMI_COLORIMETRY_ITU_601;
 		}
 		drm_hdmi_avi_infoframe_content_type(&avi, conn_state);

@@ -38,6 +38,10 @@ struct s7d_vendor_conn_values {
 	u8 scan_info;
 	/* color_space or color_depth asked for an output format */
 	bool request;
+	/* The request of the last modeset, which the link runs until the next */
+	bool link_request;
+	u8 link_space;
+	u8 link_depth;
 	/* The output runs a CEA rate divided by 1.001. */
 	bool fractional;
 	/* A mode was set since the connector reset. */
@@ -90,6 +94,8 @@ s7d_vendor_props_conn(const struct drm_connector_state *state);
  */
 void s7d_vendor_props_set_output(struct drm_connector_state *state, u8 color_space,
 				 u8 depth, bool fractional);
+/* HDMI atomic check of a modeset: the link takes the format request of @state. */
+void s7d_vendor_props_take_request(struct drm_connector_state *state);
 /* color_space and color_depth as read from @state: RGB 8-bit by default */
 void s7d_vendor_props_attr(const struct drm_connector_state *state, u8 *color_space,
 			   u8 *depth);
@@ -97,6 +103,7 @@ void s7d_vendor_props_attr(const struct drm_connector_state *state, u8 *color_sp
 u8 s7d_vendor_props_hdr_policy(const struct drm_crtc_state *state);
 /* The sink accepts ALLM in the HDMI Forum VSIF. */
 bool s7d_vendor_props_sink_allm(struct drm_connector *connector);
+/* TESTATTR answers with s7d_hdmi_vendor_format_valid() of s7d-hdmi.h. */
 #else
 static inline int s7d_vendor_props_crtc_get(const struct s7d_vendor_props *vp,
 					    struct drm_crtc *crtc,
@@ -138,6 +145,10 @@ s7d_vendor_props_conn(const struct drm_connector_state *state)
 
 static inline void s7d_vendor_props_set_output(struct drm_connector_state *state,
 					       u8 color_space, u8 depth, bool fractional)
+{
+}
+
+static inline void s7d_vendor_props_take_request(struct drm_connector_state *state)
 {
 }
 

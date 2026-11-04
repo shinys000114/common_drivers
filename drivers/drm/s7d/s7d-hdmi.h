@@ -11,11 +11,20 @@ struct drm_atomic_state;
 struct drm_bridge;
 struct drm_connector;
 struct drm_display_info;
+struct drm_display_mode;
 struct platform_driver;
 struct s7d_vpu_link;
 
 int s7d_hdmi_connector_atomic_check(struct drm_connector *connector,
 				  struct drm_atomic_state *atomic);
+/*
+ * Whether @mode runs on @connector in the vendor output format @space
+ * (HDMI_COLORSPACE_*) and @depth bits, at the default max bpc and Colorspace,
+ * as the vendor TESTATTR answers. Reads the sink's display info, so call with
+ * the mode config mutex held; touches no hardware.
+ */
+bool s7d_hdmi_vendor_format_valid(struct drm_connector *connector,
+				  const struct drm_display_mode *mode, u8 space, u8 depth);
 
 /* Whether the transmitter and the sink carry @mode with @encoding; no hardware access. */
 enum drm_mode_status s7d_hdmi_link_valid(const struct drm_display_info *info,
