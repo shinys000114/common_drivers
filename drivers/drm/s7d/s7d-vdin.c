@@ -928,6 +928,13 @@ const struct s7d_writeback_ops s7d_vdin_writeback_ops = {
 	.cancel = vdin_cancel,
 };
 
+static void vdin_put_resets(void *data)
+{
+	struct s7d_vdin *v = data;
+
+	reset_control_bulk_put(ARRAY_SIZE(v->resets), v->resets);
+}
+
 int s7d_vdin_init(struct s7d_vpu *vpu, struct s7d_vdin **result)
 {
 	struct s7d_vdin *v;
@@ -944,10 +951,32 @@ int s7d_vdin_init(struct s7d_vpu *vpu, struct s7d_vdin **result)
 	init_completion(&v->done);
 	v->resets[0].id = "vdin1";
 	v->resets[1].id = "wrmif1";
-	ret = devm_reset_control_bulk_get_exclusive(vpu->dev, ARRAY_SIZE(v->resets),
-						   v->resets);
+	/*
+	 * Only the VPU local reset controller provides these. s7d_vpu_init()
+	 * has registered it by now or does not register it in this probe, so
+	 * a deferral means that it is absent. Writeback is optional.
+	 */
+	ret = reset_control_bulk_get_optional_exclusive(vpu->dev, ARRAY_SIZE(v->resets),
+							v->resets);
+	if (ret == -ENOMEM)
+		goto free;
+	if (ret) {
+		dev_warn(vpu->dev, "VDIN1 resets unavailable (%d); no writeback\n", ret);
+		goto unavailable;
+	}
+	if (!v->resets[0].rstc || !v->resets[1].rstc) {
+		reset_control_bulk_put(ARRAY_SIZE(v->resets), v->resets);
+		dev_info(vpu->dev, "no VDIN1 resets; no writeback\n");
+		goto unavailable;
+	}
+	ret = devm_add_action_or_reset(vpu->dev, vdin_put_resets, v);
 	if (ret)
-		return ret;
+		goto free;
 	*result = v;
 	return 0;
+unavailable:
+	ret = 0;
+free:
+	devm_kfree(vpu->dev, v);
+	return ret;
 }

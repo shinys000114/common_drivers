@@ -544,18 +544,23 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	if (ret)
 		goto fini_vpu;
 	display->vpu.vdin = vdin;
-	ret = s7d_writeback_init(drm, display->vpu.crtc,
-		&s7d_vdin_writeback_caps, &s7d_vdin_writeback_ops, vdin,
-		&display->vpu.writeback);
-	if (ret)
-		goto fini_vpu;
-	writeback_encoder = s7d_writeback_encoder(display->vpu.writeback);
-	encoder->possible_clones = drm_encoder_mask(encoder) | drm_encoder_mask(writeback_encoder);
-	writeback_encoder->possible_clones = encoder->possible_clones;
+	encoder->possible_clones = drm_encoder_mask(encoder);
+	/* Without VDIN1 everything else still works; there is no writeback. */
+	if (vdin) {
+		ret = s7d_writeback_init(drm, display->vpu.crtc,
+			&s7d_vdin_writeback_caps, &s7d_vdin_writeback_ops, vdin,
+			&display->vpu.writeback);
+		if (ret)
+			goto fini_vpu;
+		writeback_encoder = s7d_writeback_encoder(display->vpu.writeback);
+		encoder->possible_clones |= drm_encoder_mask(writeback_encoder);
+		writeback_encoder->possible_clones = encoder->possible_clones;
+	}
 	drm_mode_config_reset(drm);
 	if (!primary->state || !display->vpu.crtc->state || !connector->state ||
 	    !bridge->base.state ||
-	    !s7d_writeback_connector(display->vpu.writeback)->state) {
+	    (display->vpu.writeback &&
+	     !s7d_writeback_connector(display->vpu.writeback)->state)) {
 		ret = -ENOMEM;
 		goto fini_vpu;
 	}

@@ -21,8 +21,9 @@ config DRM_S7D
 	  frees its resources; buffers the hardware may still read after a
 	  failed stop are leaked.
 	  Register one CRTC, a linear RGB primary, VD1/VD2 video planes and
-	  shared OSD2 cursor/overlay planes, an HDMI connector and a VDIN1
-	  writeback connector. NV12/NV21 primary framebuffers scan out on VD1.
+	  shared OSD2 cursor/overlay planes, an HDMI connector and, when the
+	  VDIN1 local resets are available, a VDIN1 writeback connector.
+	  NV12/NV21 primary framebuffers scan out on VD1.
 	  Cursor and RGB overlay cannot be visible together; the cursor takes
 	  ARGB8888 up to 256x256. Video is progressive NV12/NV21/NV16/NV61,
 	  UYVY/VYUY, VUY888 or XVYU2101010 with BT.601/709/2020
