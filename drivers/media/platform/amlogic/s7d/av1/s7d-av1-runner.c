@@ -55,6 +55,8 @@ struct av1_header_job {
 struct s7d_av1_runner {
 	struct device *dev;
 	struct s7d_codec_dos *dos;
+	/* The parent's HEVC core lease. */
+	struct s7d_codec_lease *lease;
 	struct s7d_codec_firmware_owner *firmware;
 	struct s7d_codec_firmware_job *preload;
 	struct s7d_hevc_engine *engine;
@@ -370,14 +372,14 @@ static int runner_halt(struct s7d_av1_runner *runner)
 	spin_lock_irqsave(&runner->irq_lock, flags);
 	runner->irq_accept = false;
 	spin_unlock_irqrestore(&runner->irq_lock, flags);
-	ret = s7d_codec_dos_prepare_access(runner->dos, S7D_CODEC_ENGINE_HEVC);
+	ret = s7d_codec_dos_prepare_access(runner->lease);
 	if (!ret)
-		ret = s7d_codec_dos_hevc_irq_mask(runner->dos, false);
+		ret = s7d_codec_dos_hevc_irq_mask(runner->lease, false);
 	if (runner->binding)
 		joined = s7d_hevc_engine_disarm(runner->engine, runner->binding);
 	mutex_lock(&runner->protocol);
 	if (!ret && !runner->quiesced)
-		halted = s7d_codec_dos_halt(runner->dos, S7D_CODEC_ENGINE_HEVC);
+		halted = s7d_codec_dos_halt(runner->lease);
 	ret = ret ?: joined ?: halted;
 	runner->quiesced = !ret;
 	mutex_unlock(&runner->protocol);
@@ -522,12 +524,13 @@ static int runner_sequence(struct s7d_av1_runner *runner, const u8 *data,
 
 struct s7d_av1_runner *
 s7d_av1_runner_create(struct device *dev, struct s7d_codec_dos *dos,
+		      struct s7d_codec_lease *lease,
 		      struct s7d_codec_firmware_owner *firmware,
 		      struct s7d_hevc_engine *engine, u32 staging_capacity)
 {
 	struct s7d_av1_runner *runner;
 
-	if (!dev || IS_ERR_OR_NULL(dos) || IS_ERR_OR_NULL(firmware) ||
+	if (!dev || IS_ERR_OR_NULL(dos) || !lease || IS_ERR_OR_NULL(firmware) ||
 	    IS_ERR_OR_NULL(engine) || !staging_capacity ||
 	    staging_capacity > S7D_AV1_INPUT_MAX_BYTES * 11U)
 		return ERR_PTR(-EINVAL);
@@ -543,6 +546,7 @@ s7d_av1_runner_create(struct device *dev, struct s7d_codec_dos *dos,
 	}
 	runner->dev = get_device(dev);
 	runner->dos = dos;
+	runner->lease = lease;
 	runner->firmware = firmware;
 	runner->engine = engine;
 	runner->staging_capacity = staging_capacity;
@@ -707,17 +711,17 @@ static int runner_run(struct s7d_av1_runner *runner,
 	if (ret)
 		goto stop;
 	runner->quiesced = false;
-	ret = s7d_codec_dos_prepare(runner->dos, S7D_CODEC_ENGINE_HEVC);
+	ret = s7d_codec_dos_prepare(runner->lease);
 	if (!ret)
 		ret = s7d_codec_firmware_set_policy(runner->dev, S7D_CODEC_ENGINE_HEVC);
 	if (!ret)
-		ret = s7d_codec_dos_port_enable(runner->dos, S7D_CODEC_ENGINE_HEVC);
+		ret = s7d_codec_dos_port_enable(runner->lease);
 	if (!ret)
 		ret = s7d_codec_firmware_load(runner->dev, S7D_CODEC_ENGINE_HEVC,
 					     S7D_CODEC_FIRMWARE_AV1_MMU);
 	job->result.firmware_loaded = !ret;
 	if (!ret)
-		ret = s7d_codec_dos_hevc_init(runner->dos);
+		ret = s7d_codec_dos_hevc_init(runner->lease);
 	if (!ret)
 		ret = s7d_av1_dma_context_program_input(runner->context, runner->map,
 						       lease_epoch, input_token);
@@ -751,14 +755,14 @@ static int runner_run(struct s7d_av1_runner *runner,
 		ret = s7d_hevc_engine_arm(runner->engine, runner->binding, input_token);
 	}
 	if (!ret)
-		ret = s7d_codec_dos_hevc_irq_mask(runner->dos, true);
+		ret = s7d_codec_dos_hevc_irq_mask(runner->lease, true);
 	if (!ret)
-		ret = s7d_codec_dos_hevc_input_enable(runner->dos);
+		ret = s7d_codec_dos_hevc_input_enable(runner->lease);
 	if (!ret && READ_ONCE(runner->stopping))
 		ret = -ECANCELED;
 	if (!ret) {
 		dma_wmb();
-		ret = s7d_codec_dos_start(runner->dos, S7D_CODEC_ENGINE_HEVC);
+		ret = s7d_codec_dos_start(runner->lease);
 	}
 	if (!ret && !wait_for_completion_timeout(&job->wake,
 			msecs_to_jiffies(AV1_JOB_TIMEOUT_MS)))

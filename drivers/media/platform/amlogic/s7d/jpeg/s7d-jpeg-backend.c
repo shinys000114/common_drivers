@@ -54,6 +54,8 @@ struct s7d_jpeg_encoder {
 	struct device *dev;
 	struct module *owner;
 	struct s7d_codec_dos *dos;
+	/* The HCODEC lease, held through each session. */
+	struct s7d_codec_lease lease;
 	struct s7d_codec_firmware_owner *firmware;
 	struct s7d_codec_core *core;
 	struct s7d_codec_firmware_job *preload;
@@ -305,7 +307,7 @@ static int jpeg_hold(void *priv, enum s7d_codec_engine engine)
 		return -ESHUTDOWN;
 	if (encoder->lease_epoch == U64_MAX)
 		return -EOVERFLOW;
-	ret = s7d_codec_dos_jpeg_hold(encoder->dos);
+	ret = s7d_codec_dos_jpeg_hold(encoder->dos, &encoder->lease);
 	if (ret)
 		return ret;
 	encoder->lease_epoch++;
@@ -337,7 +339,7 @@ static int jpeg_halt_locked(struct s7d_jpeg_encoder *encoder)
 		disable_irq_nosync(encoder->irq);
 	synchronize_irq(encoder->irq);
 	mutex_lock(&encoder->protocol);
-	ret = s7d_codec_dos_halt(encoder->dos, S7D_CODEC_ENGINE_HCODEC);
+	ret = s7d_codec_dos_halt(&encoder->lease);
 	encoder->quiesced = !ret;
 	encoder->retained = !!ret;
 	mutex_unlock(&encoder->protocol);
@@ -390,7 +392,7 @@ static void jpeg_release(void *priv, enum s7d_codec_engine engine)
 
 	mutex_lock(&encoder->control);
 	ret = engine != S7D_CODEC_ENGINE_HCODEC || !encoder->quiesced ?
-		-EBUSY : s7d_codec_dos_release(encoder->dos, engine);
+		-EBUSY : s7d_codec_dos_release(&encoder->lease);
 	if (!ret) {
 		encoder->lease_active = false;
 		mutex_unlock(&encoder->control);
@@ -626,11 +628,11 @@ int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 	if (ret)
 		goto stop;
 	encoder->quiesced = false;
-	ret = s7d_codec_dos_jpeg_prepare(encoder->dos);
+	ret = s7d_codec_dos_jpeg_prepare(&encoder->lease);
 	if (!ret)
 		ret = s7d_codec_firmware_set_policy(encoder->dev, S7D_CODEC_ENGINE_HCODEC);
 	if (!ret)
-		ret = s7d_codec_dos_jpeg_port_enable(encoder->dos);
+		ret = s7d_codec_dos_jpeg_port_enable(&encoder->lease);
 	if (!ret && !encoder->firmware_loaded)
 		ret = jpeg_preload(encoder, job);
 	if (ret)
@@ -658,7 +660,7 @@ int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 		spin_unlock_irqrestore(&encoder->irq_lock, flags);
 		enable_irq(encoder->irq);
 		dma_wmb();
-		ret = s7d_codec_dos_jpeg_start(encoder->dos);
+		ret = s7d_codec_dos_jpeg_start(&encoder->lease);
 	}
 	mutex_unlock(&encoder->protocol);
 	if (ret)

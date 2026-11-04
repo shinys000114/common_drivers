@@ -91,6 +91,8 @@ struct s7d_vp9_decoder {
 	struct device *dev;
 	struct module *owner;
 	struct s7d_codec_dos *dos;
+	/* The HEVC core lease, held through each session. */
+	struct s7d_codec_lease lease;
 	struct s7d_codec_firmware_owner *firmware;
 	struct s7d_codec_firmware_job *preload;
 	struct s7d_hevc_engine *engine;
@@ -533,9 +535,9 @@ static int vp9_halt_locked(struct s7d_vp9_decoder *decoder)
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->irq_accept = false;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
-	ret = s7d_codec_dos_prepare_access(decoder->dos, S7D_CODEC_ENGINE_HEVC);
+	ret = s7d_codec_dos_prepare_access(&decoder->lease);
 	if (!ret)
-		ret = s7d_codec_dos_hevc_irq_mask(decoder->dos, false);
+		ret = s7d_codec_dos_hevc_irq_mask(&decoder->lease, false);
 	if (decoder->binding) {
 		joined = s7d_hevc_engine_disarm(decoder->engine, decoder->binding);
 		if (!ret)
@@ -543,7 +545,7 @@ static int vp9_halt_locked(struct s7d_vp9_decoder *decoder)
 	}
 	mutex_lock(&decoder->protocol);
 	if (!ret && !decoder->quiesced)
-		ret = s7d_codec_dos_halt(decoder->dos, S7D_CODEC_ENGINE_HEVC);
+		ret = s7d_codec_dos_halt(&decoder->lease);
 	decoder->quiesced = !ret;
 	mutex_unlock(&decoder->protocol);
 	if (ret) {
@@ -581,7 +583,7 @@ static int vp9_hold(void *priv, enum s7d_codec_engine engine)
 	else if (decoder->epoch == U64_MAX)
 		ret = -EOVERFLOW;
 	else
-		ret = s7d_codec_dos_hold(decoder->dos, engine);
+		ret = s7d_codec_dos_hold(decoder->dos, engine, &decoder->lease);
 	if (!ret) {
 		decoder->epoch++;
 		decoder->lease_active = true;
@@ -637,7 +639,7 @@ static void vp9_release(void *priv, enum s7d_codec_engine engine)
 
 	mutex_lock(&decoder->control);
 	ret = engine != S7D_CODEC_ENGINE_HEVC || !decoder->quiesced ? -EBUSY :
-		s7d_codec_dos_release(decoder->dos, engine);
+		s7d_codec_dos_release(&decoder->lease);
 	if (!ret)
 		decoder->lease_active = false;
 	else {
@@ -894,14 +896,14 @@ static int vp9_start(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	ret = s7d_hevc_engine_arm(decoder->engine, decoder->binding, job->token);
 	if (!ret)
-		ret = s7d_codec_dos_hevc_irq_mask(decoder->dos, true);
+		ret = s7d_codec_dos_hevc_irq_mask(&decoder->lease, true);
 	if (!ret)
 		ret = vp9_stop_check(decoder);
 	if (!ret)
-		ret = s7d_codec_dos_hevc_input_enable(decoder->dos);
+		ret = s7d_codec_dos_hevc_input_enable(&decoder->lease);
 	if (!ret) {
 		dma_wmb();
-		ret = s7d_codec_dos_start(decoder->dos, S7D_CODEC_ENGINE_HEVC);
+		ret = s7d_codec_dos_start(&decoder->lease);
 	}
 	return ret;
 }
@@ -1271,13 +1273,13 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 		goto stop;
 	decoder->quiesced = false;
 	stage = "prepare";
-	ret = s7d_codec_dos_prepare(decoder->dos, S7D_CODEC_ENGINE_HEVC);
+	ret = s7d_codec_dos_prepare(&decoder->lease);
 	if (!ret)
 		ret = s7d_vp9_dma_context_program_input(decoder->context, decoder->map, job->epoch, token);
 	if (!ret)
 		ret = s7d_codec_firmware_set_policy(decoder->dev, S7D_CODEC_ENGINE_HEVC);
 	if (!ret)
-		ret = s7d_codec_dos_port_enable(decoder->dos, S7D_CODEC_ENGINE_HEVC);
+		ret = s7d_codec_dos_port_enable(&decoder->lease);
 	if (!ret) {
 		stage = "firmware-preload";
 		ret = vp9_preload(decoder, job);
@@ -1290,7 +1292,7 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 		load_failed = ret;
 	}
 	if (!ret)
-		ret = s7d_codec_dos_hevc_init(decoder->dos);
+		ret = s7d_codec_dos_hevc_init(&decoder->lease);
 	protocol = (struct s7d_vp9_protocol_frame) {
 		.workspace = s7d_vp9_dma_context_workspace(decoder->context),
 		.layout = &decoder->layout, .surface = decoder->surface,

@@ -95,10 +95,7 @@
 #define DMC_TIMEOUT_US		100000
 #define HEVC_RESPONSE_TIMEOUT_US	50000
 #define HEVC_IDLE_TIMEOUT_US	100000
-/*
- * Sessions one engine runs at a time. Before it can grow, time slicing needs a
- * lease per holder for the sequences and power-down on the last release.
- */
+/* Sessions one engine runs at a time. */
 #define DOS_ENGINE_HOLDERS	1
 
 /*
@@ -113,6 +110,8 @@ struct dos_engine {
 	/* Serializes this engine's lease, its sequences and the state below. */
 	struct mutex lock;
 	unsigned int holders;
+	/* The lease whose sequences the engine takes: its one holder. */
+	struct s7d_codec_lease *runner;
 	bool local_access_ready;
 	bool prepared;
 	bool hevc_init_written;
@@ -182,6 +181,27 @@ static struct dos_engine *dos_eng(struct s7d_codec_dos *dos,
 				  enum s7d_codec_engine engine)
 {
 	return &dos->eng[engine];
+}
+
+/* The engine of a held lease, or an error for any other. */
+static int dos_lease_engine(const struct s7d_codec_lease *lease,
+			    struct dos_engine **out)
+{
+	int ret;
+
+	if (!lease || !lease->dos || !lease->held)
+		return -EINVAL;
+	ret = dos_engine_check(lease->engine);
+	if (!ret)
+		*out = dos_eng(lease->dos, lease->engine);
+	return ret;
+}
+
+/* Under the engine lock: @lease runs the engine now. */
+static bool dos_runs(struct dos_engine *e, const struct s7d_codec_lease *lease)
+{
+	lockdep_assert_held(&e->lock);
+	return lease->held && e->holders && e->runner == lease;
 }
 
 static void dos_lock_all(struct s7d_codec_dos *dos)
@@ -444,8 +464,6 @@ static int dos_prepare_access_locked(struct s7d_codec_dos *dos,
 	struct dos_engine *e = dos_eng(dos, engine);
 	int ret;
 
-	if (!e->holders)
-		return -EINVAL;
 	if (e->local_access_ready)
 		return 0;
 	if (e->faulted || e->release_failed || dos->closing)
@@ -692,11 +710,12 @@ static int dos_hevc_halt_locked(struct s7d_codec_dos *dos)
 	return 0;
 }
 
-static int dos_hevc_exec_check_locked(struct s7d_codec_dos *dos)
+static int dos_hevc_exec_check_locked(struct s7d_codec_dos *dos,
+				      const struct s7d_codec_lease *lease)
 {
 	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
 
-	if (!e->holders || !e->local_access_ready || !e->prepared ||
+	if (!dos_runs(e, lease) || !e->local_access_ready || !e->prepared ||
 	    e->halted || e->started || e->faulted || e->release_failed ||
 	    dos->closing)
 		return -EBUSY;
@@ -1050,7 +1069,8 @@ struct regmap *s7d_codec_dos_regmap(struct s7d_codec_dos *dos,
 }
 
 static int dos_hold_rate(struct s7d_codec_dos *dos,
-			 enum s7d_codec_engine engine, unsigned long rate)
+			 enum s7d_codec_engine engine, unsigned long rate,
+			 struct s7d_codec_lease *lease)
 {
 	struct dos_engine *e;
 	struct device *pd_dev;
@@ -1060,6 +1080,8 @@ static int dos_hold_rate(struct s7d_codec_dos *dos,
 
 	if (ret)
 		return ret;
+	if (!dos || !lease || lease->held)
+		return -EINVAL;
 	e = dos_eng(dos, engine);
 	mutex_lock(&e->lock);
 	if (e->holders >= DOS_ENGINE_HOLDERS || e->faulted || e->release_failed ||
@@ -1095,9 +1117,13 @@ static int dos_hold_rate(struct s7d_codec_dos *dos,
 	if (ret < 0)
 		goto disable_vdec;
 	e->holders = 1;
+	e->runner = lease;
 	e->error_reported = false;
 	e->local_access_ready = false;
 	e->halted = false;
+	*lease = (struct s7d_codec_lease) {
+		.dos = dos, .engine = engine, .held = true,
+	};
 	ret = 0;
 	goto out;
 
@@ -1112,29 +1138,39 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_hold(struct s7d_codec_dos *dos,
-		       enum s7d_codec_engine engine)
+int s7d_codec_dos_hold(struct s7d_codec_dos *dos, enum s7d_codec_engine engine,
+		       struct s7d_codec_lease *lease)
 {
 	if (engine == S7D_CODEC_ENGINE_HCODEC)
 		return -EOPNOTSUPP;
-	return dos_hold_rate(dos, engine, DOS_ENGINE_RATE);
+	return dos_hold_rate(dos, engine, DOS_ENGINE_RATE, lease);
 }
 
-int s7d_codec_dos_jpeg_hold(struct s7d_codec_dos *dos)
+int s7d_codec_dos_jpeg_hold(struct s7d_codec_dos *dos, struct s7d_codec_lease *lease)
 {
-	return dos_hold_rate(dos, S7D_CODEC_ENGINE_HCODEC, DOS_JPEG_RATE);
+	return dos_hold_rate(dos, S7D_CODEC_ENGINE_HCODEC, DOS_JPEG_RATE, lease);
 }
 
-int s7d_codec_dos_jpeg_prepare(struct s7d_codec_dos *dos)
+/* The engine of a held lease of @engine, or an error. */
+static int dos_lease_of(const struct s7d_codec_lease *lease, enum s7d_codec_engine engine,
+			struct dos_engine **out)
 {
+	int ret = dos_lease_engine(lease, out);
+
+	return ret ? ret : lease->engine == engine ? 0 : -EINVAL;
+}
+
+int s7d_codec_dos_jpeg_prepare(struct s7d_codec_lease *lease)
+{
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
-	int ret = dos_engine_check(S7D_CODEC_ENGINE_HCODEC);
+	int ret = dos_lease_of(lease, S7D_CODEC_ENGINE_HCODEC, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, S7D_CODEC_ENGINE_HCODEC);
+	dos = lease->dos;
 	mutex_lock(&e->lock);
-	if (!e->holders || e->faulted || e->release_failed || dos->closing ||
+	if (!dos_runs(e, lease) || e->faulted || e->release_failed || dos->closing ||
 	    e->prepared) {
 		ret = -EBUSY;
 		goto out;
@@ -1158,16 +1194,17 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_jpeg_port_enable(struct s7d_codec_dos *dos)
+int s7d_codec_dos_jpeg_port_enable(struct s7d_codec_lease *lease)
 {
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
-	int ret = dos_engine_check(S7D_CODEC_ENGINE_HCODEC);
+	int ret = dos_lease_of(lease, S7D_CODEC_ENGINE_HCODEC, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, S7D_CODEC_ENGINE_HCODEC);
+	dos = lease->dos;
 	mutex_lock(&e->lock);
-	if (!e->holders || !e->prepared || !e->halted || e->faulted ||
+	if (!dos_runs(e, lease) || !e->prepared || !e->halted || e->faulted ||
 	    e->release_failed || dos->closing) {
 		ret = -EBUSY;
 		goto out;
@@ -1195,16 +1232,17 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_jpeg_start(struct s7d_codec_dos *dos)
+int s7d_codec_dos_jpeg_start(struct s7d_codec_lease *lease)
 {
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
-	int ret = dos_engine_check(S7D_CODEC_ENGINE_HCODEC);
+	int ret = dos_lease_of(lease, S7D_CODEC_ENGINE_HCODEC, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, S7D_CODEC_ENGINE_HCODEC);
+	dos = lease->dos;
 	mutex_lock(&e->lock);
-	if (!e->holders || !e->prepared || e->halted || e->started ||
+	if (!dos_runs(e, lease) || !e->prepared || e->halted || e->started ||
 	    e->faulted || e->release_failed || dos->closing) {
 		ret = -EBUSY;
 		goto out;
@@ -1249,32 +1287,43 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_prepare_access(struct s7d_codec_dos *dos,
-			       enum s7d_codec_engine engine)
+int s7d_codec_dos_prepare_access(struct s7d_codec_lease *lease)
 {
 	struct dos_engine *e;
-	int ret = dos_engine_check(engine);
+	int ret = dos_lease_engine(lease, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, engine);
 	mutex_lock(&e->lock);
-	ret = dos_prepare_access_locked(dos, engine);
+	ret = dos_runs(e, lease) ? dos_prepare_access_locked(lease->dos, lease->engine) :
+		-EINVAL;
 	mutex_unlock(&e->lock);
 	return ret;
 }
 
-int s7d_codec_dos_prepare(struct s7d_codec_dos *dos,
-			  enum s7d_codec_engine engine)
+/* A held lease of VDEC or the HEVC core, the engines the generic sequences serve. */
+static int dos_decoder_lease(const struct s7d_codec_lease *lease, struct dos_engine **out)
 {
+	int ret = dos_lease_engine(lease, out);
+
+	if (ret || lease->engine == S7D_CODEC_ENGINE_HEVC)
+		return ret;
+	return dos_vdec_engine_check(lease->engine);
+}
+
+int s7d_codec_dos_prepare(struct s7d_codec_lease *lease)
+{
+	enum s7d_codec_engine engine;
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
-	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
+	int ret = dos_decoder_lease(lease, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, engine);
+	dos = lease->dos;
+	engine = lease->engine;
 	mutex_lock(&e->lock);
-	if (!e->holders || e->faulted || e->release_failed || e->prepared) {
+	if (!dos_runs(e, lease) || e->faulted || e->release_failed || e->prepared) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1301,17 +1350,19 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_port_enable(struct s7d_codec_dos *dos,
-			      enum s7d_codec_engine engine)
+int s7d_codec_dos_port_enable(struct s7d_codec_lease *lease)
 {
+	enum s7d_codec_engine engine;
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
-	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
+	int ret = dos_decoder_lease(lease, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, engine);
+	dos = lease->dos;
+	engine = lease->engine;
 	mutex_lock(&e->lock);
-	if (!e->holders || !e->prepared || !e->halted || e->faulted ||
+	if (!dos_runs(e, lease) || !e->prepared || !e->halted || e->faulted ||
 	    e->release_failed) {
 		ret = -EBUSY;
 		goto out;
@@ -1371,13 +1422,17 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_hevc_init(struct s7d_codec_dos *dos)
+int s7d_codec_dos_hevc_init(struct s7d_codec_lease *lease)
 {
-	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
-	int ret;
+	struct s7d_codec_dos *dos;
+	struct dos_engine *e;
+	int ret = dos_lease_of(lease, S7D_CODEC_ENGINE_HEVC, &e);
 
+	if (ret)
+		return ret;
+	dos = lease->dos;
 	mutex_lock(&e->lock);
-	ret = dos_hevc_exec_check_locked(dos);
+	ret = dos_hevc_exec_check_locked(dos, lease);
 	if (ret)
 		goto out;
 	if (e->hevc_init_written) {
@@ -1412,18 +1467,22 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_hevc_irq_mask(struct s7d_codec_dos *dos, bool enable)
+int s7d_codec_dos_hevc_irq_mask(struct s7d_codec_lease *lease, bool enable)
 {
-	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
-	int ret = 0;
+	struct s7d_codec_dos *dos;
+	struct dos_engine *e;
+	int ret = dos_lease_of(lease, S7D_CODEC_ENGINE_HEVC, &e);
 
+	if (ret)
+		return ret;
+	dos = lease->dos;
 	mutex_lock(&e->lock);
-	if (!e->holders || !e->local_access_ready || e->release_failed) {
+	if (!dos_runs(e, lease) || !e->local_access_ready || e->release_failed) {
 		ret = -EBUSY;
 		goto out;
 	}
 	if (enable) {
-		ret = dos_hevc_exec_check_locked(dos);
+		ret = dos_hevc_exec_check_locked(dos, lease);
 		if (ret)
 			goto out;
 		if (!e->hevc_init_written) {
@@ -1449,13 +1508,17 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_hevc_input_enable(struct s7d_codec_dos *dos)
+int s7d_codec_dos_hevc_input_enable(struct s7d_codec_lease *lease)
 {
-	struct dos_engine *e = dos_eng(dos, S7D_CODEC_ENGINE_HEVC);
-	int ret;
+	struct s7d_codec_dos *dos;
+	struct dos_engine *e;
+	int ret = dos_lease_of(lease, S7D_CODEC_ENGINE_HEVC, &e);
 
+	if (ret)
+		return ret;
+	dos = lease->dos;
 	mutex_lock(&e->lock);
-	ret = dos_hevc_exec_check_locked(dos);
+	ret = dos_hevc_exec_check_locked(dos, lease);
 	if (ret)
 		goto out;
 	if (!e->hevc_init_written) {
@@ -1495,17 +1558,19 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_halt(struct s7d_codec_dos *dos,
-		       enum s7d_codec_engine engine)
+int s7d_codec_dos_halt(struct s7d_codec_lease *lease)
 {
+	enum s7d_codec_engine engine;
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
-	int ret = dos_engine_check(engine);
+	int ret = dos_lease_engine(lease, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, engine);
+	dos = lease->dos;
+	engine = lease->engine;
 	mutex_lock(&e->lock);
-	if (!e->holders) {
+	if (!dos_runs(e, lease)) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -1520,17 +1585,19 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_start(struct s7d_codec_dos *dos,
-			enum s7d_codec_engine engine)
+int s7d_codec_dos_start(struct s7d_codec_lease *lease)
 {
+	enum s7d_codec_engine engine;
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
-	int ret = engine == S7D_CODEC_ENGINE_HEVC ? 0 : dos_vdec_engine_check(engine);
+	int ret = dos_decoder_lease(lease, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, engine);
+	dos = lease->dos;
+	engine = lease->engine;
 	mutex_lock(&e->lock);
-	if (!e->holders || !e->prepared || e->halted || e->started ||
+	if (!dos_runs(e, lease) || !e->prepared || e->halted || e->started ||
 	    e->faulted || e->release_failed || dos->closing) {
 		ret = -EBUSY;
 		goto out;
@@ -1589,18 +1656,18 @@ out:
 	return ret;
 }
 
-int s7d_codec_dos_park(struct s7d_codec_dos *dos,
-		       enum s7d_codec_engine engine)
+int s7d_codec_dos_park(struct s7d_codec_lease *lease)
 {
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
 	u32 val;
-	int ret = dos_vdec_engine_check(engine);
+	int ret = dos_lease_of(lease, S7D_CODEC_ENGINE_VDEC, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, engine);
+	dos = lease->dos;
 	mutex_lock(&e->lock);
-	if (!e->holders || !e->prepared || e->halted || !e->started ||
+	if (!dos_runs(e, lease) || !e->prepared || e->halted || !e->started ||
 	    e->faulted || e->release_failed || dos->closing) {
 		ret = -EBUSY;
 		goto out;
@@ -1698,20 +1765,22 @@ static int dos_power_down_locked(struct s7d_codec_dos *dos,
 	return regmap_write(dos->map, DOS_MEM_PD_VDEC, U32_MAX);
 }
 
-int s7d_codec_dos_release(struct s7d_codec_dos *dos,
-			  enum s7d_codec_engine engine)
+int s7d_codec_dos_release(struct s7d_codec_lease *lease)
 {
+	enum s7d_codec_engine engine;
+	struct s7d_codec_dos *dos;
 	struct dos_engine *e;
 	struct device *pd_dev;
 	struct clk *clk;
 	bool drop_pin = false;
-	int ret = dos_engine_check(engine);
+	int ret = dos_lease_engine(lease, &e);
 
 	if (ret)
 		return ret;
-	e = dos_eng(dos, engine);
+	dos = lease->dos;
+	engine = lease->engine;
 	mutex_lock(&e->lock);
-	if (!e->holders || !e->halted || e->faulted) {
+	if (!dos_runs(e, lease) || !e->halted || e->faulted) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1738,6 +1807,8 @@ int s7d_codec_dos_release(struct s7d_codec_dos *dos,
 	clk_disable_unprepare(dos->bus_clk);
 	clk_rate_exclusive_put(clk);
 	e->holders = 0;
+	e->runner = NULL;
+	lease->held = false;
 	e->local_access_ready = false;
 	e->prepared = false;
 	e->hevc_init_written = false;

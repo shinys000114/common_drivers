@@ -45,6 +45,8 @@ struct s7d_vdec_runtime {
 	struct device *dev;
 	struct module *owner;
 	struct s7d_codec_dos *dos;
+	/* The VDEC lease, held through each session. */
+	struct s7d_codec_lease lease;
 	struct s7d_codec_firmware_owner *firmware;
 	struct s7d_codec_firmware_job *preload_job;
 	u64 lease_epoch;
@@ -256,7 +258,7 @@ static int runtime_hold(void *priv, enum s7d_codec_engine engine)
 	runtime->state = VDEC_ACQUIRING;
 	runtime->lease_epoch++;
 	spin_unlock_irqrestore(&runtime->lock, flags);
-	ret = s7d_codec_dos_hold(runtime->dos, engine);
+	ret = s7d_codec_dos_hold(runtime->dos, engine, &runtime->lease);
 	spin_lock_irqsave(&runtime->lock, flags);
 	runtime->state = ret ? VDEC_IDLE : VDEC_PARKED;
 	if (!ret)
@@ -403,7 +405,7 @@ static int runtime_quiesce_locked(struct s7d_vdec_runtime *runtime)
 	spin_unlock_irqrestore(&runtime->lock, flags);
 
 	runtime_block_backend(runtime);
-	ret = s7d_codec_dos_prepare_access(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_prepare_access(&runtime->lease);
 	if (!ret)
 		ret = runtime_mask(runtime, 0);
 	if (disable)
@@ -414,7 +416,7 @@ static int runtime_quiesce_locked(struct s7d_vdec_runtime *runtime)
 	if (!ret && !drain && running)
 		runtime->ops.settle(runtime->priv, runtime->map);
 	if (!ret && !drain)
-		halt = s7d_codec_dos_halt(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+		halt = s7d_codec_dos_halt(&runtime->lease);
 	if (!ret)
 		ret = drain ? drain : halt;
 
@@ -495,7 +497,7 @@ static void runtime_release(void *priv, enum s7d_codec_engine engine)
 	runtime->state = VDEC_RELEASING;
 	runtime->stopped_session = NULL;
 	spin_unlock_irqrestore(&runtime->lock, flags);
-	ret = s7d_codec_dos_release(runtime->dos, engine);
+	ret = s7d_codec_dos_release(&runtime->lease);
 	if (ret) {
 		runtime_release_fault(runtime, ret);
 		return;
@@ -594,7 +596,7 @@ int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 	runtime->session = session;
 	runtime->state = VDEC_PREPARING;
 	spin_unlock_irqrestore(&runtime->lock, flags);
-	ret = s7d_codec_dos_prepare(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_prepare(&runtime->lease);
 	if (ret)
 		goto fail;
 	ret = runtime_errno(runtime->ops.stage(runtime->priv, session, runtime->map, cancelled));
@@ -606,7 +608,7 @@ int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 	ret = s7d_codec_firmware_set_policy(runtime->dev, S7D_CODEC_ENGINE_VDEC);
 	if (ret)
 		goto fail;
-	ret = s7d_codec_dos_port_enable(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_port_enable(&runtime->lease);
 	if (ret)
 		goto fail;
 	ret = runtime_preload_locked(runtime, session, &custody, cancelled);
@@ -702,7 +704,7 @@ static int runtime_start_locked(struct s7d_vdec_runtime *runtime, bool *cancelle
 	ret = runtime_arming_check(runtime, cancelled);
 	if (ret)
 		goto fail;
-	ret = s7d_codec_dos_start(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_start(&runtime->lease);
 	if (ret)
 		goto fail;
 	ret = runtime_arming_check(runtime, cancelled);
@@ -848,7 +850,7 @@ int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 	ret = runtime_transition_check(runtime, cancelled);
 	if (ret)
 		goto fail;
-	ret = s7d_codec_dos_park(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_park(&runtime->lease);
 	if (ret)
 		goto fail;
 	mutex_lock(runtime->transaction);
@@ -948,7 +950,7 @@ int s7d_vdec_runtime_abort(struct s7d_vdec_runtime *runtime,
 	ret = runtime_transition_check(runtime, cancelled);
 	if (ret)
 		goto fail;
-	ret = s7d_codec_dos_park(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_park(&runtime->lease);
 	if (ret)
 		goto fail;
 	spin_lock_irqsave(&runtime->lock, flags);
@@ -1051,7 +1053,7 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 		ret = state.failure ? runtime_errno(state.failure) : -ESTALE;
 		goto fail;
 	}
-	ret = s7d_codec_dos_prepare(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_prepare(&runtime->lease);
 	if (ret)
 		goto fail;
 	ret = runtime_errno(runtime->ops.stage(runtime->priv, session, runtime->map, cancelled));
@@ -1068,7 +1070,7 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 	ret = s7d_codec_firmware_set_policy(runtime->dev, S7D_CODEC_ENGINE_VDEC);
 	if (ret)
 		goto fail;
-	ret = s7d_codec_dos_port_enable(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_port_enable(&runtime->lease);
 	if (ret)
 		goto fail;
 	ret = runtime_preload_locked(runtime, session, &custody, cancelled);
@@ -1173,7 +1175,7 @@ int s7d_vdec_runtime_retry_release(struct s7d_vdec_runtime *runtime)
 	}
 	runtime->state = VDEC_RELEASING;
 	spin_unlock_irqrestore(&runtime->lock, flags);
-	ret = s7d_codec_dos_release(runtime->dos, S7D_CODEC_ENGINE_VDEC);
+	ret = s7d_codec_dos_release(&runtime->lease);
 	spin_lock_irqsave(&runtime->lock, flags);
 	if (ret) {
 		runtime->state = VDEC_RELEASE_FAILED;

@@ -9,6 +9,7 @@
 
 struct device;
 struct s7d_codec_dos;
+struct s7d_codec_lease;
 struct s7d_codec_firmware_owner;
 struct s7d_codec_session;
 struct s7d_av1_runner;
@@ -48,9 +49,13 @@ struct s7d_av1_decode_result {
 	bool output_ready;
 };
 
-/* Parent owns the powered session, DOS, provider, engine and module lifetime. */
+/*
+ * Parent owns the powered session, DOS, its lease, provider, engine and module
+ * lifetime.
+ */
 struct s7d_av1_runner *
 s7d_av1_runner_create(struct device *dev, struct s7d_codec_dos *dos,
+		      struct s7d_codec_lease *lease,
 		      struct s7d_codec_firmware_owner *firmware,
 		      struct s7d_hevc_engine *engine, u32 staging_capacity);
 /* Exclusive HEVC lease; epochs increase after close. Returns a header, not a frame. */

@@ -136,6 +136,8 @@ struct s7d_av1_v4l2 {
 	struct device *dev;
 	struct module *owner;
 	struct s7d_codec_dos *dos;
+	/* The HEVC core lease, held through each session and lent to the runner. */
+	struct s7d_codec_lease lease;
 	struct s7d_codec_core *core;
 	struct s7d_av1_runner *runner;
 	struct s7d_v4l2_backend_factory factory;
@@ -166,7 +168,7 @@ static int av1_hold(void *priv, enum s7d_codec_engine engine)
 	else if (adapter->lease_epoch == U64_MAX)
 		ret = -EOVERFLOW;
 	else
-		ret = s7d_codec_dos_hold(adapter->dos, engine);
+		ret = s7d_codec_dos_hold(adapter->dos, engine, &adapter->lease);
 	if (!ret) {
 		adapter->lease_epoch++;
 		adapter->lease_active = true;
@@ -190,11 +192,11 @@ static int av1_quiesce(void *priv, enum s7d_codec_engine engine)
 	if (!ret && !adapter->runner_closed)
 		ret = -EBUSY;
 	if (!ret)
-		ret = s7d_codec_dos_prepare_access(adapter->dos, engine);
+		ret = s7d_codec_dos_prepare_access(&adapter->lease);
 	if (!ret)
-		ret = s7d_codec_dos_hevc_irq_mask(adapter->dos, false);
+		ret = s7d_codec_dos_hevc_irq_mask(&adapter->lease, false);
 	if (!ret)
-		ret = s7d_codec_dos_halt(adapter->dos, engine);
+		ret = s7d_codec_dos_halt(&adapter->lease);
 	if (!ret)
 		adapter->quiesced = true;
 	mutex_unlock(&adapter->resources);
@@ -208,7 +210,7 @@ static void av1_release(void *priv, enum s7d_codec_engine engine)
 
 	mutex_lock(&adapter->resources);
 	ret = engine != S7D_CODEC_ENGINE_HEVC || !adapter->quiesced ? -EBUSY :
-		s7d_codec_dos_release(adapter->dos, engine);
+		s7d_codec_dos_release(&adapter->lease);
 	if (!ret) {
 		adapter->lease_active = false;
 	} else {
@@ -1798,7 +1800,8 @@ s7d_av1_v4l2_create(struct device *dev, struct s7d_codec_dos *dos,
 	mutex_init(&adapter->clients);
 	mutex_init(&adapter->resources);
 	INIT_LIST_HEAD(&adapter->instances);
-	adapter->runner = s7d_av1_runner_create(dev, dos, firmware, engine, AV1_STAGING_BYTES);
+	adapter->runner = s7d_av1_runner_create(dev, dos, &adapter->lease, firmware, engine,
+						AV1_STAGING_BYTES);
 	if (IS_ERR(adapter->runner)) {
 		ret = PTR_ERR(adapter->runner);
 		goto free_adapter;
