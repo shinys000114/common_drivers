@@ -19,6 +19,12 @@
 #include "s7d-codec-session.h"
 #include "s7d-codec-memory.h"
 
+/*
+ * Open sessions of one codec core. The engine lease admits one session per
+ * engine, and so one here, until sessions time-slice an engine.
+ */
+#define S7D_CODEC_CORE_SESSIONS	1
+
 enum s7d_session_state {
 	S7D_SESSION_OPEN,
 	S7D_SESSION_STOPPING,
@@ -34,7 +40,8 @@ struct s7d_codec_core {
 	u64 dma_mask;
 	struct mutex lock;
 	struct list_head sessions;
-	struct s7d_codec_session *active;
+	/* Sessions on the list, each holding its engine through this core. */
+	unsigned int active;
 	bool failed;
 };
 
@@ -130,8 +137,7 @@ static void s7d_session_release(struct kref *ref)
 		kfree(mem);
 	}
 	core->ops.release(core->priv, session->engine);
-	if (core->active == session)
-		core->active = NULL;
+	core->active--;
 	list_del(&session->node);
 	mutex_unlock(&core->lock);
 	kfree(session);
@@ -181,10 +187,16 @@ int s7d_codec_core_destroy(struct s7d_codec_core *core)
 /* True while a session other than @own holds the core. */
 bool s7d_codec_core_busy(struct s7d_codec_core *core, const struct s7d_codec_session *own)
 {
-	bool busy;
+	struct s7d_codec_session *session;
+	bool busy = false;
 
 	mutex_lock(&core->lock);
-	busy = core->active && core->active != own;
+	list_for_each_entry(session, &core->sessions, node) {
+		if (session != own) {
+			busy = true;
+			break;
+		}
+	}
 	mutex_unlock(&core->lock);
 	return busy;
 }
@@ -208,7 +220,7 @@ int s7d_codec_session_open(struct s7d_codec_core *core,
 		ret = -EIO;
 		goto free;
 	}
-	if (core->active) {
+	if (core->active >= S7D_CODEC_CORE_SESSIONS) {
 		ret = -EBUSY;
 		goto free;
 	}
@@ -232,7 +244,7 @@ int s7d_codec_session_open(struct s7d_codec_core *core,
 	INIT_LIST_HEAD(&session->surfaces);
 	INIT_LIST_HEAD(&session->allocations);
 	list_add_tail(&session->node, &core->sessions);
-	core->active = session;
+	core->active++;
 	*out = session;
 	mutex_unlock(&core->lock);
 	return 0;
