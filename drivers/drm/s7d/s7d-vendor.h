@@ -6,6 +6,7 @@
 #include <linux/atomic.h>
 #include <linux/hdmi.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -13,6 +14,7 @@
 #include <drm/drm_modeset_helper_vtables.h>
 
 struct dentry;
+struct device;
 struct dma_fence;
 struct drm_connector;
 struct drm_crtc;
@@ -58,6 +60,17 @@ struct s7d_vendor {
 	bool node_order_ok;
 	/* MUTE_PLANE on video: kept for the whole device until unmuted. */
 	bool video_mute;
+	bool display_class;
+	/* HPD and vendor uevent state, and the amhdmitx0 device that sends them. */
+	struct mutex lock;
+	struct device *amhdmitx;
+	bool registered;
+	/* HPD reports so far, and the last one; received even before register. */
+	unsigned int hpd_reports;
+	bool hpd_report;
+	/* The last hdmitx_hpd and hdmitx_hdcppwr sent, -1 before the first. */
+	int hpd;
+	int hdcppwr;
 };
 
 #if IS_ENABLED(CONFIG_DRM_S7D_VENDOR_UAPI)
@@ -99,6 +112,12 @@ bool s7d_vendor_attr_valid(const struct drm_display_info *info,
 			   const struct drm_display_mode *mode,
 			   const struct s7d_vendor_attr *attr);
 int s7d_vendor_testattr_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+
+/* Vendor sysfs and uevents (s7d-vendor-sysfs.c). */
+void s7d_vendor_sysfs_register(struct s7d_vendor *v);
+void s7d_vendor_sysfs_unregister(struct s7d_vendor *v);
+void s7d_vendor_sysfs_hpd(struct s7d_vendor *v, bool connected, bool force);
+void s7d_vendor_sysfs_power(struct s7d_vendor *v, bool on);
 void s7d_vendor_present_init(struct s7d_vendor *v);
 void s7d_vendor_present_fini(struct s7d_vendor *v);
 

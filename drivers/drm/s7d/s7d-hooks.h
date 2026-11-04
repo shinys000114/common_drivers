@@ -75,29 +75,6 @@ int s7d_vendor_register(struct drm_device *drm);
  */
 void s7d_vendor_unregister(struct drm_device *drm);
 
-#else
-
-static inline const struct drm_driver *s7d_vendor_driver(const struct drm_driver *native)
-{
-	return native;
-}
-
-static inline int s7d_vendor_init(struct drm_device *drm, const struct s7d_vendor_objs *objs)
-{
-	return 0;
-}
-
-static inline int s7d_vendor_register(struct drm_device *drm)
-{
-	return 0;
-}
-
-static inline void s7d_vendor_unregister(struct drm_device *drm)
-{
-}
-
-#endif
-
 /*
  * s7d_hdmi_report_hpd() (s7d-hdmi.c): with a detected sink status, after
  * drm_bridge_hpd_notify() has reported it to DRM, or when DRM was not told
@@ -123,9 +100,7 @@ static inline void s7d_vendor_unregister(struct drm_device *drm)
  * overlap s7d_vendor_pm(false). A sink changed while asleep is not
  * reported here; see s7d_vendor_pm().
  */
-static inline void s7d_vendor_hpd(struct drm_device *drm, bool connected)
-{
-}
+void s7d_vendor_hpd(struct drm_device *drm, bool connected);
 
 /*
  * s7d_drm_suspend() and s7d_drm_resume() (s7d-drv.c): last call of a
@@ -139,9 +114,38 @@ static inline void s7d_vendor_hpd(struct drm_device *drm, bool connected)
  * reprobe without refreshing the connector status, so on resume the vendor
  * layer must detect the sink again rather than trust any cached status.
  */
+void s7d_vendor_pm(struct drm_device *drm, bool resume);
+
+#else
+
+static inline const struct drm_driver *s7d_vendor_driver(const struct drm_driver *native)
+{
+	return native;
+}
+
+static inline int s7d_vendor_init(struct drm_device *drm, const struct s7d_vendor_objs *objs)
+{
+	return 0;
+}
+
+static inline int s7d_vendor_register(struct drm_device *drm)
+{
+	return 0;
+}
+
+static inline void s7d_vendor_unregister(struct drm_device *drm)
+{
+}
+
+static inline void s7d_vendor_hpd(struct drm_device *drm, bool connected)
+{
+}
+
 static inline void s7d_vendor_pm(struct drm_device *drm, bool resume)
 {
 }
+
+#endif
 
 /*
  * Media glue (s7d_ext_*), provided by the glue registry in s7d-ext.c. Both

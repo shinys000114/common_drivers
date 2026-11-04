@@ -2,10 +2,12 @@
 /* Copyright (c) 2026 Hardkernel Co., Ltd. */
 #include <linux/debugfs.h>
 #include <linux/device.h>
+#include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
 
+#include <drm/drm_connector.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -13,6 +15,8 @@
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_probe_helper.h>
+#include <drm/drm_sysfs.h>
 
 #include <uapi/amlogic/drm/meson_drm.h>
 
@@ -156,6 +160,11 @@ int s7d_vendor_init(struct drm_device *drm, const struct s7d_vendor_objs *objs)
 	v->hdmi = objs->hdmi;
 	v->card_minor = -1;
 	v->render_minor = -1;
+	v->hpd = -1;
+	v->hdcppwr = -1;
+	ret = drmm_mutex_init(drm, &v->lock);
+	if (ret)
+		return ret;
 	s7d_vendor_present_init(v);
 	s7d_vendor_modes_init(v);
 	ret = s7d_vendor_props_attach(drm, objs);
@@ -179,9 +188,28 @@ static int s7d_vendor_debugfs_show(struct seq_file *m, void *data)
 }
 DEFINE_SHOW_ATTRIBUTE(s7d_vendor_debugfs);
 
+/*
+ * Send the sink state found by a detection that started after @reports HPD
+ * reports; a report that came since is newer. Without either, @force sends
+ * the last state again.
+ */
+static void s7d_vendor_send_sink(struct s7d_vendor *v, unsigned int reports, int status,
+				 bool force)
+{
+	lockdep_assert_held(&v->lock);
+	if (v->hpd_reports != reports)
+		s7d_vendor_sysfs_hpd(v, v->hpd_report, force);
+	else if (status == connector_status_connected || status == connector_status_disconnected)
+		s7d_vendor_sysfs_hpd(v, status == connector_status_connected, force);
+	else if (force && v->hpd >= 0)
+		s7d_vendor_sysfs_hpd(v, v->hpd, true);
+}
+
 int s7d_vendor_register(struct drm_device *drm)
 {
 	struct s7d_vendor *v = s7d_vendor_find(drm);
+	unsigned int reports;
+	int status;
 
 	if (!v)
 		return 0;
@@ -194,6 +222,18 @@ int s7d_vendor_register(struct drm_device *drm)
 			v->card_minor, v->render_minor);
 	v->debugfs = debugfs_create_dir("s7d", drm->debugfs_root);
 	debugfs_create_file("vendor", 0444, v->debugfs, v, &s7d_vendor_debugfs_fops);
+	s7d_vendor_sysfs_register(v);
+	/* HPD reports only edges: find the sink present at boot. */
+	mutex_lock(&v->lock);
+	reports = v->hpd_reports;
+	mutex_unlock(&v->lock);
+	status = drm_helper_probe_detect(v->hdmi, NULL, false);
+	mutex_lock(&v->lock);
+	v->registered = true;
+	/* As the vendor transmitter probe: powered, then the sink. */
+	s7d_vendor_sysfs_power(v, true);
+	s7d_vendor_send_sink(v, reports, status, false);
+	mutex_unlock(&v->lock);
 	return 0;
 }
 
@@ -203,7 +243,54 @@ void s7d_vendor_unregister(struct drm_device *drm)
 
 	if (!v)
 		return;
+	mutex_lock(&v->lock);
+	v->registered = false;
+	mutex_unlock(&v->lock);
+	s7d_vendor_sysfs_unregister(v);
 	s7d_vendor_present_fini(v);
 	debugfs_remove_recursive(v->debugfs);
 	v->debugfs = NULL;
+}
+
+void s7d_vendor_hpd(struct drm_device *drm, bool connected)
+{
+	struct s7d_vendor *v = s7d_vendor_find(drm);
+
+	if (!v)
+		return;
+	mutex_lock(&v->lock);
+	v->hpd_reports++;
+	v->hpd_report = connected;
+	if (v->registered) {
+		s7d_vendor_sysfs_hpd(v, connected, false);
+		/* The vendor DRM hotplug event names no connector. */
+		drm_sysfs_hotplug_event(drm);
+	}
+	mutex_unlock(&v->lock);
+}
+
+void s7d_vendor_pm(struct drm_device *drm, bool resume)
+{
+	struct s7d_vendor *v = s7d_vendor_find(drm);
+	int status = connector_status_unknown;
+	unsigned int reports;
+	bool registered;
+
+	if (!v)
+		return;
+	mutex_lock(&v->lock);
+	registered = v->registered;
+	reports = v->hpd_reports;
+	mutex_unlock(&v->lock);
+	/* Nothing reports a sink changed while asleep: detect it again. */
+	if (registered && resume)
+		status = drm_helper_probe_detect(v->hdmi, NULL, false);
+	mutex_lock(&v->lock);
+	if (v->registered) {
+		/* As the vendor transmitter: the sink state again on resume, then power. */
+		if (resume)
+			s7d_vendor_send_sink(v, reports, status, true);
+		s7d_vendor_sysfs_power(v, resume);
+	}
+	mutex_unlock(&v->lock);
 }
