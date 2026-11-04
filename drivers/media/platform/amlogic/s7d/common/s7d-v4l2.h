@@ -264,6 +264,8 @@ int s7d_v4l2_enum_format(struct s7d_v4l2_context *context,
 int s7d_v4l2_try_format(struct s7d_v4l2_context *context,
 			struct v4l2_format *format);
 struct s7d_codec_session *s7d_v4l2_session(struct s7d_v4l2_context *ctx);
+/* Callers hold the queue lock or are serialized with s7d_v4l2_context_rebind(). */
+enum s7d_codec_engine s7d_v4l2_engine(struct s7d_v4l2_context *ctx);
 int s7d_v4l2_set_format(struct s7d_v4l2_context *context,
 			struct v4l2_format *format);
 int s7d_v4l2_get_format(struct s7d_v4l2_context *context,

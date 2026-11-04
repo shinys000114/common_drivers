@@ -662,6 +662,12 @@ struct s7d_codec_session *s7d_v4l2_session(struct s7d_v4l2_context *ctx)
 	return READ_ONCE(ctx->session);
 }
 
+/* A rebind, under the queue lock, is the only writer. */
+enum s7d_codec_engine s7d_v4l2_engine(struct s7d_v4l2_context *ctx)
+{
+	return ctx->codec.engine;
+}
+
 int s7d_v4l2_set_format(struct s7d_v4l2_context *ctx, struct v4l2_format *format)
 {
 	struct s7d_codec_layout placeholder;

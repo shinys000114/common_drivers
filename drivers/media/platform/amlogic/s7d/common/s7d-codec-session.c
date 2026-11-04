@@ -184,21 +184,14 @@ int s7d_codec_core_destroy(struct s7d_codec_core *core)
 	return 0;
 }
 
-/* True while a session other than @own holds the core. */
-bool s7d_codec_core_busy(struct s7d_codec_core *core, const struct s7d_codec_session *own)
+bool s7d_codec_core_failed(struct s7d_codec_core *core)
 {
-	struct s7d_codec_session *session;
-	bool busy = false;
+	bool failed;
 
 	mutex_lock(&core->lock);
-	list_for_each_entry(session, &core->sessions, node) {
-		if (session != own) {
-			busy = true;
-			break;
-		}
-	}
+	failed = core->failed;
 	mutex_unlock(&core->lock);
-	return busy;
+	return failed;
 }
 
 int s7d_codec_session_open(struct s7d_codec_core *core,

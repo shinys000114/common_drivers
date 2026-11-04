@@ -46,6 +46,8 @@ struct s7d_v4l2_device {
 	struct completion video_released;
 	struct list_head clients;
 	struct list_head quarantine;
+	/* A client of this engine is in quarantine; set under the lock, never cleared. */
+	bool retained[S7D_CODEC_ENGINES];
 	bool registered;
 	bool disconnected;
 };
@@ -105,21 +107,34 @@ s7d_output_entry(struct s7d_v4l2_device *device, u32 fourcc)
 }
 
 /*
- * The DOS runs one session at a time across all codecs and the JPEG encoder. A
- * second client is refused when it sets its coded format or allocates bitstream
- * buffers, before any frame, so players can fall back to software decoding
- * instead of failing at STREAMON (Chromium falls back only when initialisation,
- * the OUTPUT S_FMT, fails).
+ * Each DOS engine runs one session: VDEC (H.264), the HEVC core (HEVC, VP9,
+ * AV1) and HCODEC (the JPEG encoder). A client whose codec needs a taken
+ * engine is refused with -EBUSY when it sets its coded format or allocates
+ * bitstream buffers, before any frame, so players can fall back to software
+ * decoding instead of failing at STREAMON (Chromium falls back only when
+ * initialisation, the OUTPUT S_FMT, fails). Codecs of other engines still
+ * start. An engine that a failed stop left in an unknown state refuses its
+ * codecs with -EIO and leaves the others alone.
  */
-static bool s7d_device_taken(struct s7d_v4l2_device *device, void *priv)
+static int s7d_engine_taken(struct s7d_v4l2_device *device,
+			    struct s7d_v4l2_context *context,
+			    enum s7d_codec_engine engine)
 {
-	struct s7d_codec_session *own = s7d_v4l2_session(s7d_file_context(priv));
 	unsigned int i;
+	int ret;
 
+	if (READ_ONCE(device->retained[engine]))
+		return -EIO;
 	for (i = 0; i < device->entries; i++)
-		if (s7d_codec_core_busy(device->entry[i].core, own))
-			return true;
-	return s7d_codec_dos_leased(device->dos, S7D_CODEC_ENGINE_HCODEC);
+		if (device->entry[i].factory.codec.engine == engine &&
+		    s7d_codec_core_failed(device->entry[i].core))
+			return -EIO;
+	ret = s7d_codec_dos_engine_state(device->dos, engine);
+	/* The caller's own session holds the engine. */
+	if (ret == -EBUSY && s7d_v4l2_session(context) &&
+	    s7d_v4l2_engine(context) == engine)
+		return 0;
+	return ret;
 }
 
 static int s7d_querycap(struct file *file, void *priv,
@@ -226,12 +241,14 @@ static int s7d_set_format(struct file *file, void *priv, struct v4l2_format *for
 	int ret;
 
 	if (format->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
-		if (s7d_device_taken(device, priv))
-			return -EBUSY;
 		entry = s7d_output_entry(device, format->fmt.pix_mp.pixelformat);
 		client = s7d_file_client(device, priv);
 		if (!client)
 			return -EINVAL;
+		ret = s7d_engine_taken(device, client->context,
+				       (entry ?: client->entry)->factory.codec.engine);
+		if (ret)
+			return ret;
 		if (entry && entry != client->entry) {
 			ret = s7d_switch_codec(client, entry);
 			if (ret)
@@ -296,13 +313,20 @@ static int s7d_streamoff(struct file *file, void *priv, enum v4l2_buf_type type)
 	return s7d_v4l2_streamoff(s7d_file_context(priv), file, type);
 }
 
+/* Called with the context's queue lock, not the node lock. */
 static int s7d_reqbufs(struct file *file, void *priv,
 		       struct v4l2_requestbuffers *request)
 {
-	if (request->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE && request->count &&
-	    s7d_device_taken(video_drvdata(file), priv))
-		return -EBUSY;
-	return s7d_v4l2_reqbufs(s7d_file_context(priv), file, request);
+	struct s7d_v4l2_context *context = s7d_file_context(priv);
+	int ret;
+
+	if (request->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE && request->count) {
+		ret = s7d_engine_taken(video_drvdata(file), context,
+				       s7d_v4l2_engine(context));
+		if (ret)
+			return ret;
+	}
+	return s7d_v4l2_reqbufs(context, file, request);
 }
 
 static int s7d_dqbuf(struct file *file, void *priv, struct v4l2_buffer *buffer)
@@ -351,10 +375,6 @@ static int s7d_open(struct file *file)
 	mutex_lock(&device->lock);
 	if (device->disconnected || !device->registered) {
 		ret = -ENODEV;
-		goto unlock;
-	}
-	if (!list_empty(&device->quarantine)) {
-		ret = -EIO;
 		goto unlock;
 	}
 	/* The first codec is the default until S_FMT selects another. */
@@ -422,6 +442,7 @@ found:
 		client->entry->factory.destroy(client->entry->priv, client->backend);
 	if (ret) {
 		list_move_tail(&client->list, &device->quarantine);
+		WRITE_ONCE(device->retained[client->entry->factory.codec.engine], true);
 		dev_err(device->dev, "decoder stop failed: %d; backend retained\n", ret);
 	} else {
 		list_del(&client->list);

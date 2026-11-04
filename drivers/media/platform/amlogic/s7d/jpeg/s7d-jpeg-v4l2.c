@@ -195,15 +195,19 @@ static int jpeg_try_format(struct file *file, void *priv, struct v4l2_format *fo
 }
 
 /*
- * The DOS runs one session at a time across the encoder and the decoders; refuse
- * a client at its raw format or buffers rather than at STREAMON.
+ * HCODEC runs one session; the decoders use other engines and run beside it.
+ * Refuse a second client at its raw format or buffers rather than at STREAMON,
+ * and every client with -EIO once a failed stop left HCODEC unusable.
  */
-static bool jpeg_taken(struct s7d_jpeg_client *ctx)
+static int jpeg_taken(struct s7d_jpeg_client *ctx)
 {
 	struct s7d_codec_dos *dos = s7d_jpeg_encoder_dos(ctx->device->encoder);
+	int ret;
 
-	return s7d_codec_core_busy(ctx->device->core, ctx->session) ||
-	       s7d_codec_dos_leased_by_other(dos, S7D_CODEC_ENGINE_HCODEC);
+	if (s7d_codec_core_failed(ctx->device->core))
+		return -EIO;
+	ret = s7d_codec_dos_engine_state(dos, S7D_CODEC_ENGINE_HCODEC);
+	return ret == -EBUSY && ctx->session ? 0 : ret;
 }
 
 static int jpeg_set_format(struct file *file, void *priv, struct v4l2_format *format)
@@ -212,9 +216,13 @@ static int jpeg_set_format(struct file *file, void *priv, struct v4l2_format *fo
 	int ret;
 
 	if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
-	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)) ||
-	    (jpeg_output(format->type) && jpeg_taken(ctx)))
+	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
 		return -EBUSY;
+	if (jpeg_output(format->type)) {
+		ret = jpeg_taken(ctx);
+		if (ret)
+			return ret;
+	}
 	ret = jpeg_try_format(file, priv, format);
 	if (ret)
 		return ret;
@@ -243,8 +251,13 @@ static int jpeg_get_format(struct file *file, void *priv, struct v4l2_format *fo
 static int jpeg_reqbufs(struct file *file, void *priv,
 			struct v4l2_requestbuffers *request)
 {
-	if (jpeg_output(request->type) && request->count && jpeg_taken(jpeg_client(priv)))
-		return -EBUSY;
+	int ret;
+
+	if (jpeg_output(request->type) && request->count) {
+		ret = jpeg_taken(jpeg_client(priv));
+		if (ret)
+			return ret;
+	}
 	return v4l2_m2m_ioctl_reqbufs(file, priv, request);
 }
 

@@ -1754,30 +1754,6 @@ out:
 	return ret;
 }
 
-bool s7d_codec_dos_leased(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
-{
-	struct dos_engine *e;
-	bool leased;
-
-	if (dos_engine_check(engine))
-		return false;
-	e = dos_eng(dos, engine);
-	mutex_lock(&e->lock);
-	leased = e->holders;
-	mutex_unlock(&e->lock);
-	return leased;
-}
-
-bool s7d_codec_dos_leased_by_other(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
-{
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(dos->eng); i++)
-		if (i != engine && s7d_codec_dos_leased(dos, i))
-			return true;
-	return false;
-}
-
 int s7d_codec_dos_engine_state(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)
 {
 	struct dos_engine *e;
