@@ -37,6 +37,7 @@ static const struct drm_ioctl_desc s7d_vendor_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(MESON_DMABUF_EXPORT_SYNC_FILE, s7d_vendor_export_sync_file_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(MESON_PRIME_HANDLE_TO_FD, s7d_vendor_prime_handle_to_fd_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(MESON_CREAT_PRESENT_FENCE, s7d_vendor_present_fence_ioctl, 0),
 };
 
 /* The vendor ADDFB2 takes the core arguments; its own formats are not offered. */
@@ -151,6 +152,7 @@ int s7d_vendor_init(struct drm_device *drm, const struct s7d_vendor_objs *objs)
 	v->hdmi = objs->hdmi;
 	v->card_minor = -1;
 	v->render_minor = -1;
+	s7d_vendor_present_init(v);
 	ret = s7d_vendor_props_attach(drm, objs);
 	if (ret)
 		return ret;
@@ -195,6 +197,7 @@ void s7d_vendor_unregister(struct drm_device *drm)
 
 	if (!v)
 		return;
+	s7d_vendor_present_fini(v);
 	debugfs_remove_recursive(v->debugfs);
 	v->debugfs = NULL;
 }
