@@ -7,6 +7,7 @@
 #include <linux/types.h>
 
 struct device;
+struct dma_buf;
 struct module;
 struct s7d_codec_core;
 struct s7d_codec_dos;
@@ -21,6 +22,12 @@ struct s7d_jpeg_source {
 	u32 stride;
 	const void *data;
 	size_t bytes;
+	/*
+	 * Optional dma-buf holding the same frame from offset 0. HCODEC reads
+	 * it in place when it maps as one DMA run; otherwise data is copied
+	 * inside dma_buf_begin_cpu_access(), which waits for its write fences.
+	 */
+	struct dma_buf *dmabuf;
 };
 
 struct s7d_jpeg_encode_result {
@@ -42,10 +49,11 @@ size_t s7d_jpeg_encoder_pool_bytes(u32 width, u32 height);
 /*
  * Synchronous worker call; session is OPEN HCODEC on encoder_core. Initial
  * NV12/NV21 is contiguous, even, at most 1920x1080, stride ALIGN(width, 32).
- * Caller excludes session_stop and retains CPU buffers until return. Neither
- * CPU pointer is retained afterwards, including when private DMA is retained
- * after an unproved halt. Negative return leaves result untouched and the
- * capture contents undefined.
+ * Caller excludes session_stop and retains CPU buffers and the dma-buf until
+ * return. Neither CPU pointer is retained afterwards; the encoder keeps its
+ * own dma-buf reference and mapping while private DMA is retained after an
+ * unproved halt. Negative return leaves result untouched and the capture
+ * contents undefined.
  */
 int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 			    struct s7d_codec_session *session,

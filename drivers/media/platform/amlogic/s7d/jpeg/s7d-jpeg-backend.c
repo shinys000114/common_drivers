@@ -3,6 +3,7 @@
 
 #include <linux/completion.h>
 #include <linux/device.h>
+#include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
@@ -11,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/overflow.h>
 #include <linux/regmap.h>
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/videodev2.h>
@@ -24,8 +26,17 @@
 
 #define JPEG_TIMEOUT_MS 3000U
 
+/* A source dma-buf HCODEC reads in place. */
+struct s7d_jpeg_import {
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	dma_addr_t dma;
+};
+
 struct s7d_jpeg_execution {
 	struct s7d_codec_session *session;
+	struct s7d_jpeg_import import;
 	struct s7d_jpeg_job hardware;
 	struct s7d_jpeg_quantization quant;
 	struct s7d_jpeg_header header;
@@ -114,7 +125,8 @@ static int jpeg_source_check(const struct s7d_jpeg_source *source,
 {
 	int ret;
 
-	if (!source || !source->data || !input_bytes || !scan_capacity)
+	if (!source || (!source->data && !source->dmabuf) || !input_bytes ||
+	    !scan_capacity)
 		return -EINVAL;
 	if (source->format != V4L2_PIX_FMT_NV12 &&
 	    source->format != V4L2_PIX_FMT_NV21)
@@ -139,10 +151,71 @@ size_t s7d_jpeg_encoder_pool_bytes(u32 width, u32 height)
 	return PAGE_ALIGN(input) + scan;
 }
 
+static void jpeg_unimport(struct s7d_jpeg_import *import)
+{
+	if (import->sgt)
+		dma_buf_unmap_attachment_unlocked(import->attach, import->sgt,
+						  DMA_TO_DEVICE);
+	if (import->attach)
+		dma_buf_detach(import->dmabuf, import->attach);
+	if (import->dmabuf)
+		dma_buf_put(import->dmabuf);
+	memset(import, 0, sizeof(*import));
+}
+
+/*
+ * Map a source dma-buf for HCODEC. It is read in place only as one DMA run of
+ * the whole frame, on the 8-byte alignment and within the 32-bit range that
+ * the canvas takes; anything else is copied.
+ */
+static int jpeg_import(struct device *dev, struct dma_buf *dmabuf, u32 bytes,
+		       struct s7d_jpeg_import *import)
+{
+	struct scatterlist *sg;
+	dma_addr_t next;
+	u64 run = 0;
+	unsigned int i;
+	int ret;
+
+	get_dma_buf(dmabuf);
+	import->dmabuf = dmabuf;
+	import->attach = dma_buf_attach(dmabuf, dev);
+	if (IS_ERR(import->attach)) {
+		ret = PTR_ERR(import->attach);
+		import->attach = NULL;
+		goto fail;
+	}
+	import->sgt = dma_buf_map_attachment_unlocked(import->attach, DMA_TO_DEVICE);
+	if (IS_ERR_OR_NULL(import->sgt)) {
+		ret = import->sgt ? PTR_ERR(import->sgt) : -ENOMEM;
+		import->sgt = NULL;
+		goto fail;
+	}
+	ret = -ERANGE;
+	if (!import->sgt->nents)
+		goto fail;
+	import->dma = sg_dma_address(import->sgt->sgl);
+	next = import->dma;
+	for_each_sgtable_dma_sg(import->sgt, sg, i) {
+		if (sg_dma_address(sg) != next || run >= bytes)
+			break;
+		run += sg_dma_len(sg);
+		next += sg_dma_len(sg);
+	}
+	if (run < bytes || !IS_ALIGNED(import->dma, 8) ||
+	    (u64)import->dma + bytes - 1 > U32_MAX)
+		goto fail;
+	return 0;
+fail:
+	jpeg_unimport(import);
+	return ret;
+}
+
 static void jpeg_free_job(struct s7d_jpeg_execution *job)
 {
 	if (!job)
 		return;
+	jpeg_unimport(&job->import);
 	s7d_codec_session_put(job->session);
 	kfree(job);
 }
@@ -380,19 +453,48 @@ static int jpeg_preload(struct s7d_jpeg_encoder *encoder,
 	return ret ? ret : jpeg_check_stop(encoder);
 }
 
+/*
+ * Copy a frame HCODEC cannot read in place. A dma-buf is read through its
+ * kernel mapping only inside CPU access, so that a cached exporter makes the
+ * producer's writes visible to the CPU first.
+ */
+static int jpeg_copy_input(struct s7d_jpeg_encoder *encoder,
+			   const struct s7d_jpeg_source *source, u32 bytes)
+{
+	int ret;
+
+	if (source->dmabuf) {
+		ret = dma_buf_begin_cpu_access(source->dmabuf, DMA_FROM_DEVICE);
+		if (ret)
+			return ret;
+	}
+	memcpy(encoder->input, source->data, bytes);
+	/* The copy is complete; a failed end only concerns the exporter. */
+	if (source->dmabuf) {
+		ret = dma_buf_end_cpu_access(source->dmabuf, DMA_FROM_DEVICE);
+		if (ret)
+			dev_warn_ratelimited(encoder->dev,
+					     "JPEG source end_cpu_access failed: %d\n", ret);
+	}
+	return 0;
+}
+
 static int jpeg_stage(struct s7d_jpeg_encoder *encoder,
 			struct s7d_jpeg_execution *job,
 			const struct s7d_jpeg_source *source,
 			u32 input_bytes, u32 scan_capacity)
 {
 	u32 y_bytes = source->stride * source->height;
+	dma_addr_t input_dma = job->import.dma;
 	int ret;
 
 	ret = jpeg_alloc_staging(encoder, &encoder->scan, &encoder->scan_dma,
 				 &encoder->scan_capacity, scan_capacity);
-	if (!ret)
+	if (!ret && !job->import.sgt) {
 		ret = jpeg_alloc_staging(encoder, &encoder->input, &encoder->input_dma,
 					 &encoder->input_bytes, input_bytes);
+		input_dma = encoder->input_dma;
+	}
 	if (ret)
 		return ret;
 	job->hardware.scan_dma = encoder->scan_dma;
@@ -401,16 +503,20 @@ static int jpeg_stage(struct s7d_jpeg_encoder *encoder,
 	job->hardware.width = source->width;
 	job->hardware.height = source->height;
 	job->hardware.y = (struct s7d_jpeg_plane) {
-		.dma = encoder->input_dma, .bytes = y_bytes, .stride = source->stride,
+		.dma = input_dma, .bytes = y_bytes, .stride = source->stride,
 	};
 	job->hardware.uv = (struct s7d_jpeg_plane) {
-		.dma = encoder->input_dma + y_bytes, .bytes = y_bytes / 2,
+		.dma = input_dma + y_bytes, .bytes = y_bytes / 2,
 		.stride = source->stride,
 	};
 	ret = s7d_jpeg_protocol_check(&job->hardware);
 	if (ret)
 		return ret;
-	memcpy(encoder->input, source->data, input_bytes);
+	if (!job->import.sgt) {
+		ret = jpeg_copy_input(encoder, source, input_bytes);
+		if (ret)
+			return ret;
+	}
 	dma_wmb();
 	return 0;
 }
@@ -459,6 +565,7 @@ int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 			    struct s7d_jpeg_encode_result *result)
 {
 	struct s7d_jpeg_execution *job, *retired = NULL;
+	struct s7d_jpeg_import import = { };
 	struct s7d_jpeg_output output;
 	unsigned long flags;
 	u32 input_bytes, scan_capacity;
@@ -471,6 +578,11 @@ int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 	ret = jpeg_source_check(source, &input_bytes, &scan_capacity);
 	if (ret)
 		return ret;
+	if (source->dmabuf) {
+		ret = jpeg_import(encoder->dev, source->dmabuf, input_bytes, &import);
+		if (ret && !source->data)
+			return ret;
+	}
 	mutex_lock(&encoder->control);
 	if (encoder->job || encoder->retained || encoder->release_error) {
 		ret = -EBUSY;
@@ -494,6 +606,8 @@ int s7d_jpeg_encoder_encode(struct s7d_jpeg_encoder *encoder,
 	}
 	job->session = session;
 	s7d_codec_session_get(session);
+	job->import = import;
+	memset(&import, 0, sizeof(import));
 	init_completion(&job->done);
 	job->status = -EINPROGRESS;
 	job->lease_epoch = encoder->lease_epoch;
@@ -585,6 +699,7 @@ idle:
 out:
 	mutex_unlock(&encoder->control);
 	jpeg_free_job(retired);
+	jpeg_unimport(&import);
 	return ret;
 }
 

@@ -530,7 +530,8 @@ static int jpeg_queue_init(void *priv, struct vb2_queue *output,
 
 		queue->type = i ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
 			V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-		queue->io_modes = VB2_MMAP;
+		/* A raw frame may come from another device as a dma-buf. */
+		queue->io_modes = i ? VB2_MMAP : VB2_MMAP | VB2_DMABUF;
 		queue->drv_priv = ctx;
 		queue->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 		queue->ops = &jpeg_queue_ops;
@@ -567,6 +568,8 @@ static void jpeg_run(struct work_struct *work)
 	if (!READ_ONCE(ctx->aborted) && !READ_ONCE(ctx->closing) && ctx->session) {
 		source.data = vb2_plane_vaddr(&src->vb2_buf, 0);
 		source.bytes = vb2_get_plane_payload(&src->vb2_buf, 0);
+		if (src->vb2_buf.memory == VB2_MEMORY_DMABUF)
+			source.dmabuf = src->vb2_buf.planes[0].dbuf;
 		ret = s7d_jpeg_encoder_encode(ctx->device->encoder, ctx->session, &source,
 					      vb2_plane_vaddr(&dst->vb2_buf, 0),
 					      vb2_plane_size(&dst->vb2_buf, 0),
