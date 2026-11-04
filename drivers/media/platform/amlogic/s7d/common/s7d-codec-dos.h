@@ -4,6 +4,7 @@
 #ifndef S7D_CODEC_DOS_H
 #define S7D_CODEC_DOS_H
 
+#include <linux/list.h>
 #include <linux/types.h>
 
 #include "s7d-codec-types.h"
@@ -16,9 +17,10 @@ struct s7d_codec_dos;
 /*
  * VDEC, the HEVC core and HCODEC are leased on their own: a lease, its
  * sequences and a fault concern only that engine, so sessions on different
- * engines run at the same time. Each engine has one holder at a time, which
- * runs it. The caller serializes lifetime and pins its module before using
- * a lease.
+ * engines run at the same time. VDEC and HCODEC have one holder at a time,
+ * which runs them. The holders of the HEVC core take turns: each runs the
+ * core's sequences only between run_begin and run_end. The caller serializes
+ * lifetime and pins its module before using a lease.
  */
 struct s7d_codec_dos *
 s7d_codec_dos_create(struct platform_device *pdev, struct module *owner);
@@ -30,13 +32,20 @@ struct regmap *s7d_codec_dos_regmap(struct s7d_codec_dos *dos,
 				 enum s7d_codec_engine engine);
 
 /*
- * One holder's lease of an engine. The holder embeds it zeroed, passes it to
- * every call on the engine, and keeps it until release succeeds; the DOS
- * owns its fields.
+ * One holder's lease of an engine. The holder embeds it zeroed, may set
+ * @contended before hold, passes it to every call on the engine, and keeps it
+ * until release succeeds; the DOS owns the other fields.
  */
 struct s7d_codec_lease {
+	/*
+	 * Atomic context, with the engine's run queue locked: another lease
+	 * began to wait while this one runs the engine. Optional.
+	 */
+	void (*contended)(void *priv);
+	void *priv;
 	struct s7d_codec_dos *dos;
 	enum s7d_codec_engine engine;
+	struct list_head queue;
 	bool held;
 };
 
@@ -68,6 +77,23 @@ int s7d_codec_dos_park(struct s7d_codec_lease *lease);
 int s7d_codec_dos_start(struct s7d_codec_lease *lease);
 /* A failure retains the lease and pins the owner until an explicit retry. */
 int s7d_codec_dos_release(struct s7d_codec_lease *lease);
+/*
+ * Wait, first come first served, until @lease runs its engine. -ECANCELED
+ * once @cancelled (atomic context, optional) returns true; it is asked again
+ * after each run_wake. -EIO when the engine is faulted. Do not hold a lock
+ * that another holder needs to end its run. Engines with one holder return 0.
+ */
+int s7d_codec_dos_run_begin(struct s7d_codec_lease *lease,
+			    bool (*cancelled)(void *priv), void *priv);
+/*
+ * After the run's halt: the next lease in line runs the engine. An engine
+ * left running is halted first, or marked faulted.
+ */
+int s7d_codec_dos_run_end(struct s7d_codec_lease *lease);
+/* Any context: make the leases waiting for @lease's engine ask @cancelled again. */
+void s7d_codec_dos_run_wake(struct s7d_codec_lease *lease);
+/* @lease runs its engine and another lease waits for it. */
+bool s7d_codec_dos_run_contended(struct s7d_codec_lease *lease);
 /*
  * Zero when the engine can take another session, -EBUSY while its holders
  * use it up, -EIO after a fault or failed release left it unusable.

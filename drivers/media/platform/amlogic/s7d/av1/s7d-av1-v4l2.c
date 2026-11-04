@@ -183,7 +183,7 @@ static int av1_hold(void *priv, enum s7d_codec_engine engine)
 static int av1_quiesce(void *priv, enum s7d_codec_engine engine)
 {
 	struct s7d_av1_v4l2 *adapter = priv;
-	int ret;
+	int ret, ended;
 
 	if (engine != S7D_CODEC_ENGINE_HEVC)
 		return -EOPNOTSUPP;
@@ -191,12 +191,19 @@ static int av1_quiesce(void *priv, enum s7d_codec_engine engine)
 	ret = adapter->stop_error;
 	if (!ret && !adapter->runner_closed)
 		ret = -EBUSY;
+	/* The halt takes the session's turn on the core. */
 	if (!ret)
+		ret = s7d_codec_dos_run_begin(&adapter->lease, NULL, NULL);
+	if (!ret) {
 		ret = s7d_codec_dos_prepare_access(&adapter->lease);
-	if (!ret)
-		ret = s7d_codec_dos_hevc_irq_mask(&adapter->lease, false);
-	if (!ret)
-		ret = s7d_codec_dos_halt(&adapter->lease);
+		if (!ret)
+			ret = s7d_codec_dos_hevc_irq_mask(&adapter->lease, false);
+		if (!ret)
+			ret = s7d_codec_dos_halt(&adapter->lease);
+		ended = s7d_codec_dos_run_end(&adapter->lease);
+		if (!ret)
+			ret = ended;
+	}
 	if (!ret)
 		adapter->quiesced = true;
 	mutex_unlock(&adapter->resources);

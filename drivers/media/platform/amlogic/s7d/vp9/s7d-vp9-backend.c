@@ -171,6 +171,12 @@ static int vp9_stop_check(struct s7d_vp9_decoder *decoder)
 		-ECANCELED : 0;
 }
 
+/* Atomic: asked while the decoder waits for its turn on the core. */
+static bool vp9_run_cancelled(void *priv)
+{
+	return vp9_stop_check(priv) != 0;
+}
+
 static bool vp9_cookie_matches(struct s7d_vp9_decoder *decoder,
 			       struct vp9_job *job, const struct s7d_hevc_irq_cookie *cookie)
 {
@@ -535,9 +541,13 @@ static int vp9_halt_locked(struct s7d_vp9_decoder *decoder)
 	spin_lock_irqsave(&decoder->irq_lock, flags);
 	decoder->irq_accept = false;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
-	ret = s7d_codec_dos_prepare_access(&decoder->lease);
-	if (!ret)
-		ret = s7d_codec_dos_hevc_irq_mask(&decoder->lease, false);
+	/* Halted already: the core may run another session's picture now. */
+	ret = 0;
+	if (!decoder->quiesced) {
+		ret = s7d_codec_dos_prepare_access(&decoder->lease);
+		if (!ret)
+			ret = s7d_codec_dos_hevc_irq_mask(&decoder->lease, false);
+	}
 	if (decoder->binding) {
 		joined = s7d_hevc_engine_disarm(decoder->engine, decoder->binding);
 		if (!ret)
@@ -568,7 +578,24 @@ void s7d_vp9_decoder_request_stop(struct s7d_vp9_decoder *decoder)
 		s7d_codec_firmware_job_stop(decoder->preload);
 	if (decoder->job)
 		complete_all(&decoder->job->wake);
+	s7d_codec_dos_run_wake(&decoder->lease);
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
+}
+
+/* A halt of a core this session may have left running takes the session's turn. */
+static int vp9_halt_run(struct s7d_vp9_decoder *decoder)
+{
+	int ret, ended;
+
+	lockdep_assert_held(&decoder->control);
+	if (decoder->quarantined || decoder->quiesced)
+		return vp9_halt_locked(decoder);
+	ret = s7d_codec_dos_run_begin(&decoder->lease, NULL, NULL);
+	if (ret)
+		return ret;
+	ret = vp9_halt_locked(decoder);
+	ended = s7d_codec_dos_run_end(&decoder->lease);
+	return ret ?: ended;
 }
 
 static int vp9_hold(void *priv, enum s7d_codec_engine engine)
@@ -624,7 +651,7 @@ static int vp9_quiesce(void *priv, enum s7d_codec_engine engine)
 		wait_for_completion(&decoder->idle);
 		mutex_lock(&decoder->control);
 	}
-	ret = vp9_halt_locked(decoder);
+	ret = vp9_halt_run(decoder);
 	if (!ret)
 		ret = vp9_unbind_locked(decoder);
 	decoder->firmware_loaded = false;
@@ -1208,7 +1235,7 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 	unsigned long flags;
 	const char *stage = "admission";
 	bool load_failed = false, corrupt = false;
-	int ret, halted = 0, idle, cleanup;
+	int ret, halted = 0, idle, cleanup, ended;
 
 	if (!decoder || !session || !bank || !view || !token || !timestamp_meta || !result)
 		return -EINVAL;
@@ -1249,6 +1276,23 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 	decoder->job = job;
 	decoder->running = true;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
+	/* The core is idle when its turn comes; nothing of this picture ran yet. */
+	stage = "run-token";
+	ret = s7d_codec_dos_run_begin(&decoder->lease, vp9_run_cancelled, decoder);
+	if (ret) {
+		result->cancelled = ret == -ECANCELED;
+		if (!result->cancelled)
+			decoder->failure = ret;
+		spin_lock_irqsave(&decoder->irq_lock, flags);
+		decoder->job = NULL;
+		spin_unlock_irqrestore(&decoder->irq_lock, flags);
+		put_session = job->session;
+		kfree(job);
+		job = NULL;
+		decoder->running = false;
+		complete_all(&decoder->idle);
+		goto out;
+	}
 	ret = vp9_stop_check(decoder);
 	if (!ret) {
 		stage = "initial-halt";
@@ -1316,6 +1360,10 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 	}
 stop:
 	halted = vp9_halt_locked(decoder);
+	/* Halted: the next session's picture may run while this one is finished. */
+	ended = s7d_codec_dos_run_end(&decoder->lease);
+	if (!halted && ended)
+		halted = ended;
 	if (job->staged) {
 		idle = s7d_vp9_dma_context_mark_idle(decoder->context, job->epoch, token,
 			halted, !halted, !ret && job->picture_complete);
@@ -1446,7 +1494,7 @@ int s7d_vp9_decoder_stream_close(struct s7d_vp9_decoder *decoder,
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = vp9_halt_locked(decoder);
+	ret = vp9_halt_run(decoder);
 	if (!ret)
 		ret = vp9_unbind_locked(decoder);
 	if (!ret && !decoder->context_ready) {

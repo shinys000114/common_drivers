@@ -18,6 +18,8 @@
 #include <linux/reset.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/wait.h>
 
 #include "s7d-codec-dos.h"
 
@@ -110,8 +112,17 @@ struct dos_engine {
 	/* Serializes this engine's lease, its sequences and the state below. */
 	struct mutex lock;
 	unsigned int holders;
-	/* The lease whose sequences the engine takes: its one holder. */
+	/*
+	 * The holders take turns, each running the engine between run_begin
+	 * and run_end; otherwise the one holder runs it. Fixed at create.
+	 */
+	bool shared;
+	/* The runner and the leases waiting to run, in arrival order. */
+	spinlock_t run_lock;
+	/* The lease whose sequences the engine takes. */
 	struct s7d_codec_lease *runner;
+	struct list_head queue;
+	wait_queue_head_t run_wait;
 	bool local_access_ready;
 	bool prepared;
 	bool hevc_init_written;
@@ -197,11 +208,31 @@ static int dos_lease_engine(const struct s7d_codec_lease *lease,
 	return ret;
 }
 
-/* Under the engine lock: @lease runs the engine now. */
+static bool dos_runner_is(struct dos_engine *e, const struct s7d_codec_lease *lease)
+{
+	bool runs;
+
+	spin_lock(&e->run_lock);
+	runs = e->runner == lease;
+	spin_unlock(&e->run_lock);
+	return runs;
+}
+
+/*
+ * Under the engine lock: @lease runs the engine now. Only the runner clears
+ * the runner, so the answer holds for the runner's own call.
+ */
 static bool dos_runs(struct dos_engine *e, const struct s7d_codec_lease *lease)
 {
 	lockdep_assert_held(&e->lock);
-	return lease->held && e->holders && e->runner == lease;
+	return lease->held && e->holders && dos_runner_is(e, lease);
+}
+
+static void dos_set_runner(struct dos_engine *e, struct s7d_codec_lease *lease)
+{
+	spin_lock(&e->run_lock);
+	e->runner = lease;
+	spin_unlock(&e->run_lock);
 }
 
 static void dos_lock_all(struct s7d_codec_dos *dos)
@@ -940,8 +971,14 @@ s7d_codec_dos_create(struct platform_device *pdev, struct module *owner)
 	dos->dev = get_device(&pdev->dev);
 	dos->owner = owner;
 	mutex_init(&dos->lock);
-	for (i = 0; i < ARRAY_SIZE(dos->eng); i++)
+	for (i = 0; i < ARRAY_SIZE(dos->eng); i++) {
 		mutex_init(&dos->eng[i].lock);
+		spin_lock_init(&dos->eng[i].run_lock);
+		INIT_LIST_HEAD(&dos->eng[i].queue);
+		init_waitqueue_head(&dos->eng[i].run_wait);
+	}
+	/* HEVC, VP9 and AV1 sessions take turns on the HEVC core picture by picture. */
+	dos->eng[S7D_CODEC_ENGINE_HEVC].shared = true;
 	dos->irq = platform_get_irq_byname(pdev, "mailbox_1");
 	if (dos->irq < 0) {
 		ret = dos->irq;
@@ -1117,13 +1154,15 @@ static int dos_hold_rate(struct s7d_codec_dos *dos,
 	if (ret < 0)
 		goto disable_vdec;
 	e->holders = 1;
-	e->runner = lease;
 	e->error_reported = false;
 	e->local_access_ready = false;
 	e->halted = false;
-	*lease = (struct s7d_codec_lease) {
-		.dos = dos, .engine = engine, .held = true,
-	};
+	lease->dos = dos;
+	lease->engine = engine;
+	INIT_LIST_HEAD(&lease->queue);
+	lease->held = true;
+	if (!e->shared)
+		dos_set_runner(e, lease);
 	ret = 0;
 	goto out;
 
@@ -1780,7 +1819,8 @@ int s7d_codec_dos_release(struct s7d_codec_lease *lease)
 	dos = lease->dos;
 	engine = lease->engine;
 	mutex_lock(&e->lock);
-	if (!dos_runs(e, lease) || !e->halted || e->faulted) {
+	/* A shared engine's holder ends its run first; another one runs it alone. */
+	if (e->shared == dos_runner_is(e, lease) || !e->halted || e->faulted) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1807,7 +1847,7 @@ int s7d_codec_dos_release(struct s7d_codec_lease *lease)
 	clk_disable_unprepare(dos->bus_clk);
 	clk_rate_exclusive_put(clk);
 	e->holders = 0;
-	e->runner = NULL;
+	dos_set_runner(e, NULL);
 	lease->held = false;
 	e->local_access_ready = false;
 	e->prepared = false;
@@ -1823,6 +1863,116 @@ out:
 	if (drop_pin)
 		module_put(dos->owner);
 	return ret;
+}
+
+/* Inside wait_event(): take a free engine when first in line, or leave the line. */
+static bool dos_run_turn(struct dos_engine *e, struct s7d_codec_lease *lease,
+			 bool (*cancelled)(void *priv), void *priv, int *ret)
+{
+	bool done = true, others = false;
+
+	spin_lock(&e->run_lock);
+	if (READ_ONCE(e->faulted) || READ_ONCE(e->release_failed) ||
+	    READ_ONCE(lease->dos->closing)) {
+		*ret = -EIO;
+	} else if (!e->runner &&
+		   list_first_entry(&e->queue, struct s7d_codec_lease, queue) == lease) {
+		e->runner = lease;
+		*ret = 0;
+	} else if (cancelled && cancelled(priv)) {
+		*ret = -ECANCELED;
+	} else {
+		done = false;
+	}
+	if (done) {
+		list_del_init(&lease->queue);
+		others = *ret && !list_empty(&e->queue);
+	}
+	spin_unlock(&e->run_lock);
+	/* Leaving the head of the line lets the next lease take a free engine. */
+	if (others)
+		wake_up_all(&e->run_wait);
+	return done;
+}
+
+int s7d_codec_dos_run_begin(struct s7d_codec_lease *lease,
+			    bool (*cancelled)(void *priv), void *priv)
+{
+	struct s7d_codec_lease *runner;
+	struct dos_engine *e;
+	int ret = dos_lease_engine(lease, &e);
+
+	if (ret || !e->shared)
+		return ret;
+	spin_lock(&e->run_lock);
+	if (e->runner == lease || !list_empty(&lease->queue)) {
+		spin_unlock(&e->run_lock);
+		return -EBUSY;
+	}
+	list_add_tail(&lease->queue, &e->queue);
+	runner = e->runner;
+	if (runner && runner->contended)
+		runner->contended(runner->priv);
+	spin_unlock(&e->run_lock);
+	wait_event(e->run_wait, dos_run_turn(e, lease, cancelled, priv, &ret));
+	return ret;
+}
+
+/* The next runner may program the engine: nothing of this run still runs. */
+static bool dos_run_idle_locked(struct dos_engine *e)
+{
+	return e->faulted || e->release_failed ||
+	       (!e->prepared && !e->started && (e->halted || !e->local_access_ready));
+}
+
+int s7d_codec_dos_run_end(struct s7d_codec_lease *lease)
+{
+	struct dos_engine *e;
+	int ret = dos_lease_engine(lease, &e);
+
+	if (ret || !e->shared)
+		return ret;
+	mutex_lock(&e->lock);
+	if (!dos_runs(e, lease)) {
+		mutex_unlock(&e->lock);
+		return -EINVAL;
+	}
+	if (!dos_run_idle_locked(e)) {
+		dev_warn(lease->dos->dev, "engine %u left running at the end of a run; halting it\n",
+			 lease->engine);
+		ret = dos_prepare_access_locked(lease->dos, lease->engine);
+		if (!ret)
+			ret = dos_halt_locked(lease->dos, lease->engine);
+		if (ret) {
+			e->faulted = true;
+			e->halted = false;
+		}
+	}
+	dos_set_runner(e, NULL);
+	mutex_unlock(&e->lock);
+	wake_up_all(&e->run_wait);
+	return ret;
+}
+
+void s7d_codec_dos_run_wake(struct s7d_codec_lease *lease)
+{
+	struct s7d_codec_dos *dos = lease ? lease->dos : NULL;
+
+	if (dos && !dos_engine_check(lease->engine))
+		wake_up_all(&dos_eng(dos, lease->engine)->run_wait);
+}
+
+bool s7d_codec_dos_run_contended(struct s7d_codec_lease *lease)
+{
+	struct dos_engine *e;
+	bool contended;
+
+	if (dos_lease_engine(lease, &e) || !e->shared)
+		return false;
+	spin_lock(&e->run_lock);
+	contended = e->runner == lease && !list_empty(&e->queue);
+	spin_unlock(&e->run_lock);
+	return contended;
 }
 
 int s7d_codec_dos_engine_state(struct s7d_codec_dos *dos, enum s7d_codec_engine engine)

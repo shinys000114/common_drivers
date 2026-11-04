@@ -362,19 +362,30 @@ static const struct s7d_hevc_irq_ops av1_irq_ops = {
 	.thread = av1_thread,
 };
 
+/* Atomic: asked while the runner waits for its turn on the core. */
+static bool runner_cancelled(void *priv)
+{
+	struct s7d_av1_runner *runner = priv;
+
+	return READ_ONCE(runner->stopping);
+}
+
 static int runner_halt(struct s7d_av1_runner *runner)
 {
 	unsigned long flags;
-	int ret, joined = 0, halted = 0;
+	int ret = 0, joined = 0, halted = 0;
 
 	if (runner->quarantined)
 		return -EIO;
 	spin_lock_irqsave(&runner->irq_lock, flags);
 	runner->irq_accept = false;
 	spin_unlock_irqrestore(&runner->irq_lock, flags);
-	ret = s7d_codec_dos_prepare_access(runner->lease);
-	if (!ret)
-		ret = s7d_codec_dos_hevc_irq_mask(runner->lease, false);
+	/* Halted already: the core may run another session's picture now. */
+	if (!runner->quiesced) {
+		ret = s7d_codec_dos_prepare_access(runner->lease);
+		if (!ret)
+			ret = s7d_codec_dos_hevc_irq_mask(runner->lease, false);
+	}
 	if (runner->binding)
 		joined = s7d_hevc_engine_disarm(runner->engine, runner->binding);
 	mutex_lock(&runner->protocol);
@@ -422,6 +433,7 @@ void s7d_av1_runner_request_stop(struct s7d_av1_runner *runner)
 		s7d_codec_firmware_job_stop(runner->preload);
 	if (runner->job)
 		complete_all(&runner->job->wake);
+	s7d_codec_dos_run_wake(runner->lease);
 	spin_unlock_irqrestore(&runner->irq_lock, flags);
 }
 
@@ -568,7 +580,7 @@ static int runner_run(struct s7d_av1_runner *runner,
 	struct s7d_hevc_irq_cookie cookie;
 	struct s7d_av1_decode_result decoded = { 0 };
 	unsigned long flags;
-	int ret, halted;
+	int ret, halted, ended;
 
 	if (!runner || !session || !lease_epoch || !input_token || !data || !bytes ||
 	    (!header_result && !decode_result) || (header_result && decode_result) ||
@@ -657,9 +669,28 @@ static int runner_run(struct s7d_av1_runner *runner,
 	spin_lock_irqsave(&runner->irq_lock, flags);
 	runner->job = job;
 	spin_unlock_irqrestore(&runner->irq_lock, flags);
+	/* The core is idle when its turn comes; nothing of this TU ran yet. */
+	ret = s7d_codec_dos_run_begin(runner->lease, runner_cancelled, runner);
+	if (ret) {
+		halted = s7d_hevc_engine_unbind(runner->engine, runner->binding);
+		if (halted) {
+			runner->quarantined = true;
+			goto retained;
+		}
+		runner->binding = 0;
+		spin_lock_irqsave(&runner->irq_lock, flags);
+		runner->job = NULL;
+		spin_unlock_irqrestore(&runner->irq_lock, flags);
+		/* A stop or a broken core: the session's failure stays its own. */
+		if (ret != -ECANCELED)
+			runner->failure = ret;
+		goto unlock;
+	}
 	ret = runner_halt(runner);
-	if (ret)
+	if (ret) {
+		s7d_codec_dos_run_end(runner->lease);
 		goto retained;
+	}
 	if (!runner->context) {
 		runner->context = s7d_av1_dma_context_create(session,
 			job->result.sequence.max_frame_width,
@@ -774,6 +805,10 @@ static int runner_run(struct s7d_av1_runner *runner,
 	mutex_unlock(&runner->protocol);
 stop:
 	halted = runner_halt(runner);
+	/* Halted: the next session's picture may run while this one is finished. */
+	ended = s7d_codec_dos_run_end(runner->lease);
+	if (!halted && ended)
+		halted = ended;
 	if (job->reference_run && !halted) {
 		int finish;
 
