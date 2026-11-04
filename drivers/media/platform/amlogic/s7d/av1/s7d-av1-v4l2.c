@@ -54,8 +54,25 @@ struct av1_bind {
 	u64 token;
 };
 
+/* What one instance holds the HEVC core with, through each of its sessions. */
+struct av1_resources {
+	struct s7d_av1_v4l2 *adapter;
+	struct mutex lock;
+	struct s7d_codec_lease lease;
+	/* Runs this instance's TUs on the core with the lease. */
+	struct s7d_av1_runner *runner;
+	u64 lease_epoch;
+	int stop_error;
+	int release_error;
+	bool lease_active;
+	bool runner_closed;
+	bool quiesced;
+	bool release_pin;
+};
+
 struct av1_backend {
 	struct s7d_av1_v4l2 *adapter;
+	struct av1_resources res;
 	struct list_head node;
 	struct mutex lock;
 	struct mutex notifications;
@@ -136,97 +153,99 @@ struct s7d_av1_v4l2 {
 	struct device *dev;
 	struct module *owner;
 	struct s7d_codec_dos *dos;
-	/* The HEVC core lease, held through each session and lent to the runner. */
-	struct s7d_codec_lease lease;
+	struct s7d_codec_firmware_owner *firmware;
+	struct s7d_hevc_engine *engine;
+	/* The AV1 sessions of all instances; each holds the core with its resources. */
 	struct s7d_codec_core *core;
-	struct s7d_av1_runner *runner;
 	struct s7d_v4l2_backend_factory factory;
 	struct mutex clients;
+	/* release_error: an instance failed to give the core back. */
 	struct mutex resources;
 	struct list_head instances;
-	struct av1_backend *active;
-	u64 lease_epoch;
-	int stop_error;
 	int release_error;
-	bool lease_active;
-	bool runner_closed;
-	bool quiesced;
-	bool release_pin;
 	bool closing;
 };
 
 static int av1_hold(void *priv, enum s7d_codec_engine engine)
 {
-	struct s7d_av1_v4l2 *adapter = priv;
+	struct av1_resources *res = priv;
+	struct s7d_av1_v4l2 *adapter;
 	int ret;
 
+	if (!res)
+		return -EINVAL;
 	if (engine != S7D_CODEC_ENGINE_HEVC)
 		return -EOPNOTSUPP;
-	mutex_lock(&adapter->resources);
-	if (READ_ONCE(adapter->closing) || adapter->release_error)
+	adapter = res->adapter;
+	mutex_lock(&res->lock);
+	if (READ_ONCE(adapter->closing) || res->release_error)
 		ret = -ESHUTDOWN;
-	else if (adapter->lease_epoch == U64_MAX)
+	else if (res->lease_epoch == U64_MAX)
 		ret = -EOVERFLOW;
 	else
-		ret = s7d_codec_dos_hold(adapter->dos, engine, &adapter->lease);
+		ret = s7d_codec_dos_hold(adapter->dos, engine, &res->lease);
 	if (!ret) {
-		adapter->lease_epoch++;
-		adapter->lease_active = true;
-		adapter->runner_closed = true;
-		adapter->quiesced = false;
-		adapter->stop_error = 0;
+		res->lease_epoch++;
+		res->lease_active = true;
+		res->runner_closed = true;
+		res->quiesced = false;
+		res->stop_error = 0;
 	}
-	mutex_unlock(&adapter->resources);
+	mutex_unlock(&res->lock);
 	return ret;
 }
 
 static int av1_quiesce(void *priv, enum s7d_codec_engine engine)
 {
-	struct s7d_av1_v4l2 *adapter = priv;
+	struct av1_resources *res = priv;
 	int ret, ended;
 
 	if (engine != S7D_CODEC_ENGINE_HEVC)
 		return -EOPNOTSUPP;
-	mutex_lock(&adapter->resources);
-	ret = adapter->stop_error;
-	if (!ret && !adapter->runner_closed)
+	mutex_lock(&res->lock);
+	ret = res->stop_error;
+	if (!ret && !res->runner_closed)
 		ret = -EBUSY;
 	/* The halt takes the session's turn on the core. */
 	if (!ret)
-		ret = s7d_codec_dos_run_begin(&adapter->lease, NULL, NULL);
+		ret = s7d_codec_dos_run_begin(&res->lease, NULL, NULL);
 	if (!ret) {
-		ret = s7d_codec_dos_prepare_access(&adapter->lease);
+		ret = s7d_codec_dos_prepare_access(&res->lease);
 		if (!ret)
-			ret = s7d_codec_dos_hevc_irq_mask(&adapter->lease, false);
+			ret = s7d_codec_dos_hevc_irq_mask(&res->lease, false);
 		if (!ret)
-			ret = s7d_codec_dos_halt(&adapter->lease);
-		ended = s7d_codec_dos_run_end(&adapter->lease);
+			ret = s7d_codec_dos_halt(&res->lease);
+		ended = s7d_codec_dos_run_end(&res->lease);
 		if (!ret)
 			ret = ended;
 	}
 	if (!ret)
-		adapter->quiesced = true;
-	mutex_unlock(&adapter->resources);
+		res->quiesced = true;
+	mutex_unlock(&res->lock);
 	return ret;
 }
 
 static void av1_release(void *priv, enum s7d_codec_engine engine)
 {
-	struct s7d_av1_v4l2 *adapter = priv;
+	struct av1_resources *res = priv;
+	struct s7d_av1_v4l2 *adapter = res->adapter;
 	int ret;
 
-	mutex_lock(&adapter->resources);
-	ret = engine != S7D_CODEC_ENGINE_HEVC || !adapter->quiesced ? -EBUSY :
-		s7d_codec_dos_release(&adapter->lease);
+	mutex_lock(&res->lock);
+	ret = engine != S7D_CODEC_ENGINE_HEVC || !res->quiesced ? -EBUSY :
+		s7d_codec_dos_release(&res->lease);
 	if (!ret) {
-		adapter->lease_active = false;
+		res->lease_active = false;
 	} else {
+		res->release_error = ret;
+		if (!res->release_pin && try_module_get(adapter->owner))
+			res->release_pin = true;
+		mutex_lock(&adapter->resources);
 		adapter->release_error = ret;
-		if (!adapter->release_pin && try_module_get(adapter->owner))
-			adapter->release_pin = true;
+		mutex_unlock(&adapter->resources);
 		dev_err(adapter->dev, "AV1 resource release failed: %d; owner retained\n", ret);
 	}
-	mutex_unlock(&adapter->resources);
+	mutex_unlock(&res->lock);
 }
 
 static const struct s7d_codec_resource_ops av1_resource_ops = {
@@ -665,7 +684,7 @@ static int av1_unbind(struct av1_backend *backend)
 
 	if (!backend->bound)
 		return 0;
-	ret = s7d_av1_runner_unbind(backend->adapter->runner, cookie, &count);
+	ret = s7d_av1_runner_unbind(backend->res.runner, cookie, &count);
 	for (i = 0; !ret && i < count; i++)
 		ret = cookie[i] && cookie[i] <= backend->captures ?
 			av1_release_capture(backend, cookie[i] - 1) : -EPROTO;
@@ -872,7 +891,7 @@ static int av1_publish(struct av1_backend *backend)
 		return -EOPNOTSUPP;
 	ret = backend->bound ? av1_publish_bound(backend) : -EPROTO;
 	if (!ret)
-		ret = s7d_av1_runner_output_committed(backend->adapter->runner, output);
+		ret = s7d_av1_runner_output_committed(backend->res.runner, output);
 	if (ret)
 		return ret;
 	backend->frame_sequence++;
@@ -882,7 +901,6 @@ static int av1_publish(struct av1_backend *backend)
 static void av1_work(struct work_struct *work)
 {
 	struct av1_backend *backend = container_of(work, struct av1_backend, work);
-	struct s7d_av1_v4l2 *adapter = backend->adapter;
 	u64 token = 0;
 	bool cancelled;
 	int ret;
@@ -1015,12 +1033,12 @@ static void av1_work(struct work_struct *work)
 						data = seeded;
 					backend->seed_sequence = false;
 				}
-				mutex_lock(&adapter->resources);
-				adapter->runner_closed = false;
-				mutex_unlock(&adapter->resources);
+				mutex_lock(&backend->res.lock);
+				backend->res.runner_closed = false;
+				mutex_unlock(&backend->res.lock);
 				mutex_unlock(&backend->lock);
 				memset(&backend->result, 0, sizeof(backend->result));
-				ret = s7d_av1_runner_decode(adapter->runner, backend->session,
+				ret = s7d_av1_runner_decode(backend->res.runner, backend->session,
 					backend->lease_epoch, picture_token, data, bytes,
 					backend->input.timestamp_ns, &target, &backend->result);
 				kvfree(seeded);
@@ -1116,16 +1134,15 @@ static int av1_prepare(void *priv, struct s7d_codec_session *session,
 		return -EINVAL;
 	mutex_lock(&adapter->clients);
 	mutex_lock(&backend->lock);
-	if (adapter->closing || backend->closing || backend->session || adapter->active) {
+	if (adapter->closing || backend->closing || backend->session) {
 		ret = -EBUSY;
 	} else {
 		s7d_codec_session_get(session);
 		backend->session = session;
 		backend->frontend = frontend;
-		mutex_lock(&adapter->resources);
-		backend->lease_epoch = adapter->lease_epoch;
-		mutex_unlock(&adapter->resources);
-		adapter->active = backend;
+		mutex_lock(&backend->res.lock);
+		backend->lease_epoch = backend->res.lease_epoch;
+		mutex_unlock(&backend->res.lock);
 	}
 	mutex_unlock(&backend->lock);
 	mutex_unlock(&adapter->clients);
@@ -1426,7 +1443,6 @@ static int av1_resume(void *priv)
 static void av1_detach(void *priv)
 {
 	struct av1_backend *backend = priv;
-	struct s7d_av1_v4l2 *adapter = backend->adapter;
 	int ret = 0;
 
 	mutex_lock(&backend->stop);
@@ -1435,7 +1451,7 @@ static void av1_detach(void *priv)
 	mutex_lock(&backend->lock);
 	backend->closing = true;
 	if (backend->session)
-		s7d_av1_runner_request_stop(adapter->runner);
+		s7d_av1_runner_request_stop(backend->res.runner);
 	mutex_unlock(&backend->lock);
 	cancel_work_sync(&backend->work);
 	mutex_lock(&backend->notifications);
@@ -1443,16 +1459,18 @@ static void av1_detach(void *priv)
 	mutex_unlock(&backend->notifications);
 	if (backend->session) {
 		if (backend->output_pending) {
-			ret = s7d_av1_runner_output_committed(adapter->runner, &backend->result.output);
+			ret = s7d_av1_runner_output_committed(backend->res.runner,
+							      &backend->result.output);
 			if (!ret)
 				backend->output_pending = false;
 		}
 		if (!ret)
-			ret = s7d_av1_runner_close(adapter->runner, backend->session, backend->lease_epoch);
-		mutex_lock(&adapter->resources);
-		adapter->stop_error = ret;
-		adapter->runner_closed = !ret;
-		mutex_unlock(&adapter->resources);
+			ret = s7d_av1_runner_close(backend->res.runner, backend->session,
+						   backend->lease_epoch);
+		mutex_lock(&backend->res.lock);
+		backend->res.stop_error = ret;
+		backend->res.runner_closed = !ret;
+		mutex_unlock(&backend->res.lock);
 	}
 	backend->stop_error = ret;
 	backend->detached = true;
@@ -1476,8 +1494,6 @@ static int av1_release_epoch(struct av1_backend *backend)
 			return ret;
 	}
 	mutex_lock(&backend->lock);
-	if (backend->adapter->active == backend)
-		backend->adapter->active = NULL;
 	session = backend->session;
 	backend->session = NULL;
 	mutex_unlock(&backend->lock);
@@ -1654,7 +1670,7 @@ static int av1_reconfigure_restore(void *priv, struct s7d_codec_session *session
 	if (adapter->closing || backend->closing || backend->failure)
 		ret = backend->failure ? backend->failure : -ESHUTDOWN;
 	else if (!av1_change_matches(backend, change) || !backend->change_stopped ||
-		 backend->session || adapter->active || backend->captures ||
+		 backend->session || backend->captures ||
 		 !backend->input_pending || !backend->preflight || !backend->held_input ||
 		 !session || !frontend || !staging || generation <= change->generation ||
 		 s7d_codec_dma_size(staging) < backend->input.bytes)
@@ -1664,10 +1680,9 @@ static int av1_reconfigure_restore(void *priv, struct s7d_codec_session *session
 	s7d_codec_session_get(session);
 	backend->session = session;
 	backend->frontend = frontend;
-	mutex_lock(&adapter->resources);
-	backend->lease_epoch = adapter->lease_epoch;
-	mutex_unlock(&adapter->resources);
-	adapter->active = backend;
+	mutex_lock(&backend->res.lock);
+	backend->lease_epoch = backend->res.lease_epoch;
+	mutex_unlock(&backend->res.lock);
 	memcpy(s7d_codec_dma_cpu(staging), backend->held_input, backend->input.bytes);
 	backend->input.memory = staging;
 	av1_take_sequence(backend, &backend->next_sequence, backend->next_payload,
@@ -1695,7 +1710,7 @@ static int av1_clear_stream(void *priv)
 	mutex_lock(&backend->lock);
 	if (adapter->closing || backend->closing || backend->failure) {
 		ret = backend->failure ? backend->failure : -ESHUTDOWN;
-	} else if (backend->session || backend->frontend || adapter->active == backend ||
+	} else if (backend->session || backend->frontend ||
 		   backend->generation || backend->captures || backend->input_pending ||
 		   backend->execution_attempted || backend->drain_pending ||
 		   work_busy(&backend->work)) {
@@ -1714,7 +1729,15 @@ static int av1_clear_stream(void *priv)
 	return ret;
 }
 
+static void *av1_resources(void *priv)
+{
+	struct av1_backend *backend = priv;
+
+	return &backend->res;
+}
+
 static const struct s7d_v4l2_backend_ops av1_ops = {
+	.resources = av1_resources,
 	.prepare = av1_prepare,
 	.submit = av1_submit,
 	.sync_initial = av1_sync_initial,
@@ -1745,13 +1768,26 @@ static void *av1_factory_create(void *priv)
 {
 	struct s7d_av1_v4l2 *adapter = priv;
 	struct av1_backend *backend;
+	int ret;
 
 	backend = kzalloc(sizeof(*backend), GFP_KERNEL);
 	if (!backend)
 		return ERR_PTR(-ENOMEM);
+	backend->res.adapter = adapter;
+	mutex_init(&backend->res.lock);
+	backend->res.runner = s7d_av1_runner_create(adapter->dev, adapter->dos,
+			&backend->res.lease, adapter->firmware, adapter->engine,
+			AV1_STAGING_BYTES);
+	if (IS_ERR(backend->res.runner)) {
+		ret = PTR_ERR(backend->res.runner);
+		kfree(backend);
+		return ERR_PTR(ret);
+	}
 	mutex_lock(&adapter->clients);
 	if (adapter->closing || !try_module_get(adapter->owner)) {
 		mutex_unlock(&adapter->clients);
+		/* Never run: nothing can keep it. */
+		WARN_ON(s7d_av1_runner_destroy(backend->res.runner));
 		kfree(backend);
 		return ERR_PTR(-ESHUTDOWN);
 	}
@@ -1774,6 +1810,13 @@ static void av1_factory_destroy(void *priv, void *instance)
 	mutex_lock(&adapter->clients);
 	av1_detach(backend);
 	ret = av1_release_epoch(backend);
+	if (!ret) {
+		mutex_lock(&backend->res.lock);
+		ret = backend->res.lease_active || backend->res.release_error ? -EBUSY : 0;
+		mutex_unlock(&backend->res.lock);
+	}
+	if (!ret)
+		ret = s7d_av1_runner_destroy(backend->res.runner);
 	if (ret) {
 		dev_err(adapter->dev, "AV1 instance stop failed: %d; owner retained\n", ret);
 		mutex_unlock(&adapter->clients);
@@ -1804,19 +1847,14 @@ s7d_av1_v4l2_create(struct device *dev, struct s7d_codec_dos *dos,
 	adapter->dev = get_device(dev);
 	adapter->owner = owner;
 	adapter->dos = dos;
+	adapter->firmware = firmware;
+	adapter->engine = engine;
 	mutex_init(&adapter->clients);
 	mutex_init(&adapter->resources);
 	INIT_LIST_HEAD(&adapter->instances);
-	adapter->runner = s7d_av1_runner_create(dev, dos, &adapter->lease, firmware, engine,
-						AV1_STAGING_BYTES);
-	if (IS_ERR(adapter->runner)) {
-		ret = PTR_ERR(adapter->runner);
-		goto free_adapter;
-	}
-	adapter->core = s7d_codec_core_create(dev, owner, &av1_resource_ops, adapter, 32);
+	adapter->core = s7d_codec_core_create(dev, owner, &av1_resource_ops, NULL, 32);
 	if (IS_ERR(adapter->core)) {
 		ret = PTR_ERR(adapter->core);
-		s7d_av1_runner_destroy(adapter->runner);
 		goto free_adapter;
 	}
 	adapter->factory = (struct s7d_v4l2_backend_factory) {
@@ -1855,12 +1893,25 @@ s7d_av1_v4l2_factory(struct s7d_av1_v4l2 *adapter)
 
 int s7d_av1_v4l2_suspend_check(struct s7d_av1_v4l2 *adapter)
 {
+	struct av1_backend *backend;
 	int ret;
 
 	mutex_lock(&adapter->clients);
 	mutex_lock(&adapter->resources);
-	ret = adapter->active || adapter->lease_active || adapter->release_error ? -EBUSY : 0;
+	ret = adapter->release_error ? -EBUSY : 0;
 	mutex_unlock(&adapter->resources);
+	list_for_each_entry(backend, &adapter->instances, node) {
+		if (ret)
+			break;
+		mutex_lock(&backend->lock);
+		if (backend->session)
+			ret = -EBUSY;
+		mutex_unlock(&backend->lock);
+		mutex_lock(&backend->res.lock);
+		if (backend->res.lease_active || backend->res.release_error)
+			ret = -EBUSY;
+		mutex_unlock(&backend->res.lock);
+	}
 	if (!ret)
 		ret = s7d_codec_dos_suspend_check(adapter->dos);
 	mutex_unlock(&adapter->clients);
@@ -1896,7 +1947,7 @@ int s7d_av1_v4l2_destroy(struct s7d_av1_v4l2 *adapter)
 		goto unlock;
 	}
 	mutex_lock(&adapter->resources);
-	ret = adapter->lease_active || adapter->release_error ? -EBUSY : 0;
+	ret = adapter->release_error ? -EBUSY : 0;
 	mutex_unlock(&adapter->resources);
 	if (ret)
 		goto unlock;
@@ -1906,7 +1957,6 @@ int s7d_av1_v4l2_destroy(struct s7d_av1_v4l2 *adapter)
 			goto unlock;
 		adapter->core = NULL;
 	}
-	ret = s7d_av1_runner_destroy(adapter->runner);
 unlock:
 	mutex_unlock(&adapter->clients);
 	if (ret)
