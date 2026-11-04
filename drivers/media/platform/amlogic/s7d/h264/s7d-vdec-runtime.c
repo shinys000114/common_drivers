@@ -89,6 +89,17 @@ struct s7d_vdec_runtime {
 	bool error_pin;
 	bool stop_requested;
 	bool preload_abort;
+	/*
+	 * Under control: this session runs VDEC, from its turn's run_begin to
+	 * the run_end after the halt or park (and the backend's reading of the
+	 * parked picture) that leaves the engine idle.
+	 */
+	bool token;
+	/*
+	 * Under the lock: a run of this hold ended with its picture parked, so
+	 * nothing of this session is left on VDEC between its runs.
+	 */
+	bool ran;
 };
 
 static void runtime_clear_resumed(struct s7d_vdec_runtime *runtime)
@@ -181,6 +192,43 @@ static void runtime_block_backend(struct s7d_vdec_runtime *runtime)
 	mutex_lock(runtime->transaction);
 	runtime->ops.block(runtime->priv);
 	mutex_unlock(runtime->transaction);
+}
+
+/* Atomic: a stop or close ends the wait for a turn on VDEC. */
+static bool runtime_turn_cancelled(void *priv)
+{
+	struct s7d_vdec_runtime *runtime = priv;
+
+	return READ_ONCE(runtime->stop_requested) || READ_ONCE(runtime->preload_abort);
+}
+
+/*
+ * Wait for this session's turn on VDEC, which the sessions of the engine
+ * take in arrival order; the engine is idle when it comes. A stop takes its
+ * turn too, to halt, and is not cancelled by itself.
+ */
+static int runtime_begin_run(struct s7d_vdec_runtime *runtime, bool stop)
+{
+	int ret;
+
+	lockdep_assert_held(&runtime->control);
+	if (runtime->token)
+		return 0;
+	ret = s7d_codec_dos_run_begin(&runtime->lease, stop ? NULL : runtime_turn_cancelled,
+				      runtime);
+	if (!ret)
+		runtime->token = true;
+	return ret;
+}
+
+/* After the halt or park that left VDEC idle: the next session may run it. */
+static int runtime_end_run(struct s7d_vdec_runtime *runtime)
+{
+	lockdep_assert_held(&runtime->control);
+	if (!runtime->token)
+		return 0;
+	runtime->token = false;
+	return s7d_codec_dos_run_end(&runtime->lease);
 }
 
 static void runtime_irq_error(struct s7d_vdec_runtime *runtime, int ret)
@@ -276,6 +324,7 @@ static int runtime_hold(void *priv, enum s7d_codec_engine engine)
 	runtime->stopped_session = NULL;
 	runtime->stop_requested = false;
 	runtime->preload_abort = false;
+	runtime->ran = false;
 	runtime_clear_park(runtime);
 	runtime_clear_resumed(runtime);
 	spin_unlock_irqrestore(&runtime->lock, flags);
@@ -365,22 +414,26 @@ void s7d_vdec_runtime_request_preload_stop(struct s7d_vdec_runtime *runtime,
 					 struct s7d_codec_session *session)
 {
 	unsigned long flags;
+	bool wake = false;
 
 	spin_lock_irqsave(&runtime->lock, flags);
 	if (session && runtime->session == session) {
 		runtime->preload_abort = true;
 		if (runtime->preload_job)
 			s7d_codec_firmware_job_stop(runtime->preload_job);
+		wake = true;
 	}
 	spin_unlock_irqrestore(&runtime->lock, flags);
+	if (wake)
+		s7d_codec_dos_run_wake(&runtime->lease);
 }
 
 static int runtime_quiesce_locked(struct s7d_vdec_runtime *runtime)
 {
 	struct s7d_codec_session *session = NULL;
 	unsigned long flags;
-	bool running;
-	int ret, drain, halt = 0;
+	bool running, lost, idle;
+	int ret, drain, halt = 0, ended;
 
 	spin_lock_irqsave(&runtime->lock, flags);
 	if (runtime->preload_job) {
@@ -403,6 +456,7 @@ static int runtime_quiesce_locked(struct s7d_vdec_runtime *runtime)
 		return -EBUSY;
 	}
 	running = runtime->state == VDEC_ARMING || runtime->state == VDEC_RUNNING;
+	idle = !runtime->token && runtime->ran;
 	runtime->state = VDEC_STOPPING;
 	runtime_clear_park(runtime);
 	runtime_clear_resumed(runtime);
@@ -411,18 +465,37 @@ static int runtime_quiesce_locked(struct s7d_vdec_runtime *runtime)
 	spin_unlock_irqrestore(&runtime->lock, flags);
 
 	runtime_block_backend(runtime);
-	ret = s7d_codec_dos_prepare_access(&runtime->lease);
-	if (!ret)
+	/*
+	 * Between its runs, a session that ran has nothing on VDEC: its last
+	 * run parked it, and run_end halts whatever a run leaves running. It
+	 * stops without a turn behind the other sessions' pictures. A hold that
+	 * never ran takes the turn, so that the last holder leaves VDEC halted.
+	 */
+	ret = idle ? 0 : runtime_begin_run(runtime, true);
+	/*
+	 * Another session's run broke VDEC, so this one can no longer take a
+	 * turn to halt it. Each of its own runs ended with the engine idle:
+	 * nothing of it runs there.
+	 */
+	lost = idle || (ret == -EIO && s7d_codec_dos_faulted_by_other(&runtime->lease));
+	if (lost)
+		ret = 0;
+	else if (!ret)
+		ret = s7d_codec_dos_prepare_access(&runtime->lease);
+	if (!ret && !lost)
 		ret = runtime_mask(runtime, 0);
 	s7d_vdec_engine_disarm(runtime->engine, runtime);
 	drain = runtime_errno(runtime->ops.drain(runtime->priv));
 	/* A picture cut short at halt hangs the bus at the next DMC port enable. */
-	if (!ret && !drain && running)
+	if (!ret && !drain && running && !lost)
 		runtime->ops.settle(runtime->priv, runtime->map);
-	if (!ret && !drain)
+	if (!ret && !drain && !lost)
 		halt = s7d_codec_dos_halt(&runtime->lease);
 	if (!ret)
 		ret = drain ? drain : halt;
+	ended = runtime_end_run(runtime);
+	if (!ret)
+		ret = ended;
 
 	spin_lock_irqsave(&runtime->lock, flags);
 	if (ret) {
@@ -458,6 +531,8 @@ static int runtime_quiesce(void *priv, enum s7d_codec_engine engine)
 		s7d_codec_firmware_job_stop(job);
 	}
 	spin_unlock_irqrestore(&runtime->lock, flags);
+	/* A run that waits for its turn behind another session gives it up. */
+	s7d_codec_dos_run_wake(&runtime->lease);
 	if (job)
 		s7d_codec_firmware_job_join(job);
 	mutex_lock(&runtime->control);
@@ -569,6 +644,18 @@ free:
 	return ERR_PTR(ret);
 }
 
+/* A picture's turn on VDEC; a stop or close while it waits cancels it. */
+static int runtime_turn(struct s7d_vdec_runtime *runtime, bool *cancelled)
+{
+	int ret = runtime_begin_run(runtime, false);
+
+	if (ret == -ECANCELED) {
+		*cancelled = true;
+		ret = -ESHUTDOWN;
+	}
+	return ret;
+}
+
 int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 			     struct s7d_codec_session *session, bool *cancelled)
 {
@@ -594,6 +681,9 @@ int s7d_vdec_runtime_prepare(struct s7d_vdec_runtime *runtime,
 	runtime->session = session;
 	runtime->state = VDEC_PREPARING;
 	spin_unlock_irqrestore(&runtime->lock, flags);
+	ret = runtime_turn(runtime, cancelled);
+	if (ret)
+		goto fail;
 	ret = s7d_codec_dos_prepare(&runtime->lease);
 	if (ret)
 		goto fail;
@@ -875,6 +965,7 @@ int s7d_vdec_runtime_park(struct s7d_vdec_runtime *runtime,
 		runtime->park_input = input;
 		runtime->park_dpb = dpb;
 		runtime->state = VDEC_AU_PARKED;
+		runtime->ran = true;
 		runtime_clear_resumed(runtime);
 	}
 	spin_unlock_irqrestore(&runtime->lock, flags);
@@ -957,6 +1048,7 @@ int s7d_vdec_runtime_abort(struct s7d_vdec_runtime *runtime,
 		runtime->park_input = runtime->resumed_input;
 		runtime->park_dpb = runtime->resumed_dpb;
 		runtime->state = VDEC_AU_PARKED;
+		runtime->ran = true;
 		runtime_clear_resumed(runtime);
 	}
 	spin_unlock_irqrestore(&runtime->lock, flags);
@@ -988,6 +1080,25 @@ int s7d_vdec_runtime_check_parked(struct s7d_vdec_runtime *runtime,
 	spin_lock_irqsave(&runtime->lock, flags);
 	ret = runtime_parked_check(runtime, session, input_token, write_token, park_epoch);
 	spin_unlock_irqrestore(&runtime->lock, flags);
+	return ret;
+}
+
+int s7d_vdec_runtime_end_run(struct s7d_vdec_runtime *runtime,
+			     struct s7d_codec_session *session)
+{
+	unsigned long flags;
+	int ret;
+
+	if (!session)
+		return -EINVAL;
+	mutex_lock(&runtime->control);
+	spin_lock_irqsave(&runtime->lock, flags);
+	ret = runtime->state == VDEC_AU_PARKED && runtime->session == session &&
+	      !runtime->irq_accept && !runtime->irq_enabled ? 0 : -ESTALE;
+	spin_unlock_irqrestore(&runtime->lock, flags);
+	if (!ret)
+		ret = runtime_end_run(runtime);
+	mutex_unlock(&runtime->control);
 	return ret;
 }
 
@@ -1045,6 +1156,9 @@ int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 		ret = state.failure ? runtime_errno(state.failure) : -ESTALE;
 		goto fail;
 	}
+	ret = runtime_turn(runtime, cancelled);
+	if (ret)
+		goto fail;
 	ret = s7d_codec_dos_prepare(&runtime->lease);
 	if (ret)
 		goto fail;
@@ -1209,7 +1323,8 @@ int s7d_vdec_runtime_destroy(struct s7d_vdec_runtime *runtime)
 	mutex_lock(&runtime->control);
 	spin_lock_irqsave(&runtime->lock, flags);
 	if (runtime->state != VDEC_IDLE || runtime->session || runtime->error_pin ||
-	    runtime->preload_job || runtime->irq_enabled || runtime->irq_accept) {
+	    runtime->preload_job || runtime->irq_enabled || runtime->irq_accept ||
+	    runtime->token) {
 		spin_unlock_irqrestore(&runtime->lock, flags);
 		mutex_unlock(&runtime->control);
 		return -EBUSY;

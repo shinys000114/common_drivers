@@ -87,6 +87,14 @@ int s7d_vdec_runtime_abort(struct s7d_vdec_runtime *runtime,
 int s7d_vdec_runtime_check_parked(struct s7d_vdec_runtime *runtime,
 				  struct s7d_codec_session *session,
 				  u64 input_token, u64 write_token, u64 park_epoch);
+/*
+ * The sessions of VDEC take turns picture by picture: prepare and resume wait
+ * for the session's turn, and a park or abort keeps it, so that the backend
+ * can still read its parked picture. Call this once the backend is done with
+ * the engine: the next session may run it. A stop ends the turn itself.
+ */
+int s7d_vdec_runtime_end_run(struct s7d_vdec_runtime *runtime,
+			     struct s7d_codec_session *session);
 /* Confirm context and retire the matching DPB/input before starting next AU. */
 int s7d_vdec_runtime_resume(struct s7d_vdec_runtime *runtime,
 			    struct s7d_codec_session *session, u64 input_token,

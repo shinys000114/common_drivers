@@ -1261,6 +1261,9 @@ static int backend_complete_picture(struct s7d_h264_backend *backend, bool *canc
 			backend->resyncs = 0;
 	}
 	mutex_unlock(&backend->transaction);
+	/* The parked picture is read: another session's picture may run. */
+	if (!ret)
+		ret = s7d_vdec_runtime_end_run(backend->runtime, backend->session);
 	return ret ? ret : backend_notify_input(backend, input, 0, cancelled);
 }
 
@@ -1310,6 +1313,8 @@ static int backend_abort_picture(struct s7d_h264_backend *backend, bool *cancell
 		ret = backend_resync(backend, error);
 	}
 	mutex_unlock(&backend->transaction);
+	if (!ret)
+		ret = s7d_vdec_runtime_end_run(backend->runtime, backend->session);
 	return ret ? ret : backend_notify_input(backend, input, error, cancelled);
 }
 
