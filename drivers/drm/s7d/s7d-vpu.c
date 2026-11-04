@@ -763,7 +763,8 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 	return rate_matches(state->pixel_rate, state->output.rate.pixel) ? 0 : -ERANGE;
 }
 
-static int check_handoff(struct s7d_vpu *v);
+static int check_handoff(struct s7d_vpu *v, bool boot);
+static int s7d_vpu_restart(struct s7d_vpu *v);
 
 static void s7d_vpu_disable_pixel(struct s7d_vpu *v)
 {
@@ -777,19 +778,15 @@ static void s7d_vpu_disable_pixel(struct s7d_vpu *v)
 	v->pixel_enabled = false;
 }
 
-static int s7d_vpu_acquire(void *data)
+/*
+ * Clock the VPU and check what it runs. At @boot, routes the takeover
+ * refuses are stopped and reset instead; if that fails, the VPU stays
+ * acquired, as after a failed stop.
+ */
+static int s7d_vpu_take(struct s7d_vpu *v, bool boot)
 {
-	struct s7d_vpu *v = data;
 	int ret;
 
-	if (v->unusable)
-		return v->unusable;
-	if (v->boot_held) {
-		v->boot_held = false;
-		return 0;
-	}
-	if (v->acquired)
-		return -EBUSY;
 	ret = pm_runtime_resume_and_get(v->dev);
 	if (ret < 0)
 		return ret;
@@ -799,7 +796,15 @@ static int s7d_vpu_acquire(void *data)
 		return ret;
 	}
 	v->acquired = true;
-	ret = check_handoff(v);
+	ret = check_handoff(v, boot);
+	if (ret == -EOPNOTSUPP && boot) {
+		ret = s7d_vpu_restart(v);
+		if (ret)
+			return ret;
+		ret = check_handoff(v, false);
+		if (ret)
+			return ret;
+	}
 	if (ret)
 		goto disable_bus;
 	/* Keep a live firmware output until prepare has verified its stop. */
@@ -825,6 +830,39 @@ disable_bus:
 	return ret;
 }
 
+static int s7d_vpu_acquire(void *data)
+{
+	struct s7d_vpu *v = data;
+
+	if (v->unusable)
+		return v->unusable;
+	if (v->boot_held) {
+		v->boot_held = false;
+		return 0;
+	}
+	if (v->acquired)
+		return -EBUSY;
+	return s7d_vpu_take(v, false);
+}
+
+/*
+ * What the firmware can leave, and what the probe makes of it:
+ * - The VPU/HDMI power domain or a VPU SRAM bank off: the VPU is never
+ *   touched (s7d_vpu_record_power()).
+ * - The VPU resets held, as with no display setup at all: they are released
+ *   and the first modeset sets everything up.
+ * - The linear OSD path, with a running ENCP output (U-Boot showed its logo)
+ *   or without one (it set the VPU up but had no sink): held as it is; a
+ *   running output stays on screen until the first modeset stops it.
+ * - Anything the takeover refuses (video, GFCD or AFBC routes, a foreign
+ *   ENCP clock or read arbiter): stopped blindly and reset, the screen dark
+ *   until the first modeset (s7d_vpu_restart()).
+ * If the takeover fails, the CRTC refuses to enable. A failed restart leaves
+ * the VPU in no known state, perhaps still scanning out: it stays acquired
+ * and is never touched again, and neither sleep nor unbind releases it, as
+ * after a failed stop. The probe completes in every case, so the DRM minors
+ * stay the display's.
+ */
 int s7d_vpu_hold_boot(struct s7d_vpu *v)
 {
 	int ret;
@@ -834,10 +872,18 @@ int s7d_vpu_hold_boot(struct s7d_vpu *v)
 	/* Keep the device for the display, without one VCBUS access. */
 	if (v->unusable)
 		return 0;
-	ret = s7d_vpu_acquire(v);
-	if (!ret)
-		v->boot_held = true;
-	return ret;
+	ret = s7d_vpu_take(v, true);
+	if (ret) {
+		v->unusable = ret;
+		/* Only a failed restart returns with the VPU acquired. */
+		v->boot.retained = v->acquired;
+		dev_err(v->dev, "display takeover failed (%d); display disabled%s\n", ret,
+			v->boot.retained ? ", VPU kept as the restart left it" : "");
+		return 0;
+	}
+	v->boot_held = true;
+	v->boot.output = v->pixel_enabled;
+	return 0;
 }
 
 static void s7d_vpu_disable_vblank(void *data)
@@ -1248,10 +1294,34 @@ static int s7d_vpu_stop(void *data)
 	return ret;
 }
 
-static int check_handoff(struct s7d_vpu *v)
+/*
+ * Initial takeover supports firmware's linear OSD path. Refuse video,
+ * GFCD/AFBC routes rather than guessing their stop/idle/reset protocols.
+ * The provider profile excludes Linux video/capture and legacy writers.
+ * ENCP FIFO must use cts_vpu_clk, not an unowned vpu_clkc route. Both
+ * OSD arbiter branches and RDMA must use the READ0 idle we check.
+ */
+static const struct {
+	u16 reg;
+	u32 mask;
+	bool untouched;
+} s7d_vpu_refused[] = {
+	{ OSD_PATH, BIT(14) | GENMASK(12, 9) | GENMASK(7, 0) },
+	{ VD1_PATH, 0x007dff00 },
+	{ VD2_PATH, 0x007dfe00 },
+	{ 0x1d26, BIT(27) },
+	{ VD1_BLEND, 0x0f0f, true },
+	{ VD2_BLEND, 0x0f0f, true },
+	{ VENC_CLK, BIT(0) },
+	{ RDARB_MODE_L2, GENMASK(18, 16) },
+};
+
+/* At @boot, record what the firmware left and report a refusal as such. */
+static int check_handoff(struct s7d_vpu *v, bool boot)
 {
 	bool cold = false;
 	unsigned int i;
+	u32 value;
 	int ret;
 
 	/* Without firmware setup the display starts cold: release its resets. */
@@ -1267,39 +1337,212 @@ static int check_handoff(struct s7d_vpu *v)
 			return ret;
 		dev_info(v->dev, "VPU held in reset; starting it without firmware setup\n");
 	}
-	/*
-	 * Initial takeover supports firmware's linear OSD path. Refuse video,
-	 * GFCD/AFBC routes rather than guessing their stop/idle/reset protocols.
-	 * The provider profile excludes Linux video/capture and legacy writers.
-	 * ENCP FIFO must use cts_vpu_clk, not an unowned vpu_clkc route. Both
-	 * OSD arbiter branches and RDMA must use the READ0 idle we check.
-	 */
+	if (boot)
+		v->boot.reset_held = cold;
+	for (i = 0; i < ARRAY_SIZE(s7d_vpu_refused); i++) {
+		if (s7d_vpu_refused[i].untouched && v->touched)
+			continue;
+		value = vpu_read(v, s7d_vpu_refused[i].reg);
+		if (!(value & s7d_vpu_refused[i].mask))
+			continue;
+		if (boot) {
+			v->boot.route = s7d_vpu_refused[i].reg;
+			v->boot.route_value = value;
+			dev_warn(v->dev, "firmware route VCBUS %#x = %#x; restarting the display\n",
+				 s7d_vpu_refused[i].reg, value);
+		} else {
+			dev_err(v->dev, "refusing takeover: VCBUS %#x = %#x\n",
+				s7d_vpu_refused[i].reg, value);
+		}
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+/*
+ * Pulse the local resets of the Mali AFBC decoder and its arbiter, and of
+ * the VD1 FBC decoder. The AFBC logic reset first, as its provider reads the
+ * decoder's top control to allow it; that read refusing it means the
+ * decoder was never enabled, which leaves nothing to reset.
+ */
+static int s7d_vpu_reset_local(struct s7d_vpu *v)
+{
+	struct reset_control *resets[] = {
+		v->local_resets[S7D_VPU_RESET_AFBCD_LOGIC].rstc,
+		v->local_resets[S7D_VPU_RESET_AFBCD_REGS].rstc,
+		v->local_resets[S7D_VPU_RESET_AFBC_ARBITER_LOGIC].rstc,
+		v->local_resets[S7D_VPU_RESET_AFBC_ARBITER_REGS].rstc,
+		v->vd1_fbc_resets[0].rstc,
+		v->vd1_fbc_resets[1].rstc,
+	};
+	unsigned int i, asserted;
+	int ret = 0, err;
+
+	for (asserted = 0; asserted < ARRAY_SIZE(resets); asserted++) {
+		ret = reset_control_assert(resets[asserted]);
+		if (ret == -EOPNOTSUPP && !asserted) {
+			resets[0] = NULL;
+			ret = 0;
+		}
+		if (ret)
+			break;
+	}
+	for (i = asserted; i-- > 0;) {
+		err = reset_control_deassert(resets[i]);
+		if (!ret)
+			ret = err;
+	}
+	return ret;
+}
+
+/* Longer than a frame of any mode the firmware sets up, 23.976 Hz included. */
+#define FIRMWARE_FRAME_US	50000
+
+/*
+ * Count the encoder clocks that the firmware left running. They share their
+ * dividers and PLL with the HDMI clocks, which an adopted firmware link
+ * counts alone: stopping that link could gate them under a running
+ * encoder. s7d_vpu_disable_pixel() drops them, as for a held output.
+ */
+static int s7d_vpu_hold_encoder_clocks(struct s7d_vpu *v)
+{
+	int ret;
+
+	if (clk_get_rate(v->clocks[PIXEL_CLK].clk)) {
+		ret = clk_prepare_enable(v->clocks[PIXEL_CLK].clk);
+		if (ret)
+			return ret;
+		v->pixel_enabled = true;
+	}
+	if (v->enci && clk_get_rate(v->enci)) {
+		ret = clk_prepare_enable(v->enci);
+		if (ret)
+			return ret;
+		v->enci_enabled = true;
+	}
+	return 0;
+}
+
+/*
+ * Assert the VPU resets this driver owns and check that each took: with
+ * its mask bit set, a line stays released whatever the driver writes. Hold
+ * them as the vendor VPU power-up does, then release them.
+ */
+static int s7d_vpu_pulse_resets(struct s7d_vpu *v)
+{
+	unsigned int i;
+	int ret;
+
+	ret = reset_control_bulk_assert(ARRAY_SIZE(v->resets), v->resets);
+	if (ret)
+		return ret;
+	for (i = 0; i < ARRAY_SIZE(v->resets); i++) {
+		ret = reset_control_status(v->resets[i].rstc);
+		if (ret != 1) {
+			dev_err(v->dev, "%s reset did not take (%d)\n", v->resets[i].id, ret);
+			return ret < 0 ? ret : -EIO;
+		}
+	}
+	usleep_range(5, 10);
+	return reset_control_bulk_deassert(ARRAY_SIZE(v->resets), v->resets);
+}
+
+/*
+ * After the restart, the video and OSD fetches must be off and show the
+ * idle state that the first modeset's stop drains to, as the encoders
+ * strobe nothing until then. Clear their enables, which the resets need not
+ * cover, and check.
+ */
+static int s7d_vpu_restart_idle(struct s7d_vpu *v)
+{
+	static const u16 fetches[] = { VD1_GEN, VD2_GEN, OSD1_CTRL, OSD2_CTRL };
 	static const struct {
 		u16 reg;
 		u32 mask;
-		bool untouched;
-	} refused[] = {
-		{ OSD_PATH, BIT(14) | GENMASK(12, 9) | GENMASK(7, 0) },
-		{ VD1_PATH, 0x007dff00 },
-		{ VD2_PATH, 0x007dfe00 },
-		{ 0x1d26, BIT(27) },
-		{ VD1_BLEND, 0x0f0f, true },
-		{ VD2_BLEND, 0x0f0f, true },
-		{ VENC_CLK, BIT(0) },
-		{ RDARB_MODE_L2, GENMASK(18, 16) },
+		u32 idle;
+	} states[] = {
+		{ VD1_GEN, VD1_BUSY, 0 },
+		{ VD2_GEN, VD1_BUSY, 0 },
+		{ OSD1_CTRL, OSD_ACTUAL_EN, 0 },
+		{ OSD2_CTRL, OSD_ACTUAL_EN, 0 },
+		{ OSD1_CTRL + OSD_FIFO_OFFSET, OSD_FIFO_STATE, 0 },
+		{ OSD2_CTRL + OSD_FIFO_OFFSET, OSD_FIFO_STATE, 0 },
+		{ ASYNC_STAT, ASYNC_IDLE, ASYNC_IDLE },
 	};
+	unsigned int i;
 	u32 value;
+	int ret;
 
-	for (i = 0; i < ARRAY_SIZE(refused); i++) {
-		if (refused[i].untouched && v->touched)
-			continue;
-		value = vpu_read(v, refused[i].reg);
-		if (value & refused[i].mask) {
-			dev_err(v->dev, "refusing takeover: VCBUS %#x = %#x\n",
-				refused[i].reg, value);
-			return -EOPNOTSUPP;
+	for (i = 0; i < ARRAY_SIZE(fetches); i++) {
+		ret = vpu_update(v, fetches[i], BIT(0), 0);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < ARRAY_SIZE(states); i++) {
+		ret = readl_poll_timeout(v->regs + states[i].reg * 4, value,
+					(value & states[i].mask) == states[i].idle,
+					10, 1000);
+		if (ret) {
+			v->failed_reg = states[i].reg;
+			dev_err(v->dev, "VCBUS %#x = %#x, not idle after the restart\n",
+				states[i].reg, value);
+			return ret;
 		}
 	}
+	return 0;
+}
+
+/*
+ * Stop firmware routes the takeover refuses, as a cold start would find
+ * them: how those video, GFCD or AFBC paths report idle is not known, so
+ * do not poll them. Stop the HDMI link, then the encoders while their
+ * clocks still run, gate those clocks, let a frame pass, then reset the
+ * VPU blocks this driver owns. No VCBUS register is read from the encoder
+ * stop until those resets have been released. RDMA stays in reset until a
+ * modeset prepares it. Then clear the refused fields, as the resets need
+ * not cover the VPP and VPU top fields among them; no modeset writes
+ * VPP_MISC bit 27 or the ENCP clock select. Last, check that the fetches
+ * are idle.
+ */
+static int s7d_vpu_restart(struct s7d_vpu *v)
+{
+	static const u32 enables[] = { ENCP_EN, ENCI_EN, ENCL_EN };
+	u32 enabled[ARRAY_SIZE(enables)];
+	unsigned int i;
+	int ret;
+
+	ret = s7d_vpu_hold_encoder_clocks(v);
+	if (ret)
+		return ret;
+	ret = v->link.quiesce(v->link.data);
+	if (ret)
+		return ret;
+	for (i = 0; i < ARRAY_SIZE(enables); i++)
+		enabled[i] = vpu_read(v, enables[i]);
+	for (i = 0; i < ARRAY_SIZE(enables); i++)
+		if (enabled[i] & BIT(0))
+			writel(enabled[i] & ~BIT(0), v->regs + enables[i] * 4);
+	s7d_vpu_disable_pixel(v);
+	fsleep(FIRMWARE_FRAME_US);
+	ret = s7d_rdma_quiesce(&v->rdma);
+	if (ret)
+		return ret;
+	ret = s7d_vpu_pulse_resets(v);
+	if (ret)
+		return ret;
+	ret = s7d_vpu_reset_local(v);
+	if (ret)
+		return ret;
+	for (i = 0; i < ARRAY_SIZE(s7d_vpu_refused); i++) {
+		ret = vpu_update(v, s7d_vpu_refused[i].reg, s7d_vpu_refused[i].mask, 0);
+		if (ret)
+			return ret;
+	}
+	ret = s7d_vpu_restart_idle(v);
+	if (ret)
+		return ret;
+	v->boot.restarted = true;
+	dev_info(v->dev, "firmware display stopped and reset; starting without its setup\n");
 	return 0;
 }
 
@@ -2540,6 +2783,11 @@ static int s7d_vpu_boot_show(struct seq_file *m, void *data)
 		else
 			seq_puts(m, i + 1 < ARRAY_SIZE(b->mem_pd) ? "? " : "?\n");
 	}
+	seq_printf(m, "reset_held\t%d\n", b->reset_held);
+	seq_printf(m, "route\t%#x %#x\n", b->route, b->route_value);
+	seq_printf(m, "restarted\t%d\n", b->restarted);
+	seq_printf(m, "retained\t%d\n", b->retained);
+	seq_printf(m, "output\t%d\n", b->output);
 	seq_printf(m, "unusable\t%d\n", v->unusable);
 	return 0;
 }
@@ -2649,6 +2897,11 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 
 int s7d_vpu_release_boot(struct s7d_vpu *v)
 {
+	/* Nothing may read the VPU that a failed restart left, nor sleep with it. */
+	if (v->boot.retained) {
+		dev_err(v->dev, "display left in an unknown state at probe; refusing to sleep\n");
+		return -EBUSY;
+	}
 	if (!v->boot_held)
 		return 0;
 	/* Only a prepare stops a running firmware output safely. */
@@ -2669,6 +2922,7 @@ int s7d_vpu_fini(struct s7d_vpu *v)
 		v->boot_held = false;
 		s7d_vpu_release(v);
 	}
+	/* A failed stop or restart: keep what the hardware may still use. */
 	if (v->acquired)
 		return -EBUSY;
 	cancel_delayed_work_sync(&v->afbc_timeout);

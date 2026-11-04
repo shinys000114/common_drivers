@@ -24,6 +24,17 @@ struct s7d_vpu_boot {
 	/* MEM_PD5..9, the VPU SRAM power-down controls, 0 when powered. */
 	u32 mem_pd[S7D_VPU_SRAM_BANKS];
 	bool mem_pd_read;
+	/* The VPU resets were held: no firmware display setup. */
+	bool reset_held;
+	/* The first firmware route the takeover refused, and its word. */
+	u16 route;
+	u32 route_value;
+	/* Those routes were stopped and the VPU reset, as on a cold start. */
+	bool restarted;
+	/* That restart failed: the VPU stays acquired and untouched for good. */
+	bool retained;
+	/* A firmware output ran; it stays held until the first modeset. */
+	bool output;
 };
 
 /* HDMI owns PHY/packets. Return only after its transmitter is safely off. */
@@ -153,9 +164,15 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *vpu,
 int s7d_vpu_hold_boot(struct s7d_vpu *vpu);
 /* Show what the probe found in the DRM device's debugfs directory. */
 void s7d_vpu_debugfs_init(struct s7d_vpu *vpu, struct drm_device *drm);
-/* Drop that hold before the first commit if the firmware output is off. */
+/*
+ * Drop that hold before the first commit if the firmware output is off;
+ * -EBUSY while it runs, or for good after a failed takeover restart.
+ */
 int s7d_vpu_release_boot(struct s7d_vpu *vpu);
-/* Only before first modeset, or after successful s7d_crtc_shutdown(). */
+/*
+ * Only before first modeset, or after successful s7d_crtc_shutdown().
+ * -EBUSY, keeping everything, after a failed stop or takeover restart.
+ */
 int s7d_vpu_fini(struct s7d_vpu *vpu);
 
 #endif

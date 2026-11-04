@@ -612,8 +612,12 @@ static int s7d_drm_probe(struct platform_device *pdev)
 
 fini_vpu:
 	s7d_hdmi_bridge_set_connector(bridge, NULL);
-	/* No commit can have started before a successful drm_dev_register(). */
-	WARN_ON(s7d_vpu_fini(&display->vpu));
+	/*
+	 * No commit can have started before a successful drm_dev_register();
+	 * only a failed takeover restart can have kept the VPU.
+	 */
+	if (s7d_vpu_fini(&display->vpu))
+		dev_err(dev, "keeping the VPU that the takeover left\n");
 	return dev_err_probe(dev, ret, "DRM initialization\n");
 }
 
