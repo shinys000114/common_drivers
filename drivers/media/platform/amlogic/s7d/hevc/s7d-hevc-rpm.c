@@ -32,6 +32,9 @@ enum s7d_hevc_rpm_word {
 	RPM_TILES = 0x23,
 	RPM_TILE_COLUMNS_MINUS1 = 0x24,
 	RPM_TILE_ROWS_MINUS1 = 0x25,
+	RPM_TILE_WIDTH = 0x26,
+	RPM_TILE_HEIGHT = 0x32,
+	RPM_MISC_FLAGS = 0x3a,
 	RPM_FIRST_SLICE = 0x41,
 	RPM_TEMPORAL_ID_PLUS1 = 0x42,
 	RPM_NAL_TYPE = 0x43,
@@ -321,14 +324,13 @@ int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
 		return ret;
 	word = rpm->word;
 	if (word[RPM_FIRST_SLICE] > 1 || word[RPM_DEPENDENT_SLICE] > 1 ||
-	    word[RPM_TEMPORAL_MVP] > 1 || word[RPM_TILES] > 1 ||
+	    word[RPM_TEMPORAL_MVP] > 1 || word[RPM_TILES] > 3 ||
 	    word[RPM_CROP_FLAG] > 1 || word[RPM_MIN_CB_MINUS3] > 3 ||
 	    word[RPM_CTB_DIFF] > 3 || word[RPM_POC_LOG2_MINUS4] > 12)
 		return -EPROTO;
 	/* Which slice segment it is, the slice check compares with the CPU parse. */
 	if (!word[RPM_TEMPORAL_ID_PLUS1] ||
 	    word[RPM_TEMPORAL_ID_PLUS1] > host->max_sub_layers ||
-	    word[RPM_TILES] || word[RPM_TILE_COLUMNS_MINUS1] || word[RPM_TILE_ROWS_MINUS1] ||
 	    (word[RPM_BIT_DEPTH] & 0xff) != (((host->bit_depth_chroma - 8) << 4) |
 					     (host->bit_depth_luma - 8)) ||
 	    (word[RPM_PROFILE_ETC] & BIT(2)) ||
@@ -357,6 +359,41 @@ int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
 	next.ctb_rows = DIV_ROUND_UP(next.coded_height, next.ctb_size);
 	next.ctb_count = next.ctb_columns * next.ctb_rows;
 	*geometry = next;
+	return 0;
+}
+
+/*
+ * The firmware's tile syntax (vendor update_tile_info: [0] enabled, [1]
+ * uniform, the sizes of all but the last column and row) against the CPU
+ * grid. Without tiles the firmware leaves all of it zero.
+ */
+int s7d_hevc_rpm_check_tiles(const struct s7d_hevc_rpm *rpm,
+			     const struct s7d_hevc_tiles *tiles)
+{
+	const u16 *word;
+	u32 i;
+
+	if (!rpm || !tiles)
+		return -EINVAL;
+	word = rpm->word;
+	if (!tiles->enabled)
+		return word[RPM_TILES] || word[RPM_TILE_COLUMNS_MINUS1] ||
+		       word[RPM_TILE_ROWS_MINUS1] ? -ESTALE : 0;
+	if (!(word[RPM_TILES] & BIT(0)) || !!(word[RPM_TILES] & BIT(1)) != tiles->uniform ||
+	    word[RPM_TILE_COLUMNS_MINUS1] + 1U != tiles->columns ||
+	    word[RPM_TILE_ROWS_MINUS1] + 1U != tiles->rows ||
+	    !!(word[RPM_MISC_FLAGS] & BIT(2)) != tiles->across)
+		return -ESTALE;
+	if (tiles->uniform)
+		return 0;
+	if (tiles->columns > 12 || tiles->rows > 8)
+		return -EOPNOTSUPP;
+	for (i = 0; i + 1 < tiles->columns; i++)
+		if (word[RPM_TILE_WIDTH + i] != tiles->column[i + 1] - tiles->column[i])
+			return -ESTALE;
+	for (i = 0; i + 1 < tiles->rows; i++)
+		if (word[RPM_TILE_HEIGHT + i] != tiles->row[i + 1] - tiles->row[i])
+			return -ESTALE;
 	return 0;
 }
 

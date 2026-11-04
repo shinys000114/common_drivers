@@ -394,8 +394,12 @@ static u32 hevc_mpred_ctrl1(const struct s7d_hevc_rpm *rpm)
 	       (2 << 4) | (3 << 8) | (5 << 12) | (36 << 16);
 }
 
-/* The slice's deblocking controls (DBLK_CFG9) and SAO across-slice bit (config_sao_hw). */
-static void hevc_loop_filter(const struct s7d_hevc_rpm *rpm, u32 *dblk9, u32 *sao_flags)
+/*
+ * The slice's deblocking controls (DBLK_CFG9) and SAO across-slice and, with
+ * tiles, across-tile bits (config_sao_hw).
+ */
+static void hevc_loop_filter(const struct s7d_hevc_rpm *rpm, bool tiles,
+			     u32 *dblk9, u32 *sao_flags)
 {
 	u32 flags = rpm->word[RPM_MISC_FLAGS], cfg = 0, disabled, beta, tc, across;
 
@@ -416,6 +420,47 @@ static void hevc_loop_filter(const struct s7d_hevc_rpm *rpm, u32 *dblk9, u32 *sa
 		 !!(flags & BIT(10)) : !!(flags & BIT(3));
 	*dblk9 = cfg | across << 1;
 	*sao_flags = across << 9;
+	if (tiles) {
+		*dblk9 |= !!(flags & BIT(2));
+		*sao_flags |= !!(flags & BIT(2)) << 8;
+	}
+}
+
+/* The tile of CTB @address (vendor get_tile_index): start x | y << 16, size w | h << 16. */
+static u32 hevc_tile_of(const struct s7d_hevc_tiles *tiles, u32 columns, u32 address,
+			u32 *start, u32 *size, u32 *width)
+{
+	u32 x = address % columns, y = address / columns, tx = 0, ty = 0;
+
+	while (tx + 1 < tiles->columns && x >= tiles->column[tx + 1])
+		tx++;
+	while (ty + 1 < tiles->rows && y >= tiles->row[ty + 1])
+		ty++;
+	*width = tiles->column[tx + 1] - tiles->column[tx];
+	*start = tiles->column[tx] | tiles->row[ty] << 16;
+	*size = *width | (tiles->row[ty + 1] - tiles->row[ty]) << 16;
+	return ty * tiles->columns + tx;
+}
+
+static int hevc_tiles_check(const struct s7d_hevc_tiles *tiles,
+			    const struct s7d_hevc_geometry *geometry)
+{
+	u32 i;
+
+	if (!tiles->columns || tiles->columns > S7D_HEVC_MAX_TILE_COLUMNS ||
+	    !tiles->rows || tiles->rows > S7D_HEVC_MAX_TILE_ROWS ||
+	    tiles->column[0] || tiles->row[0] ||
+	    tiles->column[tiles->columns] != geometry->ctb_columns ||
+	    tiles->row[tiles->rows] != geometry->ctb_rows ||
+	    (!tiles->enabled && (tiles->columns != 1 || tiles->rows != 1)))
+		return -EPROTO;
+	for (i = 0; i < tiles->columns; i++)
+		if (tiles->column[i] >= tiles->column[i + 1])
+			return -EPROTO;
+	for (i = 0; i < tiles->rows; i++)
+		if (tiles->row[i] >= tiles->row[i + 1])
+			return -EPROTO;
+	return 0;
 }
 
 /* [i] L0[i], [16 + i] L1[i] is long-term: no MV scaling (vendor config_mpred_hw). */
@@ -463,6 +508,7 @@ static int hevc_picture_program(struct regmap *map,
 				const struct s7d_hevc_sps *host,
 				const struct s7d_codec_layout *layout,
 				const struct s7d_hevc_geometry *geometry,
+				const struct s7d_hevc_tiles *tiles,
 				const struct s7d_hevc_picture_buffers *buffers,
 				const struct s7d_hevc_slice_info *slice,
 				const struct s7d_hevc_picture_plan *refs)
@@ -488,7 +534,7 @@ static int hevc_picture_program(struct regmap *map,
 		geometry->coded_height, host->bit_depth_luma);
 	u32 l0_count = refs->list_count[0];
 	u32 l1_count = refs->list_count[1];
-	u32 log2_ctb, pic_size, lcu_size, tile_size, sao_unit;
+	u32 log2_ctb, pic_size, lcu_size, tile_start, tile_size, tile_width, row_jump, sao_unit;
 	u32 mpred0, mpred1, dblk1, dblk9, sao_flags, flags;
 	u32 i;
 	int ret;
@@ -496,7 +542,9 @@ static int hevc_picture_program(struct regmap *map,
 	log2_ctb = host->log2_ctb_size;
 	pic_size = geometry->coded_width | (geometry->coded_height << 16);
 	lcu_size = (geometry->ctb_columns - 1) | ((geometry->ctb_rows - 1) << 16);
-	tile_size = geometry->ctb_columns | (geometry->ctb_rows << 16);
+	/* The first tile; the whole picture without tiles. */
+	hevc_tile_of(tiles, geometry->ctb_columns, 0, &tile_start, &tile_size, &tile_width);
+	row_jump = (geometry->ctb_columns - tile_width) * hevc_mv_unit(geometry->ctb_size);
 	sao_unit = (geometry->ctb_size == 16 ? 9 : geometry->ctb_size == 32 ? 14 : 24) << 4;
 	flags = rpm->word[RPM_MISC_FLAGS];
 	mpred0 = hevc_mpred_ctrl0(rpm, host, slice, refs, BIT(2) | BIT(3));
@@ -507,7 +555,7 @@ static int hevc_picture_program(struct regmap *map,
 		 ((rpm->word[RPM_PPS_CB_QP] & 0x1f) << 4) |
 		 ((rpm->word[RPM_PPS_CR_QP] & 0x1f) << 9) |
 		 (geometry->coded_width <= 64 ? BIT(20) : 0);
-	hevc_loop_filter(rpm, &dblk9, &sao_flags);
+	hevc_loop_filter(rpm, tiles->enabled, &dblk9, &sao_flags);
 	ret = regmap_write(map, HEVCD_MPP_ANC2AXI_TBL_CONF_ADDR, 6);
 	if (ret)
 		return ret;
@@ -580,13 +628,13 @@ static int hevc_picture_program(struct regmap *map,
 		const struct reg_sequence seq[] = {
 			{ HEVC_MPRED_MV_WR_START_ADDR, write_mv->address },
 			{ HEVC_MPRED_MV_RD_START_ADDR, read_mv->address },
-			{ HEVC_MPRED_MV_WR_ROW_JUMP, 0 },
-			{ HEVC_MPRED_MV_RD_ROW_JUMP, 0 },
+			{ HEVC_MPRED_MV_WR_ROW_JUMP, row_jump },
+			{ HEVC_MPRED_MV_RD_ROW_JUMP, row_jump },
 			{ HEVC_MPRED_CTRL0, mpred0 },
 			{ HEVC_MPRED_CTRL1, mpred1 },
 			{ HEVC_MPRED_PIC_SIZE, pic_size },
 			{ HEVC_MPRED_PIC_SIZE_LCU, lcu_size },
-			{ HEVC_MPRED_TILE_START, 0 },
+			{ HEVC_MPRED_TILE_START, tile_start },
 			{ HEVC_MPRED_TILE_SIZE_LCU, tile_size },
 			{ HEVC_MPRED_REF_NUM, l0_count | (l1_count << 8) },
 			{ HEVC_MPRED_LT_REF, hevc_long_term_refs(refs) },
@@ -707,8 +755,10 @@ static int hevc_slice_program(struct regmap *map,
 			      const struct s7d_hevc_sps *host,
 			      const struct s7d_codec_layout *layout,
 			      const struct s7d_hevc_geometry *geometry,
+			      const struct s7d_hevc_tiles *tiles,
 			      const struct s7d_hevc_picture_buffers *buffers,
 			      const struct s7d_hevc_slice_info *slice,
+			      u32 previous_address,
 			      const struct s7d_hevc_picture_plan *refs)
 {
 	u32 slot = refs->current_slot;
@@ -727,11 +777,21 @@ static int hevc_slice_program(struct regmap *map,
 	u32 l1_count = refs->list_count[1];
 	u32 pic_size = geometry->coded_width | (geometry->coded_height << 16);
 	u32 lcu_size = (geometry->ctb_columns - 1) | ((geometry->ctb_rows - 1) << 16);
-	u32 tile_size = geometry->ctb_columns | (geometry->ctb_rows << 16);
+	u32 tile_start, tile_size, tile_width, previous_start, previous_size, previous_width;
+	u32 unit = hevc_mv_unit(geometry->ctb_size), segment = 0, row_jump;
 	u32 dblk9, sao_flags;
 	int ret;
 
-	hevc_loop_filter(rpm, &dblk9, &sao_flags);
+	/* A segment that starts another tile than the previous one did (vendor new_tile). */
+	if (hevc_tile_of(tiles, geometry->ctb_columns, slice->slice_address,
+			 &tile_start, &tile_size, &tile_width) !=
+	    hevc_tile_of(tiles, geometry->ctb_columns, previous_address,
+			 &previous_start, &previous_size, &previous_width))
+		segment |= BIT(3);
+	if (slice->dependent_slice)
+		segment |= BIT(4);
+	row_jump = (geometry->ctb_columns - tile_width) * unit;
+	hevc_loop_filter(rpm, tiles->enabled, &dblk9, &sao_flags);
 	ret = hevc_mc_program(map, refs, compressed);
 	if (ret)
 		return ret;
@@ -742,14 +802,13 @@ static int hevc_slice_program(struct regmap *map,
 		const struct reg_sequence seq[] = {
 			{ HEVC_MPRED_MV_WR_START_ADDR, write_mv->address },
 			{ HEVC_MPRED_MV_RD_START_ADDR, read_mv->address },
-			{ HEVC_MPRED_MV_WR_ROW_JUMP, 0 },
-			{ HEVC_MPRED_MV_RD_ROW_JUMP, 0 },
-			{ HEVC_MPRED_CTRL0, hevc_mpred_ctrl0(rpm, host, slice, refs,
-					slice->dependent_slice ? BIT(4) : 0) },
+			{ HEVC_MPRED_MV_WR_ROW_JUMP, row_jump },
+			{ HEVC_MPRED_MV_RD_ROW_JUMP, row_jump },
+			{ HEVC_MPRED_CTRL0, hevc_mpred_ctrl0(rpm, host, slice, refs, segment) },
 			{ HEVC_MPRED_CTRL1, hevc_mpred_ctrl1(rpm) },
 			{ HEVC_MPRED_PIC_SIZE, pic_size },
 			{ HEVC_MPRED_PIC_SIZE_LCU, lcu_size },
-			{ HEVC_MPRED_TILE_START, 0 },
+			{ HEVC_MPRED_TILE_START, tile_start },
 			{ HEVC_MPRED_TILE_SIZE_LCU, tile_size },
 			{ HEVC_MPRED_REF_NUM, l0_count | (l1_count << 8) },
 			{ HEVC_MPRED_LT_REF, hevc_long_term_refs(refs) },
@@ -770,7 +829,7 @@ static int hevc_slice_program(struct regmap *map,
 	 */
 	if (!ret && !slice->dependent_slice)
 		ret = regmap_write(map, HEVC_MPRED_MV_RPTR, read_mv->address +
-				   slice->slice_address * hevc_mv_unit(geometry->ctb_size));
+				   slice->slice_address * unit);
 	if (!ret)
 		ret = regmap_write(map, HEVC_MPRED_MV_RD_END_ADDR,
 				   read_mv->address + read_mv->bytes);
@@ -1014,18 +1073,24 @@ int s7d_hevc_slice_configure(struct regmap *map,
 			     const struct s7d_hevc_rpm *rpm,
 			     const struct s7d_hevc_sps *host,
 			     const struct s7d_codec_layout *layout,
+			     const struct s7d_hevc_tiles *tiles,
 			     const struct s7d_hevc_picture_buffers *buffers,
 			     const struct s7d_hevc_slice_info *slice,
+			     u32 previous_address,
 			     const struct s7d_hevc_picture_plan *plan)
 {
 	struct s7d_hevc_geometry geometry;
 	struct s7d_hevc_slice_info checked;
 	int ret;
 
-	if (!map || !rpm || !host || !layout || !buffers || !buffers->surface ||
+	if (!map || !rpm || !host || !layout || !tiles || !buffers || !buffers->surface ||
 	    !buffers->mv || !slice || !plan)
 		return -EINVAL;
 	ret = s7d_hevc_rpm_check_sequence(rpm, host, &geometry);
+	if (!ret)
+		ret = s7d_hevc_rpm_check_tiles(rpm, tiles);
+	if (!ret)
+		ret = hevc_tiles_check(tiles, &geometry);
 	if (!ret)
 		ret = s7d_hevc_rpm_decode_slice(rpm, host, slice, &checked);
 	if (!ret)
@@ -1034,12 +1099,15 @@ int s7d_hevc_slice_configure(struct regmap *map,
 		return ret;
 	if (checked.first_slice || !checked.slice_address ||
 	    checked.slice_address >= geometry.ctb_count ||
+	    s7d_hevc_tile_scan(tiles, geometry.ctb_columns, previous_address) >=
+	    s7d_hevc_tile_scan(tiles, geometry.ctb_columns, checked.slice_address) ||
 	    layout->format != S7D_CODEC_CAPTURE_NV12M || buffers->count != plan->slot_count)
 		return -EPROTO;
 	ret = hevc_references_check(&checked, plan, buffers->count);
 	if (ret)
 		return ret;
-	return hevc_slice_program(map, rpm, host, layout, &geometry, buffers, &checked, plan);
+	return hevc_slice_program(map, rpm, host, layout, &geometry, tiles, buffers,
+				  &checked, previous_address, plan);
 }
 
 int s7d_hevc_picture_configure(struct regmap *map,
@@ -1047,6 +1115,7 @@ int s7d_hevc_picture_configure(struct regmap *map,
 			       const struct s7d_hevc_rpm *rpm,
 			       const struct s7d_hevc_sps *host,
 			       const struct s7d_codec_layout *layout,
+			       const struct s7d_hevc_tiles *tiles,
 			       const struct s7d_hevc_picture_buffers *buffers,
 			       const struct s7d_hevc_slice_info *slice,
 			       const struct s7d_hevc_picture_plan *plan)
@@ -1056,10 +1125,14 @@ int s7d_hevc_picture_configure(struct regmap *map,
 	struct s7d_hevc_slice_info checked;
 	int ret;
 
-	if (!map || !ws || !rpm || !host || !layout || !buffers ||
+	if (!map || !ws || !rpm || !host || !layout || !tiles || !buffers ||
 	    !buffers->surface || !buffers->mv || !slice || !plan)
 		return -EINVAL;
 	ret = s7d_hevc_rpm_check_sequence(rpm, host, &geometry);
+	if (!ret)
+		ret = s7d_hevc_rpm_check_tiles(rpm, tiles);
+	if (!ret)
+		ret = hevc_tiles_check(tiles, &geometry);
 	if (ret)
 		return ret;
 	ret = s7d_hevc_rpm_decode_slice(rpm, host, slice, &checked);
@@ -1082,6 +1155,6 @@ int s7d_hevc_picture_configure(struct regmap *map,
 	ret = hevc_references_check(&checked, plan, buffers->count);
 	if (ret)
 		return ret;
-	return hevc_picture_program(map, ws, rpm, host, layout, &geometry,
+	return hevc_picture_program(map, ws, rpm, host, layout, &geometry, tiles,
 				    buffers, &checked, plan);
 }

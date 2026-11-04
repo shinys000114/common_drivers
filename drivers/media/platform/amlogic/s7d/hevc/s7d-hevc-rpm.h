@@ -13,6 +13,7 @@
 
 struct s7d_hevc_sps;
 struct s7d_hevc_slice_info;
+struct s7d_hevc_tiles;
 struct device;
 
 struct s7d_hevc_geometry {
@@ -69,6 +70,9 @@ int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 			     const struct s7d_hevc_sps *host,
 			     const struct s7d_hevc_slice_info *cpu,
 			     struct s7d_hevc_slice_info *slice);
+/* The RPM's tile grid against the CPU parse of the picture's PPS. */
+int s7d_hevc_rpm_check_tiles(const struct s7d_hevc_rpm *rpm,
+			     const struct s7d_hevc_tiles *tiles);
 int s7d_hevc_classify_status(u32 status, enum s7d_hevc_event *event);
 
 #endif

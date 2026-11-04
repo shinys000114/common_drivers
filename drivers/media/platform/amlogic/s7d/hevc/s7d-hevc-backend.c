@@ -89,6 +89,7 @@ struct s7d_hevc_job {
 	/* Every segment the CPU parsed; the input lives through the decode call. */
 	const struct s7d_hevc_slice_info *host_slices;
 	u32 slice_count;
+	struct s7d_hevc_tiles tiles;
 	/* The later segment at its header pause, and its lists. */
 	struct s7d_hevc_slice_info segment;
 	struct s7d_hevc_picture_plan segment_plan;
@@ -593,7 +594,8 @@ static int hevc_next_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_jo
 		return hevc_header_failure(decoder, job, stage, ret,
 			status, status_valid, rpm_valid, data);
 	ret = s7d_hevc_slice_configure(decoder->map, &job->rpm, &decoder->sps,
-				       &decoder->layout, &buffers, &job->segment,
+				       &decoder->layout, &job->tiles, &buffers, &job->segment,
+				       job->host_slices[job->headers - 1].slice_address,
 				       &job->segment_plan);
 	if (!ret)
 		ret = regmap_update_bits(decoder->map, HEVC_WAIT_FLAG, BIT(1), BIT(1));
@@ -658,6 +660,10 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 			data = true;
 			stage = "rpm-sequence";
 			ret = s7d_hevc_rpm_check_sequence(&job->rpm, &decoder->sps, &job->geometry);
+		}
+		if (!ret) {
+			stage = "rpm-tiles";
+			ret = s7d_hevc_rpm_check_tiles(&job->rpm, &job->tiles);
 		}
 		if (!ret) {
 			stage = "rpm-slice";
@@ -758,7 +764,8 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 	if (!ret)
 		ret = s7d_hevc_picture_configure(decoder->map,
 			s7d_hevc_context_workspace(job->context), &job->rpm,
-			&decoder->sps, &decoder->layout, &buffers, &job->slice, &job->picture);
+			&decoder->sps, &decoder->layout, &job->tiles, &buffers, &job->slice,
+			&job->picture);
 	if (!ret)
 		ret = regmap_update_bits(decoder->map, HEVC_WAIT_FLAG, BIT(1), BIT(1));
 	if (!ret) {
@@ -1695,6 +1702,7 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	job->host_slice = input->slice;
 	job->host_slices = input->slices;
 	job->slice_count = input->slice_count;
+	job->tiles = input->tiles;
 	job->lease_epoch = decoder->epoch;
 	job->metadata = (struct s7d_hevc_picture_metadata) {
 		.input_token = input_token, .timestamp_ns = timestamp_ns,

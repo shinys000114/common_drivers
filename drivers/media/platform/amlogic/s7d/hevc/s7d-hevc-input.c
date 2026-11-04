@@ -311,8 +311,26 @@ static int hevc_pps_parse(struct hevc_bits *b, struct s7d_hevc_pps *pps)
 	hevc_get(b, 1);
 	pps->tiles_enabled = hevc_get(b, 1);
 	pps->entropy_coding_sync = hevc_get(b, 1);
-	if (pps->tiles_enabled)
-		return b->error ?: -EOPNOTSUPP;
+	if (pps->tiles_enabled) {
+		u32 i;
+
+		/* Up to the level 6.2 grid; the SPS bounds the sizes later. */
+		pps->tile_columns = hevc_ue(b, 19) + 1;
+		pps->tile_rows = hevc_ue(b, 21) + 1;
+		if (pps->tile_columns > S7D_HEVC_MAX_TILE_COLUMNS ||
+		    pps->tile_rows > S7D_HEVC_MAX_TILE_ROWS)
+			return b->error ?: -EOPNOTSUPP;
+		pps->uniform_spacing = hevc_get(b, 1);
+		if (!pps->uniform_spacing) {
+			if (pps->tile_rows > S7D_HEVC_MAX_EXPLICIT_TILE_ROWS)
+				return b->error ?: -EOPNOTSUPP;
+			for (i = 0; i + 1 < pps->tile_columns; i++)
+				pps->column_width[i] = hevc_ue(b, 255) + 1;
+			for (i = 0; i + 1 < pps->tile_rows; i++)
+				pps->row_height[i] = hevc_ue(b, 255) + 1;
+		}
+		pps->loop_filter_across_tiles = hevc_get(b, 1);
+	}
 	pps->loop_filter_across_slices = hevc_get(b, 1);
 	pps->deblocking_control_present = hevc_get(b, 1);
 	if (pps->deblocking_control_present) {
@@ -504,19 +522,76 @@ static size_t hevc_escaped_header_bytes(const u8 *nal, size_t bytes,
 }
 
 /* num_entry_point_offsets: at most every CTB row and/or tile starts one (7.4.7.1). */
-static u32 hevc_entry_point_limit(const struct s7d_hevc_pps *pps, u32 rows)
+static u32 hevc_entry_point_limit(const struct s7d_hevc_pps *pps,
+				  const struct s7d_hevc_tiles *tiles, u32 rows)
 {
-	return rows - 1;
+	if (!pps->tiles_enabled)
+		return rows - 1;
+	if (!pps->entropy_coding_sync)
+		return tiles->columns * tiles->rows - 1;
+	return tiles->columns * rows - 1;
+}
+
+/* Column and row boundaries in CTBs (6.5.1); one tile without tiles. */
+static int hevc_tile_grid(const struct s7d_hevc_pps *pps, u32 columns, u32 rows,
+			  struct s7d_hevc_tiles *tiles)
+{
+	u32 i;
+
+	*tiles = (struct s7d_hevc_tiles) {
+		.columns = 1, .rows = 1, .column = { 0, columns }, .row = { 0, rows },
+		.uniform = true,
+	};
+	if (!pps->tiles_enabled)
+		return 0;
+	if (pps->tile_columns > columns || pps->tile_rows > rows)
+		return -EBADMSG;
+	tiles->columns = pps->tile_columns;
+	tiles->rows = pps->tile_rows;
+	tiles->enabled = true;
+	tiles->uniform = pps->uniform_spacing;
+	tiles->across = pps->loop_filter_across_tiles;
+	for (i = 1; i < tiles->columns; i++)
+		tiles->column[i] = tiles->uniform ? i * columns / tiles->columns :
+				   tiles->column[i - 1] + pps->column_width[i - 1];
+	for (i = 1; i < tiles->rows; i++)
+		tiles->row[i] = tiles->uniform ? i * rows / tiles->rows :
+				tiles->row[i - 1] + pps->row_height[i - 1];
+	tiles->column[tiles->columns] = columns;
+	tiles->row[tiles->rows] = rows;
+	/* The explicit sizes leave the last column and row at least one CTB. */
+	if (tiles->column[tiles->columns - 1] >= columns ||
+	    tiles->row[tiles->rows - 1] >= rows)
+		return -EBADMSG;
+	return 0;
+}
+
+u32 s7d_hevc_tile_scan(const struct s7d_hevc_tiles *tiles, u32 columns, u32 address)
+{
+	u32 x = address % columns, y = address / columns, tx = 0, ty = 0, i, scan = 0;
+
+	while (tx + 1 < tiles->columns && x >= tiles->column[tx + 1])
+		tx++;
+	while (ty + 1 < tiles->rows && y >= tiles->row[ty + 1])
+		ty++;
+	for (i = 0; i < tx; i++)
+		scan += (tiles->row[ty + 1] - tiles->row[ty]) *
+			(tiles->column[i + 1] - tiles->column[i]);
+	for (i = 0; i < ty; i++)
+		scan += columns * (tiles->row[i + 1] - tiles->row[i]);
+	return scan + (y - tiles->row[ty]) * (tiles->column[tx + 1] - tiles->column[tx]) +
+	       x - tiles->column[tx];
 }
 
 /* The entry points, extension and alignment that end every segment header. */
-static int hevc_slice_tail(struct hevc_bits *b, const struct s7d_hevc_pps *pps, u32 rows,
+static int hevc_slice_tail(struct hevc_bits *b, const struct s7d_hevc_pps *pps,
+			   const struct s7d_hevc_tiles *tiles, u32 rows,
 			   u32 *entry_points, u64 *offsets)
 {
 	u32 i, bits, count;
 
 	if (pps->tiles_enabled || pps->entropy_coding_sync) {
-		*entry_points = hevc_ue(b, hevc_entry_point_limit(pps, rows));
+		*entry_points = hevc_ue(b, hevc_entry_point_limit(pps, tiles, rows));
 		if (*entry_points) {
 			bits = hevc_ue(b, 31) + 1;
 			for (i = 0; i < *entry_points; i++)
@@ -696,7 +771,7 @@ static int hevc_slice_parse(struct hevc_bits *b,
 	if (pps->loop_filter_across_slices && (sao_luma || sao_chroma || !disabled))
 		hevc_get(b, 1);
 tail:
-	ret = hevc_slice_tail(b, pps, rows, &entry_points, &offsets);
+	ret = hevc_slice_tail(b, pps, &input->view.tiles, rows, &entry_points, &offsets);
 	if (ret)
 		return ret;
 	rbsp = b->bytes - b->bit / 8;
@@ -739,6 +814,8 @@ static int hevc_next_slice(struct s7d_hevc_input *input, const u8 *nal, size_t b
 			   struct hevc_bits *bits)
 {
 	const struct s7d_hevc_slice_info *first = &input->view.slice, *previous, *parent;
+	const struct s7d_hevc_tiles *tiles = &input->view.tiles;
+	u32 columns = tiles->column[tiles->columns];
 	struct s7d_hevc_slice_info *slice;
 	int ret;
 
@@ -773,7 +850,9 @@ static int hevc_next_slice(struct s7d_hevc_input *input, const u8 *nal, size_t b
 	ret = hevc_slice_parse(bits, nal, bytes, input, slice, parent);
 	if (ret)
 		return ret;
-	if (slice->slice_address <= previous->slice_address ||
+	/* Segments follow the tile scan. */
+	if (s7d_hevc_tile_scan(tiles, columns, slice->slice_address) <=
+	    s7d_hevc_tile_scan(tiles, columns, previous->slice_address) ||
 	    !hevc_same_picture(first, slice))
 		return -EBADMSG;
 	if (!slice->dependent_slice)
@@ -907,6 +986,7 @@ static int hevc_select_parameters(const struct s7d_hevc_input_bank *bank,
 	struct hevc_bits prefix = *bits;
 	const struct hevc_vps *vps;
 	u32 id, i;
+	int ret;
 
 	hevc_get(&prefix, 1);
 	if (((nal[0] >> 1) & 63) >= 16 && ((nal[0] >> 1) & 63) <= 23)
@@ -943,6 +1023,14 @@ static int hevc_select_parameters(const struct s7d_hevc_input_bank *bank,
 	}
 	input->view.sequence = &input->sequence;
 	input->view.pps = &input->pps;
+	ret = hevc_tile_grid(&input->pps,
+			     DIV_ROUND_UP(input->sequence.sps.coded_width,
+					  1U << input->sequence.sps.log2_ctb_size),
+			     DIV_ROUND_UP(input->sequence.sps.coded_height,
+					  1U << input->sequence.sps.log2_ctb_size),
+			     &input->view.tiles);
+	if (ret)
+		return ret;
 	return hevc_slice_parse(bits, nal, bytes, input, &input->view.slice, NULL);
 }
 

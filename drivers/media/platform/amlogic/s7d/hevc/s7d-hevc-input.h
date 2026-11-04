@@ -9,6 +9,11 @@
 #define S7D_HEVC_RPS_ENTRIES 16U
 /* MaxSliceSegmentsPerPicture of level 6.2, as the vendor's 6.x limit. */
 #define S7D_HEVC_MAX_SLICES 600U
+/* The vendor's tile grid (MAX_TILE_COL_NUM, MAX_TILE_ROW_NUM). */
+#define S7D_HEVC_MAX_TILE_COLUMNS 10U
+#define S7D_HEVC_MAX_TILE_ROWS 20U
+/* The RPM holds the explicit heights of the first 8 tile rows only. */
+#define S7D_HEVC_MAX_EXPLICIT_TILE_ROWS 8U
 #define S7D_HEVC_PARAMETER_BYTES (64U * 1024U)
 /* The largest input buffer, S7D_HEVC_INPUT_MAX_BYTES; the context checks the stream size. */
 #define S7D_HEVC_AU_MAX_BYTES (6U * 1024U * 1024U)
@@ -47,9 +52,25 @@ struct s7d_hevc_slice_info {
 	u64 parameter_epoch;
 };
 
+/* A picture's tile grid in CTBs (6.5.1); one tile when tiles are off. */
+struct s7d_hevc_tiles {
+	u32 columns;
+	u32 rows;
+	/* Boundaries: column[0] = 0 .. column[columns] = PicWidthInCtbsY. */
+	u32 column[S7D_HEVC_MAX_TILE_COLUMNS + 1];
+	u32 row[S7D_HEVC_MAX_TILE_ROWS + 1];
+	bool enabled;
+	bool uniform;
+	bool across;
+};
+
 struct s7d_hevc_pps {
 	u32 pps_id;
 	u32 sps_id;
+	u32 tile_columns;
+	u32 tile_rows;
+	u32 column_width[S7D_HEVC_MAX_TILE_COLUMNS];
+	u32 row_height[S7D_HEVC_MAX_TILE_ROWS];
 	u32 extra_slice_header_bits;
 	u32 default_active[2];
 	s32 init_qp_minus26;
@@ -68,6 +89,8 @@ struct s7d_hevc_pps {
 	bool weighted_pred;
 	bool weighted_bipred;
 	bool tiles_enabled;
+	bool uniform_spacing;
+	bool loop_filter_across_tiles;
 	bool entropy_coding_sync;
 	bool loop_filter_across_slices;
 	bool deblocking_control_present;
@@ -93,6 +116,7 @@ struct s7d_hevc_input_result {
 	/* Every slice segment of the picture, in decoding order. */
 	const struct s7d_hevc_slice_info *slices;
 	u32 slice_count;
+	struct s7d_hevc_tiles tiles;
 	u32 header_rbsp_bytes;
 	u32 entry_points;
 	u32 cabac_rbsp_bytes;
@@ -100,6 +124,9 @@ struct s7d_hevc_input_result {
 
 struct s7d_hevc_input_bank;
 struct s7d_hevc_input;
+
+/* CtbAddrRsToTs (6-5) of raster CTB @address in a picture @columns CTBs wide. */
+u32 s7d_hevc_tile_scan(const struct s7d_hevc_tiles *tiles, u32 columns, u32 address);
 
 struct s7d_hevc_input_bank *s7d_hevc_input_bank_create(void);
 void s7d_hevc_input_bank_destroy(struct s7d_hevc_input_bank *bank);
