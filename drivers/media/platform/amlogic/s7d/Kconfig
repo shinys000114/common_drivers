@@ -42,7 +42,8 @@ config VIDEO_AMLOGIC_S7D_VP9_EXPERIMENTAL
 	  up to 4096x2304 at 60 frames per second, including superframes with
 	  hidden, intra-only and show-existing frames, and returns 8-bit NV12
 	  or NV12M frames or Amlogic FBC frames of the stream's depth. The
-	  frame size must not change within a stream, so reference scaling is
+	  frame size, depth and colour may change at a key frame (dynamic
+	  resolution change), not between inter frames: reference scaling is
 	  not supported. The node runs one decoder session at a time and
 	  shares the DOS with the JPEG encoder.
 

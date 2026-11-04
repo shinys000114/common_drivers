@@ -226,7 +226,8 @@ int s7d_vp9_input_prepare_frame(const struct s7d_vp9_input_bank *bank,
 		return ret;
 	if (view.bytes > s7d_vp9_input_capacity(view.prefix.width, view.prefix.height))
 		return -E2BIG;
-	if (bank->valid && !same_sequence(&bank->layout, &view.layout))
+	/* Only a key frame starts a new size; the caller then reconfigures CAPTURE. */
+	if (bank->valid && !view.prefix.keyframe && !same_sequence(&bank->layout, &view.layout))
 		return -EOPNOTSUPP;
 	if (check_add_overflow(view.bytes, 16U, &view.decode_bytes))
 		return -EOVERFLOW;

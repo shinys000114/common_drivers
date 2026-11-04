@@ -34,6 +34,15 @@ struct vp9_backend {
 	struct s7d_vp9_input *prepared;
 	struct s7d_vp9_input_result view;
 	struct s7d_codec_layout layout;
+	/*
+	 * A key frame of a new layout, held until the frontend has stopped the
+	 * session and set up CAPTURE again; the packet bytes live in held_input
+	 * meanwhile, as the staging goes with the session.
+	 */
+	struct s7d_v4l2_reconfigure change;
+	struct s7d_codec_layout next_layout;
+	void *held_input;
+	u64 change_epoch;
 	u64 generation;
 	u64 last_submitted;
 	u64 last_completed;
@@ -55,6 +64,8 @@ struct vp9_backend {
 	bool execution_attempted;
 	bool drain_pending;
 	bool drain_notified;
+	bool change_pending;
+	bool change_stopped;
 	/*
 	 * The firmware failed the last key frame the decoder ran. A second one
 	 * in a row is no damage the stream recovers from: fail the session.
@@ -105,10 +116,22 @@ static int vp9_metadata(struct vp9_backend *backend)
 	if (ret)
 		return ret;
 	view = s7d_vp9_input_view(prepared);
-	/* A seek keeps the sequence; a new size must be announced again. */
-	if (backend->sequence_notified && memcmp(&backend->layout, &view->layout,
-						 sizeof(view->layout)))
+	if (backend->sequence_valid &&
+	    memcmp(&backend->layout, &view->layout, sizeof(view->layout))) {
+		/* While decoding, a new layout waits for new CAPTURE buffers. */
+		if (backend->captures) {
+			if (!view->prefix.keyframe) {
+				s7d_vp9_input_release(prepared);
+				return -EOPNOTSUPP;
+			}
+			backend->next_layout = view->layout;
+			backend->prepared = prepared;
+			backend->view = *view;
+			return 1;
+		}
+		/* A seek keeps the sequence; a new size must be announced again. */
 		backend->sequence_notified = false;
+	}
 	backend->layout = view->layout;
 	backend->sequence_valid = true;
 	backend->prepared = prepared;
@@ -186,6 +209,23 @@ static bool vp9_frame_error(struct vp9_backend *backend, u64 token, int error)
 	return vp9_drop_frame(backend);
 }
 
+static int vp9_notify_change(struct vp9_backend *backend, bool *cancelled)
+{
+	int ret;
+
+	*cancelled = false;
+	mutex_lock(&backend->notifications);
+	if (backend->frontend && !READ_ONCE(backend->closing)) {
+		ret = s7d_v4l2_reconfigure_result(backend->frontend, &backend->next_layout,
+						 &backend->change, cancelled);
+	} else {
+		*cancelled = true;
+		ret = -ECANCELED;
+	}
+	mutex_unlock(&backend->notifications);
+	return ret;
+}
+
 static int vp9_notify_sequence(struct vp9_backend *backend, bool *cancelled)
 {
 	int ret;
@@ -260,6 +300,34 @@ static void vp9_work(struct work_struct *work)
 		if (backend->input_pending && !backend->preflight) {
 			token = backend->input.token;
 			ret = vp9_metadata(backend);
+			if (ret > 0) {
+				/*
+				 * A key frame of a new layout: the frontend returns
+				 * the frames decoded so far, marks the last one, stops
+				 * the session and restores it with new CAPTURE buffers.
+				 */
+				if (backend->change_epoch == U64_MAX) {
+					ret = -EOVERFLOW;
+					goto failed;
+				}
+				backend->change = (struct s7d_v4l2_reconfigure) {
+					.epoch = ++backend->change_epoch,
+					.input_token = token,
+					.generation = backend->generation,
+				};
+				backend->change_pending = true;
+				backend->capture_blocked = true;
+				backend->preflight = true;
+				mutex_unlock(&backend->lock);
+				ret = vp9_notify_change(backend, &cancelled);
+				mutex_lock(&backend->lock);
+				if (ret) {
+					if (backend->closing && cancelled)
+						goto unlock;
+					goto failed;
+				}
+				goto unlock;
+			}
 			if (ret == -ENODATA) {
 				if (!vp9_drop_frame(backend)) {
 					mutex_unlock(&backend->lock);
@@ -571,7 +639,9 @@ static int vp9_capture_queue(void *priv, struct s7d_codec_surface *surface,
 	int ret = -ESTALE;
 
 	mutex_lock(&backend->lock);
-	if (backend->closing || backend->failure || backend->capture_blocked) {
+	/* Before the frontend stops for a new layout, old buffers still come back. */
+	if (backend->closing || backend->failure ||
+	    (backend->capture_blocked && !backend->change_pending)) {
 		ret = backend->failure ? backend->failure : -ESHUTDOWN;
 		goto out;
 	}
@@ -646,6 +716,17 @@ static void vp9_detach(void *priv)
 	mutex_unlock(&backend->notifications);
 }
 
+static void vp9_change_forget(struct vp9_backend *backend)
+{
+	lockdep_assert_held(&backend->lock);
+	kvfree(backend->held_input);
+	backend->held_input = NULL;
+	memset(&backend->change, 0, sizeof(backend->change));
+	memset(&backend->next_layout, 0, sizeof(backend->next_layout));
+	backend->change_pending = false;
+	backend->change_stopped = false;
+}
+
 static int vp9_release_epoch(struct vp9_backend *backend)
 {
 	struct s7d_codec_session *session;
@@ -714,11 +795,145 @@ static int vp9_reset(void *priv)
 		backend->drain_pending = false;
 		backend->drain_notified = false;
 		backend->keyframe_failed = false;
+		vp9_change_forget(backend);
 		backend->closing = false;
 		mutex_unlock(&backend->lock);
 	}
 	mutex_unlock(&adapter->clients);
 	s7d_vp9_input_bank_destroy(bank);
+	return ret;
+}
+
+static bool vp9_change_matches(struct vp9_backend *backend,
+			       const struct s7d_v4l2_reconfigure *change)
+{
+	lockdep_assert_held(&backend->lock);
+	return change && change->epoch && backend->change_pending &&
+	       change->epoch == backend->change.epoch &&
+	       change->input_token == backend->change.input_token &&
+	       change->generation == backend->change.generation;
+}
+
+static int vp9_change_stop_check(struct vp9_backend *backend,
+				 const struct s7d_v4l2_reconfigure *change)
+{
+	lockdep_assert_held(&backend->lock);
+	if (backend->closing || backend->failure)
+		return backend->failure ? backend->failure : -ESHUTDOWN;
+	if (!vp9_change_matches(backend, change) || backend->change_stopped ||
+	    !backend->session || !backend->input_pending || !backend->preflight ||
+	    !backend->prepared || !backend->capture_blocked || !backend->captures ||
+	    backend->drain_pending || change->generation != backend->generation ||
+	    change->input_token != backend->input.token)
+		return -ESTALE;
+	return 0;
+}
+
+/*
+ * The frontend stops for a key frame of a new layout. VP9 has no reorder:
+ * every frame decoded before it went out when it was decoded, and the
+ * hidden ones die with the key frame. Keep the packet, end the session.
+ */
+static int vp9_reconfigure_stop(void *priv, const struct s7d_v4l2_reconfigure *change)
+{
+	struct vp9_backend *backend = priv;
+	struct s7d_vp9_v4l2 *adapter = backend->adapter;
+	struct s7d_codec_session *session;
+	u32 published;
+	bool cancelled;
+	void *held;
+	int ret;
+
+	mutex_lock(&adapter->clients);
+	mutex_lock(&backend->lock);
+	ret = adapter->closing ? -ESHUTDOWN : vp9_change_stop_check(backend, change);
+	mutex_unlock(&backend->lock);
+	if (ret)
+		goto out;
+	cancel_work_sync(&backend->work);
+	mutex_lock(&backend->notifications);
+	mutex_unlock(&backend->notifications);
+	mutex_lock(&backend->lock);
+	ret = vp9_change_stop_check(backend, change);
+	mutex_unlock(&backend->lock);
+	if (!ret && backend->decoder_bound)
+		ret = s7d_vp9_decoder_drain(adapter->decoder, backend->session,
+					    &published, &cancelled);
+	if (ret)
+		goto out;
+	/* Frames after the key frame are parsed again from the new staging. */
+	held = kvmemdup(s7d_codec_dma_cpu(backend->input.memory), backend->input.bytes,
+			GFP_KERNEL);
+	if (!held) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = s7d_codec_session_stop(backend->session);
+	if (!ret)
+		ret = s7d_vp9_decoder_stream_close(adapter->decoder, backend->session);
+	if (ret) {
+		kvfree(held);
+		goto out;
+	}
+	mutex_lock(&backend->notifications);
+	backend->frontend = NULL;
+	mutex_unlock(&backend->notifications);
+	mutex_lock(&backend->lock);
+	if (adapter->active == backend)
+		adapter->active = NULL;
+	session = backend->session;
+	backend->session = NULL;
+	backend->input.memory = NULL;
+	backend->held_input = held;
+	memset(backend->capture, 0, sizeof(backend->capture));
+	backend->captures = 0;
+	backend->generation = 0;
+	backend->decoder_bound = false;
+	backend->execution_attempted = false;
+	backend->change_stopped = true;
+	mutex_unlock(&backend->lock);
+	s7d_codec_session_put(session);
+out:
+	mutex_unlock(&adapter->clients);
+	return ret;
+}
+
+static int vp9_reconfigure_restore(void *priv, struct s7d_codec_session *session,
+				   struct s7d_v4l2_context *frontend,
+				   struct s7d_codec_dma *staging,
+				   const struct s7d_v4l2_reconfigure *change,
+				   u64 generation)
+{
+	struct vp9_backend *backend = priv;
+	struct s7d_vp9_v4l2 *adapter = backend->adapter;
+	int ret = 0;
+
+	mutex_lock(&adapter->clients);
+	mutex_lock(&backend->lock);
+	if (adapter->closing || backend->closing || backend->failure)
+		ret = backend->failure ? backend->failure : -ESHUTDOWN;
+	else if (!vp9_change_matches(backend, change) || !backend->change_stopped ||
+		 backend->session || adapter->active || backend->captures ||
+		 !backend->input_pending || !backend->prepared || !backend->held_input ||
+		 !session || !frontend || !staging || generation <= change->generation ||
+		 s7d_codec_dma_size(staging) < backend->input.bytes)
+		ret = -ESTALE;
+	if (ret)
+		goto out;
+	s7d_codec_session_get(session);
+	backend->session = session;
+	backend->frontend = frontend;
+	adapter->active = backend;
+	memcpy(s7d_codec_dma_cpu(staging), backend->held_input, backend->input.bytes);
+	backend->input.memory = staging;
+	/* The held key frame decodes first, once the new CAPTURE buffers come. */
+	backend->layout = backend->next_layout;
+	backend->sequence_valid = true;
+	backend->sequence_notified = true;
+	vp9_change_forget(backend);
+out:
+	mutex_unlock(&backend->lock);
+	mutex_unlock(&adapter->clients);
 	return ret;
 }
 
@@ -747,6 +962,7 @@ static int vp9_clear_stream(void *priv)
 		old = backend->bank;
 		backend->bank = bank;
 		bank = NULL;
+		vp9_change_forget(backend);
 		memset(&backend->layout, 0, sizeof(backend->layout));
 		backend->sequence_valid = false;
 		backend->sequence_notified = false;
@@ -770,6 +986,8 @@ static const struct s7d_v4l2_backend_ops vp9_ops = {
 	.detach = vp9_detach,
 	.reset = vp9_reset,
 	.clear_stream = vp9_clear_stream,
+	.reconfigure_stop = vp9_reconfigure_stop,
+	.reconfigure_restore = vp9_reconfigure_restore,
 };
 
 static int vp9_factory_ready(void *priv)
@@ -829,6 +1047,9 @@ static void vp9_factory_destroy(void *priv, void *instance)
 		return;
 	}
 	list_del(&backend->node);
+	mutex_lock(&backend->lock);
+	vp9_change_forget(backend);
+	mutex_unlock(&backend->lock);
 	mutex_unlock(&adapter->clients);
 	s7d_vp9_input_bank_destroy(backend->bank);
 	module_put(adapter->owner);
