@@ -135,14 +135,14 @@ static int hevc_state_check(const struct s7d_hevc_dpb *dpb)
 		const struct s7d_hevc_dpb_picture *pic = &dpb->picture[i];
 
 		if (!pic->valid) {
-			if (pic->decoded || pic->reference || pic->output_needed ||
-			    pic->published ||
+			if (pic->decoded || pic->reference || pic->long_term ||
+			    pic->output_needed || pic->published ||
 			    (dpb->retiring_mask & BIT(i)))
 				return -EUCLEAN;
 			continue;
 		}
 		if (!pic->metadata.input_token || !pic->write_token ||
-		    pic->slice_type > 2 ||
+		    pic->slice_type > 2 || (pic->long_term && !pic->reference) ||
 		    (pic->published && (!pic->decoded || pic->output_needed)) ||
 		    (!pic->decoded && !(dpb->retiring_mask & BIT(i)) &&
 		     (!dpb->active || dpb->active_plan.current_slot != i)))
@@ -225,13 +225,17 @@ static int hevc_slice_check(const struct s7d_hevc_dpb *dpb,
 	for (i = 0; i < slice->rps_count; i++) {
 		const struct s7d_hevc_rps_entry *ref = &slice->rps[i];
 
-		if (ref->long_term)
-			return -EOPNOTSUPP;
+		if (hevc_irap(slice->nal_type) && ref->used)
+			return -EBADMSG;
+		if (ref->long_term) {
+			if (ref->lt_poc_lsb >= (1U << dpb->log2_max_poc_lsb) ||
+			    (u64)ref->lt_msb_cycle << dpb->log2_max_poc_lsb > S32_MAX)
+				return -ERANGE;
+			continue;
+		}
 		if (!ref->delta_poc || ref->delta_poc < -4096 ||
 		    ref->delta_poc > 4095)
 			return -ERANGE;
-		if (hevc_irap(slice->nal_type) && ref->used)
-			return -EBADMSG;
 		if (ref->delta_poc < 0) {
 			if (positive || ref->delta_poc >= last_negative)
 				return -EBADMSG;
@@ -308,7 +312,8 @@ static int hevc_poc_plan(const struct s7d_hevc_dpb *dpb,
 	return 0;
 }
 
-static int hevc_find_reference(const struct s7d_hevc_dpb *dpb, s32 poc)
+/* A short-term reference: neither long-term already nor taken as one now. */
+static int hevc_find_reference(const struct s7d_hevc_dpb *dpb, s32 poc, u32 long_term)
 {
 	u32 i;
 	int found = -ENOENT;
@@ -316,10 +321,47 @@ static int hevc_find_reference(const struct s7d_hevc_dpb *dpb, s32 poc)
 	for (i = 0; i < dpb->slot_count; i++) {
 		const struct s7d_hevc_dpb_picture *pic = &dpb->picture[i];
 
-		if (!pic->valid || !pic->decoded || !pic->reference || pic->poc != poc)
+		if (!pic->valid || !pic->decoded || !pic->reference || pic->poc != poc ||
+		    pic->long_term || (long_term & BIT(i)))
 			continue;
 		if (found >= 0)
 			return -EUCLEAN;
+		found = i;
+	}
+	return found;
+}
+
+/*
+ * The POC a long-term entry names (8.3.2). Without its MSB only the LSBs
+ * identify the picture; the current MSB then only serves concealment.
+ */
+static s64 hevc_long_term_poc(const struct s7d_hevc_dpb *dpb, s32 poc,
+			      const struct s7d_hevc_rps_entry *rps)
+{
+	s64 max_lsb = 1LL << dpb->log2_max_poc_lsb;
+	s64 msb = (s64)poc - (poc & (max_lsb - 1));
+
+	return msb - (rps->msb_present ? (s64)rps->lt_msb_cycle * max_lsb : 0) +
+	       rps->lt_poc_lsb;
+}
+
+/* Any reference picture may become long-term; @taken holds earlier entries'. */
+static int hevc_find_long_term(const struct s7d_hevc_dpb *dpb,
+			       const struct s7d_hevc_rps_entry *rps, s64 poc, u32 taken)
+{
+	u32 i, mask = (1U << dpb->log2_max_poc_lsb) - 1;
+	int found = -ENOENT;
+
+	for (i = 0; i < dpb->slot_count; i++) {
+		const struct s7d_hevc_dpb_picture *pic = &dpb->picture[i];
+
+		if (!pic->valid || !pic->decoded || !pic->reference || (taken & BIT(i)) ||
+		    (rps->msb_present ? pic->poc != poc :
+		     ((u32)pic->poc & mask) != rps->lt_poc_lsb))
+			continue;
+		/* Two candidates for LSBs alone: the MSB had to be sent. */
+		if (found >= 0)
+			return rps->msb_present ? -EUCLEAN : -EBADMSG;
 		found = i;
 	}
 	return found;
@@ -352,8 +394,36 @@ static int hevc_reference_plan(const struct s7d_hevc_dpb *dpb,
 {
 	struct s7d_hevc_picture_ref before[S7D_HEVC_RPS_ENTRIES];
 	struct s7d_hevc_picture_ref after[S7D_HEVC_RPS_ENTRIES];
-	u32 nb = 0, na = 0, total, i, list;
+	struct s7d_hevc_picture_ref lt[S7D_HEVC_RPS_ENTRIES];
+	u32 nb = 0, na = 0, nl = 0, total, i, list;
 
+	/* Long-term entries first: they may take a short-term picture (8.3.2). */
+	for (i = 0; i < slice->rps_count; i++) {
+		const struct s7d_hevc_rps_entry *rps = &slice->rps[i];
+		s64 poc;
+		int slot;
+
+		if (!rps->long_term || plan->clear_dpb)
+			continue;
+		poc = hevc_long_term_poc(dpb, plan->poc, rps);
+		if (poc < S32_MIN || poc > S32_MAX)
+			return -EOVERFLOW;
+		slot = hevc_find_long_term(dpb, rps, poc, plan->long_term_mask);
+		if (slot == -ENOENT && !rps->used)
+			continue;
+		if (slot == -ENOENT) {
+			slot = hevc_nearest_reference(dpb, poc);
+			plan->concealed = true;
+		}
+		if (slot < 0)
+			return slot;
+		plan->long_term_mask |= BIT(slot);
+		plan->retain_mask |= BIT(slot);
+		if (rps->used)
+			lt[nl++] = (struct s7d_hevc_picture_ref) {
+				.poc = dpb->picture[slot].poc, .slot = slot,
+			};
+	}
 	for (i = 0; i < slice->rps_count; i++) {
 		const struct s7d_hevc_rps_entry *rps = &slice->rps[i];
 		struct s7d_hevc_picture_ref ref;
@@ -362,9 +432,9 @@ static int hevc_reference_plan(const struct s7d_hevc_dpb *dpb,
 
 		if (poc < S32_MIN || poc > S32_MAX)
 			return -EOVERFLOW;
-		if (plan->clear_dpb)
+		if (plan->clear_dpb || rps->long_term)
 			continue;
-		slot = hevc_find_reference(dpb, poc);
+		slot = hevc_find_reference(dpb, poc, plan->long_term_mask);
 		/* A picture only kept for later may be missing (8.3.2). */
 		if (slot == -ENOENT && !rps->used)
 			continue;
@@ -391,12 +461,13 @@ static int hevc_reference_plan(const struct s7d_hevc_dpb *dpb,
 		else
 			after[na++] = ref;
 	}
-	total = nb + na;
+	total = nb + na + nl;
 	if (slice->slice_type == 2)
 		return 0;
 	if (!total)
 		return -ENOENT;
 	plan->low_delay = true;
+	/* RefPicListTemp0 is before, after, long-term; Temp1 after, before, long-term. */
 	for (list = 0; list < 2; list++) {
 		plan->list_count[list] = slice->active[list];
 		for (i = 0; i < slice->active[list]; i++) {
@@ -406,7 +477,9 @@ static int hevc_reference_plan(const struct s7d_hevc_dpb *dpb,
 
 			if (index >= total || (slice->modification[list] && total <= 1))
 				return -EBADMSG;
-			if (list == 0)
+			if (index >= nb + na)
+				ref = lt[index - nb - na];
+			else if (list == 0)
 				ref = index < nb ? before[index] : after[index - nb];
 			else
 				ref = index < na ? after[index] : before[index - na];
@@ -544,6 +617,8 @@ int s7d_hevc_dpb_begin(struct s7d_hevc_dpb *dpb,
 	mask = hevc_valid_mask(dpb);
 	if ((plan->retain_mask | plan->drop_output_mask) & ~mask)
 		return -ESTALE;
+	if (plan->long_term_mask & ~plan->retain_mask)
+		return -EINVAL;
 	for (list = 0; list < 2; list++) {
 		if (plan->list_count[list] > S7D_HEVC_RPS_ENTRIES)
 			return -EINVAL;
@@ -675,6 +750,7 @@ int s7d_hevc_dpb_complete(struct s7d_hevc_dpb *dpb, u64 plan_id,
 		if (!pic->valid || i == slot)
 			continue;
 		pic->reference = plan->retain_mask & BIT(i);
+		pic->long_term = plan->long_term_mask & BIT(i);
 		if (plan->drop_output_mask & BIT(i))
 			pic->output_needed = false;
 		if (plan->output_needed && pic->output_needed)
@@ -819,6 +895,7 @@ int s7d_hevc_dpb_finish_sequence(struct s7d_hevc_dpb *dpb, bool discard,
 	hevc_actions_make(dpb, hevc_valid_mask(dpb), &next);
 	for (i = 0; i < dpb->slot_count; i++) {
 		dpb->picture[i].reference = false;
+		dpb->picture[i].long_term = false;
 		dpb->picture[i].output_needed = false;
 	}
 	hevc_actions_commit(dpb, &next);
@@ -886,6 +963,7 @@ int s7d_hevc_dpb_reset(struct s7d_hevc_dpb *dpb, u64 new_generation,
 	hevc_actions_make(dpb, mask, &next);
 	for (i = 0; i < dpb->slot_count; i++) {
 		dpb->picture[i].reference = false;
+		dpb->picture[i].long_term = false;
 		dpb->picture[i].output_needed = false;
 	}
 	dpb->active = false;

@@ -78,6 +78,34 @@ void s7d_hevc_rpm_report(struct device *dev, const struct s7d_hevc_rpm *rpm,
 		w[RPM_COL_INDEX], slice->collocated_ref_idx, w[RPM_MODIFICATION]);
 }
 
+/*
+ * Short-term entries must match in order. The firmware resolves the POC of
+ * a long-term entry by its own rule, so only their number and use count.
+ */
+static bool hevc_rps_same(const struct s7d_hevc_slice_info *a,
+			  const struct s7d_hevc_slice_info *b)
+{
+	u32 i, j, kind;
+
+	for (kind = 0; kind < 2; kind++) {
+		for (i = 0, j = 0;; i++, j++) {
+			while (i < a->rps_count && a->rps[i].long_term != kind)
+				i++;
+			while (j < b->rps_count && b->rps[j].long_term != kind)
+				j++;
+			if (i == a->rps_count || j == b->rps_count) {
+				if (i != a->rps_count || j != b->rps_count)
+					return false;
+				break;
+			}
+			if (a->rps[i].used != b->rps[j].used ||
+			    (!kind && a->rps[i].delta_poc != b->rps[j].delta_poc))
+				return false;
+		}
+	}
+	return true;
+}
+
 static bool hevc_slice_same(const struct s7d_hevc_slice_info *a,
 			    const struct s7d_hevc_slice_info *b)
 {
@@ -91,11 +119,8 @@ static bool hevc_slice_same(const struct s7d_hevc_slice_info *a,
 	    a->collocated_from_l0 != b->collocated_from_l0 ||
 	    a->collocated_ref_idx != b->collocated_ref_idx)
 		return false;
-	for (i = 0; i < a->rps_count; i++)
-		if (a->rps[i].delta_poc != b->rps[i].delta_poc ||
-		    a->rps[i].used != b->rps[i].used ||
-		    a->rps[i].long_term != b->rps[i].long_term)
-			return false;
+	if (!hevc_rps_same(a, b))
+		return false;
 	for (list = 0; list < 2; list++) {
 		if (a->active[list] != b->active[list] ||
 		    a->modification[list] != b->modification[list])
@@ -151,14 +176,14 @@ int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 				break;
 			if (entry & BIT(15))
 				return -EPROTO;
-			if (entry & BIT(14))
-				return -EOPNOTSUPP;
 			delta = entry & 0xfff;
 			if (entry & BIT(12))
 				delta -= 4096;
-			if (!delta)
+			/* [14] long-term: its delta is the firmware's, not compared. */
+			next.rps[i].long_term = !!(entry & BIT(14));
+			if (!delta && !next.rps[i].long_term)
 				return -EPROTO;
-			next.rps[i].delta_poc = delta;
+			next.rps[i].delta_poc = next.rps[i].long_term ? 0 : delta;
 			next.rps[i].used = !!(entry & BIT(13));
 			used += next.rps[i].used;
 			next.rps_count++;
@@ -203,6 +228,8 @@ int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 	next.parameter_epoch = cpu->parameter_epoch;
 	if (!hevc_slice_same(&next, cpu))
 		return -ESTALE;
+	/* The same entries; the CPU parse also holds the long-term POC fields. */
+	memcpy(next.rps, cpu->rps, sizeof(next.rps));
 	*slice = next;
 	return 0;
 }

@@ -50,6 +50,8 @@ struct s7d_hevc_picture_plan {
 	s32 poc;
 	u32 slice_type;
 	u32 retain_mask;
+	/* Of retain_mask, the long-term references after this picture. */
+	u32 long_term_mask;
 	u32 drop_output_mask;
 	u32 list_count[2];
 	struct s7d_hevc_picture_ref list[2][S7D_HEVC_RPS_ENTRIES];
@@ -84,6 +86,7 @@ struct s7d_hevc_dpb_picture {
 	bool valid;
 	bool decoded;
 	bool reference;
+	bool long_term;
 	bool output_needed;
 	bool published;
 	bool concealed;

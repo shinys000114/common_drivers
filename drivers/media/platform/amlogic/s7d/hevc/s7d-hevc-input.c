@@ -437,6 +437,48 @@ static void hevc_weights(struct hevc_bits *b,
 	}
 }
 
+/* The long-term part of the slice's RPS, after its short-term entries (7.3.6.1). */
+static void hevc_slice_long_term(struct hevc_bits *b,
+				 const struct s7d_hevc_sequence *sequence,
+				 struct s7d_hevc_slice_info *slice)
+{
+	u32 lsb_bits = sequence->sps.log2_max_poc_lsb, from_sps = 0, count, i;
+	u32 bits = 0, index, delta, cycle = 0;
+
+	if (sequence->num_long_term_sps)
+		from_sps = hevc_ue(b, sequence->num_long_term_sps);
+	count = from_sps + hevc_ue(b, S7D_HEVC_RPS_ENTRIES);
+	if (b->error || slice->rps_count + count >= S7D_HEVC_RPS_ENTRIES) {
+		b->error = b->error ?: -EBADMSG;
+		return;
+	}
+	while ((1U << bits) < sequence->num_long_term_sps)
+		bits++;
+	for (i = 0; i < count; i++) {
+		struct s7d_hevc_rps_entry *entry = &slice->rps[slice->rps_count + i];
+
+		entry->long_term = true;
+		if (i < from_sps) {
+			index = hevc_get(b, bits);
+			if (index >= sequence->num_long_term_sps) {
+				b->error = b->error ?: -EBADMSG;
+				return;
+			}
+			entry->lt_poc_lsb = sequence->lt_poc_lsb_sps[index];
+			entry->used = sequence->lt_used_sps[index];
+		} else {
+			entry->lt_poc_lsb = hevc_get(b, lsb_bits);
+			entry->used = hevc_get(b, 1);
+		}
+		entry->msb_present = hevc_get(b, 1);
+		delta = entry->msb_present ? hevc_ue(b, 1U << (32 - lsb_bits)) : 0;
+		/* DeltaPocMsbCycleLt adds up within the SPS and the slice entries. */
+		cycle = i == 0 || i == from_sps ? delta : cycle + delta;
+		entry->lt_msb_cycle = cycle;
+	}
+	slice->rps_count += count;
+}
+
 static size_t hevc_escaped_header_bytes(const u8 *nal, size_t bytes,
 				       size_t rbsp_bytes)
 {
@@ -502,19 +544,23 @@ static int hevc_slice_parse(struct hevc_bits *b,
 				return b->error ?: -EBADMSG;
 			rps = sequence->rps[index];
 		}
+		for (i = 0; i < rps.count; i++) {
+			if (!rps.delta[i] || rps.delta[i] < -4096 || rps.delta[i] > 4095)
+				return b->error ?: -EOPNOTSUPP;
+			slice->rps[i].delta_poc = rps.delta[i];
+			slice->rps[i].used = rps.used[i];
+		}
+		slice->rps_count = rps.count;
+		if (sequence->long_term_refs_present)
+			hevc_slice_long_term(b, sequence, slice);
 		if (sequence->temporal_mvp_enabled)
 			slice->temporal_mvp = hevc_get(b, 1);
 	}
-	if (rps.count >= sps->max_dec_pic_buffering)
+	if (slice->rps_count >= sps->max_dec_pic_buffering)
 		return b->error ?: -EBADMSG;
-	for (i = 0; i < rps.count; i++) {
-		if (!rps.delta[i] || rps.delta[i] < -4096 || rps.delta[i] > 4095)
-			return b->error ?: -EOPNOTSUPP;
-		slice->rps[i].delta_poc = rps.delta[i];
-		slice->rps[i].used = rps.used[i];
-		total += rps.used[i];
-	}
-	slice->rps_count = rps.count;
+	/* NumPicTotalCurr */
+	for (i = 0; i < slice->rps_count; i++)
+		total += slice->rps[i].used;
 	if (sequence->sao_enabled) {
 		sao_luma = hevc_get(b, 1);
 		sao_chroma = hevc_get(b, 1);
@@ -664,7 +710,7 @@ static int hevc_parameter_parse(const struct s7d_hevc_input_bank *bank,
 
 		ret = s7d_hevc_parse_sequence(nal, bytes, sequence);
 		id = sequence->sps.sps_id;
-		if (!ret && (id >= HEVC_SPS_COUNT || sequence->long_term_refs_present))
+		if (!ret && id >= HEVC_SPS_COUNT)
 			ret = -EOPNOTSUPP;
 		if (!ret)
 			ret = s7d_hevc_build_layout(&sequence->sps, S7D_CODEC_CAPTURE_NV12M, 0, &layout);

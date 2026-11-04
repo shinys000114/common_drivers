@@ -12,9 +12,14 @@
 #define S7D_HEVC_AU_MAX_BYTES (6U * 1024U * 1024U)
 
 struct s7d_hevc_rps_entry {
+	/* Short-term only. */
 	s32 delta_poc;
 	bool used;
 	bool long_term;
+	/* Long-term: PocLsbLt and, when msb_present, DeltaPocMsbCycleLt. */
+	bool msb_present;
+	u32 lt_poc_lsb;
+	u32 lt_msb_cycle;
 };
 
 struct s7d_hevc_slice_info {

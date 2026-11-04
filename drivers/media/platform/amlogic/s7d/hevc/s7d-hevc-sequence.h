@@ -11,6 +11,7 @@
 #define S7D_HEVC_SPS_MAX_BYTES (64U * 1024U)
 #define S7D_HEVC_ST_RPS_MAX 64U
 #define S7D_HEVC_ST_RPS_ENTRIES 16U
+#define S7D_HEVC_LT_SPS_MAX 32U
 /* The S7D HEVC core decodes up to 4096x2304 (4K60). */
 #define S7D_HEVC_MAX_WIDTH 4096U
 #define S7D_HEVC_MAX_HEIGHT 2304U
@@ -59,6 +60,10 @@ struct s7d_hevc_sequence {
 	struct s7d_hevc_sps sps;
 	u32 num_short_term_rps;
 	struct s7d_hevc_st_rps rps[S7D_HEVC_ST_RPS_MAX];
+	/* Long-term candidates slice headers name by index (lt_idx_sps). */
+	u32 num_long_term_sps;
+	u32 lt_poc_lsb_sps[S7D_HEVC_LT_SPS_MAX];
+	bool lt_used_sps[S7D_HEVC_LT_SPS_MAX];
 	bool sao_enabled;
 	bool temporal_mvp_enabled;
 	bool long_term_refs_present;

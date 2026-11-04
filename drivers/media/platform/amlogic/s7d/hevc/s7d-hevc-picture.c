@@ -402,7 +402,7 @@ static int hevc_picture_program(struct regmap *map,
 	u32 l0_count = refs->list_count[0];
 	u32 l1_count = refs->list_count[1];
 	u32 log2_ctb, pic_size, lcu_size, tile_size, sao_unit;
-	u32 mpred0, mpred1, dblk1, dblk9 = 0, sao_flags = 0;
+	u32 mpred0, mpred1, dblk1, dblk9 = 0, sao_flags = 0, long_term = 0;
 	u32 flags, disabled, beta, tc, across;
 	u32 i;
 	int ret;
@@ -446,6 +446,13 @@ static int hevc_picture_program(struct regmap *map,
 		 !!(flags & BIT(10)) : !!(flags & BIT(3));
 	dblk9 |= across << 1;
 	sao_flags = across << 9;
+	/* [i] L0[i], [16 + i] L1[i] is long-term: no MV scaling (vendor config_mpred_hw). */
+	for (i = 0; i < l0_count; i++)
+		if (refs->long_term_mask & BIT(refs->list[0][i].slot))
+			long_term |= BIT(i);
+	for (i = 0; i < l1_count; i++)
+		if (refs->long_term_mask & BIT(refs->list[1][i].slot))
+			long_term |= BIT(16 + i);
 	ret = regmap_write(map, HEVCD_MPP_ANC2AXI_TBL_CONF_ADDR, 6);
 	if (ret)
 		return ret;
@@ -527,7 +534,7 @@ static int hevc_picture_program(struct regmap *map,
 			{ HEVC_MPRED_TILE_START, 0 },
 			{ HEVC_MPRED_TILE_SIZE_LCU, tile_size },
 			{ HEVC_MPRED_REF_NUM, l0_count | (l1_count << 8) },
-			{ HEVC_MPRED_LT_REF, 0 },
+			{ HEVC_MPRED_LT_REF, long_term },
 			{ HEVC_MPRED_REF_EN_L0, (1U << l0_count) - 1 },
 			{ HEVC_MPRED_REF_EN_L1, (1U << l1_count) - 1 },
 			{ HEVC_MPRED_CUR_POC, (u32)refs->poc },
@@ -772,9 +779,8 @@ static int hevc_references_check(const struct s7d_hevc_slice_info *slice,
 	    plan->retain_mask & ~((1U << count) - 1) ||
 	    plan->retain_mask & BIT(plan->current_slot))
 		return -ESTALE;
-	for (i = 0; i < slice->rps_count; i++)
-		if (slice->rps[i].long_term)
-			return -EOPNOTSUPP;
+	if (plan->long_term_mask & ~plan->retain_mask)
+		return -ESTALE;
 	if (plan->list_count[0] != slice->active[0] ||
 	    plan->list_count[1] != slice->active[1] ||
 	    plan->list_count[0] > S7D_HEVC_RPS_ENTRIES ||

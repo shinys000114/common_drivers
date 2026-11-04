@@ -406,9 +406,18 @@ static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps,
 	if (sequence)
 		sequence->long_term_refs_present = flag;
 	if (flag) {
-		j = hevc_ue(b, 32);
-		for (i = 0; i < j; i++)
-			hevc_skip(b, sps->log2_max_poc_lsb + 1);
+		j = hevc_ue(b, S7D_HEVC_LT_SPS_MAX);
+		if (sequence)
+			sequence->num_long_term_sps = j;
+		for (i = 0; i < j; i++) {
+			u32 lsb = hevc_get(b, sps->log2_max_poc_lsb);
+			bool used = hevc_get(b, 1);
+
+			if (sequence) {
+				sequence->lt_poc_lsb_sps[i] = lsb;
+				sequence->lt_used_sps[i] = used;
+			}
+		}
 	}
 	flag = hevc_get(b, 1);
 	if (sequence)
