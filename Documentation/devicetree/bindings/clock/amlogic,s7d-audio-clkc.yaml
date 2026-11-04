@@ -31,7 +31,9 @@ properties:
   reg:
     items:
       - description: Clock and reset registers, at audio bus offset 0x000.
-      - description: MCLK pad clock registers, at audio bus offset 0xe80.
+      - description: MCLK pad clock registers MCLK_PAD_CTRL0/1, at audio bus
+          offset 0xe80. The bit and frame clock pads that follow belong to
+          the audio pad crossbar.
 
   '#clock-cells':
     const: 1
@@ -89,7 +91,7 @@ examples:
         clock-controller@fe330000 {
             compatible = "amlogic,s7d-audio-clkc";
             reg = <0x0 0xfe330000 0x0 0xb8>,
-                  <0x0 0xfe330e80 0x0 0x10>;
+                  <0x0 0xfe330e80 0x0 0x8>;
             #clock-cells = <1>;
             #reset-cells = <1>;
             clocks = <&clkc 0>, <&clkc 1>, <&clkc 2>,

@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Hardkernel Co., Ltd.
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pinctrl/amlogic,s7d-audio-pinctrl.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Amlogic S7D audio pad crossbar
+
+maintainers:
+  - YoungSoo Shin <shinys000114@gmail.com>
+
+description: |
+  The S7D audio block has pads of its own, which the SoC pin controller
+  then muxes to GPIOs. Each TDMIN lane selects the data pad it reads, each
+  data pad selects the TDMOUT lane it drives or works as an input, and each
+  bit and frame clock pad selects an MST A-F clock or works as an input.
+  Pads TDM_D0-D8 (groups tdm_d0-tdm_d8), TDM_SCLK0-2 (tdm_sclk0-tdm_sclk2)
+  and TDM_LRCLK0-2 (tdm_lrclk0-tdm_lrclk2) reach the SoC pins.
+
+  Functions: tdmin<a-c>_lane<0-7> on a data pad makes it an input of that
+  TDMIN lane, tdmout<a-c>_lane<0-7> makes it an output of that TDMOUT
+  lane, tdm_clk_out<a-f> drives a clock pad from MST A-F and tdm_clk_in
+  makes it an input. The MCLK pads are clocks of the audio clock
+  controller.
+
+allOf:
+  - $ref: pinctrl.yaml#
+
+properties:
+  compatible:
+    const: amlogic,s7d-audio-pinctrl
+
+  reg:
+    items:
+      - description: Data pad registers, at audio bus offset 0xe40.
+      - description: Bit and frame clock pad registers, at audio bus offset 0xe88.
+
+  clocks:
+    items:
+      - description: Peripheral bus clock.
+
+  power-domains:
+    maxItems: 1
+
+patternProperties:
+  '-pins$':
+    type: object
+    additionalProperties: false
+
+    patternProperties:
+      '^mux(-[a-z0-9]+)?$':
+        type: object
+        $ref: pinmux-node.yaml#
+        additionalProperties: false
+
+        properties:
+          groups:
+            items:
+              pattern: '^tdm_(d[0-8]|sclk[0-2]|lrclk[0-2])$'
+
+          function:
+            pattern: '^(tdmin[a-c]_lane[0-7]|tdmout[a-c]_lane[0-7]|tdm_clk_out[a-f]|tdm_clk_in)$'
+
+        required:
+          - groups
+          - function
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    bus {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        pinctrl@fe330e40 {
+            compatible = "amlogic,s7d-audio-pinctrl";
+            reg = <0x0 0xfe330e40 0x0 0x40>,
+                  <0x0 0xfe330e88 0x0 0x8>;
+            clocks = <&clkc 0>;
+            power-domains = <&pwrdm 0>;
+
+            i2s-pins {
+                mux-out {
+                    groups = "tdm_d0";
+                    function = "tdmouta_lane0";
+                };
+
+                mux-in {
+                    groups = "tdm_d1";
+                    function = "tdmina_lane0";
+                };
+
+                mux-clk {
+                    groups = "tdm_sclk0", "tdm_lrclk0";
+                    function = "tdm_clk_outa";
+                };
+            };
+        };
+    };
