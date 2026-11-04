@@ -47,6 +47,20 @@ struct s7d_plane {
 #define S7D_PLANE_ZPOS_OSD2	6
 #define S7D_PLANE_ZPOS_CURSOR	7
 
+/*
+ * Vendor mode takes the vendor zpos ranges, OSD 65..128 and video 0..255, as
+ * vendor userspace writes absolute values in them, the primary included. The
+ * defaults keep the stacking above; the cursor stays fixed on top.
+ */
+#define S7D_PLANE_VENDOR_ZPOS_OSD_MIN	65
+#define S7D_PLANE_VENDOR_ZPOS_OSD_MAX	128
+#define S7D_PLANE_VENDOR_ZPOS_VIDEO_MAX	255
+#define S7D_PLANE_VENDOR_ZPOS_PRIMARY	65
+#define S7D_PLANE_VENDOR_ZPOS_VD1	66
+#define S7D_PLANE_VENDOR_ZPOS_VD2	67
+#define S7D_PLANE_VENDOR_ZPOS_OSD2	68
+#define S7D_PLANE_VENDOR_ZPOS_CURSOR	129
+
 /* -1 keeps the Kconfig policy, 0 selects Mali AFBCD, 1 the GFCD primary. */
 static int afbc_policy = -1;
 module_param(afbc_policy, int, 0444);
@@ -63,6 +77,15 @@ MODULE_PARM_DESC(afbc_policy,
 static bool primary_afbc;
 module_param(primary_afbc, bool, 0444);
 MODULE_PARM_DESC(primary_afbc, "Offer AFBC/AFRC modifiers on the primary plane (default: false)");
+
+/*
+ * Vendor userspace takes any plane that lists NV12 or NV21 for a video plane,
+ * so in vendor mode the primary leaves them out unless this is set.
+ */
+static bool yuv_primary;
+module_param(yuv_primary, bool, 0444);
+MODULE_PARM_DESC(yuv_primary,
+		 "With the vendor interface, offer NV12/NV21 on the primary plane (default: false)");
 
 /*
  * GFCD decodes only what Mali AFBCD cannot read, XBGR8888 AFBC and AFRC,
@@ -609,10 +632,11 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	};
 	const u32 *plane_formats = formats;
 	unsigned int format_count = ARRAY_SIZE(formats);
+	bool vendor = s7d_vendor_props_active(drm);
+	unsigned int zpos, zpos_min, zpos_max;
 	struct s7d_plane *plane;
 	enum drm_plane_type type;
 	const char *name;
-	unsigned int zpos;
 	int ret;
 
 	switch (slot) {
@@ -621,7 +645,8 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 		name = "S7D OSD1";
 		zpos = S7D_PLANE_ZPOS_PRIMARY;
 		plane_formats = primary_formats;
-		format_count = ARRAY_SIZE(primary_formats);
+		/* NV12 and NV21 come last. */
+		format_count = ARRAY_SIZE(primary_formats) - (vendor && !yuv_primary ? 2 : 0);
 		if (afbc_supported && primary_afbc) {
 			funcs = &s7d_rgb_plane_funcs;
 			plane_modifiers = IS_ENABLED(CONFIG_DRM_S7D_GFCD) ?
@@ -672,11 +697,37 @@ struct drm_plane *s7d_plane_create(struct drm_device *drm,
 	plane->gfcd_primary = IS_ENABLED(CONFIG_DRM_S7D_GFCD) &&
 		(afbc_policy < 0 ? IS_ENABLED(CONFIG_DRM_S7D_AFBC_POLICY_GFCD_PRIMARY) :
 		 afbc_policy == 1);
-	if (slot == S7D_PLANE_PRIMARY || slot == S7D_PLANE_CURSOR)
+	zpos_min = 0;
+	zpos_max = S7D_PLANE_ZPOS_CURSOR - 1;
+	if (vendor) {
+		switch (slot) {
+		case S7D_PLANE_PRIMARY:
+			zpos = S7D_PLANE_VENDOR_ZPOS_PRIMARY;
+			break;
+		case S7D_PLANE_RGB:
+			zpos = S7D_PLANE_VENDOR_ZPOS_OSD2;
+			break;
+		case S7D_PLANE_VIDEO:
+			zpos = S7D_PLANE_VENDOR_ZPOS_VD1;
+			break;
+		case S7D_PLANE_VIDEO2:
+			zpos = S7D_PLANE_VENDOR_ZPOS_VD2;
+			break;
+		default:
+			zpos = S7D_PLANE_VENDOR_ZPOS_CURSOR;
+			break;
+		}
+		if (slot == S7D_PLANE_PRIMARY || slot == S7D_PLANE_RGB) {
+			zpos_min = S7D_PLANE_VENDOR_ZPOS_OSD_MIN;
+			zpos_max = S7D_PLANE_VENDOR_ZPOS_OSD_MAX;
+		} else {
+			zpos_max = S7D_PLANE_VENDOR_ZPOS_VIDEO_MAX;
+		}
+	}
+	if (slot == S7D_PLANE_CURSOR || (slot == S7D_PLANE_PRIMARY && !vendor))
 		ret = drm_plane_create_zpos_immutable_property(&plane->base, zpos);
 	else
-		ret = drm_plane_create_zpos_property(&plane->base, zpos, 0,
-						     S7D_PLANE_ZPOS_CURSOR - 1);
+		ret = drm_plane_create_zpos_property(&plane->base, zpos, zpos_min, zpos_max);
 	if (ret)
 		return ERR_PTR(ret);
 	ret = drm_plane_create_alpha_property(&plane->base);
