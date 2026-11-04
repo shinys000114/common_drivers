@@ -18,9 +18,11 @@ struct s7d_codec_dos;
  * VDEC, the HEVC core and HCODEC are leased on their own: a lease, its
  * sequences and a fault concern only that engine, so sessions on different
  * engines run at the same time. VDEC and HCODEC have one holder at a time,
- * which runs them. The holders of the HEVC core take turns: each runs the
- * core's sequences only between run_begin and run_end. The caller serializes
- * lifetime and pins its module before using a lease.
+ * which runs them. The HEVC core has up to S7D_CODEC_HEVC_SESSIONS holders
+ * that take turns: each runs the core's sequences only between run_begin and
+ * run_end. The first holder powers an engine up and the last one powers it
+ * down. The caller serializes lifetime and pins its module before using a
+ * lease.
  */
 struct s7d_codec_dos *
 s7d_codec_dos_create(struct platform_device *pdev, struct module *owner);
@@ -75,7 +77,10 @@ int s7d_codec_dos_halt(struct s7d_codec_lease *lease);
 int s7d_codec_dos_park(struct s7d_codec_lease *lease);
 /* Caller holds firmware/context/backing refs and an armed mailbox/FIFO. */
 int s7d_codec_dos_start(struct s7d_codec_lease *lease);
-/* A failure retains the lease and pins the owner until an explicit retry. */
+/*
+ * A failure retains the lease and pins the owner until an explicit retry. A
+ * fault retains only the lease whose run faulted the engine, or the last one.
+ */
 int s7d_codec_dos_release(struct s7d_codec_lease *lease);
 /*
  * Wait, first come first served, until @lease runs its engine. -ECANCELED
@@ -94,6 +99,12 @@ int s7d_codec_dos_run_end(struct s7d_codec_lease *lease);
 void s7d_codec_dos_run_wake(struct s7d_codec_lease *lease);
 /* @lease runs its engine and another lease waits for it. */
 bool s7d_codec_dos_run_contended(struct s7d_codec_lease *lease);
+/*
+ * Another holder's run faulted @lease's engine. Each run of @lease ended
+ * with the engine idle, so nothing of @lease runs there: its holder may stop
+ * without the halt that run_begin (-EIO) no longer lets it run, and release.
+ */
+bool s7d_codec_dos_faulted_by_other(struct s7d_codec_lease *lease);
 /*
  * The firmware image the engine's instruction memory holds, by a nonzero tag
  * the loader chooses; 0 when unknown: after a power-up or a fault, and until

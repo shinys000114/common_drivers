@@ -20,10 +20,10 @@
 #include "s7d-codec-memory.h"
 
 /*
- * Open sessions of one codec core. The engine lease admits one session per
- * engine, and so one here, until sessions time-slice an engine.
+ * Open sessions of one codec core. The engine lease bounds the sessions of
+ * each engine, and one codec may use them all: four on the HEVC core.
  */
-#define S7D_CODEC_CORE_SESSIONS	1
+#define S7D_CODEC_CORE_SESSIONS	S7D_CODEC_HEVC_SESSIONS
 
 enum s7d_session_state {
 	S7D_SESSION_OPEN,

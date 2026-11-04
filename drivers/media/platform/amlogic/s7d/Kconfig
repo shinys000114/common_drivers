@@ -17,9 +17,11 @@ config VIDEO_AMLOGIC_S7D
 	  profile up to 4096x2304 at 30 frames per second) on the VDEC
 	  engine; the options below add codecs on the HEVC engine and the
 	  JPEG encoder on HCODEC. The codec firmware is loaded through the
-	  Amlogic TEE service. Each engine runs one session at a time, and
-	  different engines run at the same time: an H.264 decode, a decode
-	  on the HEVC engine and a JPEG encode can share the DOS.
+	  Amlogic TEE service. VDEC and HCODEC run one session each, the
+	  HEVC engine up to four HEVC, VP9 and AV1 sessions picture by
+	  picture, and different engines run at the same time: an H.264
+	  decode, decodes on the HEVC engine and a JPEG encode can share the
+	  DOS.
 
 config VIDEO_AMLOGIC_S7D_HEVC_EXPERIMENTAL
 	bool "Amlogic S7D HEVC decoder"

@@ -18,7 +18,7 @@
  * Sessions of the HEVC core that may be bound at once: each HEVC, VP9 or AV1
  * session binds once, and they take turns on the core.
  */
-#define S7D_HEVC_ENGINE_BINDINGS	4
+#define S7D_HEVC_ENGINE_BINDINGS	S7D_CODEC_HEVC_SESSIONS
 
 struct engine_binding {
 	struct s7d_hevc_irq_cookie cookie;

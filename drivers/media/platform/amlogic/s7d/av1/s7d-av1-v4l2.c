@@ -198,6 +198,7 @@ static int av1_hold(void *priv, enum s7d_codec_engine engine)
 static int av1_quiesce(void *priv, enum s7d_codec_engine engine)
 {
 	struct av1_resources *res = priv;
+	bool lost = false;
 	int ret, ended;
 
 	if (engine != S7D_CODEC_ENGINE_HEVC)
@@ -207,9 +208,18 @@ static int av1_quiesce(void *priv, enum s7d_codec_engine engine)
 	if (!ret && !res->runner_closed)
 		ret = -EBUSY;
 	/* The halt takes the session's turn on the core. */
-	if (!ret)
-		ret = s7d_codec_dos_run_begin(&res->lease, NULL, NULL);
 	if (!ret) {
+		ret = s7d_codec_dos_run_begin(&res->lease, NULL, NULL);
+		/*
+		 * Another session's run broke the core, so this one can no
+		 * longer take a turn to halt it. Its runner is closed and each
+		 * of its runs ended halted: nothing of it runs there.
+		 */
+		lost = ret == -EIO && s7d_codec_dos_faulted_by_other(&res->lease);
+		if (lost)
+			ret = 0;
+	}
+	if (!ret && !lost) {
 		ret = s7d_codec_dos_prepare_access(&res->lease);
 		if (!ret)
 			ret = s7d_codec_dos_hevc_irq_mask(&res->lease, false);

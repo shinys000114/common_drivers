@@ -986,6 +986,26 @@ static int hevc_quiesce_locked(struct s7d_hevc_decoder *decoder,
 	return ret;
 }
 
+/*
+ * Another session's run broke the core, so this one can no longer take a turn
+ * to halt it. Its own runs all ended halted: nothing of it runs there.
+ */
+static int hevc_quiesce_lost(struct s7d_hevc_decoder *decoder)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&decoder->irq_lock, flags);
+	decoder->irq_accept = false;
+	spin_unlock_irqrestore(&decoder->irq_lock, flags);
+	if (decoder->irq_binding)
+		ret = s7d_hevc_engine_disarm(decoder->irq_engine, decoder->irq_binding);
+	mutex_lock(&decoder->protocol);
+	decoder->quiesced = !ret;
+	mutex_unlock(&decoder->protocol);
+	return ret;
+}
+
 /* A halt of a core this session may have left running takes the session's turn. */
 static int hevc_quiesce_run(struct s7d_hevc_decoder *decoder)
 {
@@ -995,6 +1015,8 @@ static int hevc_quiesce_run(struct s7d_hevc_decoder *decoder)
 	if (decoder->quarantined || decoder->quiesced)
 		return hevc_quiesce_locked(decoder, S7D_CODEC_ENGINE_HEVC);
 	ret = s7d_codec_dos_run_begin(&decoder->lease, NULL, NULL);
+	if (ret == -EIO && s7d_codec_dos_faulted_by_other(&decoder->lease))
+		return hevc_quiesce_lost(decoder);
 	if (ret)
 		return ret;
 	ret = hevc_quiesce_locked(decoder, S7D_CODEC_ENGINE_HEVC);

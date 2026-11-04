@@ -614,6 +614,17 @@ static int vp9_halt_run(struct s7d_vp9_decoder *decoder)
 	if (decoder->quarantined || decoder->quiesced)
 		return vp9_halt_locked(decoder);
 	ret = s7d_codec_dos_run_begin(&decoder->lease, NULL, NULL);
+	/*
+	 * Another session's run broke the core, so this one can no longer take
+	 * a turn to halt it. Its own runs all ended halted: nothing of it runs
+	 * there, and the halt only disarms its interrupt.
+	 */
+	if (ret == -EIO && s7d_codec_dos_faulted_by_other(&decoder->lease)) {
+		mutex_lock(&decoder->protocol);
+		decoder->quiesced = true;
+		mutex_unlock(&decoder->protocol);
+		return vp9_halt_locked(decoder);
+	}
 	if (ret)
 		return ret;
 	ret = vp9_halt_locked(decoder);

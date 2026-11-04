@@ -107,12 +107,13 @@ s7d_output_entry(struct s7d_v4l2_device *device, u32 fourcc)
 }
 
 /*
- * Each DOS engine runs one session: VDEC (H.264), the HEVC core (HEVC, VP9,
- * AV1) and HCODEC (the JPEG encoder). A client whose codec needs a taken
- * engine is refused with -EBUSY when it sets its coded format or allocates
- * bitstream buffers, before any frame, so players can fall back to software
- * decoding instead of failing at STREAMON (Chromium falls back only when
- * initialisation, the OUTPUT S_FMT, fails). Codecs of other engines still
+ * VDEC (H.264) and HCODEC (the JPEG encoder) run one session each; the HEVC
+ * core runs up to four HEVC, VP9 and AV1 sessions picture by picture. A
+ * client whose codec needs an engine with no session left is refused with
+ * -EBUSY when it sets its coded format or allocates bitstream buffers, before
+ * any frame, so players can fall back to software decoding instead of failing
+ * at STREAMON (Chromium falls back only when initialisation, the OUTPUT S_FMT,
+ * fails), as is one the codec pool cannot hold. Codecs of other engines still
  * start. An engine that a failed stop left in an unknown state refuses its
  * codecs with -EIO and leaves the others alone.
  */
