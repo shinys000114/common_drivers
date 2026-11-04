@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Run the Mali-G310 on Panthor (Mesa) instead of the vendor kbase driver.
+ * Without this overlay the GPU node keeps its kbase compatible.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/reset/amlogic,meson-s7d-reset.h>
+
+&{/} {
+	/*
+	 * Fixed board supply: no voltages, unlike the vendor gpu_opp_table.
+	 * The power values are the vendor GPU cooling model (gpu_cooling.c:
+	 * MHz * dyn_coeff 140 * num_of_pp 1 / 1024 mW), so the
+	 * power_allocator thermal governor can still throttle the GPU.
+	 */
+	panthor_opp: panthor-opp-table {
+		compatible = "operating-points-v2";
+
+		opp-285714285 {
+			opp-hz = /bits/ 64 <285714285>;
+			opp-microwatt = <39062>;
+		};
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microwatt = <54688>;
+		};
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microwatt = <68359>;
+		};
+		opp-666666666 {
+			opp-hz = /bits/ 64 <666666666>;
+			opp-microwatt = <91146>;
+		};
+		opp-852000000 {
+			opp-hz = /bits/ 64 <852000000>;
+			opp-microwatt = <116484>;
+		};
+	};
+};
+
+&gpu {
+	compatible = "amlogic,s7d-mali", "arm,mali-valhall-csf";
+	interrupt-names = "gpu", "mmu", "job";
+	clock-names = "core", "stacks";
+	resets = <&reset RESET_MALI_CAPB3>, <&reset RESET_MALI>;
+	reset-names = "bus", "core";
+	operating-points-v2 = <&panthor_opp>;
+	/* Shareable buffers come from the graphics heap, so the display can scan them out. */
+	memory-region = <&dmaheap_cma_reserved>;
+	memory-region-names = "scanout";
+};
+
+/* Panthor registers GPU cooling through devfreq; the vendor hook is for kbase. */
+&meson_cooldev {
+	status = "disabled";
+};

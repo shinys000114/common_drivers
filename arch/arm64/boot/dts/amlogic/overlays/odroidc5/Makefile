@@ -18,6 +18,7 @@ dtb-y += \
 	mcp2515_16mhz.dtbo \
 	mcp2517fd.dtbo \
 	onewire.dtbo \
+	panthor.dtbo \
 	pcf8563.dtbo \
 	pwm_a.dtbo \
 	pwm_b.dtbo \
