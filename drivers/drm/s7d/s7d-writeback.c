@@ -554,6 +554,11 @@ struct drm_encoder *s7d_writeback_encoder(struct s7d_writeback *wb)
 	return &wb->connector.encoder;
 }
 
+struct drm_writeback_connector *s7d_writeback_drm_connector(struct s7d_writeback *wb)
+{
+	return wb ? &wb->connector : NULL;
+}
+
 static const struct drm_connector_funcs wb_connector_funcs = {
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.reset = wb_state_reset,

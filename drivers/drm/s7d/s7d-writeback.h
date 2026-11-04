@@ -11,6 +11,7 @@ struct drm_connector;
 struct drm_crtc;
 struct drm_device;
 struct drm_encoder;
+struct drm_writeback_connector;
 struct s7d_crtc_state;
 struct s7d_writeback;
 
@@ -73,5 +74,7 @@ int s7d_writeback_cancel(struct s7d_writeback *wb, int error);
 int s7d_writeback_shutdown(struct s7d_writeback *wb);
 struct drm_connector *s7d_writeback_connector(struct s7d_writeback *wb);
 struct drm_encoder *s7d_writeback_encoder(struct s7d_writeback *wb);
+/* NULL without writeback. */
+struct drm_writeback_connector *s7d_writeback_drm_connector(struct s7d_writeback *wb);
 
 #endif

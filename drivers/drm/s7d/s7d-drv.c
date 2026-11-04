@@ -26,6 +26,7 @@
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_of.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -33,6 +34,7 @@
 #include "s7d-gem.h"
 #include "s7d-hdmi.h"
 #include "s7d-hdmi-output.h"
+#include "s7d-hooks.h"
 #include "s7d-plane.h"
 #include "s7d-vpu.h"
 #include "s7d-writeback.h"
@@ -375,6 +377,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	struct drm_connector *connector;
 	struct drm_encoder *encoder, *writeback_encoder;
 	struct drm_bridge *bridge;
+	struct s7d_vendor_objs objs;
 	struct s7d_vpu_link link;
 	struct s7d_vdin *vdin;
 	struct drm_plane *primary, *cursor, *overlay, *video, *video2;
@@ -413,7 +416,8 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return ret;
-	display = devm_drm_dev_alloc(dev, &s7d_drm_driver, struct s7d_drm, drm);
+	display = devm_drm_dev_alloc(dev, s7d_vendor_driver(&s7d_drm_driver),
+				     struct s7d_drm, drm);
 	if (IS_ERR(display))
 		return PTR_ERR(display);
 	drm = &display->drm;
@@ -570,11 +574,32 @@ static int s7d_drm_probe(struct platform_device *pdev)
 		goto fini_vpu;
 	drm_crtc_vblank_off(display->vpu.crtc);
 	platform_set_drvdata(pdev, display);
+	objs = (struct s7d_vendor_objs) {
+		.crtc = display->vpu.crtc,
+		.primary = primary,
+		.cursor = cursor,
+		.overlay = overlay,
+		.video = video,
+		.video2 = video2,
+		.hdmi = connector,
+		.writeback = s7d_writeback_drm_connector(display->vpu.writeback),
+		.bridge = bridge,
+	};
+	ret = s7d_vendor_init(drm, &objs);
+	/* The minors are taken: a deferral could give card0 away. */
+	if (WARN_ON(ret == -EPROBE_DEFER))
+		ret = -EINVAL;
+	if (ret)
+		goto fini_vpu;
 	/* No framebuffer/RDMA takeover occurs before the first atomic commit. */
 	ret = drm_dev_register(drm, 0);
 	if (ret)
 		goto fini_vpu;
 	drm_kms_helper_poll_init(drm);
+	/* Userspace may already use the device; on failure keep plain KMS. */
+	ret = s7d_vendor_register(drm);
+	if (ret)
+		drm_err(drm, "vendor interfaces unavailable: %d\n", ret);
 	drm_fbdev_dma_setup(drm, 32);
 	return 0;
 
@@ -591,6 +616,7 @@ static void s7d_drm_remove(struct platform_device *pdev)
 	struct drm_device *drm = &display->drm;
 	int ret;
 
+	s7d_vendor_unregister(drm);
 	drm_dev_unplug(drm);
 	drm_kms_helper_poll_fini(drm);
 	drm_atomic_helper_shutdown(drm);
@@ -641,8 +667,10 @@ static int s7d_drm_suspend(struct device *dev)
 		ret = s7d_vpu_release_boot(&display->vpu);
 		drm_modeset_unlock(&display->vpu.crtc->mutex);
 	}
-	if (!ret)
+	if (!ret) {
+		s7d_vendor_pm(&display->drm, false);
 		return 0;
+	}
 	restore = drm_mode_config_helper_resume(&display->drm);
 	if (!restore)
 		restore = s7d_crtc_last_error(display->vpu.crtc);
@@ -659,6 +687,7 @@ static int s7d_drm_resume(struct device *dev)
 	ret = drm_mode_config_helper_resume(&display->drm);
 	/* A sink swapped while asleep keeps HPD high; have clients reprobe. */
 	drm_kms_helper_hotplug_event(&display->drm);
+	s7d_vendor_pm(&display->drm, true);
 	return ret ? ret : s7d_crtc_last_error(display->vpu.crtc);
 }
 
