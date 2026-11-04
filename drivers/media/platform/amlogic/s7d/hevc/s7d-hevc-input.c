@@ -59,6 +59,8 @@ struct s7d_hevc_input {
 	struct s7d_hevc_slice_info *slices;
 	u32 slice_count;
 	u32 slice_capacity;
+	/* The last independent segment, 0 for the first. */
+	u32 independent;
 	u8 *parameter[3];
 	size_t parameter_bytes[3];
 	u8 *data;
@@ -309,7 +311,7 @@ static int hevc_pps_parse(struct hevc_bits *b, struct s7d_hevc_pps *pps)
 	hevc_get(b, 1);
 	pps->tiles_enabled = hevc_get(b, 1);
 	pps->entropy_coding_sync = hevc_get(b, 1);
-	if (pps->dependent_slices || pps->tiles_enabled)
+	if (pps->tiles_enabled)
 		return b->error ?: -EOPNOTSUPP;
 	pps->loop_filter_across_slices = hevc_get(b, 1);
 	pps->deblocking_control_present = hevc_get(b, 1);
@@ -501,10 +503,48 @@ static size_t hevc_escaped_header_bytes(const u8 *nal, size_t bytes,
 	return i;
 }
 
-/* @slice is the picture's first slice segment or one after it (7.3.6.1). */
+/* num_entry_point_offsets: at most every CTB row and/or tile starts one (7.4.7.1). */
+static u32 hevc_entry_point_limit(const struct s7d_hevc_pps *pps, u32 rows)
+{
+	return rows - 1;
+}
+
+/* The entry points, extension and alignment that end every segment header. */
+static int hevc_slice_tail(struct hevc_bits *b, const struct s7d_hevc_pps *pps, u32 rows,
+			   u32 *entry_points, u64 *offsets)
+{
+	u32 i, bits, count;
+
+	if (pps->tiles_enabled || pps->entropy_coding_sync) {
+		*entry_points = hevc_ue(b, hevc_entry_point_limit(pps, rows));
+		if (*entry_points) {
+			bits = hevc_ue(b, 31) + 1;
+			for (i = 0; i < *entry_points; i++)
+				*offsets += (u64)hevc_get(b, bits) + 1;
+		}
+	}
+	if (pps->slice_header_extension_present) {
+		count = hevc_ue(b, S7D_HEVC_PARAMETER_BYTES);
+		for (i = 0; i < count; i++)
+			hevc_get(b, 8);
+	}
+	if (!hevc_get(b, 1))
+		return b->error ?: -EBADMSG;
+	while (!b->error && b->bit % 8)
+		if (hevc_get(b, 1))
+			b->error = -EBADMSG;
+	return b->error;
+}
+
+/*
+ * @slice is the picture's first slice segment or one after it (7.3.6.1); a
+ * dependent one takes the rest of its header from @parent, the preceding
+ * independent segment.
+ */
 static int hevc_slice_parse(struct hevc_bits *b,
-			    const u8 *nal, size_t bytes,
-			    struct s7d_hevc_input *input, struct s7d_hevc_slice_info *slice)
+			    const u8 *nal, size_t bytes, struct s7d_hevc_input *input,
+			    struct s7d_hevc_slice_info *slice,
+			    const struct s7d_hevc_slice_info *parent)
 {
 	const struct s7d_hevc_sequence *sequence = &input->sequence;
 	const struct s7d_hevc_sps *sps = &sequence->sps;
@@ -518,6 +558,7 @@ static int hevc_slice_parse(struct hevc_bits *b,
 	bool sao_luma = false, sao_chroma = false, disabled = pps->deblocking_disabled;
 	u64 offsets = 0;
 	size_t escaped, rbsp;
+	int ret;
 
 	/* Every sub-layer is decoded; an IRAP belongs to sub-layer 0. */
 	if (slice->temporal_id_plus1 > sps->max_sub_layers ||
@@ -532,12 +573,23 @@ static int hevc_slice_parse(struct hevc_bits *b,
 	if (slice->first_slice != first)
 		return b->error ?: (first ? -EBADMSG : -EOPNOTSUPP);
 	if (!first) {
+		if (pps->dependent_slices)
+			slice->dependent_slice = hevc_get(b, 1);
 		while ((1U << bits) < columns * rows)
 			bits++;
 		slice->slice_address = hevc_get(b, bits);
 		if (slice->slice_address >= columns * rows)
 			return b->error ?: -EBADMSG;
 		bits = 0;
+	}
+	if (slice->dependent_slice) {
+		u32 address = slice->slice_address;
+
+		*slice = *parent;
+		slice->first_slice = false;
+		slice->dependent_slice = true;
+		slice->slice_address = address;
+		goto tail;
 	}
 	for (i = 0; i < pps->extra_slice_header_bits; i++)
 		if (hevc_get(b, 1))
@@ -643,26 +695,10 @@ static int hevc_slice_parse(struct hevc_bits *b,
 	}
 	if (pps->loop_filter_across_slices && (sao_luma || sao_chroma || !disabled))
 		hevc_get(b, 1);
-	if (pps->entropy_coding_sync) {
-		entry_points = hevc_ue(b, rows - 1);
-		if (entry_points) {
-			bits = hevc_ue(b, 31) + 1;
-			for (i = 0; i < entry_points; i++)
-				offsets += (u64)hevc_get(b, bits) + 1;
-		}
-	}
-	if (pps->slice_header_extension_present) {
-		index = hevc_ue(b, S7D_HEVC_PARAMETER_BYTES);
-		for (i = 0; i < index; i++)
-			hevc_get(b, 8);
-	}
-	if (!hevc_get(b, 1))
-		return b->error ?: -EBADMSG;
-	while (!b->error && b->bit % 8)
-		if (hevc_get(b, 1))
-			b->error = -EBADMSG;
-	if (b->error)
-		return b->error;
+tail:
+	ret = hevc_slice_tail(b, pps, rows, &entry_points, &offsets);
+	if (ret)
+		return ret;
 	rbsp = b->bytes - b->bit / 8;
 	escaped = hevc_escaped_header_bytes(nal, bytes, b->bit / 8);
 	if (!rbsp || escaped >= bytes || offsets >= bytes - escaped)
@@ -702,7 +738,7 @@ static bool hevc_same_picture(const struct s7d_hevc_slice_info *a,
 static int hevc_next_slice(struct s7d_hevc_input *input, const u8 *nal, size_t bytes,
 			   struct hevc_bits *bits)
 {
-	const struct s7d_hevc_slice_info *previous;
+	const struct s7d_hevc_slice_info *first = &input->view.slice, *previous, *parent;
 	struct s7d_hevc_slice_info *slice;
 	int ret;
 
@@ -724,18 +760,24 @@ static int hevc_next_slice(struct s7d_hevc_input *input, const u8 *nal, size_t b
 		input->slices = next;
 		input->slice_capacity = capacity;
 	}
-	previous = input->slice_count == 1 ? &input->view.slice :
-		   &input->slices[input->slice_count - 1];
+	previous = input->slice_count == 1 ? first : &input->slices[input->slice_count - 1];
+	parent = input->independent ? &input->slices[input->independent] : first;
 	slice = &input->slices[input->slice_count];
 	*slice = (struct s7d_hevc_slice_info) {
 		.nal_type = (nal[0] >> 1) & 63, .temporal_id_plus1 = nal[1] & 7,
 	};
-	ret = hevc_slice_parse(bits, nal, bytes, input, slice);
+	/* All VCL NAL units of a picture have one type and TemporalId (7.4.2.4.5). */
+	if (slice->nal_type != first->nal_type ||
+	    slice->temporal_id_plus1 != first->temporal_id_plus1)
+		return -EBADMSG;
+	ret = hevc_slice_parse(bits, nal, bytes, input, slice, parent);
 	if (ret)
 		return ret;
 	if (slice->slice_address <= previous->slice_address ||
-	    !hevc_same_picture(&input->view.slice, slice))
+	    !hevc_same_picture(first, slice))
 		return -EBADMSG;
+	if (!slice->dependent_slice)
+		input->independent = input->slice_count;
 	input->slice_count++;
 	return 0;
 }
@@ -901,7 +943,7 @@ static int hevc_select_parameters(const struct s7d_hevc_input_bank *bank,
 	}
 	input->view.sequence = &input->sequence;
 	input->view.pps = &input->pps;
-	return hevc_slice_parse(bits, nal, bytes, input, &input->view.slice);
+	return hevc_slice_parse(bits, nal, bytes, input, &input->view.slice, NULL);
 }
 
 /*

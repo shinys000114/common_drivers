@@ -368,7 +368,10 @@ static int hevc_mcrcc_program(struct regmap *map,
 	return regmap_write(map, HEVCD_MCRCC_CTL1, 0xff0);
 }
 
-/* Vendor config_mpred_hw HEVC_MPRED_CTRL0; @segment: [2] new picture, [3] new tile. */
+/*
+ * Vendor config_mpred_hw HEVC_MPRED_CTRL0; @segment: [2] new picture,
+ * [3] new tile, [4] dependent slice segment (CABAC and slice state go on).
+ */
 static u32 hevc_mpred_ctrl0(const struct s7d_hevc_rpm *rpm, const struct s7d_hevc_sps *host,
 			    const struct s7d_hevc_slice_info *slice,
 			    const struct s7d_hevc_picture_plan *refs, u32 segment)
@@ -741,7 +744,8 @@ static int hevc_slice_program(struct regmap *map,
 			{ HEVC_MPRED_MV_RD_START_ADDR, read_mv->address },
 			{ HEVC_MPRED_MV_WR_ROW_JUMP, 0 },
 			{ HEVC_MPRED_MV_RD_ROW_JUMP, 0 },
-			{ HEVC_MPRED_CTRL0, hevc_mpred_ctrl0(rpm, host, slice, refs, 0) },
+			{ HEVC_MPRED_CTRL0, hevc_mpred_ctrl0(rpm, host, slice, refs,
+					slice->dependent_slice ? BIT(4) : 0) },
 			{ HEVC_MPRED_CTRL1, hevc_mpred_ctrl1(rpm) },
 			{ HEVC_MPRED_PIC_SIZE, pic_size },
 			{ HEVC_MPRED_PIC_SIZE_LCU, lcu_size },
@@ -760,8 +764,11 @@ static int hevc_slice_program(struct regmap *map,
 		ret = regmap_write(map, HEVC_MPRED_COL_POC, (u32)refs->collocated.poc);
 	if (!ret)
 		ret = hevc_ref_pocs(map, refs);
-	/* The collocated motion of this slice's first CTB; writes continue. */
-	if (!ret)
+	/*
+	 * The collocated motion of this slice's first CTB; writes continue. A
+	 * dependent segment goes on reading where its slice is.
+	 */
+	if (!ret && !slice->dependent_slice)
 		ret = regmap_write(map, HEVC_MPRED_MV_RPTR, read_mv->address +
 				   slice->slice_address * hevc_mv_unit(geometry->ctb_size));
 	if (!ret)

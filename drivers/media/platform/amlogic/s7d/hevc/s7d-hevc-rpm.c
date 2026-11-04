@@ -326,7 +326,7 @@ int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
 	    word[RPM_CTB_DIFF] > 3 || word[RPM_POC_LOG2_MINUS4] > 12)
 		return -EPROTO;
 	/* Which slice segment it is, the slice check compares with the CPU parse. */
-	if (word[RPM_DEPENDENT_SLICE] || !word[RPM_TEMPORAL_ID_PLUS1] ||
+	if (!word[RPM_TEMPORAL_ID_PLUS1] ||
 	    word[RPM_TEMPORAL_ID_PLUS1] > host->max_sub_layers ||
 	    word[RPM_TILES] || word[RPM_TILE_COLUMNS_MINUS1] || word[RPM_TILE_ROWS_MINUS1] ||
 	    (word[RPM_BIT_DEPTH] & 0xff) != (((host->bit_depth_chroma - 8) << 4) |
