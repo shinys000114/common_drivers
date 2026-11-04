@@ -73,6 +73,7 @@ struct au_sps {
 	u32 mb_count;
 	u32 max_references;
 	bool poc1_always_zero;
+	bool frame_num_gaps;
 	struct s7d_codec_colour colour;
 	struct s7d_h264_sps sps;
 };
@@ -672,6 +673,7 @@ static int au_sps_parse(struct au_bits *b, struct au_cache *cache, u32 *sps_id,
 	ret = au_get(b, 1, &v);
 	if (ret)
 		return ret;
+	sps.frame_num_gaps = v;
 	ret = au_ue(b, AU_MAX_MB_DIM - 1, &width);
 	if (ret)
 		return ret;
@@ -1174,6 +1176,7 @@ static void au_info_first(struct s7d_h264_au_info *info,
 	info->coded_width = sps->coded_width;
 	info->coded_height = sps->coded_height;
 	info->max_references = sps->max_references;
+	info->frame_num_gaps = sps->frame_num_gaps;
 	info->colour = sps->colour;
 	info->sps = sps->sps;
 	info->delta_bottom = slice->delta_bottom;

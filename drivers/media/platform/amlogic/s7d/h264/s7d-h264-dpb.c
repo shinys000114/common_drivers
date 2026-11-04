@@ -11,6 +11,12 @@
 #include "s7d-h264-dpb.h"
 
 #define H264_MAX_REFERENCES 16U
+/* Pictures fill [0, count); the "non-existing" frames of 8.2.5.2 sit above. */
+#define H264_GAP_BASE S7D_CODEC_MAX_CAPTURE_BUFFERS
+#define H264_ENTRIES (H264_GAP_BASE + H264_MAX_REFERENCES)
+#define for_each_entry(dpb, i) \
+	for ((i) = 0; (i) < H264_ENTRIES; \
+	     (i) = (i) + 1 == (dpb)->count ? H264_GAP_BASE : (i) + 1)
 
 struct s7d_h264_picture {
 	u32 frame_num;
@@ -29,11 +35,15 @@ struct s7d_h264_picture {
 	bool output;
 	bool reference;
 	bool direct_8x8;
+	/* A frame_num gap entry: a reference with no surface, never output. */
+	bool nonexisting;
+	/* Decoded or concealment content that is never published. */
+	bool hidden;
 };
 
 struct s7d_h264_marking {
-	bool reference[S7D_CODEC_MAX_CAPTURE_BUFFERS];
-	s32 long_term_index[S7D_CODEC_MAX_CAPTURE_BUFFERS];
+	bool reference[H264_ENTRIES];
+	s32 long_term_index[H264_ENTRIES];
 	s32 max_long_term_index;
 	bool reset_poc;
 };
@@ -54,7 +64,7 @@ struct s7d_h264_dpb {
 	struct s7d_codec_session *session;
 	struct s7d_codec_layout layout;
 	struct s7d_h264_capture_binding bindings[S7D_CODEC_MAX_CAPTURE_BUFFERS];
-	struct s7d_h264_picture pictures[S7D_CODEC_MAX_CAPTURE_BUFFERS];
+	struct s7d_h264_picture pictures[H264_ENTRIES];
 	struct s7d_h264_marking marking;
 	struct s7d_h264_poc_state previous;
 	struct s7d_h264_poc_state next;
@@ -229,6 +239,199 @@ static s32 picture_number(const struct s7d_h264_picture *picture,
 		(s32)picture->frame_num;
 }
 
+static bool frame_num_gap(const struct s7d_h264_poc_state *previous, bool idr,
+			  u32 frame_num, u32 log2_frame_num)
+{
+	u32 max_frame_num = 1U << log2_frame_num;
+
+	return !idr && previous->initialized && log2_frame_num == previous->log2_frame_num &&
+	       frame_num != previous->reference_frame_num &&
+	       frame_num != (previous->reference_frame_num + 1U) % max_frame_num;
+}
+
+static int reclaim_pictures(struct s7d_h264_dpb *dpb);
+static int bump_picture(struct s7d_h264_dpb *dpb);
+
+/* 8.2.5.3 before storing an inferred frame; @slice is the coded picture. */
+static int slide_window(struct s7d_h264_dpb *dpb, const struct s7d_h264_slice *slice)
+{
+	u32 i, references = 0;
+	s32 oldest = INT_MAX, number;
+	int found = -1;
+
+	for_each_entry(dpb, i) {
+		const struct s7d_h264_picture *p = &dpb->pictures[i];
+
+		if (!p->occupied || !p->reference)
+			continue;
+		references++;
+		number = picture_number(p, slice);
+		if (p->long_term_index < 0 && number < oldest) {
+			oldest = number;
+			found = i;
+		}
+	}
+	if (references < max(1U, dpb->max_references))
+		return 0;
+	if (found < 0)
+		return -EBADMSG;
+	dpb->pictures[found].reference = false;
+	if (dpb->pictures[found].mv_slot >= 0) {
+		dpb->mv_used[dpb->pictures[found].mv_slot] = false;
+		dpb->pictures[found].mv_slot = -1;
+	}
+	return 0;
+}
+
+/*
+ * 8.2.5.2: store a "non-existing" short-term frame for each frame_num skipped
+ * since the last reference picture, with sliding window marking, before the
+ * coded picture is decoded. Only the last max_num_ref_frames survive the
+ * window, so only those are stored; the FrameNumOffset still advances over
+ * the whole gap. The inference holds whether or not this picture completes.
+ */
+static int fill_frame_num_gap(struct s7d_h264_dpb *dpb,
+			      const struct s7d_h264_slice *slice)
+{
+	struct s7d_h264_poc_state *prev = &dpb->previous;
+	u32 max_frame_num = 1U << slice->log2_frame_num;
+	u32 gap, keep, i, n, frame_num, slot, stored = 0;
+	s64 offset = prev->frame_offset, top, bottom;
+	int ret;
+
+	if (!frame_num_gap(prev, slice->idr, slice->frame_num, slice->log2_frame_num))
+		return 0;
+	/* Without gaps_in_frame_num_value_allowed_flag this is a lost picture. */
+	if (!slice->frame_num_gaps || slice->poc_type != prev->poc_type)
+		return -EBADMSG;
+	gap = (slice->frame_num + max_frame_num - prev->reference_frame_num - 1U) %
+	      max_frame_num;
+	keep = min(gap, max(1U, dpb->max_references));
+	frame_num = prev->frame_num;
+	for (i = 0; i < gap; i++) {
+		n = (prev->reference_frame_num + 1U + i) % max_frame_num;
+		if (n < frame_num)
+			offset += max_frame_num;
+		frame_num = n;
+		if (i < gap - keep)
+			continue;
+		if (slice->poc_type == 0) {
+			/* No POC is defined (8.2.1); keep it after the last reference. */
+			stored++;
+			top = (s64)prev->msb + prev->lsb + 2 * (s64)stored;
+			bottom = top;
+		} else if (slice->poc_type == 1) {
+			ret = expected_poc(slice->poc1, slice->poc1->cycle ? offset + n : 0,
+					   true, &top);
+			if (ret)
+				return ret;
+			bottom = top + slice->poc1->top_to_bottom;
+		} else {
+			top = 2 * (offset + n);
+			bottom = top;
+		}
+		if (offset > U32_MAX || top < INT_MIN || top > INT_MAX ||
+		    bottom < INT_MIN || bottom > INT_MAX)
+			return -EOVERFLOW;
+		ret = slide_window(dpb, slice);
+		if (ret)
+			return ret;
+		for (slot = H264_GAP_BASE; slot < H264_ENTRIES; slot++)
+			if (!dpb->pictures[slot].occupied || !dpb->pictures[slot].reference)
+				break;
+		if (slot == H264_ENTRIES)
+			return -EBADMSG;
+		dpb->pictures[slot] = (struct s7d_h264_picture) {
+			.frame_num = n, .poc = min(top, bottom), .top_poc = top,
+			.bottom_poc = bottom, .long_term_index = -1, .mv_slot = -1,
+			.occupied = true, .complete = true, .output = true,
+			.reference = true, .nonexisting = true,
+		};
+	}
+	if (offset > U32_MAX)
+		return -EOVERFLOW;
+	prev->frame_num = frame_num;
+	prev->frame_offset = offset;
+	prev->reference_frame_num = frame_num;
+	return reclaim_pictures(dpb);
+}
+
+/*
+ * A P or B picture whose references are all gap entries still needs a picture
+ * for the hardware to read: back the newest gap entry with a free surface. Its
+ * content is whatever the buffer held; it is never published.
+ */
+static int back_gap_entry(struct s7d_h264_dpb *dpb, const struct s7d_h264_slice *slice)
+{
+	struct s7d_h264_picture *gap;
+	u32 i, slot, pass, mv;
+	s32 newest = INT_MIN;
+	int found = -1, ret;
+	u64 token;
+
+	if (slice->type == S7D_H264_SLICE_I)
+		return 0;
+	for_each_entry(dpb, i) {
+		const struct s7d_h264_picture *p = &dpb->pictures[i];
+
+		if (!p->occupied || !p->reference)
+			continue;
+		if (!p->nonexisting)
+			return 0;
+		if (picture_number(p, slice) > newest) {
+			newest = picture_number(p, slice);
+			found = i;
+		}
+	}
+	if (found < 0)
+		return 0;
+	for (mv = 0; mv < dpb->mv_slots; mv++)
+		if (!dpb->mv_used[mv])
+			break;
+	if (mv == dpb->mv_slots)
+		return -EAGAIN;
+retry:
+	for (pass = 0; pass < 2; pass++) {
+		for (slot = 0; slot < dpb->count; slot++) {
+			if (dpb->pictures[slot].occupied ||
+			    (!pass && s7d_codec_surface_reading(dpb->bindings[slot].surface)))
+				continue;
+			ret = s7d_codec_surface_acquire(dpb->bindings[slot].surface, &token);
+			if (!ret)
+				break;
+			if (ret != -EAGAIN)
+				return ret;
+		}
+		if (slot < dpb->count)
+			break;
+	}
+	if (slot == dpb->count) {
+		ret = bump_picture(dpb);
+		if (ret)
+			return ret;
+		goto retry;
+	}
+	ret = s7d_codec_surface_written(dpb->bindings[slot].surface, token);
+	if (!ret)
+		ret = s7d_codec_surface_ref_get(dpb->bindings[slot].surface);
+	if (ret) {
+		dpb->failed = ret;
+		return ret;
+	}
+	gap = &dpb->pictures[found];
+	dpb->pictures[slot] = *gap;
+	dpb->pictures[slot].nonexisting = false;
+	dpb->pictures[slot].hidden = true;
+	dpb->pictures[slot].mv_slot = mv;
+	dpb->pictures[slot].direct_8x8 = (slice->mode_8x8_flags & 6U) == 6U;
+	dpb->pictures[slot].write_token = token;
+	dpb->mv_used[mv] = true;
+	memset(gap, 0, sizeof(*gap));
+	gap->long_term_index = -1;
+	gap->mv_slot = -1;
+	return 0;
+}
+
 static int find_reference(const struct s7d_h264_dpb *dpb,
 			  const struct s7d_h264_marking *marking,
 			  const struct s7d_h264_slice *slice,
@@ -236,7 +439,7 @@ static int find_reference(const struct s7d_h264_dpb *dpb,
 {
 	u32 i;
 
-	for (i = 0; i < dpb->count; i++) {
+	for_each_entry(dpb, i) {
 		if (!dpb->pictures[i].occupied || !marking->reference[i])
 			continue;
 		if (long_term && number >= 0 && marking->long_term_index[i] == number)
@@ -253,7 +456,7 @@ static void clear_long_term(const struct s7d_h264_dpb *dpb,
 {
 	u32 i;
 
-	for (i = 0; i < dpb->count; i++)
+	for_each_entry(dpb, i)
 		if (marking->reference[i] && marking->long_term_index[i] == (s32)index)
 			marking->reference[i] = false;
 }
@@ -268,7 +471,7 @@ static int plan_marking(const struct s7d_h264_dpb *dpb,
 
 	memset(marking, 0, sizeof(*marking));
 	marking->max_long_term_index = dpb->max_long_term_index;
-	for (i = 0; i < dpb->count; i++) {
+	for_each_entry(dpb, i) {
 		marking->reference[i] = dpb->pictures[i].reference;
 		marking->long_term_index[i] = dpb->pictures[i].long_term_index;
 	}
@@ -276,7 +479,7 @@ static int plan_marking(const struct s7d_h264_dpb *dpb,
 		memset(marking->reference, 0, sizeof(marking->reference));
 		marking->max_long_term_index = slice->long_term_reference ? 0 : -1;
 	} else if (slice->reference && !slice->mmco_count) {
-		for (i = 0; i < dpb->count; i++) {
+		for_each_entry(dpb, i) {
 			if (!marking->reference[i])
 				continue;
 			references++;
@@ -333,9 +536,9 @@ static int plan_marking(const struct s7d_h264_dpb *dpb,
 			if (command->long_term_index > max_references)
 				return -EBADMSG;
 			marking->max_long_term_index = (s32)command->long_term_index - 1;
-			for (found = 0; found < (int)dpb->count; found++)
-				if (marking->long_term_index[found] > marking->max_long_term_index)
-					marking->reference[found] = false;
+			for_each_entry(dpb, i)
+				if (marking->long_term_index[i] > marking->max_long_term_index)
+					marking->reference[i] = false;
 			break;
 		case 5:
 			memset(marking->reference, 0, sizeof(marking->reference));
@@ -353,7 +556,7 @@ static int plan_marking(const struct s7d_h264_dpb *dpb,
 	    marking->long_term_index[active_slot] > marking->max_long_term_index)
 		return -EBADMSG;
 	references = 0;
-	for (i = 0; i < dpb->count; i++) {
+	for_each_entry(dpb, i) {
 		if (!marking->reference[i])
 			continue;
 		references++;
@@ -397,7 +600,7 @@ static int reorder_list(const struct s7d_h264_dpb *dpb,
 	s32 number;
 	int found;
 
-	for (i = 0; i < dpb->count; i++) {
+	for_each_entry(dpb, i) {
 		refs.reference[i] = dpb->pictures[i].reference;
 		refs.long_term_index[i] = dpb->pictures[i].long_term_index;
 	}
@@ -440,6 +643,35 @@ static int reorder_list(const struct s7d_h264_dpb *dpb,
 	return 0;
 }
 
+/*
+ * The picture the hardware reads for list entry @index. A conformant stream
+ * never predicts from a frame_num gap entry (8.2.5.2), but the list still
+ * names it: give the hardware the real reference nearest to it in POC.
+ */
+static int list_picture(const struct s7d_h264_dpb *dpb, u32 index)
+{
+	const struct s7d_h264_picture *gap = &dpb->pictures[index];
+	s64 distance, best = S64_MAX;
+	int found = -EBADMSG;
+	u32 i;
+
+	if (!gap->nonexisting)
+		return index;
+	for (i = 0; i < dpb->count; i++) {
+		const struct s7d_h264_picture *p = &dpb->pictures[i];
+
+		if (!p->occupied || !p->reference)
+			continue;
+		distance = (s64)p->poc - gap->poc;
+		distance = distance < 0 ? -distance : distance;
+		if (distance < best) {
+			best = distance;
+			found = i;
+		}
+	}
+	return found;
+}
+
 static int build_lists(const struct s7d_h264_dpb *dpb,
 		       const struct s7d_h264_slice *slice, s32 poc,
 		       struct s7d_h264_picture_plan *plan)
@@ -451,7 +683,7 @@ static int build_lists(const struct s7d_h264_dpb *dpb,
 	if (slice->type == S7D_H264_SLICE_I)
 		return 0;
 	for (which = 0; which < (slice->type == S7D_H264_SLICE_B ? 2U : 1U); which++) {
-		for (i = 0; i < dpb->count; i++) {
+		for_each_entry(dpb, i) {
 			if (!dpb->pictures[i].occupied || !dpb->pictures[i].reference)
 				continue;
 			j = counts[which]++;
@@ -476,12 +708,16 @@ static int build_lists(const struct s7d_h264_dpb *dpb,
 			return ret;
 		plan->list_count[which] = counts[which];
 		for (i = 0; i < counts[which]; i++) {
-			const struct s7d_h264_picture *p = &dpb->pictures[lists[which][i]];
+			const struct s7d_h264_picture *p;
+			int slot = list_picture(dpb, lists[which][i]);
 
+			if (slot < 0)
+				return slot;
+			p = &dpb->pictures[slot];
 			if (p->direct_8x8 != ((slice->mode_8x8_flags & 6U) == 6U))
 				return -EOPNOTSUPP;
 			plan->list[which][i] = (struct s7d_h264_picture_ref) {
-				.slot = lists[which][i], .frame_num = p->frame_num,
+				.slot = slot, .frame_num = p->frame_num,
 				.poc = p->poc, .top_poc = p->top_poc,
 				.bottom_poc = p->bottom_poc, .long_term_index = p->long_term_index,
 				.mv_slot = p->mv_slot, .direct_8x8 = p->direct_8x8,
@@ -562,12 +798,19 @@ int s7d_h264_dpb_create(struct s7d_codec_session *session,
 	dpb->max_references = sps->max_num_ref_frames;
 	dpb->reorder_limit = sps->bitstream_restriction ?
 			     sps->num_reorder_frames : layout->dpb_slots;
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < H264_ENTRIES; i++) {
 		dpb->pictures[i].long_term_index = -1;
 		dpb->pictures[i].mv_slot = -1;
 	}
 	*out = dpb;
 	return 0;
+}
+
+bool s7d_h264_dpb_frame_num_gap(const struct s7d_h264_dpb *dpb, bool idr,
+				u32 frame_num, u32 log2_frame_num)
+{
+	return dpb && dpb->active_slot < 0 && log2_frame_num >= 4 && log2_frame_num <= 16 &&
+	       frame_num_gap(&dpb->previous, idr, frame_num, log2_frame_num);
 }
 
 int s7d_h264_dpb_adopt_sequence(struct s7d_h264_dpb *dpb,
@@ -620,6 +863,11 @@ int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 	} else {
 		if (slice->first_mb)
 			return -EOPNOTSUPP;
+		ret = fill_frame_num_gap(dpb, slice);
+		if (!ret)
+			ret = back_gap_entry(dpb, slice);
+		if (ret)
+			return ret;
 		ret = calculate_poc(dpb, slice, &picture, &next);
 		if (ret)
 			return ret;
@@ -637,6 +885,7 @@ int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 	if (ret)
 		return ret;
 	if (new_picture) {
+retry:
 		for (pass = 0; pass < 2; pass++) {
 			for (slot = 0; slot < dpb->count; slot++) {
 				if (dpb->pictures[slot].occupied)
@@ -660,8 +909,12 @@ int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 			if (slot < dpb->count)
 				break;
 		}
-		if (slot == dpb->count)
-			return -EAGAIN;
+		if (slot == dpb->count) {
+			ret = bump_picture(dpb);
+			if (ret)
+				return ret;
+			goto retry;
+		}
 		picture.occupied = true;
 		picture.frame_num = slice->frame_num;
 		picture.write_token = token;
@@ -730,13 +983,23 @@ static int reclaim_pictures(struct s7d_h264_dpb *dpb)
 	u32 i;
 	int ret;
 
+	for (i = H264_GAP_BASE; i < H264_ENTRIES; i++) {
+		if (dpb->pictures[i].reference)
+			continue;
+		memset(&dpb->pictures[i], 0, sizeof(dpb->pictures[i]));
+		dpb->pictures[i].long_term_index = -1;
+		dpb->pictures[i].mv_slot = -1;
+	}
 	for (i = 0; i < dpb->count; i++) {
 		struct s7d_h264_picture *picture = &dpb->pictures[i];
 
 		if (!picture->occupied || !picture->complete ||
 		    !picture->output || picture->reference)
 			continue;
-		ret = s7d_codec_surface_ref_put(dpb->bindings[i].surface);
+		/* An unpublished surface goes back to the queue. */
+		ret = picture->hidden ?
+		      s7d_codec_surface_discard(dpb->bindings[i].surface, picture->write_token) :
+		      s7d_codec_surface_ref_put(dpb->bindings[i].surface);
 		if (ret)
 			return ret;
 		memset(picture, 0, sizeof(*picture));
@@ -769,6 +1032,37 @@ static int discard_prior_pictures(struct s7d_h264_dpb *dpb)
 	return 0;
 }
 
+static int publish_picture(struct s7d_h264_dpb *dpb, u32 index)
+{
+	struct s7d_h264_picture *picture = &dpb->pictures[index];
+	struct s7d_codec_frame frame = {
+		.surface_id = dpb->bindings[index].surface_id,
+		.generation = dpb->bindings[index].generation,
+		.write_token = picture->write_token,
+		.timestamp_ns = picture->timestamp_ns,
+		.timestamp_meta = picture->timestamp_meta,
+		.sequence = dpb->sequence,
+		.flags = picture->flags,
+		.bytesused = { dpb->layout.size[0], dpb->layout.size[1] },
+	};
+	int ret;
+
+	if (picture->hidden) {
+		picture->output = true;
+		return 0;
+	}
+	if (dpb->output_started && picture->poc < dpb->last_output_poc)
+		return -EBADMSG;
+	ret = s7d_codec_session_frame_ready(dpb->session, &frame);
+	if (ret)
+		return ret;
+	picture->output = true;
+	dpb->last_output_poc = picture->poc;
+	dpb->output_started = true;
+	dpb->sequence++;
+	return 0;
+}
+
 static int output_pictures(struct s7d_h264_dpb *dpb, bool flush)
 {
 	u32 i, pending, resident;
@@ -793,33 +1087,44 @@ static int output_pictures(struct s7d_h264_dpb *dpb, bool flush)
 		if (!pending || (!flush && pending <= dpb->reorder_limit &&
 				 resident <= dpb->layout.dpb_slots))
 			return 0;
-		if (dpb->output_started && dpb->pictures[selected].poc < dpb->last_output_poc)
-			return -EBADMSG;
-		{
-			struct s7d_h264_picture *picture = &dpb->pictures[selected];
-			struct s7d_codec_frame frame = {
-				.surface_id = dpb->bindings[selected].surface_id,
-				.generation = dpb->bindings[selected].generation,
-				.write_token = picture->write_token,
-				.timestamp_ns = picture->timestamp_ns,
-				.timestamp_meta = picture->timestamp_meta,
-				.sequence = dpb->sequence,
-				.flags = picture->flags,
-				.bytesused = { dpb->layout.size[0], dpb->layout.size[1] },
-			};
-
-			ret = s7d_codec_session_frame_ready(dpb->session, &frame);
-			if (ret)
-				return ret;
-			picture->output = true;
-			dpb->last_output_poc = picture->poc;
-			dpb->output_started = true;
-			dpb->sequence++;
-		}
-		ret = reclaim_pictures(dpb);
+		ret = publish_picture(dpb, selected);
+		if (!ret)
+			ret = reclaim_pictures(dpb);
 		if (ret)
 			return ret;
 	}
+}
+
+/*
+ * C.4.5.3: no picture buffer is free, as a backed gap entry needs one more:
+ * output the first picture in output order, once per call until a buffer is
+ * empty. A hidden picture's buffer is free at once, a published one once the
+ * client returns it. 0: look for a free buffer again; -EAGAIN: wait for the
+ * client.
+ */
+static int bump_picture(struct s7d_h264_dpb *dpb)
+{
+	int selected = -1, ret;
+	u32 i;
+
+	for (i = 0; i < dpb->count; i++) {
+		const struct s7d_h264_picture *picture = &dpb->pictures[i];
+
+		/* An empty buffer the client still holds. */
+		if (!picture->occupied)
+			return -EAGAIN;
+		if (picture->complete && !picture->output &&
+		    (selected < 0 || picture->poc < dpb->pictures[selected].poc))
+			selected = i;
+	}
+	if (selected < 0)
+		return -EAGAIN;
+	ret = publish_picture(dpb, selected);
+	if (!ret)
+		ret = reclaim_pictures(dpb);
+	if (ret)
+		dpb->failed = ret;
+	return ret;
 }
 
 int s7d_h264_dpb_picture_done(struct s7d_h264_dpb *dpb, u32 slot,
@@ -850,7 +1155,7 @@ int s7d_h264_dpb_picture_done(struct s7d_h264_dpb *dpb, u32 slot,
 			goto failed;
 		dpb->output_started = false;
 	}
-	for (i = 0; i < dpb->count; i++) {
+	for_each_entry(dpb, i) {
 		dpb->pictures[i].reference = dpb->marking.reference[i];
 		dpb->pictures[i].long_term_index = dpb->marking.long_term_index[i];
 		if (!dpb->pictures[i].reference && dpb->pictures[i].mv_slot >= 0) {
@@ -953,7 +1258,7 @@ int s7d_h264_dpb_resync(struct s7d_h264_dpb *dpb)
 	ret = output_pictures(dpb, true);
 	if (ret)
 		goto failed;
-	for (i = 0; i < dpb->count; i++) {
+	for_each_entry(dpb, i) {
 		struct s7d_h264_picture *picture = &dpb->pictures[i];
 
 		picture->reference = false;
@@ -1015,7 +1320,7 @@ int s7d_h264_dpb_get_state(const struct s7d_h264_dpb *dpb,
 		snapshot.write_token = picture->write_token;
 		snapshot.input_token = picture->input_token;
 	}
-	for (i = 0; i < dpb->count; i++) {
+	for_each_entry(dpb, i) {
 		const struct s7d_h264_picture *picture = &dpb->pictures[i];
 
 		if (!picture->occupied)

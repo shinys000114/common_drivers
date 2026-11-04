@@ -59,6 +59,8 @@ struct s7d_h264_slice {
 	bool reference;
 	bool long_term_reference;
 	bool no_output_of_prior_pics;
+	/* gaps_in_frame_num_value_allowed_flag of the host SPS. */
+	bool frame_num_gaps;
 	/* The host parse of the SPS; set for pic_order_cnt_type 1 only. */
 	const struct s7d_h264_poc1 *poc1;
 };
@@ -133,6 +135,9 @@ int s7d_h264_dpb_create(struct s7d_codec_session *session,
 			const struct s7d_h264_capture_binding *bindings,
 			unsigned int count, unsigned int mv_slots,
 			struct s7d_h264_dpb **out);
+/* Between pictures: frame_num skips a value after the last reference (8.2.5.2). */
+bool s7d_h264_dpb_frame_num_gap(const struct s7d_h264_dpb *dpb, bool idr,
+				u32 frame_num, u32 log2_frame_num);
 /* An SPS at an IDR with the same layout and reference count; between pictures. */
 int s7d_h264_dpb_adopt_sequence(struct s7d_h264_dpb *dpb,
 				const struct s7d_h264_sps *sps);

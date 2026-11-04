@@ -621,6 +621,7 @@ static int backend_slice_identity(struct s7d_h264_backend *backend)
 	    (backend->au.idr && backend->au.idr_pic_id != backend->slice.idr_pic_id) ||
 	    backend->au.poc_type != backend->slice.poc_type)
 		return -EBADMSG;
+	backend->slice.frame_num_gaps = backend->au.frame_num_gaps;
 	if (backend->au.poc_type != 1)
 		return 0;
 	/* The host SPS decides type 1 POCs; the RPM keeps 128 truncated offsets. */
@@ -1100,6 +1101,21 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 					ret = backend_hold_reconfigure(backend);
 					changed = !ret;
 				}
+			}
+			if (!ret && !completed && !changed && !backend->hunting &&
+			    !backend->au.frame_num_gaps &&
+			    s7d_h264_dpb_frame_num_gap(backend->dpb, backend->au.idr,
+						       backend->au.frame_num,
+						       backend->au.log2_frame_num)) {
+				/* A gap the SPS does not allow: a reference picture was lost. */
+				status = -ENODATA;
+				ret = s7d_h264_input_reject_picture(backend->stream, token,
+								 status, true, &returned);
+				if (!ret && (returned.token != token || returned.status != status))
+					ret = -ESTALE;
+				completed = !ret;
+				if (!ret)
+					ret = backend_resync(backend, status);
 			}
 		} else if (!ret && preflight.kind == S7D_H264_INPUT_HEADERS) {
 			ret = s7d_h264_input_accept_headers(backend->stream, token, &returned);

@@ -63,6 +63,7 @@ struct s7d_h264_au_info {
 	struct s7d_h264_sps sps;
 	u8 cavlc_tail_bits;
 	u8 delta_poc_present;
+	bool frame_num_gaps;
 	bool idr;
 	bool reference;
 	bool no_output_of_prior_pics;
