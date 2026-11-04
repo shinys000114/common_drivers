@@ -21,6 +21,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_bridge.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_eld.h>
 #include <drm/drm_probe_helper.h>
@@ -33,6 +34,7 @@
 #include "s7d-hdmi-io.h"
 #include "s7d-hdmi-ddc.h"
 #include "s7d-hdmi-audio.h"
+#include "s7d-hooks.h"
 #include "s7d-vpu.h"
 
 /* TOP offsets are bytes; core offsets address 8-bit registers. */
@@ -1639,6 +1641,28 @@ static void s7d_hdmi_audio_hpd(struct s7d_hdmi *h)
 	schedule_work(&h->audio_notify);
 }
 
+/* Report a sink status to DRM, then a detected one to the vendor interfaces. */
+static void s7d_hdmi_report_hpd(struct s7d_hdmi *h, enum drm_connector_status status)
+{
+	struct drm_device *drm = NULL;
+
+	drm_bridge_hpd_notify(&h->bridge, status);
+	/* An I/O error is no unplug; keep the last detected status. */
+	if (status == connector_status_unknown)
+		return;
+	/* The display drops the connector before it releases its device. */
+	mutex_lock(&h->lock);
+	if (h->connector) {
+		drm = h->connector->dev;
+		drm_dev_get(drm);
+	}
+	mutex_unlock(&h->lock);
+	if (!drm)
+		return;
+	s7d_vendor_hpd(drm, status == connector_status_connected);
+	drm_dev_put(drm);
+}
+
 static void s7d_hdmi_hpd_recovery(struct work_struct *work)
 {
 	struct s7d_hdmi *h = container_of(to_delayed_work(work),
@@ -1661,7 +1685,7 @@ static void s7d_hdmi_hpd_recovery(struct work_struct *work)
 	mutex_unlock(&h->lock);
 	s7d_hdmi_audio_hpd(h);
 	if (READ_ONCE(h->hpd_enabled))
-		drm_bridge_hpd_notify(&h->bridge, s7d_hdmi_detect(&h->bridge));
+		s7d_hdmi_report_hpd(h, s7d_hdmi_detect(&h->bridge));
 }
 
 static bool s7d_hdmi_scdc_active(struct s7d_hdmi *h, u8 config)
@@ -1725,8 +1749,8 @@ static irqreturn_t s7d_hdmi_irq(int irq, void *data)
 			mod_delayed_work(system_wq, &h->hpd_recovery, HZ);
 	}
 	if (READ_ONCE(h->hpd_enabled))
-		drm_bridge_hpd_notify(&h->bridge, ret < 0 ? connector_status_unknown :
-				      s7d_hdmi_detect(&h->bridge));
+		s7d_hdmi_report_hpd(h, ret < 0 ? connector_status_unknown :
+				    s7d_hdmi_detect(&h->bridge));
 	return IRQ_HANDLED;
 }
 
@@ -2091,7 +2115,7 @@ static int s7d_hdmi_resume(struct device *dev)
 	enable_irq(h->irq);
 	/* The sink may have changed while asleep. */
 	if (READ_ONCE(h->hpd_enabled))
-		drm_bridge_hpd_notify(&h->bridge, s7d_hdmi_detect(&h->bridge));
+		s7d_hdmi_report_hpd(h, s7d_hdmi_detect(&h->bridge));
 	return 0;
 }
 
