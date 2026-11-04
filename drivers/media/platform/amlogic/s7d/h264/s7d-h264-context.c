@@ -361,6 +361,27 @@ int s7d_h264_context_begin(struct s7d_h264_context *context, u64 input_token)
 	return 0;
 }
 
+static u32 s7d_context_nal_control(const struct s7d_h264_sps *sps)
+{
+	return BIT(16) | BIT(2) | BIT(0) | (sps->level_idc << 7) |
+	       (sps->bitstream_restriction ? BIT(15) : 0);
+}
+
+int s7d_h264_context_adopt_sequence(struct s7d_h264_context *context,
+				    const struct s7d_h264_sps *sps)
+{
+	if (!sps)
+		return -EINVAL;
+	if (context->faulted)
+		return -EIO;
+	/* Parked between pictures; the next restore writes the new control word. */
+	if (!context->sequence_known || !context->park_confirmed ||
+	    context->completion_pending)
+		return -EBUSY;
+	context->nal_control = s7d_context_nal_control(sps);
+	return 0;
+}
+
 int s7d_h264_context_set_sequence(struct s7d_h264_context *context,
 				  struct regmap *map,
 				  const struct s7d_h264_sps *sps,
@@ -401,8 +422,7 @@ int s7d_h264_context_set_sequence(struct s7d_h264_context *context,
 	if ((config_scratch1 & 0xff) != (sps->mb_width & 0xff) ||
 	    ((config_scratch1 >> 8) & 0xffff) != mb_total)
 		return -EBADMSG;
-	nal = BIT(16) | BIT(2) | BIT(0) | (sps->level_idc << 7) |
-	      (sps->bitstream_restriction ? BIT(15) : 0);
+	nal = s7d_context_nal_control(sps);
 	counts = (mv_slots << 24) | (capture_slots << 16) | (capture_slots << 8);
 	if (context->sequence_known &&
 	    (context->sequence_info != config_scratch1 ||

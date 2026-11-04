@@ -46,6 +46,9 @@ int s7d_h264_context_set_sequence(struct s7d_h264_context *context,
 				  const struct s7d_codec_layout *layout,
 				  u32 config_scratch1, u32 mv_slots,
 				  u32 capture_slots);
+/* An SPS at an IDR with the same layout and buffer counts, while parked. */
+int s7d_h264_context_adopt_sequence(struct s7d_h264_context *context,
+				    const struct s7d_h264_sps *sps);
 /* Actual SLICE01 pause; no action ACK or input completion is sent. */
 int s7d_h264_context_save_slice(struct s7d_h264_context *context,
 				struct regmap *map, u64 input_token,

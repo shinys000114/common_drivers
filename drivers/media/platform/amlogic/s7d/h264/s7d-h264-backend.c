@@ -64,7 +64,9 @@ struct s7d_h264_backend {
 	struct s7d_h264_au_info au;
 	struct s7d_h264_dpb *dpb;
 	struct s7d_h264_mv_buffer mv;
+	/* Its colour is the CAPTURE format's; an adopted SPS may code another. */
 	struct s7d_h264_sequence sequence;
+	struct s7d_codec_colour stream_colour;
 	struct s7d_codec_layout layout;
 	struct s7d_h264_capture_binding capture[S7D_CODEC_MAX_CAPTURE_BUFFERS];
 	struct s7d_h264_capture_descriptor descriptor[S7D_CODEC_MAX_CAPTURE_BUFFERS];
@@ -343,11 +345,21 @@ static bool backend_same_sps(const struct s7d_h264_sps *a,
 			    !memcmp(&a->colour, &b->colour, sizeof(a->colour)));
 }
 
+/* Against the stream's current SPS, with the colour it codes. */
+static bool backend_same_stream_sps(const struct s7d_h264_backend *backend,
+				    const struct s7d_h264_sps *sps)
+{
+	struct s7d_h264_sps stream = backend->sequence.sps;
+
+	stream.colour = backend->stream_colour;
+	return backend_same_sps(&stream, sps, false);
+}
+
 static bool backend_same_sequence(struct s7d_h264_backend *backend,
 				  const struct s7d_h264_au_info *au)
 {
 	return backend->sequence_valid &&
-	       backend_same_sps(&backend->sequence.sps, &au->sps, false) &&
+	       backend_same_stream_sps(backend, &au->sps) &&
 	       (!backend->sequence_syntax_valid ||
 		(backend->sequence_poc_type == au->poc_type &&
 		 backend->sequence_log2_frame_num == au->log2_frame_num &&
@@ -367,8 +379,54 @@ static int backend_set_host_sequence(struct s7d_h264_backend *backend,
 	if (ret)
 		return ret;
 	backend->sequence = sequence;
+	backend->stream_colour = sequence.sps.colour;
 	backend->sequence_valid = true;
 	*notify = true;
+	return 0;
+}
+
+/*
+ * An SPS at an IDR that changes neither the CAPTURE layout nor the reference
+ * count (level, profile, POC syntax, reordering, VUI colour) is taken in place:
+ * dev-decoder.rst signals only changes of the format or the buffer count. The
+ * CAPTURE format keeps the colour it reported.
+ */
+static bool backend_can_adopt(struct s7d_h264_backend *backend,
+			      struct s7d_h264_sps *sps)
+{
+	struct s7d_codec_layout layout;
+
+	lockdep_assert_held(&backend->decoder->transaction);
+	if (!backend->au.idr || !backend->sequence_valid || !backend->sequence_syntax_valid ||
+	    !backend->hardware_started || !backend->captures || !backend->dpb ||
+	    backend->input_staging || backend->config_waiting || backend->slice_waiting ||
+	    backend->timeout_armed || backend->change_pending)
+		return false;
+	*sps = backend->au.sps;
+	backend_normalize_sps(sps);
+	sps->colour = backend->sequence.sps.colour;
+	if (sps->max_num_ref_frames != backend->sequence.sps.max_num_ref_frames ||
+	    s7d_h264_build_layout(sps, S7D_CODEC_CAPTURE_NV12M, 0, &layout))
+		return false;
+	return !memcmp(&layout, &backend->sequence.layout, sizeof(layout));
+}
+
+static int backend_adopt_sequence(struct s7d_h264_backend *backend,
+				  const struct s7d_h264_sps *sps)
+{
+	int ret;
+
+	lockdep_assert_held(&backend->decoder->transaction);
+	ret = s7d_h264_context_adopt_sequence(backend->context, sps);
+	if (!ret)
+		ret = s7d_h264_dpb_adopt_sequence(backend->dpb, sps);
+	if (ret)
+		return ret;
+	backend->sequence.sps = *sps;
+	backend->stream_colour = backend->au.sps.colour;
+	backend->sequence_poc_type = backend->au.poc_type;
+	backend->sequence_log2_frame_num = backend->au.log2_frame_num;
+	backend->sequence_log2_poc_lsb = backend->au.log2_poc_lsb;
 	return 0;
 }
 
@@ -390,12 +448,10 @@ static int backend_hold_reconfigure(struct s7d_h264_backend *backend)
 				    0, &next.layout);
 	if (ret)
 		return ret;
-	if (old->coded_width == layout->coded_width && old->coded_height == layout->coded_height &&
-	    old->visible_left == layout->visible_left && old->visible_top == layout->visible_top &&
-	    old->visible_width == layout->visible_width &&
-	    old->visible_height == layout->visible_height &&
-	    old->min_capture_buffers == layout->min_capture_buffers)
+	if (!memcmp(old, layout, sizeof(*layout)) &&
+	    next.sps.max_num_ref_frames == backend->sequence.sps.max_num_ref_frames)
 		return -EOPNOTSUPP;
+	/* An unchanged layout still rebuilds the DPB and MV pool for new references. */
 	if (backend->change_epoch == U64_MAX)
 		return -EOVERFLOW;
 	backend->change = (struct s7d_v4l2_reconfigure) {
@@ -421,7 +477,7 @@ static int backend_reconcile_config(struct s7d_h264_backend *backend,
 	backend_normalize_sps(&sequence->sps);
 	sequence->sps.colour = backend->sequence.sps.colour;
 	if (!backend_same_sps(&backend->sequence.sps, &sequence->sps, true) ||
-	    !backend_same_sps(&backend->sequence.sps, &backend->au.sps, false))
+	    !backend_same_stream_sps(backend, &backend->au.sps))
 		return -EBADMSG;
 	ret = s7d_h264_build_layout(&sequence->sps, backend->layout.format,
 				    0, &layout);
@@ -911,6 +967,7 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 	struct s7d_h264_decoder *decoder = backend->decoder;
 	struct s7d_h264_input_return returned;
 	struct s7d_h264_preflight preflight;
+	struct s7d_h264_sps adopted;
 	u64 token;
 	bool notify = false, changed = false, completed = false, start = false, resume = false;
 	int ret, status = 0;
@@ -948,6 +1005,8 @@ static int backend_run_submit(struct s7d_h264_backend *backend, bool *cancelled)
 					if (!ret && (returned.token != token || returned.status != status))
 						ret = -ESTALE;
 					completed = !ret;
+				} else if (backend_can_adopt(backend, &adopted)) {
+					ret = backend_adopt_sequence(backend, &adopted);
 				} else {
 					ret = backend_hold_reconfigure(backend);
 					changed = !ret;
@@ -1832,11 +1891,12 @@ static int backend_reconfigure_restore(void *priv, struct s7d_codec_session *ses
 		backend->last_submitted = restored.token;
 		backend->initial_complete = true;
 		backend->sequence = backend->next_sequence;
+		backend->stream_colour = backend->sequence.sps.colour;
 		backend->sequence_valid = true;
 		backend->sequence_syntax_valid = false;
 		ret = s7d_h264_input_get_au(backend->stream, restored.token, &backend->au);
 		if (!ret && (!backend->input_picture || !backend->au.idr ||
-			     !backend_same_sps(&backend->sequence.sps, &backend->au.sps, false)))
+			     !backend_same_stream_sps(backend, &backend->au.sps)))
 			ret = -ESTALE;
 		if (!ret) {
 			s7d_h264_input_checkpoint_discard(&backend->checkpoint);
@@ -1878,6 +1938,7 @@ static int backend_clear_stream(void *priv)
 		backend->change_stopped = false;
 		s7d_h264_parameters_clear(backend->parameters);
 		memset(&backend->sequence, 0, sizeof(backend->sequence));
+		memset(&backend->stream_colour, 0, sizeof(backend->stream_colour));
 		backend->sequence_valid = false;
 		backend->sequence_syntax_valid = false;
 		backend->sequence_poc_type = 0;

@@ -570,6 +570,23 @@ int s7d_h264_dpb_create(struct s7d_codec_session *session,
 	return 0;
 }
 
+int s7d_h264_dpb_adopt_sequence(struct s7d_h264_dpb *dpb,
+				const struct s7d_h264_sps *sps)
+{
+	if (!dpb || !sps)
+		return -EINVAL;
+	if (dpb->failed)
+		return dpb->failed;
+	if (dpb->active_slot >= 0)
+		return -EBUSY;
+	if (sps->max_num_ref_frames != dpb->max_references)
+		return -EINVAL;
+	/* The IDR's own completion still outputs or discards the prior pictures. */
+	dpb->reorder_limit = sps->bitstream_restriction ?
+			     sps->num_reorder_frames : dpb->layout.dpb_slots;
+	return 0;
+}
+
 int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 			 const struct s7d_h264_slice *slice, u64 input_token,
 			 u64 timestamp_ns,

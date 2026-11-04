@@ -133,6 +133,9 @@ int s7d_h264_dpb_create(struct s7d_codec_session *session,
 			const struct s7d_h264_capture_binding *bindings,
 			unsigned int count, unsigned int mv_slots,
 			struct s7d_h264_dpb **out);
+/* An SPS at an IDR with the same layout and reference count; between pictures. */
+int s7d_h264_dpb_adopt_sequence(struct s7d_h264_dpb *dpb,
+				const struct s7d_h264_sps *sps);
 /* Serialized process context; firmware remains paused until the plan is applied. */
 int s7d_h264_dpb_prepare(struct s7d_h264_dpb *dpb,
 			 const struct s7d_h264_slice *slice, u64 input_token,
