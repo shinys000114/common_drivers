@@ -26,6 +26,12 @@ struct s7d_hevc_decode_result {
 	 * and decoding goes on (from the next IRAP if it may be a reference).
 	 */
 	bool recovered;
+	/*
+	 * -EAGAIN: no CAPTURE buffer was free and another session waited for
+	 * the core, so the picture gave the core up; it runs again from its
+	 * start once the client queues a CAPTURE buffer.
+	 */
+	bool yielded;
 };
 
 /*

@@ -448,6 +448,9 @@ static void hevc_work(struct work_struct *work)
 			if (ret) {
 				if (result.cancelled && backend->closing)
 					goto unlock;
+				/* It waits for a CAPTURE buffer; the next QBUF runs it again. */
+				if (result.yielded)
+					goto unlock;
 				/* A dropped damaged picture fails only its OUTPUT buffer. */
 				if (!result.recovered)
 					goto failed;

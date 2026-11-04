@@ -104,6 +104,10 @@ struct s7d_hevc_job {
 	struct s7d_hevc_decode_result result;
 	struct completion wake;
 	u64 lease_epoch;
+	/* The core run's own number, new for each attempt at the picture. */
+	u64 run_token;
+	/* The client's CAPTURE QBUF count when the header last found no buffer. */
+	u64 queued_seen;
 	u64 firmware_epoch;
 	u64 write_token;
 	u32 opaque_swap;
@@ -158,6 +162,15 @@ struct s7d_hevc_decoder {
 	u64 firmware_epoch;
 	u64 generation;
 	u64 last_input_token;
+	u64 run_serial;
+	/*
+	 * CAPTURE buffers the client queued, and how many a picture had seen
+	 * when it last gave the core up for want of one: it runs again after
+	 * the next.
+	 */
+	u64 queued_count;
+	u64 yield_count;
+	bool yielded;
 	u32 captures;
 	u32 queued_mask;
 	u32 pin_mask;
@@ -321,7 +334,7 @@ static irqreturn_t hevc_irq(void *data, const struct s7d_hevc_irq_cookie *cookie
 	if (job && (cookie->session != job->session ||
 	    cookie->lease_epoch != job->lease_epoch ||
 	    cookie->binding != decoder->irq_binding ||
-	    cookie->input_token != job->metadata.input_token))
+	    cookie->input_token != job->run_token))
 		job = NULL;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	if (!job)
@@ -688,6 +701,7 @@ static int hevc_header(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *jo
 
 		spin_lock_irqsave(&decoder->irq_lock, flags);
 		mask = decoder->queued_mask;
+		job->queued_seen = decoder->queued_count;
 		spin_unlock_irqrestore(&decoder->irq_lock, flags);
 		/* First a buffer no importer still reads, then any queued one. */
 		idle = hevc_idle_slots(decoder, mask);
@@ -814,7 +828,7 @@ static irqreturn_t hevc_irq_thread(void *data, const struct s7d_hevc_irq_cookie 
 	if (job && (cookie->session != job->session ||
 	    cookie->lease_epoch != job->lease_epoch ||
 	    cookie->binding != decoder->irq_binding ||
-	    cookie->input_token != job->metadata.input_token))
+	    cookie->input_token != job->run_token))
 		job = NULL;
 	if (job)
 		snapshot = job->snapshot;
@@ -883,6 +897,18 @@ static const struct s7d_hevc_irq_ops hevc_irq_ops = {
 	.irq = hevc_irq,
 	.thread = hevc_irq_thread,
 };
+
+/* Another session waits for the core: wake a picture that waits for a buffer. */
+static void hevc_contended(void *priv)
+{
+	struct s7d_hevc_decoder *decoder = priv;
+	unsigned long flags;
+
+	spin_lock_irqsave(&decoder->irq_lock, flags);
+	if (decoder->job)
+		complete_all(&decoder->job->wake);
+	spin_unlock_irqrestore(&decoder->irq_lock, flags);
+}
 
 static int hevc_hold(void *priv, enum s7d_codec_engine engine)
 {
@@ -1148,7 +1174,7 @@ static int hevc_start(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *job
 	decoder->irq_accept = true;
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	ret = s7d_hevc_engine_arm(decoder->irq_engine, decoder->irq_binding,
-				  job->metadata.input_token);
+				  job->run_token);
 	if (!ret)
 		ret = s7d_codec_dos_hevc_irq_mask(&decoder->lease, true);
 	if (!ret)
@@ -1381,6 +1407,7 @@ int s7d_hevc_decoder_capture_queue(struct s7d_hevc_decoder *decoder,
 		}
 		decoder->queue_serial[slot]++;
 		decoder->queued_mask |= BIT(slot);
+		decoder->queued_count++;
 		if (decoder->job)
 			complete_all(&decoder->job->wake);
 		ret = 0;
@@ -1397,7 +1424,7 @@ static int hevc_job_halt(struct s7d_hevc_decoder *decoder, struct s7d_hevc_job *
 	ret = hevc_quiesce_locked(decoder, S7D_CODEC_ENGINE_HEVC);
 	if (job->context_begun) {
 		marked = s7d_hevc_context_mark_idle(job->context, job->lease_epoch,
-				job->metadata.input_token, ret, true);
+				job->run_token, ret, true);
 		if (!ret)
 			ret = marked;
 		if (!ret)
@@ -1524,10 +1551,20 @@ static int hevc_wait_picture(struct s7d_hevc_decoder *decoder, struct s7d_hevc_j
 			ret = hevc_header(decoder, job, &cancelled);
 			if (ret && cancelled)
 				job->result.cancelled = true;
-			if (ret == -EAGAIN)
+			if (ret == -EAGAIN) {
+				/*
+				 * No CAPTURE buffer is free. Wait for the client
+				 * alone, but give the core to a session that
+				 * waits for it: the picture starts over later.
+				 */
 				ret = 0;
-			else if (!ret && job->header_armed)
+				if (s7d_codec_dos_run_contended(&decoder->lease)) {
+					job->result.yielded = true;
+					ret = -EAGAIN;
+				}
+			} else if (!ret && job->header_armed) {
 				deadline = jiffies + msecs_to_jiffies(HEVC_TIMEOUT_MS);
+			}
 		} else {
 			ret = 0;
 		}
@@ -1691,7 +1728,7 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	struct s7d_hevc_first_failure failure;
 	const char *stage = "quiesce";
 	int ret, stopped, ended, cleanup = 0, fault, first_error;
-	bool waited = false, timed_out, data;
+	bool waited = false, timed_out, data, waiting;
 
 	if (!decoder || !session || !input || !input->data || !input->bytes ||
 	    !input_token || !timestamp_meta || !result ||
@@ -1706,13 +1743,25 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 		ret = decoder->failure ? decoder->failure : -EBUSY;
 		goto out;
 	}
-	if (input_token <= decoder->last_input_token || decoder->decode_count == U32_MAX) {
+	if (input_token <= decoder->last_input_token || decoder->decode_count == U32_MAX ||
+	    decoder->run_serial == U64_MAX) {
 		ret = -ESTALE;
 		goto out;
 	}
 	ret = hevc_check_stop(decoder);
 	if (ret) {
 		result->cancelled = true;
+		goto out;
+	}
+	/* It gave the core up for want of a buffer: none came since. */
+	spin_lock_irqsave(&decoder->irq_lock, flags);
+	waiting = decoder->yielded && decoder->queued_count == decoder->yield_count;
+	if (!waiting)
+		decoder->yielded = false;
+	spin_unlock_irqrestore(&decoder->irq_lock, flags);
+	if (waiting) {
+		result->yielded = true;
+		ret = -EAGAIN;
 		goto out;
 	}
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
@@ -1730,6 +1779,7 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	job->slice_count = input->slice_count;
 	job->tiles = input->tiles;
 	job->lease_epoch = decoder->epoch;
+	job->run_token = ++decoder->run_serial;
 	job->metadata = (struct s7d_hevc_picture_metadata) {
 		.input_token = input_token, .timestamp_ns = timestamp_ns,
 		.timestamp_meta = *timestamp_meta,
@@ -1774,7 +1824,7 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	}
 	au = (struct s7d_hevc_context_au) {
 		.data = input->data, .bytes = input->bytes, .sps = &decoder->sps,
-		.lease_epoch = decoder->epoch, .input_token = input_token,
+		.lease_epoch = decoder->epoch, .input_token = job->run_token,
 	};
 	if (!ret) {
 		stage = "stage-input";
@@ -1782,7 +1832,7 @@ int s7d_hevc_decoder_decode(struct s7d_hevc_decoder *decoder,
 	}
 	if (!ret) {
 		stage = "context-begin";
-		ret = s7d_hevc_context_begin(job->context, decoder->epoch, input_token);
+		ret = s7d_hevc_context_begin(job->context, decoder->epoch, job->run_token);
 	}
 	if (ret)
 		goto stop;
@@ -1850,6 +1900,21 @@ stop:
 	if (fault) {
 		ret = fault;
 		job->result.cancelled = false;
+		job->result.yielded = false;
+	}
+	/* Given up at its header pause: nothing of the picture is kept. */
+	if (!stopped && ret == -EAGAIN && job->result.yielded) {
+		cleanup = hevc_discard_current(decoder, job);
+		if (!cleanup) {
+			spin_lock_irqsave(&decoder->irq_lock, flags);
+			/* A QBUF after the header looked lets the next decode run. */
+			decoder->yielded = true;
+			decoder->yield_count = job->queued_seen;
+			spin_unlock_irqrestore(&decoder->irq_lock, flags);
+			goto finish;
+		}
+		ret = cleanup;
+		job->result.yielded = false;
 	}
 	/* A damaged picture on a halted core is dropped; decoding goes on. */
 	timed_out = waited && !fault && ret == -ETIMEDOUT;
@@ -1941,6 +2006,7 @@ stop:
 			decoder->lost_iraps = 0;
 		}
 	}
+finish:
 	hevc_release_bodies(decoder, S7D_HEVC_NO_SLOT);
 	*result = job->result;
 	spin_lock_irqsave(&decoder->irq_lock, flags);
@@ -1948,7 +2014,7 @@ stop:
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	s7d_codec_session_put(job->session);
 	kfree(job);
-	if (ret && !result->cancelled && !result->recovered)
+	if (ret && !result->cancelled && !result->recovered && !result->yielded)
 		decoder->failure = ret;
 	decoder->running = false;
 	complete_all(&decoder->idle);
@@ -2097,6 +2163,7 @@ int s7d_hevc_decoder_stream_close(struct s7d_hevc_decoder *decoder,
 	decoder->session = NULL;
 	decoder->generation = 0;
 	decoder->last_input_token = 0;
+	decoder->yielded = false;
 	decoder->pin_mask = 0;
 	decoder->output_sequence = 0;
 	decoder->decode_count = 0;
@@ -2139,6 +2206,8 @@ s7d_hevc_decoder_create(struct device *dev, struct s7d_codec_dos *borrowed_dos,
 	decoder->dev = get_device(dev);
 	decoder->owner = owner;
 	decoder->dos = borrowed_dos;
+	decoder->lease.contended = hevc_contended;
+	decoder->lease.priv = decoder;
 	decoder->firmware = borrowed_firmware;
 	decoder->irq_engine = borrowed_engine;
 	mutex_init(&decoder->control);

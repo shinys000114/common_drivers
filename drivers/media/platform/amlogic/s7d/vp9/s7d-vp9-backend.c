@@ -239,6 +239,31 @@ static u32 vp9_pick_slot(struct s7d_vp9_decoder *decoder, u32 available)
 	return __ffs(available);
 }
 
+/*
+ * Before taking the core: a picture needs a free CAPTURE buffer at its header
+ * pause, so wait for one here, where waiting keeps no other session off the
+ * core. A show-existing frame runs nothing on the core.
+ */
+static int vp9_wait_capture(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
+{
+	unsigned long flags;
+	bool free;
+	int ret;
+
+	if (job->header.show_existing)
+		return 0;
+	for (;;) {
+		spin_lock_irqsave(&decoder->irq_lock, flags);
+		reinit_completion(&job->wake);
+		free = decoder->queued_mask & ~decoder->pin_mask;
+		spin_unlock_irqrestore(&decoder->irq_lock, flags);
+		ret = vp9_stop_check(decoder);
+		if (ret || free)
+			return ret;
+		wait_for_completion(&job->wake);
+	}
+}
+
 static int vp9_acquire_surface(struct s7d_vp9_decoder *decoder, struct vp9_job *job)
 {
 	unsigned long flags;
@@ -1279,7 +1304,9 @@ int s7d_vp9_decoder_decode(struct s7d_vp9_decoder *decoder,
 	spin_unlock_irqrestore(&decoder->irq_lock, flags);
 	/* The core is idle when its turn comes; nothing of this picture ran yet. */
 	stage = "run-token";
-	ret = s7d_codec_dos_run_begin(&decoder->lease, vp9_run_cancelled, decoder);
+	ret = vp9_wait_capture(decoder, job);
+	if (!ret)
+		ret = s7d_codec_dos_run_begin(&decoder->lease, vp9_run_cancelled, decoder);
 	if (ret) {
 		result->cancelled = ret == -ECANCELED;
 		if (!result->cancelled)
