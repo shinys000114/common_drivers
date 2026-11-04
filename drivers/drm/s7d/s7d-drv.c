@@ -36,6 +36,7 @@
 #include "s7d-hdmi-output.h"
 #include "s7d-hooks.h"
 #include "s7d-plane.h"
+#include "s7d-vendor-props.h"
 #include "s7d-vpu.h"
 #include "s7d-writeback.h"
 #include "s7d-vdin.h"
@@ -390,6 +391,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	struct drm_device *drm;
 	struct s7d_drm *display;
 	u8 major, revision;
+	bool vendor_order;
 	int ret;
 
 	ret = meson_cpu_version_read(MESON_CPU_VERSION_LVL_MAJOR, &major);
@@ -465,11 +467,18 @@ static int s7d_drm_probe(struct platform_device *pdev)
 		ret = PTR_ERR(primary);
 		goto fini_vpu;
 	}
-	cursor = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
-				  S7D_PLANE_CURSOR, false);
-	if (IS_ERR(cursor)) {
-		ret = PTR_ERR(cursor);
-		goto fini_vpu;
+	/*
+	 * Vendor userspace takes OSD and video planes by their order; the vendor
+	 * driver has no cursor, so in vendor mode it comes after them.
+	 */
+	vendor_order = s7d_vendor_props_active(drm);
+	if (!vendor_order) {
+		cursor = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
+					  S7D_PLANE_CURSOR, false);
+		if (IS_ERR(cursor)) {
+			ret = PTR_ERR(cursor);
+			goto fini_vpu;
+		}
 	}
 	overlay = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36), S7D_PLANE_RGB,
 				   display->vpu.afbc_available &&
@@ -489,6 +498,14 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	if (IS_ERR(video2)) {
 		ret = PTR_ERR(video2);
 		goto fini_vpu;
+	}
+	if (vendor_order) {
+		cursor = s7d_plane_create(drm, BIT(0), DMA_BIT_MASK(36),
+					  S7D_PLANE_CURSOR, false);
+		if (IS_ERR(cursor)) {
+			ret = PTR_ERR(cursor);
+			goto fini_vpu;
+		}
 	}
 	display->vpu.crtc = s7d_crtc_create(drm, primary, cursor, revision, &display->vpu.scanout,
 					    &s7d_vpu_crtc_ops, &display->vpu);
