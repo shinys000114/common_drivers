@@ -31,10 +31,6 @@ struct s7d_jpeg_execution {
 	struct s7d_jpeg_header header;
 	struct s7d_jpeg_irq_snapshot snapshot;
 	struct completion done;
-	void *input;
-	void *scan;
-	dma_addr_t input_dma;
-	size_t input_bytes;
 	u64 generation;
 	u64 lease_epoch;
 	int status;
@@ -52,6 +48,17 @@ struct s7d_jpeg_encoder {
 	struct s7d_codec_firmware_job *preload;
 	struct s7d_jpeg_execution *job;
 	struct regmap *map;
+	/*
+	 * Input copy and scan buffer, kept from the first encode of a session
+	 * until a proved halt at its stop. Retained with the job after an
+	 * unproved halt.
+	 */
+	void *input;
+	void *scan;
+	dma_addr_t input_dma;
+	dma_addr_t scan_dma;
+	u32 input_bytes;
+	u32 scan_capacity;
 	struct mutex control; /* Serializes execution and session teardown. */
 	struct mutex protocol; /* Serializes register programming and threaded IRQ. */
 	struct completion idle;
@@ -126,19 +133,48 @@ size_t s7d_jpeg_encoder_pool_bytes(u32 width, u32 height)
 	return PAGE_ALIGN(input) + scan;
 }
 
-static void jpeg_free_job(struct s7d_jpeg_encoder *encoder,
-			  struct s7d_jpeg_execution *job)
+static void jpeg_free_job(struct s7d_jpeg_execution *job)
 {
 	if (!job)
 		return;
-	if (job->scan)
-		dma_free_coherent(encoder->dev, job->hardware.scan_capacity,
-				  job->scan, job->hardware.scan_dma);
-	if (job->input)
-		dma_free_coherent(encoder->dev, job->input_bytes, job->input,
-				  job->input_dma);
 	s7d_codec_session_put(job->session);
 	kfree(job);
+}
+
+/* HCODEC is proved idle, or never started on these buffers. */
+static void jpeg_free_staging(struct s7d_jpeg_encoder *encoder)
+{
+	lockdep_assert_held(&encoder->control);
+	if (encoder->scan)
+		dma_free_coherent(encoder->dev, encoder->scan_capacity,
+				  encoder->scan, encoder->scan_dma);
+	if (encoder->input)
+		dma_free_coherent(encoder->dev, encoder->input_bytes,
+				  encoder->input, encoder->input_dma);
+	encoder->scan = NULL;
+	encoder->input = NULL;
+	encoder->scan_capacity = 0;
+	encoder->input_bytes = 0;
+}
+
+/*
+ * One format holds for a whole session, so a buffer from its first encode
+ * serves every later one. Another size replaces it; no job runs here.
+ */
+static int jpeg_alloc_staging(struct s7d_jpeg_encoder *encoder, void **cpu,
+			      dma_addr_t *dma, u32 *bytes, u32 want)
+{
+	lockdep_assert_held(&encoder->control);
+	if (*cpu && *bytes == want)
+		return 0;
+	if (*cpu)
+		dma_free_coherent(encoder->dev, *bytes, *cpu, *dma);
+	*bytes = 0;
+	*cpu = dma_alloc_coherent(encoder->dev, want, dma, GFP_KERNEL);
+	if (!*cpu)
+		return -ENOMEM;
+	*bytes = want;
+	return 0;
 }
 
 static irqreturn_t jpeg_irq_thread(int irq, void *data)
@@ -257,10 +293,12 @@ static int jpeg_quiesce(void *priv, enum s7d_codec_engine engine)
 		mutex_lock(&encoder->control);
 	}
 	ret = jpeg_halt_locked(encoder);
-	if (!ret)
+	if (!ret) {
 		job = jpeg_detach_job(encoder);
+		jpeg_free_staging(encoder);
+	}
 	mutex_unlock(&encoder->control);
-	jpeg_free_job(encoder, job);
+	jpeg_free_job(job);
 	return ret;
 }
 
@@ -342,30 +380,29 @@ static int jpeg_stage(struct s7d_jpeg_encoder *encoder,
 	u32 y_bytes = source->stride * source->height;
 	int ret;
 
-	job->input_bytes = input_bytes;
-	job->input = dma_alloc_coherent(encoder->dev, input_bytes,
-					 &job->input_dma, GFP_KERNEL);
-	if (!job->input)
-		return -ENOMEM;
-	job->hardware.scan_capacity = scan_capacity;
-	job->scan = dma_alloc_coherent(encoder->dev, scan_capacity,
-					&job->hardware.scan_dma, GFP_KERNEL);
-	if (!job->scan)
-		return -ENOMEM;
+	ret = jpeg_alloc_staging(encoder, &encoder->scan, &encoder->scan_dma,
+				 &encoder->scan_capacity, scan_capacity);
+	if (!ret)
+		ret = jpeg_alloc_staging(encoder, &encoder->input, &encoder->input_dma,
+					 &encoder->input_bytes, input_bytes);
+	if (ret)
+		return ret;
+	job->hardware.scan_dma = encoder->scan_dma;
+	job->hardware.scan_capacity = encoder->scan_capacity;
 	job->hardware.input_format = source->format;
 	job->hardware.width = source->width;
 	job->hardware.height = source->height;
 	job->hardware.y = (struct s7d_jpeg_plane) {
-		.dma = job->input_dma, .bytes = y_bytes, .stride = source->stride,
+		.dma = encoder->input_dma, .bytes = y_bytes, .stride = source->stride,
 	};
 	job->hardware.uv = (struct s7d_jpeg_plane) {
-		.dma = job->input_dma + y_bytes, .bytes = y_bytes / 2,
+		.dma = encoder->input_dma + y_bytes, .bytes = y_bytes / 2,
 		.stride = source->stride,
 	};
 	ret = s7d_jpeg_protocol_check(&job->hardware);
 	if (ret)
 		return ret;
-	memcpy(job->input, source->data, input_bytes);
+	memcpy(encoder->input, source->data, input_bytes);
 	dma_wmb();
 	return 0;
 }
@@ -501,12 +538,12 @@ stop:
 		ret = jpeg_check_stop(encoder);
 	if (!ret) {
 		dma_rmb();
-		ret = s7d_jpeg_validate_output(job->scan, job->hardware.scan_capacity,
+		ret = s7d_jpeg_validate_output(encoder->scan, job->hardware.scan_capacity,
 				job->snapshot.scan_bytes, capture_capacity, &output);
 	}
 	if (!ret) {
 		memcpy(capture, job->header.data, sizeof(job->header.data));
-		memcpy((u8 *)capture + sizeof(job->header.data), job->scan,
+		memcpy((u8 *)capture + sizeof(job->header.data), encoder->scan,
 		       output.scan_bytes);
 		*result = (struct s7d_jpeg_encode_result) {
 			.bytesused = output.bytesused, .scan_bytes = output.scan_bytes,
@@ -519,7 +556,7 @@ idle:
 	complete_all(&encoder->idle);
 out:
 	mutex_unlock(&encoder->control);
-	jpeg_free_job(encoder, retired);
+	jpeg_free_job(retired);
 	return ret;
 }
 
@@ -543,11 +580,13 @@ int s7d_jpeg_encoder_stop(struct s7d_jpeg_encoder *encoder,
 		goto out;
 	}
 	ret = jpeg_halt_locked(encoder);
-	if (!ret)
+	if (!ret) {
 		job = jpeg_detach_job(encoder);
+		jpeg_free_staging(encoder);
+	}
 out:
 	mutex_unlock(&encoder->control);
-	jpeg_free_job(encoder, job);
+	jpeg_free_job(job);
 	return ret;
 }
 
