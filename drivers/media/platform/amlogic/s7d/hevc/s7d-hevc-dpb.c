@@ -67,6 +67,17 @@ static bool hevc_reference(u32 nal)
 	return hevc_irap(nal) || (nal <= 9 && (nal & 1));
 }
 
+/*
+ * A sub-layer non-reference picture may still be a reference of the higher
+ * sub-layers (3.132); only one of the highest sub-layer never is.
+ */
+static bool hevc_may_reference(const struct s7d_hevc_dpb *dpb,
+			       const struct s7d_hevc_slice_info *slice)
+{
+	return hevc_reference(slice->nal_type) ||
+	       slice->temporal_id_plus1 < dpb->max_sub_layers;
+}
+
 static u32 hevc_slot_mask(const struct s7d_hevc_dpb *dpb)
 {
 	return (1U << dpb->slot_count) - 1;
@@ -97,7 +108,8 @@ static int hevc_state_check(const struct s7d_hevc_dpb *dpb)
 	u32 i;
 
 	if (!dpb || !dpb->generation || !dpb->parameter_epoch ||
-	    !dpb->revision || !dpb->max_dec_pic_buffering ||
+	    !dpb->revision || !dpb->max_sub_layers || dpb->max_sub_layers > 7 ||
+	    !dpb->max_dec_pic_buffering ||
 	    dpb->max_dec_pic_buffering > 16 ||
 	    dpb->num_reorder_pics >= dpb->max_dec_pic_buffering ||
 	    dpb->slot_count < dpb->max_dec_pic_buffering + 2 ||
@@ -146,14 +158,13 @@ int s7d_hevc_dpb_init(struct s7d_hevc_dpb *dpb,
 	u64 latency;
 
 	if (!dpb || !sps || !generation || !parameter_epoch ||
+	    !sps->max_sub_layers || sps->max_sub_layers > 7 ||
 	    !sps->max_dec_pic_buffering || sps->max_dec_pic_buffering > 16 ||
 	    sps->num_reorder_pics >= sps->max_dec_pic_buffering ||
 	    sps->log2_max_poc_lsb < 4 || sps->log2_max_poc_lsb > 16 ||
 	    slot_count < sps->max_dec_pic_buffering + 2 ||
 	    slot_count > S7D_HEVC_DPB_SLOTS)
 		return -EINVAL;
-	if (sps->max_sub_layers != 1)
-		return -EOPNOTSUPP;
 	latency = sps->max_latency_increase_plus1 ?
 		(u64)sps->num_reorder_pics + sps->max_latency_increase_plus1 - 1 : 0;
 	if (latency > U32_MAX)
@@ -163,6 +174,7 @@ int s7d_hevc_dpb_init(struct s7d_hevc_dpb *dpb,
 	dpb->parameter_epoch = parameter_epoch;
 	dpb->revision = 1;
 	dpb->slot_count = slot_count;
+	dpb->max_sub_layers = sps->max_sub_layers;
 	dpb->max_dec_pic_buffering = sps->max_dec_pic_buffering;
 	dpb->num_reorder_pics = sps->num_reorder_pics;
 	dpb->max_latency_pictures = latency;
@@ -178,7 +190,7 @@ static int hevc_slice_check(const struct s7d_hevc_dpb *dpb,
 	u32 i;
 
 	if (!slice || slice->slice_type > 2 ||
-	    !slice->temporal_id_plus1 || slice->temporal_id_plus1 > 7 ||
+	    !slice->temporal_id_plus1 || slice->temporal_id_plus1 > dpb->max_sub_layers ||
 	    slice->rps_count > S7D_HEVC_RPS_ENTRIES ||
 	    slice->active[0] > S7D_HEVC_RPS_ENTRIES ||
 	    slice->active[1] > S7D_HEVC_RPS_ENTRIES ||
@@ -186,10 +198,11 @@ static int hevc_slice_check(const struct s7d_hevc_dpb *dpb,
 		return -EINVAL;
 	if (slice->parameter_epoch != dpb->parameter_epoch)
 		return -ESTALE;
-	if (slice->temporal_id_plus1 != 1 || !slice->first_slice ||
-	    slice->dependent_slice || slice->slice_address ||
+	if (!slice->first_slice || slice->dependent_slice || slice->slice_address ||
 	    (slice->nal_type > 9 && !hevc_irap(slice->nal_type)))
 		return -EOPNOTSUPP;
+	if (hevc_irap(slice->nal_type) && slice->temporal_id_plus1 != 1)
+		return -EBADMSG;
 	if (slice->rps_count >= dpb->max_dec_pic_buffering)
 		return -EINVAL;
 	if (hevc_irap(slice->nal_type) && slice->slice_type != 2)
@@ -285,7 +298,9 @@ static int hevc_poc_plan(const struct s7d_hevc_dpb *dpb,
 			return 0;
 		}
 	}
-	if (!hevc_leading(slice->nal_type) && hevc_reference(slice->nal_type)) {
+	/* prevTid0Pic: TemporalId 0, neither RASL, RADL nor sub-layer non-reference. */
+	if (slice->temporal_id_plus1 == 1 && !hevc_leading(slice->nal_type) &&
+	    hevc_reference(slice->nal_type)) {
 		next->prev_tid0_poc = poc;
 		next->prev_tid0_valid = true;
 	}
@@ -442,7 +457,7 @@ int s7d_hevc_dpb_plan(const struct s7d_hevc_dpb *dpb,
 	next.collocated.slot = S7D_HEVC_NO_SLOT;
 	next.metadata = *metadata;
 	next.slice_type = slice->slice_type;
-	next.reference = hevc_reference(slice->nal_type);
+	next.reference = hevc_may_reference(dpb, slice);
 	next.output_needed = slice->pic_output_flag;
 	next.temporal_mvp = slice->temporal_mvp;
 	ret = hevc_poc_plan(dpb, slice, &next);

@@ -42,9 +42,13 @@ struct s7d_hevc_sps {
 	u32 log2_min_cb_size;
 	u32 log2_ctb_size;
 	u32 log2_max_poc_lsb;
+	/* Of the highest sub-layer: all sub-layers are decoded. */
 	u32 max_dec_pic_buffering;
 	u32 num_reorder_pics;
 	u32 max_latency_increase_plus1;
+	/* Of sub-layer 0, which the firmware may report instead. */
+	u32 max_dec_pic_buffering_tid0;
+	u32 num_reorder_pics_tid0;
 	struct s7d_codec_colour colour;
 	bool separate_colour_plane;
 	bool interlaced_source;

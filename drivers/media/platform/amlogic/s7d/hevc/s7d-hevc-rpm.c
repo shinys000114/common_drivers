@@ -134,9 +134,7 @@ int s7d_hevc_rpm_decode_slice(const struct s7d_hevc_rpm *rpm,
 	next.dependent_slice = word[RPM_DEPENDENT_SLICE];
 	next.slice_address = word[RPM_SLICE_ADDRESS];
 	if (next.slice_type > 2 ||
-	    (next.nal_type != 0 && next.nal_type != 1 &&
-	     !(next.nal_type >= 6 && next.nal_type <= 9) &&
-	     !(next.nal_type >= 16 && next.nal_type <= 21)))
+	    (next.nal_type > 9 && !(next.nal_type >= 16 && next.nal_type <= 21)))
 		return -EOPNOTSUPP;
 	if (next.nal_type >= 16 && next.slice_type != 2)
 		return -EPROTO;
@@ -226,6 +224,19 @@ int s7d_hevc_rpm_parse(const void *snapshot, size_t bytes,
 	return 0;
 }
 
+/*
+ * The firmware names its DPB words after sub-layer 0; with several
+ * sub-layers either their or the highest sub-layer's values may be there.
+ */
+static bool hevc_dpb_words(const u16 *word, const struct s7d_hevc_sps *host)
+{
+	u32 dpb = word[RPM_DPB_MINUS1] + 1U, reorder = word[RPM_REORDER];
+
+	return (dpb == host->max_dec_pic_buffering && reorder == host->num_reorder_pics) ||
+	       (dpb == host->max_dec_pic_buffering_tid0 &&
+		reorder == host->num_reorder_pics_tid0);
+}
+
 static int s7d_hevc_host_check(const struct s7d_hevc_sps *host)
 {
 	u64 crop_x = (u64)host->crop_left + host->crop_right;
@@ -238,10 +249,13 @@ static int s7d_hevc_host_check(const struct s7d_hevc_sps *host)
 	    host->log2_ctb_size < 4 || host->log2_ctb_size > 6 ||
 	    host->log2_max_poc_lsb < 4 || host->log2_max_poc_lsb > 16 ||
 	    !host->max_dec_pic_buffering || host->max_dec_pic_buffering > 16 ||
-	    host->num_reorder_pics >= host->max_dec_pic_buffering)
+	    host->num_reorder_pics >= host->max_dec_pic_buffering ||
+	    !host->max_dec_pic_buffering_tid0 ||
+	    host->max_dec_pic_buffering_tid0 > host->max_dec_pic_buffering ||
+	    host->num_reorder_pics_tid0 >= host->max_dec_pic_buffering_tid0 ||
+	    !host->max_sub_layers || host->max_sub_layers > 7)
 		return -EINVAL;
 	if ((host->profile_idc != 1 && host->profile_idc != 2) ||
-	    host->max_sub_layers != 1 ||
 	    host->chroma_format_idc != 1 || host->separate_colour_plane ||
 	    (host->bit_depth_luma != 8 && host->bit_depth_luma != 10) ||
 	    host->bit_depth_chroma != host->bit_depth_luma ||
@@ -278,7 +292,8 @@ int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
 	    word[RPM_CTB_DIFF] > 3 || word[RPM_POC_LOG2_MINUS4] > 12)
 		return -EPROTO;
 	if (word[RPM_FIRST_SLICE] != 1 || word[RPM_DEPENDENT_SLICE] ||
-	    word[RPM_SLICE_ADDRESS] || word[RPM_TEMPORAL_ID_PLUS1] != 1 ||
+	    word[RPM_SLICE_ADDRESS] || !word[RPM_TEMPORAL_ID_PLUS1] ||
+	    word[RPM_TEMPORAL_ID_PLUS1] > host->max_sub_layers ||
 	    word[RPM_TILES] || word[RPM_TILE_COLUMNS_MINUS1] || word[RPM_TILE_ROWS_MINUS1] ||
 	    (word[RPM_BIT_DEPTH] & 0xff) != (((host->bit_depth_chroma - 8) << 4) |
 					     (host->bit_depth_luma - 8)) ||
@@ -297,8 +312,7 @@ int s7d_hevc_rpm_check_sequence(const struct s7d_hevc_rpm *rpm,
 	    word[RPM_CHROMA] != host->chroma_format_idc ||
 	    min_cb != host->log2_min_cb_size || ctb != host->log2_ctb_size ||
 	    poc_log2 != host->log2_max_poc_lsb ||
-	    word[RPM_DPB_MINUS1] + 1U != host->max_dec_pic_buffering ||
-	    word[RPM_REORDER] != host->num_reorder_pics ||
+	    !hevc_dpb_words(word, host) ||
 	    crop[0] != host->crop_left || crop[1] != host->crop_right ||
 	    crop[2] != host->crop_top || crop[3] != host->crop_bottom)
 		return -ESTALE;

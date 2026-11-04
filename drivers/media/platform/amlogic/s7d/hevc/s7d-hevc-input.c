@@ -14,6 +14,7 @@
 #define HEVC_SPS_COUNT 8U
 #define HEVC_PPS_COUNT 64U
 #define HEVC_NAL_COUNT 64U
+#define HEVC_MAX_SUB_LAYERS 7U
 
 struct hevc_bits {
 	const u8 *data;
@@ -162,10 +163,40 @@ static int hevc_rbsp(const u8 *nal, size_t bytes, u8 **out, size_t *written)
 	return 0;
 }
 
+static void hevc_skip(struct hevc_bits *b, u32 count)
+{
+	for (; count > 32; count -= 32)
+		hevc_get(b, 32);
+	hevc_get(b, count);
+}
+
+/* The sub-layer part of profile_tier_level(): every sub-layer is decoded. */
+static void hevc_sub_layer_ptl(struct hevc_bits *b, u32 sub_layers)
+{
+	bool profile[HEVC_MAX_SUB_LAYERS], level[HEVC_MAX_SUB_LAYERS];
+	u32 i;
+
+	if (sub_layers < 2)
+		return;
+	for (i = 0; i + 1 < sub_layers; i++) {
+		profile[i] = hevc_get(b, 1);
+		level[i] = hevc_get(b, 1);
+	}
+	for (i = sub_layers - 1; i < 8; i++)
+		if (hevc_get(b, 2))
+			b->error = b->error ?: -EBADMSG;
+	for (i = 0; i + 1 < sub_layers; i++) {
+		if (profile[i])
+			hevc_skip(b, 88);
+		if (level[i])
+			hevc_skip(b, 8);
+	}
+}
+
 static int hevc_vps_parse(struct hevc_bits *b, struct hevc_vps *vps)
 {
-	u32 profile, compatibility, i, constraint, layers, sets;
-	bool interlaced;
+	u32 profile, compatibility, i, constraint, layers, sets, start;
+	bool interlaced, nesting;
 
 	vps->id = hevc_get(b, 4);
 	if (!hevc_get(b, 1) || !hevc_get(b, 1))
@@ -173,8 +204,10 @@ static int hevc_vps_parse(struct hevc_bits *b, struct hevc_vps *vps)
 	/* Only the base layer is decoded; NAL units of the others are dropped. */
 	hevc_get(b, 6);
 	vps->max_sub_layers = hevc_get(b, 3) + 1;
-	if (vps->max_sub_layers != 1 || !hevc_get(b, 1))
-		return b->error ?: -EOPNOTSUPP;
+	nesting = hevc_get(b, 1);
+	if (vps->max_sub_layers > HEVC_MAX_SUB_LAYERS ||
+	    (vps->max_sub_layers == 1 && !nesting))
+		return b->error ?: -EBADMSG;
 	if (hevc_get(b, 16) != 0xffff)
 		return b->error ?: -EBADMSG;
 	if (hevc_get(b, 2))
@@ -193,10 +226,13 @@ static int hevc_vps_parse(struct hevc_bits *b, struct hevc_vps *vps)
 	     (profile || !(compatibility & (BIT(30) | BIT(29))))) ||
 	    interlaced || constraint)
 		return b->error ?: -EOPNOTSUPP;
-	hevc_get(b, 1);
-	vps->max_dec_pic_buffering = hevc_ue(b, 15) + 1;
-	vps->num_reorder_pics = hevc_ue(b, vps->max_dec_pic_buffering - 1);
-	hevc_ue(b, U32_MAX - 1);
+	hevc_sub_layer_ptl(b, vps->max_sub_layers);
+	start = hevc_get(b, 1) ? 0 : vps->max_sub_layers - 1;
+	for (i = start; i < vps->max_sub_layers; i++) {
+		vps->max_dec_pic_buffering = hevc_ue(b, 15) + 1;
+		vps->num_reorder_pics = hevc_ue(b, vps->max_dec_pic_buffering - 1);
+		hevc_ue(b, U32_MAX - 1);
+	}
 	layers = hevc_get(b, 6) + 1;
 	sets = hevc_ue(b, 1023);
 	for (i = 0; i < sets * layers; i++)
@@ -434,6 +470,10 @@ static int hevc_slice_parse(struct hevc_bits *b,
 	u64 offsets = 0;
 	size_t escaped;
 
+	/* Every sub-layer is decoded; an IRAP belongs to sub-layer 0. */
+	if (slice->temporal_id_plus1 > sps->max_sub_layers ||
+	    (slice->nal_type >= 16 && slice->temporal_id_plus1 != 1))
+		return -EBADMSG;
 	slice->first_slice = hevc_get(b, 1);
 	if (slice->nal_type >= 16 && slice->nal_type <= 23)
 		slice->no_output_of_prior_pics = hevc_get(b, 1);
@@ -624,8 +664,7 @@ static int hevc_parameter_parse(const struct s7d_hevc_input_bank *bank,
 
 		ret = s7d_hevc_parse_sequence(nal, bytes, sequence);
 		id = sequence->sps.sps_id;
-		if (!ret && (id >= HEVC_SPS_COUNT || sequence->sps.max_sub_layers != 1 ||
-			     sequence->long_term_refs_present))
+		if (!ret && (id >= HEVC_SPS_COUNT || sequence->long_term_refs_present))
 			ret = -EOPNOTSUPP;
 		if (!ret)
 			ret = s7d_hevc_build_layout(&sequence->sps, S7D_CODEC_CAPTURE_NV12M, 0, &layout);
@@ -715,7 +754,7 @@ static int hevc_select_parameters(const struct s7d_hevc_input_bank *bank,
 	if (!parameter[0])
 		return -ENODATA;
 	vps = parameter[0]->typed;
-	if (vps->max_sub_layers != input->sequence.sps.max_sub_layers ||
+	if (vps->max_sub_layers < input->sequence.sps.max_sub_layers ||
 	    input->pps.log2_parallel_merge_level > input->sequence.sps.log2_ctb_size ||
 	    input->pps.diff_cu_qp_delta_depth > input->sequence.sps.log2_ctb_size -
 					     input->sequence.sps.log2_min_cb_size ||
@@ -867,8 +906,8 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 		/* Removed from the access unit: the firmware would parse them too. */
 		if (hevc_ignored(nal))
 			continue;
-		if ((nal[1] & 7) != 1) {
-			ret = -EOPNOTSUPP;
+		if (!(nal[1] & 7)) {
+			ret = -EBADMSG;
 			goto failed;
 		}
 		type = (nal[0] >> 1) & 63;
@@ -908,8 +947,7 @@ int s7d_hevc_input_prepare(const struct s7d_hevc_input_bank *bank,
 			 */
 			*unsupported = !picture && ret && ret != -EBADMSG && ret != -E2BIG &&
 				       ret != -ENOMEM;
-		} else if (type == 0 || type == 1 || (type >= 6 && type <= 9) ||
-			   (type >= 16 && type <= 21)) {
+		} else if (type <= 9 || (type >= 16 && type <= 21)) {
 			if (dropped) {
 				ret = 0;
 			} else if (picture) {

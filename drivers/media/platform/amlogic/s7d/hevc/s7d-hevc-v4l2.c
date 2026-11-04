@@ -98,6 +98,8 @@ static bool hevc_same_sps(const struct s7d_hevc_sps *a,
 	       a->max_dec_pic_buffering == b->max_dec_pic_buffering &&
 	       a->num_reorder_pics == b->num_reorder_pics &&
 	       a->max_latency_increase_plus1 == b->max_latency_increase_plus1 &&
+	       a->max_dec_pic_buffering_tid0 == b->max_dec_pic_buffering_tid0 &&
+	       a->num_reorder_pics_tid0 == b->num_reorder_pics_tid0 &&
 	       a->separate_colour_plane == b->separate_colour_plane &&
 	       a->interlaced_source == b->interlaced_source &&
 	       a->field_seq == b->field_seq &&

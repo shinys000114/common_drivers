@@ -202,8 +202,7 @@ s7d_hevc_context_create_stream(struct s7d_codec_session *session,
 	ret = s7d_hevc_build_layout(sps, S7D_CODEC_CAPTURE_NV12M, 0, &layout);
 	if (ret)
 		return ERR_PTR(ret);
-	if (sps->max_sub_layers != 1 || sps->log2_ctb_size < 4 ||
-	    sps->log2_ctb_size > 6)
+	if (sps->log2_ctb_size < 4 || sps->log2_ctb_size > 6)
 		return ERR_PTR(-EOPNOTSUPP);
 	if (!lease_epoch || slot_count < layout.min_capture_buffers ||
 	    slot_count > S7D_HEVC_MAX_CAPTURE_BUFFERS ||
@@ -472,6 +471,8 @@ static bool hevc_same_sps(const struct s7d_hevc_sps *a,
 	       a->max_dec_pic_buffering == b->max_dec_pic_buffering &&
 	       a->num_reorder_pics == b->num_reorder_pics &&
 	       a->max_latency_increase_plus1 == b->max_latency_increase_plus1 &&
+	       a->max_dec_pic_buffering_tid0 == b->max_dec_pic_buffering_tid0 &&
+	       a->num_reorder_pics_tid0 == b->num_reorder_pics_tid0 &&
 	       a->separate_colour_plane == b->separate_colour_plane &&
 	       a->interlaced_source == b->interlaced_source &&
 	       a->field_seq == b->field_seq &&

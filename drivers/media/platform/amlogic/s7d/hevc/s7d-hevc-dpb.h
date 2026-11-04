@@ -97,6 +97,7 @@ struct s7d_hevc_dpb {
 	u64 active_write_token;
 	u64 last_input_token;
 	u32 slot_count;
+	u32 max_sub_layers;
 	u32 max_dec_pic_buffering;
 	u32 num_reorder_pics;
 	u32 max_latency_pictures;

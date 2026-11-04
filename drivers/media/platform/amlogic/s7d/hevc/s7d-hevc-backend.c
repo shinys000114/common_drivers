@@ -1533,14 +1533,16 @@ static void hevc_report_drop(struct s7d_hevc_decoder *decoder,
 
 /*
  * A dropped picture that later pictures may reference ends decoding until
- * the next IRAP; a sub-layer non-reference picture is never referenced.
+ * the next IRAP; a sub-layer non-reference picture of the highest sub-layer
+ * is never referenced.
  */
 static int hevc_drop_picture(struct s7d_hevc_decoder *decoder,
 			     const struct s7d_hevc_job *job)
 {
 	u32 nal = job->host_slice.nal_type;
 
-	if (nal <= 9 && !(nal & 1))
+	if (nal <= 9 && !(nal & 1) &&
+	    job->host_slice.temporal_id_plus1 == decoder->sps.max_sub_layers)
 		return 0;
 	return s7d_hevc_dpb_resync(decoder->dpb);
 }

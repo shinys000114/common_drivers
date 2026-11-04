@@ -356,6 +356,9 @@ static int hevc_sps_rbsp(struct hevc_bits *b, struct s7d_hevc_sps *sps,
 	sps->max_dec_pic_buffering = buffering[last];
 	sps->num_reorder_pics = reorder[last];
 	sps->max_latency_increase_plus1 = latency[last];
+	/* Without per-sub-layer values the highest sub-layer's apply to all (7.4.3.2.1). */
+	sps->max_dec_pic_buffering_tid0 = buffering[start];
+	sps->num_reorder_pics_tid0 = reorder[start];
 	sps->log2_min_cb_size = hevc_ue(b, 3) + 3;
 	sps->log2_ctb_size = sps->log2_min_cb_size + hevc_ue(b, 3);
 	min_tb = hevc_ue(b, 3) + 2;
