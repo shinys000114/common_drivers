@@ -3,6 +3,7 @@
 #include <linux/amlogic/clk/s7d-hdmi-pll-rate.h>
 #include <linux/amlogic/s7d-vpu-reset.h>
 #include <linux/arm-smccc.h>
+#include <linux/clk-provider.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -855,8 +856,9 @@ static int s7d_vpu_acquire(void *data)
  *   or without one (it set the VPU up but had no sink): held as it is; a
  *   running output stays on screen until the first modeset stops it.
  * - Anything the takeover refuses (video, GFCD or AFBC routes, a foreign
- *   ENCP clock or read arbiter): stopped blindly and reset, the screen dark
- *   until the first modeset (s7d_vpu_restart()).
+ *   ENCP clock or read arbiter), or a fetch still enabled with no encoder
+ *   running, which no stop can drain: stopped blindly and reset, the screen
+ *   dark until the first modeset (s7d_vpu_restart()).
  * If the takeover fails, the CRTC refuses to enable. A failed restart leaves
  * the VPU in no known state, perhaps still scanning out: it stays acquired
  * and is never touched again, and neither sleep nor unbind releases it, as
@@ -1316,6 +1318,49 @@ static const struct {
 	{ RDARB_MODE_L2, GENMASK(18, 16) },
 };
 
+/* Whether the encoder enabled in @reg strobes: its clock must run too. */
+static bool s7d_vpu_encoder_runs(struct s7d_vpu *v, u16 reg, struct clk *clk)
+{
+	return (vpu_read(v, reg) & BIT(0)) && clk && clk_get_rate(clk) && __clk_is_enabled(clk);
+}
+
+/*
+ * A fetch drains only while an encoder strobes. Firmware that stopped the
+ * encoder clock before the fetches (U-Boot "hdmitx off; osd close" leaves
+ * ENCP enabled without its PLL) leaves an enable latched that no stop can
+ * drain: restart the display instead.
+ */
+static int check_stranded_fetch(struct s7d_vpu *v)
+{
+	static const struct {
+		u16 reg;
+		u32 mask;
+	} fetches[] = {
+		{ OSD1_CTRL, OSD_ACTUAL_EN },
+		{ OSD2_CTRL, OSD_ACTUAL_EN },
+		{ VD1_GEN, VD1_BUSY },
+		{ VD2_GEN, VD1_BUSY },
+	};
+	struct clk *pixel = v->clocks[PIXEL_CLK].clk;
+	unsigned int i;
+	u32 value;
+
+	if (s7d_vpu_encoder_runs(v, ENCP_EN, pixel) || s7d_vpu_encoder_runs(v, ENCL_EN, pixel) ||
+	    s7d_vpu_encoder_runs(v, ENCI_EN, v->enci))
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(fetches); i++) {
+		value = vpu_read(v, fetches[i].reg);
+		if (!(value & fetches[i].mask))
+			continue;
+		v->boot.route = fetches[i].reg;
+		v->boot.route_value = value;
+		dev_warn(v->dev, "VCBUS %#x = %#x with no encoder running; restarting the display\n",
+			 fetches[i].reg, value);
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
 /* At @boot, record what the firmware left and report a refusal as such. */
 static int check_handoff(struct s7d_vpu *v, bool boot)
 {
@@ -1356,7 +1401,7 @@ static int check_handoff(struct s7d_vpu *v, bool boot)
 		}
 		return -EOPNOTSUPP;
 	}
-	return 0;
+	return boot ? check_stranded_fetch(v) : 0;
 }
 
 /*
