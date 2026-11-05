@@ -41,8 +41,8 @@ struct s7d_vpu_boot {
 	phys_addr_t logo_base;
 	phys_addr_t logo_size;
 	bool logo_ram;
-	/* The firmware output showed the logo: return it after the first stop. */
-	bool logo_shown;
+	/* Mapped RAM: return it after the restart or the first verified stop. */
+	bool logo_pending;
 	bool logo_returned;
 };
 

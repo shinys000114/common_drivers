@@ -791,7 +791,11 @@ static void s7d_vpu_disable_pixel(struct s7d_vpu *v)
 /*
  * Whether the running firmware output shows the boot-logo reservation: OSD1
  * on, linear and physically addressed, its fetch within the region. Read
- * only while that output runs, before anything stops it.
+ * only while that output runs, before anything stops it. Whatever it
+ * shows, the restart's reset or the first modeset's stop also ends a fetch
+ * that only overlaps the region or that an ENCI or ENCL output strobes:
+ * return the region then if it is mapped RAM and still reserved, as an
+ * earlier bind may have returned it already.
  */
 static void s7d_vpu_check_logo(struct s7d_vpu *v)
 {
@@ -802,14 +806,26 @@ static void s7d_vpu_check_logo(struct s7d_vpu *v)
 	struct s7d_vpu_boot *b = &v->boot;
 	u32 *w = b->osd1, cpp, x1, x2, y1, y2;
 	u64 base, stride, first, end;
+	unsigned long pfn;
+	const char *fate;
 	unsigned int i;
 
 	if (!b->logo_size)
 		return;
+	pfn = PFN_UP(b->logo_base);
+	b->logo_pending = b->logo_ram && pfn_valid(pfn) && PageReserved(pfn_to_page(pfn));
+	if (!b->logo_ram)
+		fate = "it is not plain RAM and stays reserved";
+	else if (!b->logo_pending)
+		fate = "its pages are not reserved";
+	else if (b->restarted)
+		fate = "returning it now";
+	else
+		fate = "returning it after the first modeset";
 	if (!b->output) {
-		dev_info(v->dev, "%s; boot logo %pa+%pa stays reserved\n",
+		dev_info(v->dev, "%s; boot logo %pa+%pa: %s\n",
 			 b->restarted ? "firmware display restarted" : "no firmware output",
-			 &b->logo_base, &b->logo_size);
+			 &b->logo_base, &b->logo_size, fate);
 		return;
 	}
 	for (i = 0; i < ARRAY_SIZE(regs); i++)
@@ -840,29 +856,27 @@ static void s7d_vpu_check_logo(struct s7d_vpu *v)
 	    (w[1] & BIT(30)) || !cpp || !stride || x2 < x1 || y2 < y1 ||
 	    (x2 + 1) * cpp > stride ||
 	    first < b->logo_base || end > b->logo_base + b->logo_size) {
-		dev_info(v->dev, "boot logo %pa+%pa not shown (OSD1 %#x %#x %#x %#x %#x %#x); it stays reserved\n",
-			 &b->logo_base, &b->logo_size, w[0], w[1], w[2], w[3], w[4], w[5]);
+		dev_info(v->dev, "boot logo %pa+%pa not shown (OSD1 %#x %#x %#x %#x %#x %#x); %s\n",
+			 &b->logo_base, &b->logo_size, w[0], w[1], w[2], w[3], w[4], w[5], fate);
 		return;
 	}
-	b->logo_shown = b->logo_ram;
-	dev_info(v->dev, "boot logo %pa+%pa shown; %s\n", &b->logo_base, &b->logo_size,
-		 b->logo_ram ? "returning it after the first modeset" :
-		 "it is not plain RAM and stays reserved");
+	dev_info(v->dev, "boot logo %pa+%pa shown; %s\n", &b->logo_base, &b->logo_size, fate);
 }
 
 /*
- * Return the boot logo once a stop has verified that no firmware output
- * reads it any more. free_reserved_area() is not exported: free it page by
- * page as that does, and only if every page is still reserved. Called once.
+ * Return the boot logo once a stop, or the restart's reset, has verified
+ * that no firmware output reads it any more. free_reserved_area() is not
+ * exported: free it page by page as that does, and only if every page is
+ * still reserved. It acts at most once.
  */
 static void s7d_vpu_return_logo(struct s7d_vpu *v)
 {
 	struct s7d_vpu_boot *b = &v->boot;
 	unsigned long pfn, first, last;
 
-	if (!b->logo_shown)
+	if (!b->logo_pending)
 		return;
-	b->logo_shown = false;
+	b->logo_pending = false;
 	first = PFN_UP(b->logo_base);
 	last = PFN_DOWN(b->logo_base + b->logo_size);
 	for (pfn = first; pfn < last; pfn++) {
@@ -986,6 +1000,12 @@ int s7d_vpu_hold_boot(struct s7d_vpu *v)
 	v->boot_held = true;
 	v->boot.output = v->pixel_enabled;
 	s7d_vpu_check_logo(v);
+	/*
+	 * The restart has stopped the encoders, reset the VPU and found the
+	 * video and OSD fetches idle.
+	 */
+	if (v->boot.restarted)
+		s7d_vpu_return_logo(v);
 	return 0;
 }
 
