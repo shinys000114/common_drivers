@@ -2833,14 +2833,16 @@ static int s7d_vpu_adopt(void *data, const struct s7d_crtc_state *state)
 	struct s7d_vpu *v = data;
 	struct s7d_vpu_fastboot *f = &v->boot.fast;
 	const char *what;
+	unsigned int i;
 	u32 route;
 	int ret;
 
 	if (f->state != S7D_FASTBOOT_MATCH || !v->boot_held || !v->acquired || v->touched ||
 	    state->writeback_only || state->encp.enci ||
-	    memcmp(&state->encp, &f->encp, sizeof(state->encp)) ||
+	    !s7d_encp_same(&state->encp, &f->encp) ||
 	    !s7d_hdmi_output_same(&state->output, &f->output))
 		return -EINVAL;
+	v->failed_reg = 0;
 	/* The firmware leaves RDMA unused: reset it under the running output. */
 	ret = s7d_rdma_prepare(&v->rdma);
 	if (ret) {
@@ -2862,6 +2864,20 @@ static int s7d_vpu_adopt(void *data, const struct s7d_crtc_state *state)
 	if (ret)
 		goto fail;
 	v->pixel_protected = true;
+	/*
+	 * The setup of the inputs that are off and unrouted, where the probe
+	 * found it to differ, and the VD1 scaler tables, which every prepare
+	 * loads so that a later commit can start VD1 scaling at vblank.
+	 */
+	what = "offpath";
+	for (i = 0; i < f->offpath_count; i++) {
+		ret = vpu_update(v, f->offpath[i].reg, f->offpath[i].mask, f->offpath[i].value);
+		if (ret)
+			goto fail;
+	}
+	ret = load_video_scaler_luts(v);
+	if (ret)
+		goto fail;
 	what = "IRQ";
 	ret = irq_set_irqchip_state(v->rdma_irq, IRQCHIP_STATE_PENDING, false);
 	if (!ret)
@@ -2893,7 +2909,7 @@ static int s7d_vpu_adopt(void *data, const struct s7d_crtc_state *state)
 	spin_unlock_irq(&v->frame_lock);
 	return 0;
 fail:
-	s7d_vpu_mismatch(&f->reason, "A14", what, 0, -ret, 0);
+	s7d_vpu_mismatch(&f->reason, "A14", what, v->failed_reg, -ret, 0);
 	if (v->pixel_protected) {
 		clk_rate_exclusive_put(v->clocks[PIXEL_CLK].clk);
 		v->pixel_protected = false;

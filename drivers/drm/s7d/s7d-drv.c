@@ -203,6 +203,34 @@ static int s7d_build_writeback_outputs(struct drm_device *drm, struct drm_atomic
 	return 0;
 }
 
+/*
+ * The first commit after a takeover went through the full check. It keeps
+ * the output if it plans the same mode, output and link on the same route,
+ * as i915 fastset does. NULL then, or what differs.
+ */
+static const char *s7d_drm_fastset(struct s7d_drm *display, struct drm_atomic_state *state,
+				   const struct drm_crtc_state *old,
+				   const struct drm_crtc_state *new)
+{
+	const struct s7d_crtc_state *before = container_of(old, const struct s7d_crtc_state, base);
+	const struct s7d_crtc_state *after = container_of(new, const struct s7d_crtc_state, base);
+	struct s7d_encp_state encp;
+
+	if (!new->enable || !new->active)
+		return "off";
+	if (new->active_changed || new->connectors_changed ||
+	    new->connector_mask != old->connector_mask || after->writeback_only)
+		return "connector";
+	if (new->ctm || new->degamma_lut)
+		return "color";
+	if (!s7d_hdmi_output_same(&before->output, &after->output))
+		return "output";
+	if (s7d_encp_build_state(&new->adjusted_mode, &encp) != MODE_OK ||
+	    !s7d_encp_same(&encp, &before->encp))
+		return "mode";
+	return s7d_hdmi_bridge_fastset(display->bridge, state);
+}
+
 static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *state)
 {
 	struct s7d_drm *display = container_of(drm, struct s7d_drm, drm);
@@ -231,7 +259,10 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 	ret = s7d_check_output_routes(drm, state);
 	if (ret)
 		return ret;
-	/* An output the probe took over goes through a full check, as on i915. */
+	/*
+	 * An output the probe took over goes through a full check, as on i915;
+	 * a commit that plans the same output keeps it below.
+	 */
 	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, crtc_state, i)
 		if (to_s7d_crtc_state(old_crtc_state)->inherited)
 			crtc_state->mode_changed = true;
@@ -240,6 +271,17 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 	ret = drm_atomic_helper_check_modeset(drm, state);
 	if (ret)
 		return ret;
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, crtc_state, i) {
+		struct s7d_crtc_state *next = to_s7d_crtc_state(crtc_state);
+
+		if (!to_s7d_crtc_state(old_crtc_state)->inherited)
+			continue;
+		next->takeover_differs = s7d_drm_fastset(display, state, old_crtc_state,
+							 crtc_state);
+		/* The bridge set it for InfoFrame bytes alone; the flush sends those. */
+		if (!next->takeover_differs)
+			crtc_state->mode_changed = false;
+	}
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
 		if (crtc_state->mode_changed)
 			checked_modesets |= drm_crtc_mask(crtc);
@@ -292,7 +334,8 @@ static void s7d_atomic_commit_tail(struct drm_atomic_state *state)
 		if (to_s7d_crtc_state(old_crtc_state)->inherited)
 			s7d_vpu_fastboot_done(&display->vpu,
 					      drm_atomic_crtc_needs_modeset(crtc_state),
-					      crtc_state->active ? "modeset" : "off");
+					      to_s7d_crtc_state(crtc_state)->takeover_differs ?:
+					      "crtc");
 	drm_atomic_helper_commit_modeset_disables(drm, state);
 	drm_atomic_helper_commit_planes(drm, state, 0);
 	drm_atomic_helper_commit_modeset_enables(drm, state);

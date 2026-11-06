@@ -47,6 +47,9 @@ s7d_encp_build_state(const struct drm_display_mode *mode,
 int s7d_encp_read_mode(u32 (*read)(void *data, u32 reg), void *data,
 		       struct drm_display_mode *mode);
 
+/* Whether two built states program the same encoder. */
+bool s7d_encp_same(const struct s7d_encp_state *a, const struct s7d_encp_state *b);
+
 /* ENCI image written before the checked regs[]; ENCI states only. */
 unsigned int s7d_enci_image_size(void);
 void s7d_enci_image_entry(const struct s7d_encp_state *state, unsigned int i,

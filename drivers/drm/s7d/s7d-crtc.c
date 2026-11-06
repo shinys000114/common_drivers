@@ -109,6 +109,7 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->vendor.brr_update = false;
 	state->vendor.nonblock_by_vblank = false;
 	state->inherited = false;
+	state->takeover_differs = NULL;
 	return &state->base;
 }
 
@@ -333,13 +334,22 @@ static int s7d_crtc_build_live(const struct s7d_crtc_state *state,
 		if (ret)
 			return ret;
 	}
+	/* Firmware scalers may run 1:1 at other sizes: set the unscaled ones. */
+	if (old && old->inherited)
+		s7d_vpp_build_scaler_live(state->base.adjusted_mode.hdisplay,
+					  state->base.adjusted_mode.vdisplay, live);
 	for (i = 0; i < ARRAY_SIZE(state->osd.scalers); i++) {
+		struct s7d_osd_scaler_state from;
+
 		if (!(state->osd_scaler_live & BIT(i)))
 			continue;
 		if (!old)
 			return -EINVAL;
-		ret = s7d_osd_scaler_build_live(i, &old->osd.scalers[i],
-						&state->osd.scalers[i], live);
+		/* As from off, with the filter tables reloaded: the firmware's are unknown. */
+		from = old->osd.scalers[i];
+		if (old->inherited)
+			from.enabled = false;
+		ret = s7d_osd_scaler_build_live(i, &from, &state->osd.scalers[i], live);
 		if (ret)
 			return ret;
 	}
@@ -394,7 +404,7 @@ static int s7d_crtc_build_update(struct s7d_crtc_state *state,
 	for (i = 0; i < S7D_OSD_UPDATE_REG_COUNT; i++) {
 		u32 reg = le32_to_cpu(state->osd.update[i].reg);
 
-		if (old && old->valid && old->base.active &&
+		if (old && old->valid && old->base.active && !old->inherited &&
 		    !drm_atomic_crtc_needs_modeset(&state->base) &&
 		    (reg == 0x1a1e || reg == 0x1a13 || reg == 0x39b1 || reg == 0x39b2) &&
 		    state->osd.update[i].value == old->osd.update[i].value)
@@ -483,7 +493,8 @@ static int s7d_crtc_build_update(struct s7d_crtc_state *state,
 				return n;
 			count += n;
 		}
-		if (old->base.gamma_lut != state->base.gamma_lut) {
+		/* The firmware LUT cannot be read back: load the whole table. */
+		if (old->base.gamma_lut != state->base.gamma_lut || old->inherited) {
 			n = s7d_gamma_build(state->base.gamma_lut, state->output.rgb_limited,
 					    state->update + count);
 			if (n < 0)
@@ -893,7 +904,9 @@ static int s7d_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state 
 		 * The graphics decoders and field scaling prepare while stopped.
 		 */
 		for (i = 0; i < ARRAY_SIZE(state->osd.scalers); i++) {
-			if (s7d_osd_scaler_same(&state->osd.scalers[i],
+			/* A firmware output's scalers always restart from off. */
+			if (!before->inherited &&
+			    s7d_osd_scaler_same(&state->osd.scalers[i],
 						&before->osd.scalers[i]))
 				continue;
 			if (interlace || s7d_crtc_osd_compressed(state, i) ||

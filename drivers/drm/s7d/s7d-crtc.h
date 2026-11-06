@@ -78,6 +78,8 @@ struct s7d_crtc_state {
 	 * enable leaves an output; duplicates clear it.
 	 */
 	bool inherited;
+	/* After an inherited state: why this commit cannot keep it, or NULL. */
+	const char *takeover_differs;
 	/* Derived from attached connectors, independently of HPD and WB jobs. */
 	bool writeback_only;
 	bool video_unchanged;

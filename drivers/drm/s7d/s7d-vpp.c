@@ -207,6 +207,25 @@ int s7d_vpp_setup_image(u32 width, u32 height, struct s7d_vpp_setting *image)
 	return ARRAY_SIZE(settings);
 }
 
+void s7d_vpp_build_scaler_live(u32 width, u32 height, struct s7d_rdma_live *live)
+{
+	struct s7d_vpp_setting image[S7D_VPP_SETUP_COUNT];
+	int count = s7d_vpp_setup_image(width, height, image);
+	int i;
+
+	for (i = 0; i < count; i++) {
+		switch (image[i].reg) {
+		case 0x1dbf:
+		case 0x1dc9 ... 0x1dcb:
+		case 0x3d38:
+			s7d_rdma_live_add(live, image[i].reg, image[i].mask, image[i].value);
+			break;
+		default:
+			break;
+		}
+	}
+}
+
 int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 {
 	struct s7d_vpp_setting settings[S7D_VPP_SETUP_COUNT];

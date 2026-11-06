@@ -38,6 +38,15 @@ int s7d_vpp_setup_image(u32 width, u32 height, struct s7d_vpp_setting *image);
  */
 int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg);
 
+struct s7d_rdma_live;
+
+/*
+ * The OSD scaler sizes and alpha division of s7d_vpp_setup() for an
+ * unscaled @width x @height output, as masked writes for a running one.
+ * The scaler enables are the scaler live lists' own.
+ */
+void s7d_vpp_build_scaler_live(u32 width, u32 height, struct s7d_rdma_live *live);
+
 /* Caller holds the VPU resources and has stopped VENC and every fetcher. */
 int s7d_vpp_post2_program(void __iomem *vcbus, const u32 matrix[13], u32 *failed_reg);
 int s7d_vpp_post2_disable(void __iomem *vcbus, u32 *failed_reg);

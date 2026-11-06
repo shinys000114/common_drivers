@@ -2248,7 +2248,7 @@ void s7d_hdmi_commit_vendor(struct drm_crtc *crtc, struct drm_atomic_state *atom
 	for_each_oldnew_connector_in_state(atomic, connector, old, new, i) {
 		before = s7d_vendor_props_conn(old);
 		after = s7d_vendor_props_conn(new);
-		if (new->crtc != crtc || !new->best_encoder || !before || !after)
+		if (new->crtc != crtc || !new->best_encoder)
 			continue;
 		bridge = drm_bridge_chain_get_first_bridge(new->best_encoder);
 		if (!bridge || bridge->funcs != &s7d_hdmi_bridge_funcs)
@@ -2256,9 +2256,13 @@ void s7d_hdmi_commit_vendor(struct drm_crtc *crtc, struct drm_atomic_state *atom
 		h = to_s7d_hdmi(bridge);
 		old_bridge = drm_atomic_get_old_bridge_state(atomic, bridge);
 		new_bridge = drm_atomic_get_new_bridge_state(atomic, bridge);
-		/* Only on a configured link; the next one starts from the state. */
+		/*
+		 * Only on a configured link; the next one starts from the state.
+		 * Without the vendor interface the InfoFrames differ only after
+		 * a takeover at probe, whose first commit keeps the link.
+		 */
 		mutex_lock(&h->lock);
-		if (h->prepared && before->avmute != after->avmute &&
+		if (h->prepared && before && after && before->avmute != after->avmute &&
 		    s7d_hdmi_avmute(h, after->avmute))
 			dev_warn(h->dev, "HDMI AV mute %d failed\n", after->avmute);
 		if (h->prepared && old_bridge && new_bridge &&
@@ -2311,6 +2315,40 @@ void s7d_hdmi_bridge_uninherit(struct drm_bridge *bridge)
 		return;
 	state = to_s7d_hdmi_state(drm_priv_to_bridge_state(bridge->base.state));
 	memset(&state->mode, 0, sizeof(*state) - offsetof(struct s7d_hdmi_state, mode));
+}
+
+const char *s7d_hdmi_bridge_fastset(struct drm_bridge *bridge, struct drm_atomic_state *atomic)
+{
+	const struct s7d_vendor_conn_values *vendor;
+	const struct drm_bridge_state *old, *new;
+	const struct s7d_hdmi_state *a, *b;
+	struct s7d_hdmi *h;
+
+	if (bridge->funcs != &s7d_hdmi_bridge_funcs)
+		return "bridge";
+	h = to_s7d_hdmi(bridge);
+	old = drm_atomic_get_old_bridge_state(atomic, bridge);
+	new = drm_atomic_get_new_bridge_state(atomic, bridge);
+	if (!old || !new)
+		return "bridge";
+	a = container_of(old, const struct s7d_hdmi_state, base);
+	b = container_of(new, const struct s7d_hdmi_state, base);
+	if (!a->valid || !b->valid)
+		return "bridge";
+	if (a->hdmi != b->hdmi)
+		return "hdmi";
+	/* SCDC is set up only above 340 MHz, where the readout found it on. */
+	if (a->high_tmds != b->high_tmds || (b->high_tmds && !b->scdc))
+		return "scdc";
+	if (a->hdr_len || b->hdr_len)
+		return "hdr";
+	/* As the vendor driver, a vendor format write takes a modeset. */
+	vendor = h->connector ?
+		s7d_vendor_props_conn(drm_atomic_get_new_connector_state(atomic, h->connector)) :
+		NULL;
+	if (vendor && (vendor->update || vendor->depth_written))
+		return "vendor";
+	return NULL;
 }
 
 int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link)

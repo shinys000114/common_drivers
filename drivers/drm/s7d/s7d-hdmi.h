@@ -51,6 +51,13 @@ int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link);
 int s7d_hdmi_bridge_inherit(struct drm_bridge *bridge, const struct drm_display_mode *mode,
 			    const struct s7d_hdmi_output_state *output);
 void s7d_hdmi_bridge_uninherit(struct drm_bridge *bridge);
+/*
+ * Fastboot, atomic check of the first commit after a takeover, once the
+ * bridge has checked it: NULL if it keeps the link as the probe read it
+ * out, the AVI and vendor InfoFrames aside, which the flush rewrites;
+ * otherwise what differs.
+ */
+const char *s7d_hdmi_bridge_fastset(struct drm_bridge *bridge, struct drm_atomic_state *atomic);
 void s7d_hdmi_bridge_eld_updated(struct drm_bridge *bridge, struct drm_connector *connector);
 int s7d_hdmi_bridge_set_connector(struct drm_bridge *bridge, struct drm_connector *connector);
 

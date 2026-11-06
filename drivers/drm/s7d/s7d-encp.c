@@ -429,3 +429,19 @@ int s7d_encp_read_mode(u32 (*read)(void *data, u32 reg), void *data,
 	mode->vsync_end = mode->vsync_start + vs_end - vs;
 	return 0;
 }
+
+bool s7d_encp_same(const struct s7d_encp_state *a, const struct s7d_encp_state *b)
+{
+	unsigned int i;
+
+	if (a->count != b->count || a->count > S7D_ENCP_REG_COUNT ||
+	    a->interlace != b->interlace || a->enci != b->enci || a->pal != b->pal ||
+	    a->flip_start != b->flip_start || a->flip_end != b->flip_end ||
+	    a->fifo_hold_lines != b->fifo_hold_lines ||
+	    a->hsync_positive != b->hsync_positive || a->vsync_positive != b->vsync_positive)
+		return false;
+	for (i = 0; i < a->count; i++)
+		if (a->regs[i].reg != b->regs[i].reg || a->regs[i].value != b->regs[i].value)
+			return false;
+	return true;
+}
