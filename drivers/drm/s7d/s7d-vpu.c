@@ -859,6 +859,7 @@ static void s7d_vpu_check_logo(struct s7d_vpu *v)
 			 &b->logo_base, &b->logo_size, w[0], w[1], w[2], w[3], w[4], w[5], fate);
 		return;
 	}
+	b->logo_shown = true;
 	dev_info(v->dev, "boot logo %pa+%pa shown; %s\n", &b->logo_base, &b->logo_size, fate);
 }
 
@@ -2991,6 +2992,7 @@ static int s7d_vpu_boot_show(struct seq_file *m, void *data)
 		   b->osd1[2], b->osd1[3], b->osd1[4], b->osd1[5]);
 	seq_printf(m, "logo\t%pa %pa ram %d returned %d\n", &b->logo_base, &b->logo_size,
 		   b->logo_ram, READ_ONCE(b->logo_returned));
+	seq_printf(m, "logo_shown\t%d\n", b->logo_shown);
 	seq_printf(m, "unusable\t%d\n", v->unusable);
 	return 0;
 }
