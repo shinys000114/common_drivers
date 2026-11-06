@@ -1184,6 +1184,7 @@ static int s7d_vpu_stop_hw(void *data)
 	bool abort_prepare = false;
 	bool recover_detiling = false;
 	bool recover = false;
+	bool running;
 	int ret;
 
 	ret = s7d_writeback_cancel(v->writeback, -ECANCELED);
@@ -1407,9 +1408,12 @@ static int s7d_vpu_stop_hw(void *data)
 		if (ret)
 			return ret;
 	}
+	running = (vpu_read(v, ENCP_EN) | vpu_read(v, ENCI_EN) | vpu_read(v, ENCL_EN)) & BIT(0);
 	ret = stop_encoders(v);
 	if (ret)
 		return ret;
+	if (running)
+		WRITE_ONCE(v->boot.link_stops, v->boot.link_stops + 1);
 	if (v->gamma_touched) {
 		ret = s7d_gamma_disable(v->regs, &v->failed_reg);
 		if (ret)
@@ -1757,6 +1761,8 @@ static int s7d_vpu_restart(struct s7d_vpu *v)
 	for (i = 0; i < ARRAY_SIZE(enables); i++)
 		if (enabled[i] & BIT(0))
 			writel(enabled[i] & ~BIT(0), v->regs + enables[i] * 4);
+	if ((enabled[0] | enabled[1] | enabled[2]) & BIT(0))
+		WRITE_ONCE(v->boot.link_stops, v->boot.link_stops + 1);
 	s7d_vpu_disable_pixel(v);
 	fsleep(FIRMWARE_FRAME_US);
 	ret = s7d_rdma_quiesce(&v->rdma);
@@ -3592,6 +3598,8 @@ static int s7d_vpu_boot_show(struct seq_file *m, void *data)
 			   b->fast.reason.want);
 	else
 		seq_puts(m, "fastboot_reason\t-\n");
+	seq_printf(m, "link_stops\t%u\n", READ_ONCE(b->link_stops));
+	seq_printf(m, "phy_off\t%u\n", v->link.phy_offs(v->link.data));
 	return 0;
 }
 
@@ -3613,7 +3621,8 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	struct resource *res;
 	int ret;
 
-	if (!link || !link->quiesce || !link->prepare || !link->readout || !link->adopt)
+	if (!link || !link->quiesce || !link->prepare || !link->readout || !link->adopt ||
+	    !link->phy_offs)
 		return -EINVAL;
 	v->link = *link;
 	v->dev = dev;

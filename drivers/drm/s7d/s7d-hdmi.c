@@ -109,6 +109,8 @@ struct s7d_hdmi {
 	struct phy *phy;
 	int irq;
 	bool phy_on;
+	/* Quiesce powered the PHY off this often since probe. */
+	unsigned int phy_offs;
 	bool phy_initialized;
 	bool video_on;
 	bool prepared;
@@ -538,6 +540,7 @@ static int s7d_hdmi_quiesce(void *data)
 		if (ret)
 			goto out;
 		h->phy_on = false;
+		WRITE_ONCE(h->phy_offs, h->phy_offs + 1);
 	}
 	ret = s7d_hdmi_phy_exit(h);
 	if (ret)
@@ -550,6 +553,13 @@ static int s7d_hdmi_quiesce(void *data)
 out:
 	mutex_unlock(&h->lock);
 	return ret;
+}
+
+static unsigned int s7d_hdmi_phy_offs(void *data)
+{
+	struct s7d_hdmi *h = data;
+
+	return READ_ONCE(h->phy_offs);
 }
 
 static int s7d_hdmi_packet(struct s7d_hdmi *h, unsigned int bank,
@@ -2400,6 +2410,7 @@ int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link)
 		.prepare = s7d_hdmi_prepare,
 		.readout = s7d_hdmi_readout,
 		.adopt = s7d_hdmi_adopt,
+		.phy_offs = s7d_hdmi_phy_offs,
 		.data = to_s7d_hdmi(bridge),
 	};
 	return 0;

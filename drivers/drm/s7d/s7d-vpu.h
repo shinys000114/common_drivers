@@ -91,6 +91,8 @@ struct s7d_vpu_boot {
 	bool logo_pending;
 	bool logo_returned;
 	struct s7d_vpu_fastboot fast;
+	/* Encoder stops since probe: each one ends the signal on the link. */
+	unsigned int link_stops;
 };
 
 /* HDMI owns PHY/packets. Return only after its transmitter is safely off. */
@@ -113,6 +115,8 @@ struct s7d_vpu_link {
 	 * clocks or the link setup. After it, quiesce stops the link.
 	 */
 	int (*adopt)(void *data, const struct s7d_hdmi_output_state *output);
+	/* How often quiesce has powered the PHY off since probe; any context */
+	unsigned int (*phy_offs)(void *data);
 	void *data;
 };
 
