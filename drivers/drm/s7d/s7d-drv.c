@@ -853,6 +853,57 @@ static void s7d_drm_shutdown(struct platform_device *pdev)
 	/* No devres/DMA release here: failed stop is never permission to free. */
 }
 
+/*
+ * A sleep before the first commit after a takeover saved the state the
+ * probe read out, with the boot logo that no new plane state may take and
+ * that the suspend's stop has returned. Resume to everything off instead;
+ * the hotplug event after resume has the clients set their mode again.
+ */
+static void s7d_drm_drop_logo_state(struct drm_device *drm)
+{
+	struct drm_atomic_state *state = drm->mode_config.suspend_state;
+	struct drm_connector_state *conn_state;
+	struct drm_plane_state *plane_state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_connector *connector;
+	struct drm_plane *plane;
+	struct drm_crtc *crtc;
+	u32 crtcs = 0;
+	int i;
+
+	if (!state)
+		return;
+	/*
+	 * The saved state holds every object but no acquire context: only use
+	 * the state's own CRTC states, as for the connectors below.
+	 */
+	for_each_new_plane_in_state(state, plane, plane_state, i) {
+		if (!s7d_fb_is_logo(plane_state->fb))
+			continue;
+		drm_atomic_set_fb_for_plane(plane_state, NULL);
+		if (!plane_state->crtc)
+			continue;
+		crtcs |= drm_crtc_mask(plane_state->crtc);
+		crtc_state = drm_atomic_get_new_crtc_state(state, plane_state->crtc);
+		if (crtc_state)
+			crtc_state->plane_mask &= ~drm_plane_mask(plane);
+		plane_state->crtc = NULL;
+	}
+	if (!crtcs)
+		return;
+	for_each_new_connector_in_state(state, connector, conn_state, i)
+		if (conn_state->crtc && (crtcs & drm_crtc_mask(conn_state->crtc)) &&
+		    drm_atomic_set_crtc_for_connector(conn_state, NULL))
+			drm_err(drm, "saved boot logo connector state kept its CRTC\n");
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (!(crtcs & drm_crtc_mask(crtc)))
+			continue;
+		crtc_state->active = false;
+		if (drm_atomic_set_mode_prop_for_crtc(crtc_state, NULL))
+			drm_err(drm, "saved boot logo CRTC state kept its mode\n");
+	}
+}
+
 static int s7d_drm_suspend(struct device *dev)
 {
 	struct s7d_drm *display = dev_get_drvdata(dev);
@@ -861,6 +912,7 @@ static int s7d_drm_suspend(struct device *dev)
 	ret = drm_mode_config_helper_suspend(&display->drm);
 	if (ret)
 		return ret;
+	s7d_drm_drop_logo_state(&display->drm);
 	/* Atomic disable cannot return its hardware-stop error to the helper. */
 	ret = s7d_crtc_last_error(display->vpu.crtc);
 	/*
