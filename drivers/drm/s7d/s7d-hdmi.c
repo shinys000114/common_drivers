@@ -74,6 +74,8 @@
 #define CORE_HDCP2	0x08bd
 #define CORE_AUDIO_EN	0x0a13
 
+#define S7D_HDMI_AVMUTE_MS	100
+
 struct s7d_hdmi_state {
 	struct drm_bridge_state base;
 	struct drm_display_mode mode;
@@ -514,12 +516,47 @@ static int s7d_hdmi_phy_exit(struct s7d_hdmi *h)
 	return ret;
 }
 
+/* As the vendor: both GCP bits clear, then Set_AVMUTE (3) or Clear_AVMUTE (7) */
+static int s7d_hdmi_avmute(struct s7d_hdmi *h, bool mute)
+{
+	unsigned int bit = mute ? BIT(3) : BIT(7);
+	int ret;
+
+	ret = regmap_update_bits(h->core, CORE_TPI_SC, BIT(7) | BIT(3), 0);
+	return ret ?: regmap_update_bits(h->core, CORE_TPI_SC, bit, bit);
+}
+
+/*
+ * Set_AVMUTE on a running HDMI link before it stops, as the vendor driver
+ * does, so that the sink blanks and mutes rather than lose the TMDS signal
+ * in the middle of a picture. The GCP repeats every frame; wait as long as
+ * the vendor encoder disable does before the PHY goes off.
+ */
+static void s7d_hdmi_mute_sink(struct s7d_hdmi *h)
+{
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(h->core, CORE_TPI_SC, &value);
+	/* DVI has no GCP; a vendor AV mute already holds the sink muted. */
+	if (ret || !(value & BIT(0)) || (value & BIT(3)))
+		return;
+	ret = s7d_hdmi_avmute(h, true);
+	if (ret) {
+		dev_warn(h->dev, "HDMI AV mute before the link stop failed: %d\n", ret);
+		return;
+	}
+	msleep(S7D_HDMI_AVMUTE_MS);
+}
+
 static int s7d_hdmi_quiesce(void *data)
 {
 	struct s7d_hdmi *h = data;
 	int ret = 0;
 
 	mutex_lock(&h->lock);
+	if (h->phy_on)
+		s7d_hdmi_mute_sink(h);
 	h->prepared = false;
 	h->scdc_config = 0;
 	if (h->audio_valid) {
@@ -2246,16 +2283,6 @@ static const struct drm_bridge_funcs s7d_hdmi_bridge_funcs = {
 	.hpd_enable = s7d_hdmi_hpd_enable,
 	.hpd_disable = s7d_hdmi_hpd_disable,
 };
-
-/* As the vendor: both GCP bits clear, then Set_AVMUTE (3) or Clear_AVMUTE (7) */
-static int s7d_hdmi_avmute(struct s7d_hdmi *h, bool mute)
-{
-	unsigned int bit = mute ? BIT(3) : BIT(7);
-	int ret;
-
-	ret = regmap_update_bits(h->core, CORE_TPI_SC, BIT(7) | BIT(3), 0);
-	return ret ?: regmap_update_bits(h->core, CORE_TPI_SC, bit, bit);
-}
 
 /*
  * The vendor and AVI InfoFrames that a commit without a modeset changed, each
