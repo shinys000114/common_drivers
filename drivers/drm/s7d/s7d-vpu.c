@@ -874,9 +874,9 @@ static void s7d_vpu_return_logo(struct s7d_vpu *v)
 	struct s7d_vpu_boot *b = &v->boot;
 	unsigned long pfn, first, last;
 
-	if (!b->logo_pending)
+	/* A stop and the logo framebuffer release can race; one of them returns it. */
+	if (!xchg(&b->logo_pending, false))
 		return;
-	b->logo_pending = false;
 	first = PFN_UP(b->logo_base);
 	last = PFN_DOWN(b->logo_base + b->logo_size);
 	for (pfn = first; pfn < last; pfn++) {
@@ -891,6 +891,11 @@ static void s7d_vpu_return_logo(struct s7d_vpu *v)
 	WRITE_ONCE(b->logo_returned, true);
 	dev_info(v->dev, "returned the boot logo %pa+%pa to the page allocator\n",
 		 &b->logo_base, &b->logo_size);
+}
+
+void s7d_vpu_logo_release(void *data)
+{
+	s7d_vpu_return_logo(data);
 }
 
 /*

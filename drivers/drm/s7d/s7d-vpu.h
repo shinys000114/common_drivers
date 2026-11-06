@@ -173,6 +173,11 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *vpu,
  * A display found unusable is left alone, and its CRTC refuses to enable.
  */
 int s7d_vpu_hold_boot(struct s7d_vpu *vpu);
+/*
+ * The boot logo framebuffer's release: return the logo once nothing reads
+ * it. Process context; at most once, whatever else returns it.
+ */
+void s7d_vpu_logo_release(void *data);
 /* Show what the probe found in the DRM device's debugfs directory. */
 void s7d_vpu_debugfs_init(struct s7d_vpu *vpu, struct drm_device *drm);
 /*

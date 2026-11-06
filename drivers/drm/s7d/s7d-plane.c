@@ -431,6 +431,9 @@ static int s7d_plane_atomic_check(struct drm_plane *plane,
 	struct drm_crtc_state *crtc_state = NULL;
 	int ret;
 
+	/* The boot logo stays in the state the probe read out, never a new one. */
+	if (s7d_fb_is_logo(state->fb))
+		return -EINVAL;
 	ret = s7d_plane_take_async_fence(state);
 	if (ret)
 		return ret;

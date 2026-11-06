@@ -4,6 +4,7 @@
 #include <linux/slab.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_framebuffer_helper.h>
@@ -16,6 +17,71 @@
 #include "s7d-afbc.h"
 #include "s7d-afrc.h"
 #include "s7d-fb.h"
+
+/*
+ * The boot logo that a running firmware output scans out. Its memory is a
+ * reservation, not a GEM object: no handle, no mapping, nothing that reads
+ * the pixels. release() returns the reservation once armed.
+ */
+struct s7d_logo_fb {
+	struct drm_framebuffer base;
+	void (*release)(void *data);
+	void *data;
+	bool armed;
+};
+
+static void s7d_logo_fb_destroy(struct drm_framebuffer *fb)
+{
+	struct s7d_logo_fb *logo = container_of(fb, struct s7d_logo_fb, base);
+
+	drm_framebuffer_cleanup(fb);
+	if (logo->armed)
+		logo->release(logo->data);
+	kfree(logo);
+}
+
+static const struct drm_framebuffer_funcs s7d_logo_fb_funcs = {
+	.destroy = s7d_logo_fb_destroy,
+};
+
+struct drm_framebuffer *s7d_fb_create_logo(struct drm_device *dev, u32 format,
+					   u32 width, u32 height, u32 pitch,
+					   void (*release)(void *data), void *data)
+{
+	struct s7d_logo_fb *logo;
+	int ret;
+
+	if (!release || !width || !height || !pitch)
+		return ERR_PTR(-EINVAL);
+	logo = kzalloc(sizeof(*logo), GFP_KERNEL);
+	if (!logo)
+		return ERR_PTR(-ENOMEM);
+	logo->base.dev = dev;
+	logo->base.format = drm_format_info(format);
+	logo->base.width = width;
+	logo->base.height = height;
+	logo->base.pitches[0] = pitch;
+	logo->base.modifier = DRM_FORMAT_MOD_LINEAR;
+	logo->release = release;
+	logo->data = data;
+	ret = drm_framebuffer_init(dev, &logo->base, &s7d_logo_fb_funcs);
+	if (ret) {
+		kfree(logo);
+		return ERR_PTR(ret);
+	}
+	return &logo->base;
+}
+
+bool s7d_fb_is_logo(const struct drm_framebuffer *fb)
+{
+	return fb && fb->funcs == &s7d_logo_fb_funcs;
+}
+
+void s7d_fb_arm_logo(struct drm_framebuffer *fb)
+{
+	if (s7d_fb_is_logo(fb))
+		container_of(fb, struct s7d_logo_fb, base)->armed = true;
+}
 
 static const struct drm_framebuffer_funcs s7d_afbc_fb_funcs = {
 	.destroy = drm_gem_fb_destroy,
