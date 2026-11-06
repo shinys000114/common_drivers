@@ -3,6 +3,7 @@
 #include <linux/amlogic/clk/s7d-hdmi-pll-rate.h>
 #include <linux/amlogic/s7d-vpu-reset.h>
 #include <linux/arm-smccc.h>
+#include <linux/bitfield.h>
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -55,6 +56,10 @@
 #define OSD_PATH		0x1a0e
 #define VD1_BLEND		0x1dfb
 #define VD2_BLEND		0x1dfc
+#define VPP_OFIFO_URG_CTRL	0x1dd8
+#define OFIFO_URG_EN		BIT(15)
+#define OFIFO_URG_UP		GENMASK(11, 6)
+#define OFIFO_URG_DOWN		GENMASK(5, 0)
 #define VD1_PATH		0x1a0a
 #define VD1_GEN			0x4800
 #define AFBC_ENABLE		0x4840
@@ -1939,6 +1944,19 @@ static const struct s7d_vpp_setting s7d_vpu_arbiter[] = {
 	{ 0x270a, BIT(17) | BIT(13) | BIT(9) | BIT(5) | BIT(1), 0 },
 };
 
+/*
+ * The VPP output FIFO raises its arbiter urgency by its fill level, with
+ * the thresholds (in 256 pixels) that the vendor VPU driver sets on S7D.
+ * The reset value leaves it off and the firmware does not set it. It
+ * changes nothing on the screen, so a takeover sets it under the output.
+ */
+static int program_ofifo_urgency(struct s7d_vpu *v)
+{
+	return vpu_update(v, VPP_OFIFO_URG_CTRL, OFIFO_URG_EN | OFIFO_URG_UP | OFIFO_URG_DOWN,
+			  OFIFO_URG_EN | FIELD_PREP(OFIFO_URG_UP, 8) |
+			  FIELD_PREP(OFIFO_URG_DOWN, 5));
+}
+
 static int program_arbiter(struct s7d_vpu *v)
 {
 	unsigned int i;
@@ -1950,7 +1968,7 @@ static int program_arbiter(struct s7d_vpu *v)
 		if (ret)
 			return ret;
 	}
-	return 0;
+	return program_ofifo_urgency(v);
 }
 
 /* VPU words that every modeset clears or sets, after the video CSCs. */
@@ -2882,6 +2900,10 @@ static int s7d_vpu_adopt(void *data, const struct s7d_crtc_state *state)
 			goto fail;
 	}
 	ret = load_video_scaler_luts(v);
+	if (ret)
+		goto fail;
+	what = "urgency";
+	ret = program_ofifo_urgency(v);
 	if (ret)
 		goto fail;
 	what = "IRQ";
