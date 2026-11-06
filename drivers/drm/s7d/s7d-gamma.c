@@ -11,9 +11,9 @@
 #include "s7d-gamma.h"
 #include "s7d-rdma.h"
 
-#define VPP_DOLBY_CTRL		0x1d93
-#define POST2_TO_OUTBUF_BYPASS	BIT(2)
-#define VPP_GAMMA_CTRL		0x39d4
+#define VPP_DOLBY_CTRL		S7D_GAMMA_BYPASS_REG
+#define POST2_TO_OUTBUF_BYPASS	S7D_GAMMA_BYPASS
+#define VPP_GAMMA_CTRL		S7D_GAMMA_CTRL
 #define VPP_GAMMA_BIN_ADDR	0x39d5
 #define VPP_GAMMA_BIN_DATA	0x39d6
 

@@ -158,6 +158,17 @@ struct s7d_hdmi {
 	u8 spd[HDMI_INFOFRAME_HEADER_SIZE + HDMI_SPD_INFOFRAME_SIZE];
 	unsigned int sink_generation;
 	unsigned int edid_generation;
+	/* What a fastboot readout found the firmware link sends */
+	struct {
+		bool valid;
+		bool hdmi;
+		/* TPI packet banks transmitted, and the contents of 0, 3 and 5 */
+		u16 banks;
+		u8 avi[HDMI_INFOFRAME_HEADER_SIZE + HDMI_AVI_INFOFRAME_SIZE];
+		u8 spd[HDMI_INFOFRAME_HEADER_SIZE + HDMI_SPD_INFOFRAME_SIZE];
+		u8 vendor[HDMI_INFOFRAME_SIZE(MAX)];
+		u8 vendor_len;
+	} boot;
 };
 
 static struct s7d_hdmi *to_s7d_hdmi(struct drm_bridge *bridge)
@@ -835,6 +846,167 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 	if (state->avmute)
 		return regmap_update_bits(h->core, CORE_TPI_SC, BIT(3), BIT(3));
 	return s7d_hdmi_write_checked(h, h->core, CORE_TPI_SC, BIT(7), BIT(7));
+}
+
+static int s7d_hdmi_mismatch(struct s7d_fastboot_reason *r, const char *cond,
+			     const char *what, u32 reg, u64 hw, u64 want)
+{
+	*r = (struct s7d_fastboot_reason) {
+		.cond = cond, .what = what, .reg = reg, .hw = hw, .want = want,
+	};
+	return -EINVAL;
+}
+
+/* The TPI packet banks with their contents, through the bank selector. */
+static int s7d_hdmi_read_banks(struct s7d_hdmi *h)
+{
+	unsigned int bank, i, value;
+	u8 data[31];
+	int ret;
+
+	h->boot.banks = 0;
+	for (bank = 0; bank < 11; bank++) {
+		ret = regmap_write(h->core, CORE_INFO_SELECT, bank);
+		if (!ret)
+			ret = regmap_read(h->core, CORE_INFO_ENABLE, &value);
+		if (ret)
+			return ret;
+		if ((value & CORE_INFO_TRANSMIT) != CORE_INFO_TRANSMIT)
+			continue;
+		h->boot.banks |= BIT(bank);
+		if (bank != 0 && bank != 3 && bank != 5)
+			continue;
+		for (i = 0; i < sizeof(data); i++) {
+			ret = regmap_read(h->core, CORE_INFO_DATA + i, &value);
+			if (ret)
+				return ret;
+			data[i] = value;
+		}
+		if (bank == 0) {
+			memcpy(h->boot.avi, data, sizeof(h->boot.avi));
+		} else if (bank == 3) {
+			memcpy(h->boot.spd, data, sizeof(h->boot.spd));
+		} else {
+			h->boot.vendor_len = min_t(unsigned int, sizeof(h->boot.vendor),
+						   HDMI_INFOFRAME_HEADER_SIZE + data[2]);
+			memcpy(h->boot.vendor, data, h->boot.vendor_len);
+		}
+	}
+	return 0;
+}
+
+/*
+ * Fastboot readout of the transmitter that the probe adopted: the link
+ * setup of s7d_hdmi_setup_tx() and the clocks of s7d_hdmi_prepare() for
+ * @output, no AV mute, no HDR metadata, and on HDMI above 340 MHz a sink
+ * that scrambles. Records the packets the link sends for the first commit.
+ */
+static int s7d_hdmi_readout(void *data, const struct drm_display_mode *mode,
+			    const struct s7d_hdmi_output_state *output,
+			    struct s7d_fastboot_reason *r)
+{
+	struct s7d_hdmi *h = data;
+	struct s7d_hdmi_tx_setting image[S7D_HDMI_TX_SETTING_COUNT];
+	struct s7d_hdmi_state state = {
+		.mode = *mode, .output = *output, .high_tmds = output->high_tmds,
+	};
+	unsigned int i, value;
+	u8 mapping[2], config;
+	int count, ret;
+
+	mutex_lock(&h->lock);
+	h->boot.valid = false;
+	if (!h->phy_on || !h->phy_initialized || !h->video_on || h->prepared) {
+		ret = s7d_hdmi_mismatch(r, "A6", "PHY", 0, h->phy_on, 1);
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(h->video); i++) {
+		bool half = !i && output->pixel_divider == 2;
+		unsigned long rate = output->rate.pixel / (half ? 2 : 1);
+
+		if (clk_get_rate(h->video[i].clk) != rate ||
+		    !clk_is_match(clk_get_parent(h->video_mux[i].clk),
+				  half ? h->video_div2 : h->video_parent)) {
+			ret = s7d_hdmi_mismatch(r, "A9", "TX clock", i,
+						clk_get_rate(h->video[i].clk), rate);
+			goto out;
+		}
+	}
+	mutex_lock(&h->ddc.lock);
+	ret = regmap_read(h->core, CORE_TPI_SC, &value);
+	if (ret)
+		goto unlock_ddc;
+	/* HDMI or DVI, and on HDMI Clear_AVMUTE sent last */
+	state.hdmi = value & BIT(0);
+	if ((value & 0x89) != (state.hdmi ? 0x81 : 0)) {
+		ret = s7d_hdmi_mismatch(r, "A6", "TX", CORE_TPI_SC, value & 0x89,
+					state.hdmi ? 0x81 : 0);
+		goto unlock_ddc;
+	}
+	count = s7d_hdmi_tx_image(&state, image);
+	if (count < 0) {
+		ret = s7d_hdmi_mismatch(r, "A11", "TX", 0, output->bpc, 8);
+		goto unlock_ddc;
+	}
+	for (i = 0; i < count; i++) {
+		/* The first commit stops the firmware's audio, EMP and HDR data. */
+		if (image[i].stage == S7D_HDMI_TX_DATA)
+			continue;
+		ret = regmap_read(image[i].top ? h->top : h->core, image[i].reg, &value);
+		if (ret)
+			goto unlock_ddc;
+		if ((value & image[i].mask) != image[i].value) {
+			ret = s7d_hdmi_mismatch(r, "A11", image[i].top ? "TX top" : "TX",
+						image[i].reg, value & image[i].mask,
+						image[i].value);
+			goto unlock_ddc;
+		}
+	}
+	ret = regmap_bulk_read(h->core, 0x0b44, mapping, sizeof(mapping));
+	if (ret)
+		goto unlock_ddc;
+	if ((mapping[0] | mapping[1] << 8) != output->tx_mapping) {
+		ret = s7d_hdmi_mismatch(r, "A11", "TX", 0x0b44, mapping[0] | mapping[1] << 8,
+					output->tx_mapping);
+		goto unlock_ddc;
+	}
+	ret = s7d_hdmi_read_banks(h);
+	if (ret)
+		goto unlock_ddc;
+	/* No HDR metadata; a DVI link sends no packets at all. */
+	if ((h->boot.banks & BIT(6)) || (!state.hdmi && h->boot.banks)) {
+		ret = s7d_hdmi_mismatch(r, "A13", "TX bank", CORE_INFO_ENABLE, h->boot.banks,
+					state.hdmi ? h->boot.banks & ~BIT(6) : 0);
+		goto unlock_ddc;
+	}
+unlock_ddc:
+	mutex_unlock(&h->ddc.lock);
+out:
+	mutex_unlock(&h->lock);
+	if (ret) {
+		if (!r->cond)
+			s7d_hdmi_mismatch(r, "A11", "TX read", 0, -ret, 0);
+		return -EINVAL;
+	}
+	/*
+	 * The sink must scramble at 1/40 the clock ratio the link runs. As
+	 * in s7d_hdmi_scdc_check(), no DDC transfer runs under the lock.
+	 */
+	if (output->high_tmds) {
+		const u8 scrambling = SCDC_SCRAMBLING_ENABLE | SCDC_TMDS_BIT_CLOCK_RATIO_BY_40;
+
+		config = 0;
+		ret = state.hdmi ? drm_scdc_readb(&h->ddc.adapter, SCDC_TMDS_CONFIG, &config) :
+			-EINVAL;
+		if (ret || (config & scrambling) != scrambling)
+			return s7d_hdmi_mismatch(r, "A12", "SCDC", SCDC_TMDS_CONFIG, config,
+						 scrambling);
+	}
+	mutex_lock(&h->lock);
+	h->boot.hdmi = state.hdmi;
+	h->boot.valid = true;
+	mutex_unlock(&h->lock);
+	return 0;
 }
 
 static int s7d_hdmi_prepare(void *data,
@@ -2076,6 +2248,7 @@ int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link)
 	*link = (struct s7d_vpu_link) {
 		.quiesce = s7d_hdmi_quiesce,
 		.prepare = s7d_hdmi_prepare,
+		.readout = s7d_hdmi_readout,
 		.data = to_s7d_hdmi(bridge),
 	};
 	return 0;

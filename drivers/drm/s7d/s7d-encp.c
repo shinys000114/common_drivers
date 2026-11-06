@@ -397,3 +397,35 @@ s7d_encp_build_state(const struct drm_display_mode *m, struct s7d_encp_state *st
 	};
 	return MODE_OK;
 }
+
+int s7d_encp_read_mode(u32 (*read)(void *data, u32 reg), void *data,
+		       struct drm_display_mode *mode)
+{
+	u32 htotal = read(data, ENCP_VIDEO_MAX_PXCNT) + 1;
+	u32 vtotal = read(data, ENCP_VIDEO_MAX_LNCNT) + 1;
+	u32 hs = read(data, ENCP_DVI_HSO_BEGIN);
+	u32 hs_end = read(data, ENCP_DVI_HSO_END);
+	u32 vs = read(data, ENCP_DVI_VSO_BLINE_EVN);
+	u32 vs_end = read(data, ENCP_DVI_VSO_ELINE_EVN);
+	u32 de_h_begin = read(data, ENCP_DE_H_BEGIN);
+	u32 de_h_end = read(data, ENCP_DE_H_END);
+	u32 de_v_begin = read(data, ENCP_DE_V_BEGIN_EVEN);
+	u32 de_v_end = read(data, ENCP_DE_V_END_EVEN);
+
+	/* The inverse of the progressive timing in s7d_encp_build_state(). */
+	if (htotal > 8192 || vtotal > 8192 || hs_end <= hs || vs_end <= vs ||
+	    de_h_end <= de_h_begin || de_v_end <= de_v_begin ||
+	    de_h_end > htotal + hs || de_v_end > vtotal + vs)
+		return -EINVAL;
+	*mode = (struct drm_display_mode) {
+		.hdisplay = de_h_end - de_h_begin,
+		.htotal = htotal,
+		.vdisplay = de_v_end - de_v_begin,
+		.vtotal = vtotal,
+	};
+	mode->hsync_start = mode->hdisplay + htotal + hs - de_h_end;
+	mode->hsync_end = mode->hsync_start + hs_end - hs;
+	mode->vsync_start = mode->vdisplay + vtotal + vs - de_v_end;
+	mode->vsync_end = mode->vsync_start + vs_end - vs;
+	return 0;
+}

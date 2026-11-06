@@ -8,6 +8,7 @@
 
 #include "s7d-crtc.h"
 #include "s7d-afbc-engine.h"
+#include "s7d-vpp.h"
 
 struct drm_device;
 struct platform_device;
@@ -16,6 +17,42 @@ struct s7d_vdin;
 struct s7d_writeback;
 
 #define S7D_VPU_SRAM_BANKS	5
+
+/* What fastboot made of the firmware output. */
+enum s7d_fastboot {
+	S7D_FASTBOOT_OFF,
+	/* No running firmware output that shows the boot logo */
+	S7D_FASTBOOT_NONE,
+	/* An output that differs from what this driver sets up */
+	S7D_FASTBOOT_MISMATCH,
+	/* The output this driver would set up for its mode */
+	S7D_FASTBOOT_MATCH,
+};
+
+/* The first check that refused an output, and the word it compared. */
+struct s7d_fastboot_reason {
+	/* The condition (design A1..A14), and what it compared */
+	const char *cond;
+	const char *what;
+	u32 reg;
+	u64 hw;
+	u64 want;
+};
+
+/* Register writes of a modeset that the output takes off its visible path. */
+#define S7D_FASTBOOT_OFFPATH_MAX 128
+
+struct s7d_vpu_fastboot {
+	enum s7d_fastboot state;
+	struct s7d_fastboot_reason reason;
+	/* The running mode and the plan this driver makes for it */
+	struct drm_display_mode mode;
+	struct s7d_encp_state encp;
+	struct s7d_hdmi_output_state output;
+	/* Writes the snapshot found to differ, on inputs off and unrouted */
+	struct s7d_vpp_setting offpath[S7D_FASTBOOT_OFFPATH_MAX];
+	unsigned int offpath_count;
+};
 
 /* What the probe found the firmware had left, for the log and debugfs. */
 struct s7d_vpu_boot {
@@ -46,6 +83,7 @@ struct s7d_vpu_boot {
 	/* Mapped RAM: return it after the restart or the first verified stop. */
 	bool logo_pending;
 	bool logo_returned;
+	struct s7d_vpu_fastboot fast;
 };
 
 /* HDMI owns PHY/packets. Return only after its transmitter is safely off. */
@@ -53,6 +91,15 @@ struct s7d_vpu_link {
 	int (*quiesce)(void *data);
 	/* Prepare TX/branch clocks while VENC is stopped; PHY stays off. */
 	int (*prepare)(void *data, const struct s7d_hdmi_output_state *output);
+	/*
+	 * Fastboot, at probe, while the firmware output runs: whether the
+	 * transmitter runs @mode with @output as prepare and the bridge enable
+	 * would leave it, packets aside. Reads only, but for the packet bank
+	 * selector. 0, or -EINVAL with @reason filled in.
+	 */
+	int (*readout)(void *data, const struct drm_display_mode *mode,
+		       const struct s7d_hdmi_output_state *output,
+		       struct s7d_fastboot_reason *reason);
 	void *data;
 };
 
@@ -151,6 +198,8 @@ struct s7d_vpu {
 	struct s7d_vpu_boot boot;
 	/* Set at probe: never touch the VPU, refuse to enable the CRTC. */
 	int unusable;
+	/* Set before hold_boot: compare a running firmware output at probe. */
+	bool fastboot;
 };
 
 extern const struct s7d_crtc_ops s7d_vpu_crtc_ops;

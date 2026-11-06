@@ -38,6 +38,15 @@ enum drm_mode_status
 s7d_encp_build_state(const struct drm_display_mode *mode,
 		    struct s7d_encp_state *state);
 
+/*
+ * The timing that the progressive ENCP words @read returns encode, as
+ * s7d_encp_build_state() writes them, without clock or sync polarity.
+ * Rebuild the state from the result and compare it with the words: an
+ * encoding of anything else gives a different state, or -EINVAL.
+ */
+int s7d_encp_read_mode(u32 (*read)(void *data, u32 reg), void *data,
+		       struct drm_display_mode *mode);
+
 /* ENCI image written before the checked regs[]; ENCI states only. */
 unsigned int s7d_enci_image_size(void);
 void s7d_enci_image_entry(const struct s7d_encp_state *state, unsigned int i,

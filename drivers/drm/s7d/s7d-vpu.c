@@ -4,6 +4,7 @@
 #include <linux/amlogic/s7d-vpu-reset.h>
 #include <linux/arm-smccc.h>
 #include <linux/clk-provider.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -22,6 +23,7 @@
 #include <drm/drm_debugfs.h>
 #include <drm/drm_debugfs_crc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_modes.h>
 #include <drm/drm_vblank.h>
 
 #include <dt-bindings/reset/amlogic,s7d-vpu-reset.h>
@@ -774,6 +776,7 @@ static int s7d_vpu_check(void *data, const struct s7d_crtc_state *state)
 
 static int check_handoff(struct s7d_vpu *v, bool boot);
 static int s7d_vpu_restart(struct s7d_vpu *v);
+static void s7d_vpu_snapshot(struct s7d_vpu *v);
 
 static void s7d_vpu_disable_pixel(struct s7d_vpu *v)
 {
@@ -1005,6 +1008,8 @@ int s7d_vpu_hold_boot(struct s7d_vpu *v)
 	v->boot_held = true;
 	v->boot.output = v->pixel_enabled;
 	s7d_vpu_check_logo(v);
+	if (v->fastboot)
+		s7d_vpu_snapshot(v);
 	/*
 	 * The restart has stopped the encoders, reset the VPU and found the
 	 * video and OSD fetches idle.
@@ -1886,18 +1891,34 @@ static int program_arbiter(struct s7d_vpu *v)
 	return 0;
 }
 
+/* VPU words that every modeset clears or sets, after the video CSCs. */
+static const struct s7d_vpp_setting s7d_vpu_output_fixed[] = {
+	{ 0x58b0, GENMASK(28, 0), BIT(0) },
+	{ 0x3968, GENMASK(23, 0), 0 },
+	{ 0x3969, 0x1ffff9ff, 0 },
+};
+
+/* VIU1 from ENCI or ENCP, coupled sync selection; preserve VIU2 selection. */
+#define VENC_MUX_MASK		(BIT(20) | GENMASK(1, 0))
+
+/*
+ * Source ENCI (1) or ENCP (2). 4:2:0 writes the post FIFO every second
+ * ENCP clock (wr_rate_post 1).
+ */
+static u32 s7d_vpu_hdmi_setting(const struct s7d_hdmi_output_state *output,
+				const struct s7d_encp_state *encp)
+{
+	return (output->map_pre << 16) | (output->map_post << 5) |
+		(encp->enci ? BIT(0) : BIT(1)) |
+		(s7d_hdmi_output_is_y420(output) ? BIT(20) : 0) |
+		(encp->hsync_positive ? BIT(2) : 0) |
+		(encp->vsync_positive ? BIT(3) : 0);
+}
+
 static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 {
 	const struct s7d_hdmi_output_state *output = &state->output;
-	/*
-	 * Source ENCI (1) or ENCP (2). 4:2:0 writes the post FIFO every second
-	 * ENCP clock (wr_rate_post 1).
-	 */
-	u32 setting = (output->map_pre << 16) | (output->map_post << 5) |
-		      (state->encp.enci ? BIT(0) : BIT(1)) |
-		      (s7d_hdmi_output_is_y420(output) ? BIT(20) : 0) |
-		      (state->encp.hsync_positive ? BIT(2) : 0) |
-		      (state->encp.vsync_positive ? BIT(3) : 0);
+	u32 setting = s7d_vpu_hdmi_setting(output, &state->encp);
 	static const struct {
 		u16 reg;
 		u32 mask;
@@ -1975,15 +1996,12 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 		if (ret)
 			return ret;
 	}
-	ret = vpu_update(v, 0x58b0, GENMASK(28, 0), BIT(0));
-	if (ret)
-		return ret;
-	ret = vpu_update(v, 0x3968, GENMASK(23, 0), 0);
-	if (ret)
-		return ret;
-	ret = vpu_update(v, 0x3969, 0x1ffff9ff, 0);
-	if (ret)
-		return ret;
+	for (i = 0; i < ARRAY_SIZE(s7d_vpu_output_fixed); i++) {
+		ret = vpu_update(v, s7d_vpu_output_fixed[i].reg, s7d_vpu_output_fixed[i].mask,
+				 s7d_vpu_output_fixed[i].value);
+		if (ret)
+			return ret;
+	}
 	if (state->encp.enci) {
 		u32 reg, value;
 
@@ -2006,8 +2024,7 @@ static int program_output(struct s7d_vpu *v, const struct s7d_crtc_state *state)
 			vpu_read(v, ENCI_DBG_FLDLN_RST);
 		writel(0x0f05, v->regs + ENCI_DBG_FLDLN_RST * 4);
 	}
-	/* VIU1 from ENCI or ENCP, coupled sync selection; preserve VIU2 selection. */
-	ret = vpu_update(v, VENC_MUX, BIT(20) | GENMASK(1, 0), state->encp.enci ? 1 : 2);
+	ret = vpu_update(v, VENC_MUX, VENC_MUX_MASK, state->encp.enci ? 1 : 2);
 	if (ret)
 		return ret;
 	/* S7D selects ENCP here; it has no T7-style per-VENC selector at 0x1cef. */
@@ -2201,6 +2218,371 @@ static int s7d_vpu_prepare_pixel(struct s7d_vpu *v,
 	if (!ret)
 		v->enci_enabled = true;
 	return ret;
+}
+
+/*
+ * Fastboot keeps a running firmware output only if every word a modeset
+ * writes on its visible path holds what the modeset would write, apart
+ * from what the first frame update rewrites at vblank. An image entry
+ * says which of these a modeset write is.
+ */
+enum s7d_image_class {
+	/* Visible static setup: the firmware must have written the same. */
+	S7D_IMAGE_MATCH,
+	/* Setup of VD1, VD2 or OSD2, off and unrouted: rewritten while running. */
+	S7D_IMAGE_OFFPATH,
+	/* Part of every frame update, or of the first one after takeover */
+	S7D_IMAGE_FRAME,
+};
+
+#define S7D_VPU_IMAGE_MAX	256
+
+/* The value each register holds once a modeset has written it. */
+struct s7d_vpu_image {
+	struct s7d_vpp_setting entry[S7D_VPU_IMAGE_MAX];
+	u8 class[S7D_VPU_IMAGE_MAX];
+	unsigned int count;
+	bool overflow;
+	/* What s7d_vpu_build_image() builds the entries from, off the stack */
+	struct s7d_vpp_setting vpp[S7D_VPP_SETUP_COUNT];
+	struct s7d_video_pipeline_state video[2];
+	struct s7d_osd_pipeline_state osd;
+	struct s7d_csc_state csc[2];
+};
+
+static void image_add(struct s7d_vpu_image *im, u32 reg, u32 mask, u32 value,
+		      enum s7d_image_class class)
+{
+	struct s7d_vpp_setting *e;
+	unsigned int i;
+
+	for (i = 0; i < im->count; i++)
+		if (im->entry[i].reg == reg)
+			break;
+	if (i == im->count) {
+		if (i == ARRAY_SIZE(im->entry)) {
+			im->overflow = true;
+			return;
+		}
+		im->entry[i] = (struct s7d_vpp_setting) { .reg = reg };
+		im->class[i] = class;
+		im->count++;
+	}
+	/* A later write of a field replaces the earlier one. */
+	e = &im->entry[i];
+	e->mask |= mask;
+	e->value = (e->value & ~mask) | (value & mask);
+	im->class[i] = min_t(u8, im->class[i], class);
+}
+
+/* The VPP setup words of an OSD1-only output. */
+static enum s7d_image_class s7d_vpu_vpp_class(u32 reg)
+{
+	switch (reg) {
+	/* Postblend routes and VPP_MISC, which every frame update writes */
+	case 0x1dfb ... 0x1dfe:
+	case 0x1d26:
+	/* OSD scalers, which the first frame update turns off and sizes */
+	case 0x1dbf ... 0x1dcb:
+	case 0x3d00 ... 0x3d38:
+	/* Gamma, which the first frame update loads */
+	case S7D_GAMMA_CTRL:
+		return S7D_IMAGE_FRAME;
+	/* Film grain, VD1/VD2 HDR and matrices, OSD2 HDR and matrices */
+	case 0x4870:
+	case 0x329d:
+	case 0x3800 ... 0x389f:
+	case 0x6000 ... 0x603c:
+	case 0x392d:
+	case 0x3d7d:
+		return S7D_IMAGE_OFFPATH;
+	default:
+		return S7D_IMAGE_MATCH;
+	}
+}
+
+static enum s7d_image_class s7d_vpu_osd_class(const struct s7d_osd_pipeline_state *osd,
+					      u32 reg)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(osd->update); i++)
+		if (le32_to_cpu(osd->update[i].reg) == reg)
+			return S7D_IMAGE_FRAME;
+	switch (reg) {
+	/* OSD2 FIFO, protection, dimming and swap; blend inputs DIN2/DIN3 */
+	case 0x1a4b:
+	case 0x1a4e:
+	case 0x1acf:
+	case 0x1abf:
+	case 0x39b5 ... 0x39b8:
+		return S7D_IMAGE_OFFPATH;
+	default:
+		return S7D_IMAGE_MATCH;
+	}
+}
+
+/*
+ * What program_output() and the gamma setup write for an unscaled
+ * progressive OSD1-only output of @f, as the CRTC check plans it, with
+ * no video and the default plane colour properties.
+ */
+static int s7d_vpu_build_image(const struct s7d_vpu_fastboot *f, struct s7d_vpu_image *im)
+{
+	const struct drm_display_mode *mode = &f->mode;
+	struct s7d_vpp_setting *vpp = im->vpp;
+	struct s7d_video_pipeline_state *video = im->video;
+	struct s7d_osd_layer layers[2] = {0};
+	struct s7d_osd_pipeline_state *osd = &im->osd;
+	struct s7d_csc_state *csc = im->csc;
+	unsigned int hold = f->encp.flip_end ? f->encp.fifo_hold_lines : 8;
+	unsigned int i, j;
+	int count, ret;
+
+	for (i = 0; i < ARRAY_SIZE(s7d_vpu_arbiter); i++)
+		image_add(im, s7d_vpu_arbiter[i].reg, s7d_vpu_arbiter[i].mask,
+			  s7d_vpu_arbiter[i].value, S7D_IMAGE_MATCH);
+	count = s7d_vpp_setup_image(mode->hdisplay, mode->vdisplay, vpp);
+	if (count < 0)
+		return count;
+	for (i = 0; i < count; i++)
+		image_add(im, vpp[i].reg, vpp[i].mask, vpp[i].value,
+			  s7d_vpu_vpp_class(vpp[i].reg));
+	ret = s7d_video_build_pipeline(NULL, NULL, hold, &video[0]);
+	if (!ret)
+		ret = s7d_video_build_vd2_pipeline(NULL, NULL, hold, &video[1]);
+	if (!ret)
+		ret = s7d_csc_build_state(DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE,
+					  S7D_CSC_INPUT_YCBCR, &csc[0]);
+	if (!ret)
+		ret = s7d_csc_build_video2_state(DRM_COLOR_YCBCR_BT709,
+						 DRM_COLOR_YCBCR_LIMITED_RANGE,
+						 S7D_CSC_INPUT_YCBCR, &csc[1]);
+	if (ret)
+		return ret;
+	for (i = 0; i < ARRAY_SIZE(im->video); i++)
+		for (j = 0; j < S7D_VIDEO_SETUP_REG_COUNT; j++)
+			if (video[i].setup[j].mask)
+				image_add(im, video[i].setup[j].reg, video[i].setup[j].mask,
+					  video[i].setup[j].value, S7D_IMAGE_OFFPATH);
+	for (i = 0; i < ARRAY_SIZE(im->csc); i++) {
+		for (j = 0; j < S7D_CSC_MATRIX_REG_COUNT; j++)
+			image_add(im, csc[i].matrix[j].reg, csc[i].matrix[j].mask,
+				  csc[i].matrix[j].value, S7D_IMAGE_OFFPATH);
+		for (j = 0; j < S7D_CSC_CONTROL_REG_COUNT; j++)
+			image_add(im, csc[i].control[j].reg, csc[i].control[j].mask,
+				  csc[i].control[j].value, S7D_IMAGE_OFFPATH);
+	}
+	for (i = 0; i < ARRAY_SIZE(s7d_vpu_output_fixed); i++)
+		image_add(im, s7d_vpu_output_fixed[i].reg, s7d_vpu_output_fixed[i].mask,
+			  s7d_vpu_output_fixed[i].value, S7D_IMAGE_MATCH);
+	image_add(im, VENC_MUX, VENC_MUX_MASK, 2, S7D_IMAGE_MATCH);
+	image_add(im, HDMI_FMT, U32_MAX, f->output.fmt, S7D_IMAGE_MATCH);
+	image_add(im, HDMI_SETTING, U32_MAX, s7d_vpu_hdmi_setting(&f->output, &f->encp),
+		  S7D_IMAGE_MATCH);
+	image_add(im, HDMI_DITH, U32_MAX, f->output.dith, S7D_IMAGE_MATCH);
+	/* POST2 off: s7d_vpp_post2_disable() */
+	image_add(im, 0x39ad, s7d_vpp_post2_reg_mask(0x39ad), 0, S7D_IMAGE_MATCH);
+	image_add(im, s7d_osd_scaler_route.reg, s7d_osd_scaler_route.mask,
+		  s7d_osd_scaler_route.value, S7D_IMAGE_MATCH);
+	ret = s7d_osd_build_pipeline(S7D_OSD_REV_B, mode->hdisplay, mode->vdisplay, false,
+				     layers, osd);
+	if (ret)
+		return ret;
+	for (i = 0; i < S7D_OSD_SETUP_REG_COUNT; i++) {
+		u32 reg = le32_to_cpu(osd->setup[i].reg);
+		u32 value = le32_to_cpu(osd->setup[i].value);
+		u32 mask = U32_MAX;
+
+		/* The FIFO hold lines of the mode; the FIFO state is status. */
+		if (reg == OSD1_CTRL + OSD_FIFO_OFFSET || reg == OSD2_CTRL + OSD_FIFO_OFFSET) {
+			value = (value & ~GENMASK(9, 5)) | (f->encp.fifo_hold_lines << 5);
+			mask = ~(u32)OSD_FIFO_STATE;
+		}
+		image_add(im, reg, mask, value, s7d_vpu_osd_class(osd, reg));
+	}
+	/* s7d_gamma_program() leaves the POST2 output unbypassed. */
+	image_add(im, S7D_GAMMA_BYPASS_REG, S7D_GAMMA_BYPASS, 0, S7D_IMAGE_MATCH);
+	return im->overflow ? -ENOSPC : 0;
+}
+
+static u32 s7d_vpu_read_word(void *data, u32 reg)
+{
+	return vpu_read(data, reg);
+}
+
+static int s7d_vpu_mismatch(struct s7d_fastboot_reason *r, const char *cond,
+			    const char *what, u32 reg, u64 hw, u64 want)
+{
+	*r = (struct s7d_fastboot_reason) {
+		.cond = cond, .what = what, .reg = reg, .hw = hw, .want = want,
+	};
+	return -EINVAL;
+}
+
+static int s7d_vpu_check_rate(struct s7d_fastboot_reason *r, struct clk *clk,
+			      unsigned int index, unsigned long want)
+{
+	unsigned long rate = clk_get_rate(clk);
+
+	return rate == want ? 0 : s7d_vpu_mismatch(r, "A9", "clock", index, rate, want);
+}
+
+/*
+ * The output the firmware runs, and whether it is the one this driver
+ * would set up for its mode: everything but the conditions the first
+ * commit checks. Only reads the VPU, while the output is proven to run.
+ */
+static int s7d_vpu_compare_boot(struct s7d_vpu *v, struct s7d_vpu_image *im,
+				struct s7d_fastboot_reason *r)
+{
+	static const u16 sources[] = { VD1_BLEND, VD2_BLEND, 0x1dfd, 0x1dfe };
+	struct s7d_vpu_fastboot *f = &v->boot.fast;
+	const struct s7d_hdmi_output_rate *rate = &f->output.rate;
+	unsigned int i, osd1 = 0;
+	u32 value, before, setting;
+	int ret;
+
+	if (!v->boot.output || !v->boot.logo_shown) {
+		f->state = S7D_FASTBOOT_NONE;
+		return s7d_vpu_mismatch(r, v->boot.output ? "A4" : "A3", "logo", OSD1_CTRL,
+					v->boot.osd1[0], 0);
+	}
+	/* The restart has stopped what the firmware ran. */
+	if (v->boot.restarted || v->boot.retained)
+		return s7d_vpu_mismatch(r, "A2", "route", v->boot.route, v->boot.route_value, 0);
+	/* ENCP alone, with its clock, and its line counter moving */
+	value = vpu_read(v, ENCI_EN) | vpu_read(v, ENCL_EN);
+	if (value & BIT(0))
+		return s7d_vpu_mismatch(r, "A3", "VCBUS", ENCI_EN, value, 0);
+	if (!s7d_vpu_encoder_runs(v, ENCP_EN, v->clocks[PIXEL_CLK].clk))
+		return s7d_vpu_mismatch(r, "A3", "VCBUS", ENCP_EN, vpu_read(v, ENCP_EN), 1);
+	before = vpu_read(v, ENCP_INFO_READ);
+	usleep_range(200, 400);
+	value = vpu_read(v, ENCP_INFO_READ);
+	if (value == before)
+		return s7d_vpu_mismatch(r, "A3", "VCBUS", ENCP_INFO_READ, value, 0);
+	/* A 32-bit XRGB logo: the format of the framebuffer that wraps it */
+	if ((v->boot.osd1[1] & 0xffff) != 0x8504)
+		return s7d_vpu_mismatch(r, "A4", "VCBUS", OSD1_BLK0_CFG_W0, v->boot.osd1[1],
+					0x8504);
+	/* OSD1 alone reaches postblend: OSD2, VD1, VD2 and the VD1 FBC are off. */
+	value = vpu_read(v, OSD2_CTRL);
+	if (value & BIT(0))
+		return s7d_vpu_mismatch(r, "A5", "VCBUS", OSD2_CTRL, value, 0);
+	for (i = 0; i < 2; i++) {
+		value = vpu_read(v, i ? VD2_GEN : VD1_GEN);
+		if (value & (VD1_BUSY | BIT(0)))
+			return s7d_vpu_mismatch(r, "A5", "VCBUS", i ? VD2_GEN : VD1_GEN, value, 0);
+	}
+	value = vpu_read(v, AFBC_ENABLE);
+	if (value & BIT(8))
+		return s7d_vpu_mismatch(r, "A5", "VCBUS", AFBC_ENABLE, value, 0);
+	for (i = 0; i < ARRAY_SIZE(sources); i++) {
+		u32 source = (vpu_read(v, sources[i]) >> 8) & 7;
+
+		/* Postblend source 3 is OSD1. */
+		if (source && source != 3)
+			return s7d_vpu_mismatch(r, "A5", "VCBUS", sources[i], source, 3);
+		osd1 += source == 3;
+	}
+	if (osd1 != 1)
+		return s7d_vpu_mismatch(r, "A5", "VCBUS", 0x1dfd, osd1, 1);
+	/* The progressive mode ENCP runs, as this driver would program it */
+	ret = s7d_encp_read_mode(s7d_vpu_read_word, v, &f->mode);
+	if (ret)
+		return s7d_vpu_mismatch(r, "A7", "VCBUS", ENCP_EN, 0, 0);
+	setting = vpu_read(v, HDMI_SETTING);
+	f->mode.clock = DIV_ROUND_CLOSEST(clk_get_rate(v->clocks[PIXEL_CLK].clk), 1000);
+	f->mode.flags = (setting & BIT(2) ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
+		(setting & BIT(3) ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
+	f->mode.type = DRM_MODE_TYPE_DRIVER;
+	drm_mode_set_crtcinfo(&f->mode, CRTC_INTERLACE_HALVE_V);
+	drm_mode_set_name(&f->mode);
+	if (s7d_encp_build_state(&f->mode, &f->encp) != MODE_OK || f->encp.interlace)
+		return s7d_vpu_mismatch(r, "A7", "mode", 0, f->mode.hdisplay, f->mode.vdisplay);
+	for (i = 0; i < f->encp.count; i++) {
+		value = vpu_read(v, f->encp.regs[i].reg);
+		if (value != f->encp.regs[i].value)
+			return s7d_vpu_mismatch(r, "A7", "VCBUS", f->encp.regs[i].reg, value,
+						f->encp.regs[i].value);
+	}
+	/* RGB 8 bpc, limited range in the gamma LUT as this driver sets it */
+	ret = s7d_hdmi_output_build(S7D_HDMI_OUTPUT_RGB8, (unsigned long)f->mode.clock * 1000,
+				    24000000, &f->output);
+	if (!ret)
+		ret = s7d_hdmi_output_apply_rgb_range(&f->output,
+						      vpu_read(v, S7D_GAMMA_CTRL) & BIT(0));
+	if (ret)
+		return s7d_vpu_mismatch(r, "A8", "mode", 0, f->mode.clock, 0);
+	value = vpu_read(v, HDMI_FMT);
+	if (value != f->output.fmt)
+		return s7d_vpu_mismatch(r, "A8", "VCBUS", HDMI_FMT, value, f->output.fmt);
+	/* Equal rates: taking the clocks over does not reprogram them. */
+	ret = s7d_vpu_check_rate(r, v->hdmi_rate[HDMI_SHARED].clk, 0, rate->shared);
+	if (!ret)
+		ret = s7d_vpu_check_rate(r, v->hdmi_rate[HDMI_SERIAL].clk, 1, rate->serial);
+	if (!ret)
+		ret = s7d_vpu_check_rate(r, v->pixel_route[PIXEL_PLL].clk, 2, rate->pixel);
+	if (!ret)
+		ret = s7d_vpu_check_rate(r, v->clocks[PIXEL_CLK].clk, 3, rate->pixel);
+	if (ret)
+		return ret;
+	if (!clk_is_match(clk_get_parent(v->pixel_route[PIXEL_SOURCE].clk),
+			  v->pixel_route[PIXEL_PLL].clk) ||
+	    !clk_is_match(clk_get_parent(v->pixel_route[PIXEL_MUX].clk),
+			  v->pixel_route[PIXEL_PARENT].clk))
+		return s7d_vpu_mismatch(r, "A9", "parent", PIXEL_MUX, 0, 0);
+	/* The static setup: matched, rewritten at the first frame, or off path */
+	ret = s7d_vpu_build_image(f, im);
+	if (ret)
+		return s7d_vpu_mismatch(r, "A10", "image", 0, im->count, S7D_VPU_IMAGE_MAX);
+	f->offpath_count = 0;
+	for (i = 0; i < im->count; i++) {
+		const struct s7d_vpp_setting *e = &im->entry[i];
+
+		if (im->class[i] == S7D_IMAGE_FRAME)
+			continue;
+		value = vpu_read(v, e->reg);
+		if ((value & e->mask) == e->value)
+			continue;
+		if (im->class[i] == S7D_IMAGE_MATCH)
+			return s7d_vpu_mismatch(r, "A10", "VCBUS", e->reg, value & e->mask,
+						e->value);
+		if (f->offpath_count == ARRAY_SIZE(f->offpath))
+			return s7d_vpu_mismatch(r, "A10", "offpath", e->reg, f->offpath_count,
+						ARRAY_SIZE(f->offpath));
+		f->offpath[f->offpath_count++] = *e;
+	}
+	return v->link.readout(v->link.data, &f->mode, &f->output, r);
+}
+
+/*
+ * Fastboot: record at probe whether the firmware output is one this driver
+ * could keep, while the output is proven to run and before anything stops
+ * it. Only reads, apart from the TX packet bank selector.
+ */
+static void s7d_vpu_snapshot(struct s7d_vpu *v)
+{
+	struct s7d_vpu_fastboot *f = &v->boot.fast;
+	struct s7d_fastboot_reason *r = &f->reason;
+	struct s7d_vpu_image *im;
+	int ret = -ENOMEM;
+
+	f->state = S7D_FASTBOOT_MISMATCH;
+	im = kzalloc(sizeof(*im), GFP_KERNEL);
+	if (im)
+		ret = s7d_vpu_compare_boot(v, im, r);
+	else
+		s7d_vpu_mismatch(r, "A10", "memory", 0, 0, 0);
+	kfree(im);
+	if (ret) {
+		dev_info(v->dev, "firmware display not adopted: %s %s %#x hw %#llx want %#llx\n",
+			 r->cond, r->what, r->reg, r->hw, r->want);
+		return;
+	}
+	f->state = S7D_FASTBOOT_MATCH;
+	dev_info(v->dev, "firmware display %s matches its modeset (fastboot)\n", f->mode.name);
 }
 
 static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
@@ -2972,6 +3354,13 @@ static void s7d_vpu_record_power(struct s7d_vpu *v)
 		 b->power ? "assumed on" : "on");
 }
 
+static const char *const s7d_fastboot_names[] = {
+	[S7D_FASTBOOT_OFF] = "off",
+	[S7D_FASTBOOT_NONE] = "none",
+	[S7D_FASTBOOT_MISMATCH] = "mismatch",
+	[S7D_FASTBOOT_MATCH] = "match",
+};
+
 static int s7d_vpu_boot_show(struct seq_file *m, void *data)
 {
 	struct drm_debugfs_entry *entry = m->private;
@@ -3000,6 +3389,13 @@ static int s7d_vpu_boot_show(struct seq_file *m, void *data)
 		   b->logo_ram, READ_ONCE(b->logo_returned));
 	seq_printf(m, "logo_shown\t%d\n", b->logo_shown);
 	seq_printf(m, "unusable\t%d\n", v->unusable);
+	seq_printf(m, "fastboot\t%s\n", s7d_fastboot_names[b->fast.state]);
+	if (b->fast.reason.cond)
+		seq_printf(m, "fastboot_reason\t%s %s %#x %#llx %#llx\n", b->fast.reason.cond,
+			   b->fast.reason.what, b->fast.reason.reg, b->fast.reason.hw,
+			   b->fast.reason.want);
+	else
+		seq_puts(m, "fastboot_reason\t-\n");
 	return 0;
 }
 
@@ -3021,7 +3417,7 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	struct resource *res;
 	int ret;
 
-	if (!link || !link->quiesce || !link->prepare)
+	if (!link || !link->quiesce || !link->prepare || !link->readout)
 		return -EINVAL;
 	v->link = *link;
 	v->dev = dev;

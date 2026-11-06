@@ -3,9 +3,14 @@
 #ifndef __S7D_GAMMA_H
 #define __S7D_GAMMA_H
 
+#include <linux/bits.h>
 #include <linux/types.h>
 
 #define S7D_GAMMA_LUT_SIZE 65
+/* The LUT enable, which reads back bit 0 only, and the POST2 output bypass */
+#define S7D_GAMMA_CTRL		0x39d4
+#define S7D_GAMMA_BYPASS_REG	0x1d93
+#define S7D_GAMMA_BYPASS	BIT(2)
 /* BIN_ADDR, 3 x 33 BIN_DATA words, CTRL. */
 #define S7D_GAMMA_UPDATE_COUNT (1 + 3 * 33 + 1)
 

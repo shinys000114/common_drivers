@@ -41,6 +41,14 @@
 #include "s7d-writeback.h"
 #include "s7d-vdin.h"
 
+/*
+ * Keep a running firmware output that the first commit would set up the
+ * same way, instead of stopping it for a full modeset, as i915 fastboot.
+ */
+static bool fastboot;
+module_param(fastboot, bool, 0444);
+MODULE_PARM_DESC(fastboot, "Take a matching firmware display over without a modeset (default: false)");
+
 struct s7d_drm {
 	struct drm_device drm;
 	struct s7d_vpu vpu;
@@ -452,6 +460,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	ret = s7d_vpu_init(pdev, &display->vpu, &link);
 	if (ret)
 		return dev_err_probe(dev, ret, "VPU resources\n");
+	display->vpu.fastboot = fastboot;
 	/* Cache read-only retained-state admission before building IN_FORMATS. */
 	ret = s7d_vpu_hold_boot(&display->vpu);
 	if (ret)
