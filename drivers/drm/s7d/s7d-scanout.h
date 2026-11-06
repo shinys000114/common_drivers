@@ -134,6 +134,16 @@ int s7d_scanout_begin_initial(struct s7d_scanout *scanout,
 			      const struct s7d_scanout_buffers *buffers);
 int s7d_scanout_initial_ready(struct s7d_scanout *scanout);
 
+/*
+ * Firmware takeover: a running output already scans out @buffers, linear
+ * framebuffers only, with RDMA prepared and idle and no list pending.
+ * Take references and start idle, as after a completed frame, so that the
+ * next submit replaces the set at vblank. Only on a stopped owner. As
+ * for any other set, quiesce or a later frame completion releases them.
+ */
+int s7d_scanout_adopt(struct s7d_scanout *scanout,
+		      const struct s7d_scanout_buffers *buffers);
+
 /* One pending flip only. RDMA submit errors never arm the new list. */
 int s7d_scanout_submit(struct s7d_scanout *scanout,
 			const struct s7d_scanout_buffers *buffers,

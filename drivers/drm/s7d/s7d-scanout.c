@@ -242,6 +242,42 @@ int s7d_scanout_initial_ready(struct s7d_scanout *s)
 	return ret;
 }
 
+int s7d_scanout_adopt(struct s7d_scanout *s, const struct s7d_scanout_buffers *buffers)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	if (!buffers || !buffers_present(buffers) || buffers->video.fb || buffers->video2.fb ||
+	    buffers->afbc.plan.surface_mask || buffers->gfcd.fb)
+		return -EINVAL;
+	flush_work(&s->retire_work);
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->fault) {
+		ret = -EIO;
+	} else if (s->phase != S7D_SCANOUT_STOPPED ||
+		   buffers_present(&s->active) || buffers_present(&s->pending) ||
+		   buffers_present(&s->retired)) {
+		ret = -EBUSY;
+	} else if (s->generation == ~0ULL) {
+		ret = -EOVERFLOW;
+	} else {
+		buffers_get(buffers);
+		s->active = *buffers;
+		s->active.generation = ++s->generation;
+		s->active.afbc.generation = 0;
+		s->pending_afbc_epoch = 0;
+		s->pending_afbc_unchanged = false;
+		s->pending_transaction = S7D_SCANOUT_TRANSACTION_RDMA;
+		s->vblank_valid = false;
+		s->early_complete = false;
+		s->wait_field = false;
+		/* As after a completed frame: the next submit replaces the set. */
+		s->phase = S7D_SCANOUT_IDLE;
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	return ret;
+}
+
 void s7d_scanout_flush_retired(struct s7d_scanout *s)
 {
 	flush_work(&s->retire_work);
