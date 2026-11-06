@@ -1414,6 +1414,9 @@ static int s7d_vpu_stop(void *data)
 
 	if (ret && v->afbc_enabled)
 		s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
+	/* A complete stop has ended any firmware output and every fetch. */
+	if (!ret && v->touched)
+		s7d_vpu_return_logo(v);
 	return ret;
 }
 
@@ -2214,8 +2217,6 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	ret = s7d_vpu_stop(v);
 	if (ret)
 		return ret;
-	/* The first stop has ended any firmware output. */
-	s7d_vpu_return_logo(v);
 	ret = clk_rate_exclusive_get(v->clocks[0].clk);
 	if (ret)
 		return ret;
