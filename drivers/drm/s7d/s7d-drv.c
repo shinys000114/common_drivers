@@ -15,6 +15,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_atomic_uapi.h>
 #include <drm/drm_blend.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_modeset_helper.h>
@@ -23,10 +24,12 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_of.h>
 #include <drm/drm_print.h>
+#include <drm/drm_rect.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -204,7 +207,7 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 {
 	struct s7d_drm *display = container_of(drm, struct s7d_drm, drm);
 	struct drm_crtc *crtc;
-	struct drm_crtc_state *crtc_state;
+	struct drm_crtc_state *crtc_state, *old_crtc_state;
 	struct drm_plane *plane;
 	struct drm_plane_state *old_plane_state, *new_plane_state;
 	unsigned int checked_modesets = 0;
@@ -228,6 +231,10 @@ static int s7d_atomic_check(struct drm_device *drm, struct drm_atomic_state *sta
 	ret = s7d_check_output_routes(drm, state);
 	if (ret)
 		return ret;
+	/* An output the probe took over goes through a full check, as on i915. */
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, crtc_state, i)
+		if (to_s7d_crtc_state(old_crtc_state)->inherited)
+			crtc_state->mode_changed = true;
 	/* Cursor updates also require VSYNC RDMA completion and buffer retirement. */
 	state->legacy_cursor_update = false;
 	ret = drm_atomic_helper_check_modeset(drm, state);
@@ -277,10 +284,15 @@ static void s7d_atomic_commit_tail(struct drm_atomic_state *state)
 	struct drm_device *drm = state->dev;
 	struct s7d_drm *display = container_of(drm, struct s7d_drm, drm);
 	bool capture = s7d_writeback_has_job(display->vpu.writeback, state);
-	struct drm_crtc_state *crtc_state;
+	struct drm_crtc_state *crtc_state, *old_crtc_state;
 	struct drm_crtc *crtc;
 	int i;
 
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, crtc_state, i)
+		if (to_s7d_crtc_state(old_crtc_state)->inherited)
+			s7d_vpu_fastboot_done(&display->vpu,
+					      drm_atomic_crtc_needs_modeset(crtc_state),
+					      crtc_state->active ? "modeset" : "off");
 	drm_atomic_helper_commit_modeset_disables(drm, state);
 	drm_atomic_helper_commit_planes(drm, state, 0);
 	drm_atomic_helper_commit_modeset_enables(drm, state);
@@ -386,6 +398,103 @@ static int s7d_drm_preflight(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * Fastboot: describe the running firmware output that the probe matched in
+ * the reset state, the boot logo on the primary plane, and take it over.
+ * Afterwards the CRTC, the primary, the connector and the bridge are on, as
+ * after a modeset; on failure everything is reset again.
+ */
+static int s7d_drm_inherit(struct s7d_drm *display, struct drm_plane *primary,
+			   struct drm_connector *connector, struct drm_encoder *encoder)
+{
+	struct s7d_vpu *v = &display->vpu;
+	const struct s7d_vpu_fastboot *f = &v->boot.fast;
+	struct drm_device *drm = &display->drm;
+	struct drm_crtc *crtc = v->crtc;
+	struct drm_plane_state *plane_state = primary->state;
+	struct drm_connector_state *conn_state = connector->state;
+	struct drm_framebuffer *fb;
+	u32 x1, x2, y1, y2;
+	int ret;
+
+	if (f->state != S7D_FASTBOOT_MATCH)
+		return -ENODEV;
+	/* OSD1 W1/W2: the logo window; the snapshot found it 1:1 and linear. */
+	x1 = v->boot.osd1[4] & 0x1fff;
+	x2 = (v->boot.osd1[4] >> 16) & 0x1fff;
+	y1 = v->boot.osd1[5] & 0x1fff;
+	y2 = (v->boot.osd1[5] >> 16) & 0x1fff;
+	fb = s7d_fb_create_logo(drm, DRM_FORMAT_XRGB8888, x2 + 1, y2 + 1,
+				(v->boot.osd1[3] & 0xfff) << 4, s7d_vpu_logo_release, v);
+	if (IS_ERR(fb)) {
+		ret = PTR_ERR(fb);
+		goto fail;
+	}
+	ret = s7d_crtc_inherit(crtc, &f->mode, &f->encp, &f->output, fb);
+	if (ret)
+		goto reset;
+	drm_atomic_set_fb_for_plane(plane_state, fb);
+	plane_state->crtc = crtc;
+	plane_state->src_x = x1 << 16;
+	plane_state->src_y = y1 << 16;
+	plane_state->src_w = (x2 - x1 + 1) << 16;
+	plane_state->src_h = (y2 - y1 + 1) << 16;
+	plane_state->crtc_w = f->mode.hdisplay;
+	plane_state->crtc_h = f->mode.vdisplay;
+	plane_state->src = DRM_RECT_INIT(plane_state->src_x, plane_state->src_y,
+					 plane_state->src_w, plane_state->src_h);
+	plane_state->dst = DRM_RECT_INIT(0, 0, f->mode.hdisplay, f->mode.vdisplay);
+	plane_state->visible = true;
+	/*
+	 * The only plane on the CRTC, as drm_atomic_normalize_zpos() leaves
+	 * it. The reset left the zpos default there, and a commit that keeps
+	 * the plane mask and zpos does not normalize again.
+	 */
+	plane_state->normalized_zpos = 0;
+	crtc->state->plane_mask = drm_plane_mask(primary);
+	drm_connector_get(connector);
+	conn_state->crtc = crtc;
+	conn_state->best_encoder = encoder;
+	conn_state->hdmi.output_bpc = f->output.bpc;
+	conn_state->hdmi.output_format = HDMI_COLORSPACE_RGB;
+	conn_state->hdmi.is_limited_range = f->output.rgb_limited;
+	conn_state->hdmi.tmds_char_rate = div_u64(f->output.rate.tmds_numerator,
+						  f->output.rate.tmds_denominator);
+	crtc->state->connector_mask = drm_connector_mask(connector);
+	crtc->state->encoder_mask = drm_encoder_mask(encoder);
+	ret = s7d_hdmi_bridge_inherit(display->bridge, &f->mode, &f->output);
+	if (ret)
+		goto reset;
+	/* The legacy view that a commit's drm_atomic_helper_update_legacy_modeset_state() sets */
+	drm_mode_copy(&crtc->mode, &f->mode);
+	crtc->enabled = true;
+	connector->encoder = encoder;
+	encoder->crtc = crtc;
+	connector->dpms = DRM_MODE_DPMS_ON;
+	ret = s7d_crtc_install(crtc);
+	if (ret)
+		goto legacy;
+	/* Only the states and the scanout refer to it now. */
+	s7d_fb_arm_logo(fb);
+	drm_framebuffer_put(fb);
+	s7d_vpu_fastboot_adopted(v, true);
+	return 0;
+
+legacy:
+	connector->dpms = DRM_MODE_DPMS_OFF;
+	encoder->crtc = NULL;
+	connector->encoder = NULL;
+	crtc->enabled = false;
+	memset(&crtc->mode, 0, sizeof(crtc->mode));
+reset:
+	s7d_hdmi_bridge_uninherit(display->bridge);
+	drm_mode_config_reset(drm);
+	drm_framebuffer_put(fb);
+fail:
+	s7d_vpu_fastboot_adopted(v, false);
+	return ret;
+}
+
 static int s7d_drm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -399,7 +508,7 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	struct drm_device *drm;
 	struct s7d_drm *display;
 	u8 major, revision;
-	bool vendor_order;
+	bool vendor_order, inherited = false;
 	int ret;
 
 	ret = meson_cpu_version_read(MESON_CPU_VERSION_LVL_MAJOR, &major);
@@ -624,7 +733,17 @@ static int s7d_drm_probe(struct platform_device *pdev)
 		ret = -EINVAL;
 	if (ret)
 		goto fini_vpu;
-	/* No framebuffer/RDMA takeover occurs before the first atomic commit. */
+	/*
+	 * Only fastboot takes a running output over before the first atomic
+	 * commit, after the vendor connector state has replaced the reset one.
+	 */
+	if (fastboot) {
+		inherited = !s7d_drm_inherit(display, primary, connector, encoder);
+		if (!primary->state || !display->vpu.crtc->state || !connector->state) {
+			ret = -ENOMEM;
+			goto fini_vpu;
+		}
+	}
 	ret = drm_dev_register(drm, 0);
 	if (ret)
 		goto fini_vpu;
@@ -637,10 +756,17 @@ static int s7d_drm_probe(struct platform_device *pdev)
 	return 0;
 
 fini_vpu:
+	/* Stop an output the probe took over before anything it reads goes. */
+	if (inherited) {
+		drm_atomic_helper_shutdown(drm);
+		if (s7d_crtc_shutdown(display->vpu.crtc))
+			dev_err(dev, "taken over display did not stop\n");
+	}
 	s7d_hdmi_bridge_set_connector(bridge, NULL);
 	/*
-	 * No commit can have started before a successful drm_dev_register();
-	 * only a failed takeover restart can have kept the VPU.
+	 * No commit can have started before a successful drm_dev_register()
+	 * but for the shutdown above; only a failed takeover restart or
+	 * failed stop can have kept the VPU.
 	 */
 	if (s7d_vpu_fini(&display->vpu))
 		dev_err(dev, "keeping the VPU that the takeover left\n");

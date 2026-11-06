@@ -9,6 +9,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
+#include <drm/drm_atomic_uapi.h>
 #include <drm/drm_blend.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_color_mgmt.h>
@@ -107,6 +108,7 @@ static struct drm_crtc_state *s7d_crtc_duplicate_state(struct drm_crtc *crtc)
 	state->vendor.force_output = 0;
 	state->vendor.brr_update = false;
 	state->vendor.nonblock_by_vblank = false;
+	state->inherited = false;
 	return &state->base;
 }
 
@@ -1310,6 +1312,95 @@ static void s7d_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_sta
 		}
 	}
 	mutex_unlock(&c->mutex);
+}
+
+int s7d_crtc_inherit(struct drm_crtc *crtc, const struct drm_display_mode *mode,
+		     const struct s7d_encp_state *encp,
+		     const struct s7d_hdmi_output_state *output, struct drm_framebuffer *fb)
+{
+	struct s7d_crtc_state *state = to_s7d_crtc_state(crtc->state);
+	u16 alpha[2] = { DRM_BLEND_ALPHA_OPAQUE, DRM_BLEND_ALPHA_OPAQUE };
+	unsigned int hold = encp->flip_end ? encp->fifo_hold_lines : 8;
+	u32 zpos[S7D_INPUT_COUNT] = {0};
+	int ret;
+
+	if (state->base.enable || !fb)
+		return -EINVAL;
+	ret = drm_atomic_set_mode_for_crtc(&state->base, mode);
+	if (ret)
+		return ret;
+	drm_mode_copy(&state->base.adjusted_mode, mode);
+	state->base.active = true;
+	state->encp = *encp;
+	state->output = *output;
+	state->pixel_rate = (unsigned long)s7d_mode_clock(mode) * 1000;
+	/* The pipeline the CRTC check plans for a primary alone */
+	ret = s7d_video_build_pipeline(NULL, NULL, hold, &state->video);
+	if (!ret)
+		ret = s7d_video_build_vd2_pipeline(NULL, NULL, hold, &state->video2);
+	if (!ret)
+		ret = s7d_csc_build_state(DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE,
+					  s7d_crtc_csc_order(NULL), &state->csc);
+	if (!ret)
+		ret = s7d_csc_build_video2_state(DRM_COLOR_YCBCR_BT709,
+						 DRM_COLOR_YCBCR_LIMITED_RANGE,
+						 s7d_crtc_csc_order(NULL), &state->csc2);
+	if (!ret)
+		ret = s7d_display_claim(&state->resources, S7D_INPUT_OSD1, S7D_FETCH_LINEAR);
+	if (!ret)
+		ret = s7d_postblend_build_state(mode->hdisplay, mode->vdisplay, &state->resources,
+						zpos, BIT(S7D_INPUT_OSD1), alpha, NULL, 0, 0, NULL,
+						&state->postblend);
+	if (ret)
+		return ret;
+	state->buffers.fb[S7D_PLANE_PRIMARY] = fb;
+	state->valid = true;
+	state->inherited = true;
+	return 0;
+}
+
+int s7d_crtc_install(struct drm_crtc *crtc)
+{
+	struct s7d_crtc *c = to_s7d_crtc(crtc);
+	struct s7d_crtc_state *state = to_s7d_crtc_state(crtc->state);
+	int ret;
+
+	if (!state->inherited || !state->valid || !c->ops->adopt)
+		return -EINVAL;
+	mutex_lock(&c->mutex);
+	ret = -EBUSY;
+	if (c->prepared)
+		goto out;
+	ret = s7d_scanout_adopt(c->scanout, &state->buffers);
+	if (ret)
+		goto out;
+	ret = c->ops->adopt(c->data, state);
+	if (ret) {
+		/* Nothing was submitted; this only drops the set's references. */
+		if (s7d_scanout_quiesce(c->scanout))
+			drm_err(crtc->dev, "S7D scanout kept the boot logo set\n");
+		goto out;
+	}
+	c->link_required = c->ops->wait_for_link && !state->writeback_only;
+	WRITE_ONCE(c->last_error, 0);
+	WRITE_ONCE(c->prepared, true);
+	/* As a modeset's commit sets them before the enable */
+	drm_calc_timestamping_constants(crtc, &state->base.adjusted_mode);
+	drm_crtc_vblank_on(crtc);
+	c->vblank_on = true;
+	ret = drm_crtc_vblank_get(crtc);
+	if (ret) {
+		/* Taken over: a running output that faulted, as after enable */
+		s7d_crtc_fail(c, ret, NULL);
+		ret = 0;
+		goto out;
+	}
+	c->vblank_ref = true;
+	s7d_ext_mode_set(crtc, &state->base.adjusted_mode);
+	c->ext_mode = true;
+out:
+	mutex_unlock(&c->mutex);
+	return ret;
 }
 
 void s7d_crtc_ext_mode_set(struct drm_crtc *crtc, const struct drm_crtc_state *state)

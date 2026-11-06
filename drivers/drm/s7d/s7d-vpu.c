@@ -135,6 +135,15 @@ static int vpu_update(struct s7d_vpu *v, u32 reg, u32 mask, u32 value)
 	return 0;
 }
 
+static int s7d_vpu_mismatch(struct s7d_fastboot_reason *r, const char *cond,
+			    const char *what, u32 reg, u64 hw, u64 want)
+{
+	*r = (struct s7d_fastboot_reason) {
+		.cond = cond, .what = what, .reg = reg, .hw = hw, .want = want,
+	};
+	return -EINVAL;
+}
+
 static int s7d_vpu_reset_access(void *data)
 {
 	struct s7d_vpu *v = data;
@@ -896,9 +905,50 @@ static void s7d_vpu_return_logo(struct s7d_vpu *v)
 		 &b->logo_base, &b->logo_size);
 }
 
-void s7d_vpu_logo_release(void *data)
+void s7d_vpu_logo_release(void *data, struct drm_framebuffer *fb)
 {
-	s7d_vpu_return_logo(data);
+	struct s7d_vpu *v = data;
+
+	/* A framebuffer freed under the scanout is a leak, not a release. */
+	if (s7d_scanout_holds(&v->scanout, fb)) {
+		dev_err(v->dev, "boot logo freed while scanned out; keeping it\n");
+		return;
+	}
+	s7d_vpu_return_logo(v);
+}
+
+void s7d_vpu_fastboot_adopted(struct s7d_vpu *v, bool adopted)
+{
+	struct s7d_vpu_fastboot *f = &v->boot.fast;
+	struct s7d_fastboot_reason *r = &f->reason;
+
+	if (adopted) {
+		f->state = S7D_FASTBOOT_INSTALLED;
+		dev_info(v->dev, "firmware display %s adopted (fastboot)\n", f->mode.name);
+		return;
+	}
+	f->state = S7D_FASTBOOT_MISMATCH;
+	if (!r->cond)
+		s7d_vpu_mismatch(r, "A14", "state", 0, 0, 0);
+	dev_info(v->dev, "firmware display not adopted: %s %s %#x hw %#llx want %#llx\n",
+		 r->cond, r->what, r->reg, r->hw, r->want);
+}
+
+void s7d_vpu_fastboot_done(struct s7d_vpu *v, bool modeset, const char *what)
+{
+	struct s7d_vpu_fastboot *f = &v->boot.fast;
+
+	if (f->state != S7D_FASTBOOT_INSTALLED)
+		return;
+	if (!modeset) {
+		f->state = S7D_FASTBOOT_KEPT;
+		dev_info(v->dev, "kept the firmware output; first flip by RDMA\n");
+		return;
+	}
+	f->state = S7D_FASTBOOT_FALLBACK;
+	f->reason = (struct s7d_fastboot_reason) { .cond = "B", .what = what };
+	dev_info(v->dev, "firmware output not kept: B %s; %s\n", what,
+		 strcmp(what, "off") ? "full modeset" : "stopped");
 }
 
 /*
@@ -1096,6 +1146,31 @@ static int s7d_vpu_set_crc(void *data, bool enable)
 	if (put)
 		drm_crtc_vblank_put(v->crtc);
 	return ret;
+}
+
+/* Drop the PLL, HDMI and VPU rate protections and the shared clock enable. */
+static void s7d_vpu_put_rates(struct s7d_vpu *v)
+{
+	if (v->pll_protected) {
+		clk_rate_exclusive_put(v->pixel_route[PIXEL_PLL].clk);
+		v->pll_protected = false;
+	}
+	if (v->serial_protected) {
+		clk_rate_exclusive_put(v->hdmi_rate[HDMI_SERIAL].clk);
+		v->serial_protected = false;
+	}
+	if (v->shared_enabled) {
+		clk_disable_unprepare(v->hdmi_rate[HDMI_SHARED].clk);
+		v->shared_enabled = false;
+	}
+	if (v->shared_protected) {
+		clk_rate_exclusive_put(v->hdmi_rate[HDMI_SHARED].clk);
+		v->shared_protected = false;
+	}
+	if (v->core_protected) {
+		clk_rate_exclusive_put(v->clocks[0].clk);
+		v->core_protected = false;
+	}
 }
 
 static int s7d_vpu_stop_hw(void *data)
@@ -1394,26 +1469,7 @@ static int s7d_vpu_stop_hw(void *data)
 		v->pixel_protected = false;
 	}
 	s7d_vpu_disable_pixel(v);
-	if (v->pll_protected) {
-		clk_rate_exclusive_put(v->pixel_route[PIXEL_PLL].clk);
-		v->pll_protected = false;
-	}
-	if (v->serial_protected) {
-		clk_rate_exclusive_put(v->hdmi_rate[HDMI_SERIAL].clk);
-		v->serial_protected = false;
-	}
-	if (v->shared_enabled) {
-		clk_disable_unprepare(v->hdmi_rate[HDMI_SHARED].clk);
-		v->shared_enabled = false;
-	}
-	if (v->shared_protected) {
-		clk_rate_exclusive_put(v->hdmi_rate[HDMI_SHARED].clk);
-		v->shared_protected = false;
-	}
-	if (v->core_protected) {
-		clk_rate_exclusive_put(v->clocks[0].clk);
-		v->core_protected = false;
-	}
+	s7d_vpu_put_rates(v);
 	return 0;
 }
 
@@ -2150,15 +2206,56 @@ static int s7d_vpu_check_link_rates(struct s7d_vpu *v,
 	return 0;
 }
 
+/*
+ * Whether each clock already runs at the rate prepare_pixel() sets and would
+ * round that rate to itself, so that CCF returns before it reprograms one.
+ */
+static int s7d_vpu_rates_unchanged(struct s7d_vpu *v, const struct s7d_hdmi_output_rate *rate)
+{
+	const struct {
+		struct clk *clk;
+		unsigned long rate;
+	} clocks[] = {
+		{ v->hdmi_rate[HDMI_SHARED].clk, rate->shared },
+		{ v->hdmi_rate[HDMI_SERIAL].clk, rate->serial },
+		{ v->pixel_route[PIXEL_PLL].clk, rate->pixel },
+		{ v->clocks[PIXEL_CLK].clk, rate->pixel },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(clocks); i++)
+		if (clk_get_rate(clocks[i].clk) != clocks[i].rate ||
+		    clk_round_rate(clocks[i].clk, clocks[i].rate) != clocks[i].rate)
+			return -ERANGE;
+	if (!clk_is_match(clk_get_parent(v->pixel_route[PIXEL_SOURCE].clk),
+			  v->pixel_route[PIXEL_PLL].clk) ||
+	    !clk_is_match(clk_get_parent(v->pixel_route[PIXEL_MUX].clk),
+			  v->pixel_route[PIXEL_PARENT].clk))
+		return -EINVAL;
+	return 0;
+}
+
+/*
+ * With @adopt, take over the clocks of a running firmware output instead:
+ * the same protections, which change no rate, and its held ENCP enable.
+ */
 static int s7d_vpu_prepare_pixel(struct s7d_vpu *v,
-				 const struct s7d_hdmi_output_state *output, bool enci)
+				 const struct s7d_hdmi_output_state *output, bool enci,
+				 bool adopt)
 {
 	const struct s7d_hdmi_output_rate *rate = &output->rate;
 	int ret;
 
-	if (v->pixel_enabled || v->shared_enabled || v->shared_protected ||
+	if ((v->pixel_enabled && !adopt) || v->shared_enabled || v->shared_protected ||
 	    v->serial_protected || v->pll_protected)
 		return -EBUSY;
+	if (adopt) {
+		if (!v->pixel_enabled || enci)
+			return -EINVAL;
+		ret = s7d_vpu_rates_unchanged(v, rate);
+		if (ret)
+			return ret;
+	}
 	/* Refresh a failed or stale root before CCF's equal-rate early return. */
 	clk_get_rate(v->hdmi_rate[HDMI_SHARED].clk);
 	ret = clk_set_rate_exclusive(v->hdmi_rate[HDMI_SHARED].clk, rate->shared);
@@ -2201,7 +2298,7 @@ static int s7d_vpu_prepare_pixel(struct s7d_vpu *v,
 	if (ret)
 		return ret;
 	ret = s7d_vpu_check_link_rates(v, rate, 3);
-	if (ret)
+	if (ret || adopt)
 		return ret;
 	ret = clk_prepare_enable(v->clocks[PIXEL_CLK].clk);
 	if (ret)
@@ -2411,15 +2508,6 @@ static u32 s7d_vpu_read_word(void *data, u32 reg)
 	return vpu_read(data, reg);
 }
 
-static int s7d_vpu_mismatch(struct s7d_fastboot_reason *r, const char *cond,
-			    const char *what, u32 reg, u64 hw, u64 want)
-{
-	*r = (struct s7d_fastboot_reason) {
-		.cond = cond, .what = what, .reg = reg, .hw = hw, .want = want,
-	};
-	return -EINVAL;
-}
-
 static int s7d_vpu_check_rate(struct s7d_fastboot_reason *r, struct clk *clk,
 			      unsigned int index, unsigned long want)
 {
@@ -2585,6 +2673,25 @@ static void s7d_vpu_snapshot(struct s7d_vpu *v)
 	dev_info(v->dev, "firmware display %s matches its modeset (fastboot)\n", f->mode.name);
 }
 
+/* The encoder, its counter and flip window, and the frame of @state. */
+static void s7d_vpu_set_timing(struct s7d_vpu *v, const struct s7d_crtc_state *state)
+{
+	v->info_reg = state->encp.enci ? ENCI_INFO_READ : ENCP_INFO_READ;
+	v->field_lines = state->encp.interlace && !state->encp.enci ?
+		(state->base.adjusted_mode.vtotal + 1) / 2 : 0;
+	v->venc_en = state->encp.enci ? ENCI_EN : ENCP_EN;
+	v->flip_start = state->encp.flip_start;
+	v->flip_end = state->encp.flip_end;
+	v->afbc_replay_frame_ns =
+		DIV_ROUND_UP_ULL((u64)state->base.adjusted_mode.htotal *
+				 state->base.adjusted_mode.vtotal * NSEC_PER_SEC,
+				 state->pixel_rate);
+	v->replay_prepare_end = v->afbc_replay_frame_ns > NSEC_PER_MSEC ?
+		state->base.adjusted_mode.vtotal -
+		DIV_ROUND_UP_ULL((u64)state->base.adjusted_mode.vtotal * NSEC_PER_MSEC,
+				v->afbc_replay_frame_ns) : 0;
+}
+
 static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 {
 	struct s7d_vpu *v = data;
@@ -2633,7 +2740,7 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 					      clk_get_rate(v->clocks[0].clk));
 	if (ret)
 		return ret;
-	ret = s7d_vpu_prepare_pixel(v, &state->output, state->encp.enci);
+	ret = s7d_vpu_prepare_pixel(v, &state->output, state->encp.enci, false);
 	if (ret)
 		return ret;
 	ret = clk_rate_exclusive_get(v->clocks[PIXEL_CLK].clk);
@@ -2700,19 +2807,7 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 		if (ret)
 			return s7d_afbc_engine_fail(&v->afbc, ret, v->failed_reg);
 	}
-	v->info_reg = state->encp.enci ? ENCI_INFO_READ : ENCP_INFO_READ;
-	v->field_lines = state->encp.interlace && !state->encp.enci ?
-		(state->base.adjusted_mode.vtotal + 1) / 2 : 0;
-	v->venc_en = state->encp.enci ? ENCI_EN : ENCP_EN;
-	v->flip_start = state->encp.flip_start;
-	v->flip_end = state->encp.flip_end;
-	v->afbc_replay_frame_ns = DIV_ROUND_UP_ULL(
-		(u64)state->base.adjusted_mode.htotal *
-		state->base.adjusted_mode.vtotal * NSEC_PER_SEC, state->pixel_rate);
-	v->replay_prepare_end = v->afbc_replay_frame_ns > NSEC_PER_MSEC ?
-		state->base.adjusted_mode.vtotal -
-		DIV_ROUND_UP_ULL((u64)state->base.adjusted_mode.vtotal * NSEC_PER_MSEC,
-				v->afbc_replay_frame_ns) : 0;
+	s7d_vpu_set_timing(v, state);
 	/* RDMA done was acknowledged by prepare; clear stale GIC edge state. */
 	ret = irq_set_irqchip_state(v->rdma_irq, IRQCHIP_STATE_PENDING, false);
 	if (ret)
@@ -2724,6 +2819,87 @@ static int s7d_vpu_prepare(void *data, const struct s7d_crtc_state *state)
 	v->gamma_touched = true;
 	return s7d_gamma_program(v->regs, state->base.gamma_lut,
 				 state->output.rgb_limited, &v->failed_reg);
+}
+
+/*
+ * Take the firmware output that the probe matched over as prepare and
+ * start would leave it for @state, without writing anything it shows:
+ * set up RDMA, take the clocks without a rate change, and the link as
+ * prepared and enabled. On failure the VPU stays held for the first
+ * modeset, which then stops the output as without fastboot.
+ */
+static int s7d_vpu_adopt(void *data, const struct s7d_crtc_state *state)
+{
+	struct s7d_vpu *v = data;
+	struct s7d_vpu_fastboot *f = &v->boot.fast;
+	const char *what;
+	u32 route;
+	int ret;
+
+	if (f->state != S7D_FASTBOOT_MATCH || !v->boot_held || !v->acquired || v->touched ||
+	    state->writeback_only || state->encp.enci ||
+	    memcmp(&state->encp, &f->encp, sizeof(state->encp)) ||
+	    !s7d_hdmi_output_same(&state->output, &f->output))
+		return -EINVAL;
+	/* The firmware leaves RDMA unused: reset it under the running output. */
+	ret = s7d_rdma_prepare(&v->rdma);
+	if (ret) {
+		s7d_vpu_mismatch(&f->reason, "A14", "RDMA", 0, -ret, 0);
+		return ret;
+	}
+	what = "clock";
+	ret = clk_rate_exclusive_get(v->clocks[0].clk);
+	if (ret)
+		goto fail;
+	v->core_protected = true;
+	ret = -ERANGE;
+	if (clk_get_rate(v->clocks[0].clk) < state->pixel_rate)
+		goto fail;
+	ret = s7d_vpu_prepare_pixel(v, &state->output, false, true);
+	if (ret)
+		goto fail;
+	ret = clk_rate_exclusive_get(v->clocks[PIXEL_CLK].clk);
+	if (ret)
+		goto fail;
+	v->pixel_protected = true;
+	what = "IRQ";
+	ret = irq_set_irqchip_state(v->rdma_irq, IRQCHIP_STATE_PENDING, false);
+	if (!ret)
+		ret = irq_set_irqchip_state(v->vsync_irq, IRQCHIP_STATE_PENDING, false);
+	if (ret)
+		goto fail;
+	what = "link";
+	ret = v->link.adopt(v->link.data, &state->output);
+	if (ret)
+		goto fail;
+	/* As acquire, prepare and start would leave it */
+	v->boot_held = false;
+	v->touched = true;
+	v->post2_touched = true;
+	v->gamma_touched = true;
+	route = vpu_read(v, s7d_osd_scaler_route.reg) & s7d_osd_scaler_route.mask;
+	v->osd_scaler_route_saved = route;
+	v->osd_scaler_route_owned = true;
+	v->normal_unpack_owned = BIT(0) | BIT(1);
+	v->osd1_enable = true;
+	v->osd2_enable = false;
+	v->video_enable[0] = false;
+	v->video_enable[1] = false;
+	v->vd1_fbc = false;
+	s7d_vpu_set_timing(v, state);
+	spin_lock_irq(&v->frame_lock);
+	enable_irq(v->rdma_irq);
+	v->rdma_enabled = true;
+	spin_unlock_irq(&v->frame_lock);
+	return 0;
+fail:
+	s7d_vpu_mismatch(&f->reason, "A14", what, 0, -ret, 0);
+	if (v->pixel_protected) {
+		clk_rate_exclusive_put(v->clocks[PIXEL_CLK].clk);
+		v->pixel_protected = false;
+	}
+	s7d_vpu_put_rates(v);
+	return ret;
 }
 
 static int s7d_vpu_start(void *data)
@@ -2802,6 +2978,7 @@ const struct s7d_crtc_ops s7d_vpu_crtc_ops = {
 	.check = s7d_vpu_check,
 	.acquire = s7d_vpu_acquire,
 	.prepare = s7d_vpu_prepare,
+	.adopt = s7d_vpu_adopt,
 	.start = s7d_vpu_start,
 	.submit = s7d_vpu_submit,
 	.stop = s7d_vpu_stop,
@@ -3359,6 +3536,9 @@ static const char *const s7d_fastboot_names[] = {
 	[S7D_FASTBOOT_NONE] = "none",
 	[S7D_FASTBOOT_MISMATCH] = "mismatch",
 	[S7D_FASTBOOT_MATCH] = "match",
+	[S7D_FASTBOOT_INSTALLED] = "installed",
+	[S7D_FASTBOOT_KEPT] = "kept",
+	[S7D_FASTBOOT_FALLBACK] = "fallback",
 };
 
 static int s7d_vpu_boot_show(struct seq_file *m, void *data)
@@ -3417,7 +3597,7 @@ int s7d_vpu_init(struct platform_device *pdev, struct s7d_vpu *v,
 	struct resource *res;
 	int ret;
 
-	if (!link || !link->quiesce || !link->prepare || !link->readout)
+	if (!link || !link->quiesce || !link->prepare || !link->readout || !link->adopt)
 		return -EINVAL;
 	v->link = *link;
 	v->dev = dev;

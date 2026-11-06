@@ -18,12 +18,14 @@ s7d_fb_create(struct drm_device *dev, struct drm_file *file,
  * scans out, for the state that the probe reads out of it. It has no GEM
  * object, so no file sees, maps or gets a handle of it, and no new plane
  * state may take it. Once armed, the last reference calls @release with
- * @data: arm it only when every reference left is a state or the scanout
- * owner, whose release proves that the hardware no longer reads it.
+ * @data and the framebuffer, as it goes: arm it only when every reference
+ * left is a state or the scanout owner, whose release proves that the
+ * hardware no longer reads it.
  */
 struct drm_framebuffer *s7d_fb_create_logo(struct drm_device *dev, u32 format,
 					   u32 width, u32 height, u32 pitch,
-					   void (*release)(void *data), void *data);
+					   void (*release)(void *data, struct drm_framebuffer *fb),
+					   void *data);
 bool s7d_fb_is_logo(const struct drm_framebuffer *fb);
 void s7d_fb_arm_logo(struct drm_framebuffer *fb);
 /* Borrowed metadata; the caller holds a framebuffer reference. */

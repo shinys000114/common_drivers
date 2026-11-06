@@ -73,6 +73,11 @@ struct s7d_crtc_state {
 	struct s7d_scanout_afbc previous_afbc;
 	unsigned long pixel_rate;
 	bool valid;
+	/*
+	 * Read out of a running firmware output at probe and taken over as
+	 * enable leaves an output; duplicates clear it.
+	 */
+	bool inherited;
 	/* Derived from attached connectors, independently of HPD and WB jobs. */
 	bool writeback_only;
 	bool video_unchanged;
@@ -130,6 +135,12 @@ struct s7d_crtc_ops {
 	int (*check)(void *data, const struct s7d_crtc_state *state);
 	int (*acquire)(void *data);
 	int (*prepare)(void *data, const struct s7d_crtc_state *state);
+	/*
+	 * Optional, at probe: take over the running output that an inherited
+	 * @state describes, as acquire, prepare and start leave an output,
+	 * without writing what the output shows. On failure nothing is taken.
+	 */
+	int (*adopt)(void *data, const struct s7d_crtc_state *state);
 	int (*start)(void *data);
 	int (*submit)(void *data, const struct s7d_crtc_state *state);
 	int (*stop)(void *data);
@@ -173,6 +184,20 @@ void s7d_crtc_link_error(struct drm_crtc *crtc, int error);
  * active, if it started without error. s7d_crtc_stop() withdraws it.
  */
 void s7d_crtc_ext_mode_set(struct drm_crtc *crtc, const struct drm_crtc_state *state);
+
+/*
+ * Fastboot, at probe, on the reset state: describe the running firmware
+ * output of @mode, @encp and @output that scans @fb out on the primary.
+ * The caller attaches the primary plane and the connector.
+ */
+int s7d_crtc_inherit(struct drm_crtc *crtc, const struct drm_display_mode *mode,
+		     const struct s7d_encp_state *encp,
+		     const struct s7d_hdmi_output_state *output, struct drm_framebuffer *fb);
+/*
+ * Then take that output over: its backend, scanout, vblank and media glue
+ * mode, as atomic_enable leaves them. On failure nothing is taken over.
+ */
+int s7d_crtc_install(struct drm_crtc *crtc);
 
 /*
  * Before freeing backend resources, stop new commits and call shutdown. It

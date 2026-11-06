@@ -44,6 +44,13 @@ enum drm_mode_status s7d_hdmi_link_valid(const struct drm_display_info *info,
 extern struct platform_driver s7d_hdmi_driver;
 
 int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link);
+/*
+ * Fastboot, at probe: describe the link that the link readout matched, for
+ * @mode and @output, in the bridge's reset state; uninherit resets it.
+ */
+int s7d_hdmi_bridge_inherit(struct drm_bridge *bridge, const struct drm_display_mode *mode,
+			    const struct s7d_hdmi_output_state *output);
+void s7d_hdmi_bridge_uninherit(struct drm_bridge *bridge);
 void s7d_hdmi_bridge_eld_updated(struct drm_bridge *bridge, struct drm_connector *connector);
 int s7d_hdmi_bridge_set_connector(struct drm_bridge *bridge, struct drm_connector *connector);
 

@@ -1009,6 +1009,34 @@ out:
 	return 0;
 }
 
+static int s7d_hdmi_adopt(void *data, const struct s7d_hdmi_output_state *output)
+{
+	struct s7d_hdmi *h = data;
+	int ret = 0;
+
+	mutex_lock(&h->lock);
+	if (!h->boot.valid || !h->phy_on || !h->phy_initialized || !h->video_on ||
+	    h->prepared) {
+		ret = -EBUSY;
+		goto out;
+	}
+	h->prepared_output = *output;
+	h->prepared = true;
+	/* As the enable leaves a link that scrambles: recheck the sink. */
+	h->scdc_config = output->high_tmds ? SCDC_SCRAMBLING_ENABLE |
+		SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 : 0;
+	if (h->scdc_config) {
+		h->sink_scrambled = true;
+		mod_delayed_work(system_wq, &h->scdc_check, HZ);
+	}
+	h->audio_error = 0;
+	h->audio_valid = false;
+	h->audio_resume = false;
+out:
+	mutex_unlock(&h->lock);
+	return ret;
+}
+
 static int s7d_hdmi_prepare(void *data,
 			    const struct s7d_hdmi_output_state *output)
 {
@@ -2241,6 +2269,50 @@ void s7d_hdmi_commit_vendor(struct drm_crtc *crtc, struct drm_atomic_state *atom
 	}
 }
 
+int s7d_hdmi_bridge_inherit(struct drm_bridge *bridge, const struct drm_display_mode *mode,
+			    const struct s7d_hdmi_output_state *output)
+{
+	struct s7d_hdmi *h = to_s7d_hdmi(bridge);
+	struct s7d_hdmi_state *state;
+	int ret = 0;
+
+	if (bridge->funcs != &s7d_hdmi_bridge_funcs || !bridge->base.state)
+		return -EINVAL;
+	state = to_s7d_hdmi_state(drm_priv_to_bridge_state(bridge->base.state));
+	mutex_lock(&h->lock);
+	if (!h->boot.valid || state->valid) {
+		ret = -EINVAL;
+		goto out;
+	}
+	state->mode = *mode;
+	state->output = *output;
+	state->hdmi = h->boot.hdmi;
+	/* The readout found the sink scrambling, as enable leaves an SCDC link. */
+	state->scdc = output->high_tmds;
+	state->high_tmds = output->high_tmds;
+	/* The packets the link sends; the first commit rewrites what differs. */
+	if (h->boot.banks & BIT(0))
+		memcpy(state->avi, h->boot.avi, sizeof(state->avi));
+	if (h->boot.banks & BIT(5)) {
+		state->vendor_len = h->boot.vendor_len;
+		memcpy(state->vendor, h->boot.vendor, state->vendor_len);
+	}
+	state->valid = true;
+out:
+	mutex_unlock(&h->lock);
+	return ret;
+}
+
+void s7d_hdmi_bridge_uninherit(struct drm_bridge *bridge)
+{
+	struct s7d_hdmi_state *state;
+
+	if (bridge->funcs != &s7d_hdmi_bridge_funcs || !bridge->base.state)
+		return;
+	state = to_s7d_hdmi_state(drm_priv_to_bridge_state(bridge->base.state));
+	memset(&state->mode, 0, sizeof(*state) - offsetof(struct s7d_hdmi_state, mode));
+}
+
 int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link)
 {
 	if (!bridge || bridge->funcs != &s7d_hdmi_bridge_funcs || !link)
@@ -2249,6 +2321,7 @@ int s7d_hdmi_bridge_link(struct drm_bridge *bridge, struct s7d_vpu_link *link)
 		.quiesce = s7d_hdmi_quiesce,
 		.prepare = s7d_hdmi_prepare,
 		.readout = s7d_hdmi_readout,
+		.adopt = s7d_hdmi_adopt,
 		.data = to_s7d_hdmi(bridge),
 	};
 	return 0;

@@ -25,7 +25,7 @@
  */
 struct s7d_logo_fb {
 	struct drm_framebuffer base;
-	void (*release)(void *data);
+	void (*release)(void *data, struct drm_framebuffer *fb);
 	void *data;
 	bool armed;
 };
@@ -36,7 +36,7 @@ static void s7d_logo_fb_destroy(struct drm_framebuffer *fb)
 
 	drm_framebuffer_cleanup(fb);
 	if (logo->armed)
-		logo->release(logo->data);
+		logo->release(logo->data, fb);
 	kfree(logo);
 }
 
@@ -46,7 +46,8 @@ static const struct drm_framebuffer_funcs s7d_logo_fb_funcs = {
 
 struct drm_framebuffer *s7d_fb_create_logo(struct drm_device *dev, u32 format,
 					   u32 width, u32 height, u32 pitch,
-					   void (*release)(void *data), void *data)
+					   void (*release)(void *data, struct drm_framebuffer *fb),
+					   void *data)
 {
 	struct s7d_logo_fb *logo;
 	int ret;

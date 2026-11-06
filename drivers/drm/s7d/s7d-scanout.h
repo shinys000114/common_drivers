@@ -144,6 +144,9 @@ int s7d_scanout_initial_ready(struct s7d_scanout *scanout);
 int s7d_scanout_adopt(struct s7d_scanout *scanout,
 		      const struct s7d_scanout_buffers *buffers);
 
+/* Whether a set of the owner still refers to @fb; any context. */
+bool s7d_scanout_holds(struct s7d_scanout *scanout, const struct drm_framebuffer *fb);
+
 /* One pending flip only. RDMA submit errors never arm the new list. */
 int s7d_scanout_submit(struct s7d_scanout *scanout,
 			const struct s7d_scanout_buffers *buffers,

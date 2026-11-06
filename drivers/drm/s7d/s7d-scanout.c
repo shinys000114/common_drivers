@@ -278,6 +278,19 @@ int s7d_scanout_adopt(struct s7d_scanout *s, const struct s7d_scanout_buffers *b
 	return ret;
 }
 
+bool s7d_scanout_holds(struct s7d_scanout *s, const struct drm_framebuffer *fb)
+{
+	unsigned long flags;
+	unsigned int i;
+	bool held = false;
+
+	spin_lock_irqsave(&s->lock, flags);
+	for (i = 0; i < S7D_SCANOUT_MAX_PLANES; i++)
+		held |= s->active.fb[i] == fb || s->pending.fb[i] == fb || s->retired.fb[i] == fb;
+	spin_unlock_irqrestore(&s->lock, flags);
+	return held;
+}
+
 void s7d_scanout_flush_retired(struct s7d_scanout *s)
 {
 	flush_work(&s->retire_work);

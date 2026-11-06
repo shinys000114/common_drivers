@@ -11,6 +11,7 @@
 #include "s7d-vpp.h"
 
 struct drm_device;
+struct drm_framebuffer;
 struct platform_device;
 struct regmap;
 struct s7d_vdin;
@@ -27,6 +28,12 @@ enum s7d_fastboot {
 	S7D_FASTBOOT_MISMATCH,
 	/* The output this driver would set up for its mode */
 	S7D_FASTBOOT_MATCH,
+	/* Read into the initial state and taken over */
+	S7D_FASTBOOT_INSTALLED,
+	/* The first commit kept it, flipping by RDMA */
+	S7D_FASTBOOT_KEPT,
+	/* The first commit stopped it for a full modeset */
+	S7D_FASTBOOT_FALLBACK,
 };
 
 /* The first check that refused an output, and the word it compared. */
@@ -100,6 +107,12 @@ struct s7d_vpu_link {
 	int (*readout)(void *data, const struct drm_display_mode *mode,
 		       const struct s7d_hdmi_output_state *output,
 		       struct s7d_fastboot_reason *reason);
+	/*
+	 * Take the link that readout matched over as prepare and the bridge
+	 * enable would leave it for @output, without touching the PHY, its
+	 * clocks or the link setup. After it, quiesce stops the link.
+	 */
+	int (*adopt)(void *data, const struct s7d_hdmi_output_state *output);
 	void *data;
 };
 
@@ -226,7 +239,11 @@ int s7d_vpu_hold_boot(struct s7d_vpu *vpu);
  * The boot logo framebuffer's release: return the logo once nothing reads
  * it. Process context; at most once, whatever else returns it.
  */
-void s7d_vpu_logo_release(void *data);
+void s7d_vpu_logo_release(void *data, struct drm_framebuffer *fb);
+/* Fastboot: the probe did or did not take the matched output over. */
+void s7d_vpu_fastboot_adopted(struct s7d_vpu *vpu, bool adopted);
+/* Fastboot: the first commit kept the output, or replaced it for @what. */
+void s7d_vpu_fastboot_done(struct s7d_vpu *vpu, bool modeset, const char *what);
 /* Show what the probe found in the DRM device's debugfs directory. */
 void s7d_vpu_debugfs_init(struct s7d_vpu *vpu, struct drm_device *drm);
 /*
