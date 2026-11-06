@@ -1009,6 +1009,43 @@ out:
 	return 0;
 }
 
+/*
+ * Stop the packet data that the firmware left on an adopted link, as the
+ * link setup leaves it, without the gap of rewriting every bank: PCM, ACR
+ * and the audio InfoFrame, Dynamic HDR and EMP, and every bank this
+ * driver does not send. The SPD InfoFrame becomes this driver's; the AVI
+ * and vendor ones are the first commit's.
+ */
+static int s7d_hdmi_stop_data(struct s7d_hdmi *h, const struct s7d_hdmi_output_state *output)
+{
+	struct s7d_hdmi_tx_setting image[S7D_HDMI_TX_SETTING_COUNT];
+	const struct s7d_hdmi_state state = { .output = *output };
+	unsigned int bank;
+	int count, ret;
+
+	count = s7d_hdmi_tx_image(&state, image);
+	if (count < 0)
+		return count;
+	mutex_lock(&h->ddc.lock);
+	ret = s7d_hdmi_tx_apply(h, image, count, S7D_HDMI_TX_DATA);
+	if (!ret)
+		ret = s7d_hdmi_audio_disable(h->core);
+	for (bank = 0; !ret && bank < 11; bank++) {
+		if (!(h->boot.banks & BIT(bank)) || bank == 0 || bank == 2 || bank == 5 ||
+		    (bank == 3 && h->boot.hdmi))
+			continue;
+		ret = core_write(h, CORE_INFO_SELECT, bank);
+		if (!ret)
+			ret = s7d_hdmi_write_checked(h, h->core, CORE_INFO_ENABLE,
+						     CORE_INFO_TRANSMIT, 0);
+	}
+	if (!ret && h->boot.hdmi &&
+	    (!(h->boot.banks & BIT(3)) || memcmp(h->boot.spd, h->spd, sizeof(h->spd))))
+		ret = s7d_hdmi_packet(h, 3, h->spd, sizeof(h->spd));
+	mutex_unlock(&h->ddc.lock);
+	return ret;
+}
+
 static int s7d_hdmi_adopt(void *data, const struct s7d_hdmi_output_state *output)
 {
 	struct s7d_hdmi *h = data;
@@ -1020,6 +1057,9 @@ static int s7d_hdmi_adopt(void *data, const struct s7d_hdmi_output_state *output
 		ret = -EBUSY;
 		goto out;
 	}
+	ret = s7d_hdmi_stop_data(h, output);
+	if (ret)
+		goto out;
 	h->prepared_output = *output;
 	h->prepared = true;
 	/* As the enable leaves a link that scrambles: recheck the sink. */
