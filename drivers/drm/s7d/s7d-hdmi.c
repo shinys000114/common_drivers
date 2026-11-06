@@ -658,7 +658,35 @@ static int s7d_hdmi_check_phase(struct s7d_hdmi *h,
 	return 0;
 }
 
-static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *state)
+/* The stages of s7d_hdmi_setup_tx() in which its register image is written. */
+enum s7d_hdmi_tx_stage {
+	S7D_HDMI_TX_PATTERN,
+	S7D_HDMI_TX_LINK,
+	S7D_HDMI_TX_DE,
+	/* PCM, Dynamic HDR and EMP off: packet data rather than link setup */
+	S7D_HDMI_TX_DATA,
+	S7D_HDMI_TX_ACTIVE,
+};
+
+struct s7d_hdmi_tx_setting {
+	u8 stage;
+	bool top;
+	u16 reg;
+	u32 mask;
+	u32 value;
+};
+
+#define S7D_HDMI_TX_SETTING_COUNT 25
+
+/*
+ * The masked TX writes of s7d_hdmi_setup_tx() for @state, in order, for
+ * TOP or core registers; @image takes S7D_HDMI_TX_SETTING_COUNT entries.
+ * The TMDS pattern load, the output mapping, the packets, the FIFO resets
+ * and the TPI mode come between and after them. Pure. Returns the count or
+ * -EINVAL for an output the TX cannot carry.
+ */
+static int s7d_hdmi_tx_image(const struct s7d_hdmi_state *state,
+			     struct s7d_hdmi_tx_setting *image)
 {
 	static const struct reg_sequence config[] = {
 		{ 0x029d, 0 }, /* FRL_LINK_RATE_CONFIG */
@@ -672,13 +700,10 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 		{ 0x06ed, 4 }, /* VTEM disabled */
 		{ 0x06f7, 4 }, /* GEN5 disabled */
 	};
-	const u8 mapping[] = {
-		state->output.tx_mapping & 0xff, state->output.tx_mapping >> 8,
-	};
-	u8 actual[sizeof(mapping)], p2t, merge;
-	unsigned int i;
-	int ret;
+	unsigned int count = 0, i;
+	u8 p2t, merge;
 
+	static_assert(3 + 4 + ARRAY_SIZE(config) + 1 + 3 + 3 + 1 == S7D_HDMI_TX_SETTING_COUNT);
 	if (state->output.bpc == 8) {
 		p2t = 0;
 		merge = 0;
@@ -701,15 +726,65 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 	} else {
 		return -EINVAL;
 	}
-	ret = top_write(h, TOP_CLK, 7, 7);
-	if (ret)
-		return ret;
-	ret = top_write(h, TOP_PATTERN0, U32_MAX,
-			state->high_tmds ? 0 : 0x001f001f);
-	if (ret)
-		return ret;
-	ret = top_write(h, TOP_PATTERN1, U32_MAX,
-			state->high_tmds ? 0x03ff03ff : 0x001f001f);
+#define TX(st, t, r, m, v) (image[count++] = (struct s7d_hdmi_tx_setting) { \
+	.stage = (st), .top = (t), .reg = (r), .mask = (m), .value = (v) })
+	TX(S7D_HDMI_TX_PATTERN, true, TOP_CLK, 7, 7);
+	TX(S7D_HDMI_TX_PATTERN, true, TOP_PATTERN0, U32_MAX,
+	   state->high_tmds ? 0 : 0x001f001f);
+	TX(S7D_HDMI_TX_PATTERN, true, TOP_PATTERN1, U32_MAX,
+	   state->high_tmds ? 0x03ff03ff : 0x001f001f);
+	TX(S7D_HDMI_TX_LINK, true, TOP_PATTERN_CTRL, BIT(1), state->high_tmds ? BIT(1) : 0);
+	TX(S7D_HDMI_TX_LINK, false, 0x0900, 0xff, BIT(5) | state->high_tmds); /* SCRCTL */
+	TX(S7D_HDMI_TX_LINK, true, TOP_BIST, GENMASK(14, 12) | GENMASK(11, 0), BIT(12));
+	TX(S7D_HDMI_TX_LINK, false, 0x0236, 0xff, p2t);
+	for (i = 0; i < ARRAY_SIZE(config); i++)
+		TX(S7D_HDMI_TX_LINK, false, config[i].reg, 0xff,
+		   config[i].reg == 0x0b46 ? state->output.tx_mask : config[i].def);
+	TX(S7D_HDMI_TX_LINK, false, 0x06e1, 0xff, merge);
+	TX(S7D_HDMI_TX_DE, false, 0x012a, 3, 0); /* Original DE */
+	TX(S7D_HDMI_TX_DE, false, 0x023c, BIT(6), BIT(6));
+	TX(S7D_HDMI_TX_DE, false, 0x023d, BIT(0), 0);
+	/* PCM stays disabled until hdmi-codec configures audio explicitly. */
+	TX(S7D_HDMI_TX_DATA, false, CORE_AUDIO_EN, 0xff, 0);
+	TX(S7D_HDMI_TX_DATA, false, 0x0f00, BIT(0), 0); /* Dynamic HDR */
+	TX(S7D_HDMI_TX_DATA, false, 0x0f15, BIT(0), 0); /* EMP insertion */
+	/* The transmitter sees repeated pixels: 1440 per line for 480i/576i. */
+	TX(S7D_HDMI_TX_ACTIVE, true, TOP_ACTIVE, 0x7fff7fff, (state->mode.vdisplay << 16) |
+	   (state->mode.hdisplay << !!(state->mode.flags & DRM_MODE_FLAG_DBLCLK)));
+#undef TX
+	return count;
+}
+
+static int s7d_hdmi_tx_apply(struct s7d_hdmi *h, const struct s7d_hdmi_tx_setting *image,
+			     unsigned int count, enum s7d_hdmi_tx_stage stage)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < count; i++) {
+		if (image[i].stage != stage)
+			continue;
+		ret = s7d_hdmi_write_checked(h, image[i].top ? h->top : h->core, image[i].reg,
+					     image[i].mask, image[i].value);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *state)
+{
+	struct s7d_hdmi_tx_setting image[S7D_HDMI_TX_SETTING_COUNT];
+	const u8 mapping[] = {
+		state->output.tx_mapping & 0xff, state->output.tx_mapping >> 8,
+	};
+	u8 actual[sizeof(mapping)];
+	int ret, count;
+
+	count = s7d_hdmi_tx_image(state, image);
+	if (count < 0)
+		return count;
+	ret = s7d_hdmi_tx_apply(h, image, count, S7D_HDMI_TX_PATTERN);
 	if (ret)
 		return ret;
 	ret = top_write(h, TOP_PATTERN_CTRL, BIT(1), 0);
@@ -721,25 +796,7 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 	dev_dbg(h->dev, "TX TMDS pattern load end: %d\n", ret);
 	if (ret)
 		return ret;
-	ret = top_write(h, TOP_PATTERN_CTRL, BIT(1), state->high_tmds ? BIT(1) : 0);
-	if (ret)
-		return ret;
-	ret = core_write(h, 0x0900, BIT(5) | state->high_tmds); /* SCRCTL */
-	if (ret)
-		return ret;
-	ret = top_write(h, TOP_BIST, GENMASK(14, 12) | GENMASK(11, 0), BIT(12));
-	if (ret)
-		return ret;
-	ret = core_write(h, 0x0236, p2t);
-	if (ret)
-		return ret;
-	for (i = 0; i < ARRAY_SIZE(config); i++) {
-		ret = core_write(h, config[i].reg, config[i].reg == 0x0b46 ?
-				 state->output.tx_mask : config[i].def);
-		if (ret)
-			return ret;
-	}
-	ret = core_write(h, 0x06e1, merge);
+	ret = s7d_hdmi_tx_apply(h, image, count, S7D_HDMI_TX_LINK);
 	if (ret)
 		return ret;
 	/* Write the complete two-byte mapping before checking its readback. */
@@ -754,32 +811,15 @@ static int s7d_hdmi_setup_tx(struct s7d_hdmi *h, const struct s7d_hdmi_state *st
 			actual[1], actual[0], state->output.tx_mapping);
 		return -EIO;
 	}
-	ret = s7d_hdmi_write_checked(h, h->core, 0x012a, 3, 0); /* Original DE */
-	if (ret)
-		return ret;
-	ret = s7d_hdmi_write_checked(h, h->core, 0x023c, BIT(6), BIT(6));
-	if (ret)
-		return ret;
-	ret = s7d_hdmi_write_checked(h, h->core, 0x023d, BIT(0), 0);
-	if (ret)
-		return ret;
-	/* PCM stays disabled until hdmi-codec configures audio explicitly. */
-	ret = core_write(h, CORE_AUDIO_EN, 0);
-	if (ret)
-		return ret;
-	ret = s7d_hdmi_write_checked(h, h->core, 0x0f00, BIT(0), 0); /* Dynamic HDR */
-	if (ret)
-		return ret;
-	ret = s7d_hdmi_write_checked(h, h->core, 0x0f15, BIT(0), 0); /* EMP insertion */
+	ret = s7d_hdmi_tx_apply(h, image, count, S7D_HDMI_TX_DE);
+	if (!ret)
+		ret = s7d_hdmi_tx_apply(h, image, count, S7D_HDMI_TX_DATA);
 	if (ret)
 		return ret;
 	/* S7D has no accessible DSC packet bank; even a disable read can hang. */
 	ret = s7d_hdmi_packets(h, state);
-	if (ret)
-		return ret;
-	/* The transmitter sees repeated pixels: 1440 per line for 480i/576i. */
-	ret = top_write(h, TOP_ACTIVE, 0x7fff7fff, (state->mode.vdisplay << 16) |
-			(state->mode.hdisplay << !!(state->mode.flags & DRM_MODE_FLAG_DBLCLK)));
+	if (!ret)
+		ret = s7d_hdmi_tx_apply(h, image, count, S7D_HDMI_TX_ACTIVE);
 	if (ret)
 		return ret;
 	ret = s7d_hdmi_fifo_reset(h, BIT(2));
