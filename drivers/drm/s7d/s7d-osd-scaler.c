@@ -143,6 +143,9 @@ static int scaler_write(void __iomem *vcbus, u32 reg, u32 mask, u32 value,
 	return -EIO;
 }
 
+/* Rev.B has a local OSD1 scaler before the independent OSD blend outputs. */
+const struct s7d_vpp_setting s7d_osd_scaler_route = { 0x1dff, GENMASK(2, 0), 1 };
+
 static const u32 scaler_base[] = { 0x1dc0, 0x3d00 };
 static const u32 scaler_coef_index[] = { 0x1dcc, 0x3d18 };
 static const u32 scaler_div_alpha[] = { 0x1dbf, 0x3d38 };
@@ -242,8 +245,8 @@ int s7d_osd_scaler_setup(void __iomem *vcbus,
 		return -EBUSY;
 	if (readl(vcbus + 0x4800 * 4) & (BIT(17) | BIT(0)))
 		return -EBUSY;
-	/* Rev.B has a local OSD1 scaler before the independent OSD blend outputs. */
-	ret = scaler_write(vcbus, 0x1dff, GENMASK(2, 0), 1, failed_reg);
+	ret = scaler_write(vcbus, s7d_osd_scaler_route.reg, s7d_osd_scaler_route.mask,
+			   s7d_osd_scaler_route.value, failed_reg);
 	if (ret)
 		return ret;
 	for (index = 0; index < 2; index++) {

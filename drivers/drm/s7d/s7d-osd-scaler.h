@@ -7,6 +7,7 @@
 
 #include "s7d-filter.h"
 #include "s7d-rdma.h"
+#include "s7d-vpp.h"
 
 #define S7D_OSD_SCALER_MAX_UPSCALE 4
 #define S7D_OSD_SCALER_MAX_DOWNSCALE 2
@@ -35,6 +36,9 @@ bool s7d_osd_scaler_same(const struct s7d_osd_scaler_state *a,
 int s7d_osd_scaler_check_mode(const struct s7d_osd_scaler_state states[2],
 			      u32 htotal, unsigned long pixel_rate,
 			      unsigned long core_rate);
+/* The scaler route that s7d_osd_scaler_setup() selects first. */
+extern const struct s7d_vpp_setting s7d_osd_scaler_route;
+
 /* Caller owns the VPU and has stopped all fetchers, VENCs and RDMA. */
 int s7d_osd_scaler_setup(void __iomem *vcbus,
 			 const struct s7d_osd_scaler_state states[2], u32 *failed_reg);

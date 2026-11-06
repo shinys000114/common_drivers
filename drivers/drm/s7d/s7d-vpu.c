@@ -51,7 +51,6 @@
 #define OSD_FIFO_OFFSET		0x1b
 #define OSD_FIFO_STATE		GENMASK(21, 20)
 #define OSD_PATH		0x1a0e
-#define OSD_SCALE_CTRL		0x1dff
 #define VD1_BLEND		0x1dfb
 #define VD2_BLEND		0x1dfc
 #define VD1_PATH		0x1a0a
@@ -1350,7 +1349,7 @@ static int s7d_vpu_stop_hw(void *data)
 	}
 	if (v->osd_scaler_route_owned) {
 		/* Fetch, FIFO, READ0 and VENC are idle; clock references still held. */
-		ret = vpu_update(v, OSD_SCALE_CTRL, GENMASK(2, 0),
+		ret = vpu_update(v, s7d_osd_scaler_route.reg, s7d_osd_scaler_route.mask,
 				 v->osd_scaler_route_saved);
 		if (ret)
 			return ret;
@@ -1722,7 +1721,8 @@ static int program_osd_scaler(struct s7d_vpu *v,
 	 * start at vblank. prepare() has verified stop and holds the VPU/clock
 	 * references.
 	 */
-	v->osd_scaler_route_saved = vpu_read(v, OSD_SCALE_CTRL) & GENMASK(2, 0);
+	v->osd_scaler_route_saved = vpu_read(v, s7d_osd_scaler_route.reg) &
+		s7d_osd_scaler_route.mask;
 	/* Own it before setup: a partial write failure must also be restored. */
 	v->osd_scaler_route_owned = true;
 	return s7d_osd_scaler_setup(v->regs, states, &v->failed_reg);
@@ -1851,28 +1851,26 @@ static int program_video2_pps(struct s7d_vpu *v,
  * Memory arbiter routing, request enables and urgency as the firmware sets
  * them at boot. Deep suspend power-cycles the VPU, so set them every modeset.
  */
+static const struct s7d_vpp_setting s7d_vpu_arbiter[] = {
+	/* OSD2, VD1 AFBCD and Mali AFBCD on VPP arbiter 1, the rest on 0. */
+	{ 0x3978, GENMASK(24, 20) | GENMASK(27, 26), BIT(21) | BIT(23) | BIT(27) },
+	{ 0x3979, 0xf3ff, 0xf3ff },
+	{ RDARB_MODE_L2, GENMASK(22, 20) | GENMASK(18, 16), 0 },
+	{ 0x279e, 0x3f3f, 0x3f3f },
+	{ 0x27c2, GENMASK(19, 0), 0xffff }, /* Read urgency */
+	{ 0x27c3, GENMASK(9, 0), 0 }, /* Write urgency */
+	{ 0x27a2, U32_MAX, BIT(17) }, /* Write arbiter mode */
+	{ 0x270a, BIT(17) | BIT(13) | BIT(9) | BIT(5) | BIT(1), 0 },
+};
+
 static int program_arbiter(struct s7d_vpu *v)
 {
-	static const struct {
-		u16 reg;
-		u32 mask;
-		u32 value;
-	} arbiter[] = {
-		/* OSD2, VD1 AFBCD and Mali AFBCD on VPP arbiter 1, the rest on 0. */
-		{ 0x3978, GENMASK(24, 20) | GENMASK(27, 26), BIT(21) | BIT(23) | BIT(27) },
-		{ 0x3979, 0xf3ff, 0xf3ff },
-		{ RDARB_MODE_L2, GENMASK(22, 20) | GENMASK(18, 16), 0 },
-		{ 0x279e, 0x3f3f, 0x3f3f },
-		{ 0x27c2, GENMASK(19, 0), 0xffff }, /* Read urgency */
-		{ 0x27c3, GENMASK(9, 0), 0 }, /* Write urgency */
-		{ 0x27a2, U32_MAX, BIT(17) }, /* Write arbiter mode */
-		{ 0x270a, BIT(17) | BIT(13) | BIT(9) | BIT(5) | BIT(1), 0 },
-	};
 	unsigned int i;
 	int ret;
 
-	for (i = 0; i < ARRAY_SIZE(arbiter); i++) {
-		ret = vpu_update(v, arbiter[i].reg, arbiter[i].mask, arbiter[i].value);
+	for (i = 0; i < ARRAY_SIZE(s7d_vpu_arbiter); i++) {
+		ret = vpu_update(v, s7d_vpu_arbiter[i].reg, s7d_vpu_arbiter[i].mask,
+				 s7d_vpu_arbiter[i].value);
 		if (ret)
 			return ret;
 	}
