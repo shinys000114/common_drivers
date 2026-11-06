@@ -4,6 +4,7 @@
 #include <linux/errno.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/string.h>
 
 #include "s7d-rdma.h"
 #include "s7d-vpp.h"
@@ -15,12 +16,6 @@
 #define OSD2_CTRL_STAT		0x1a30
 #define VD1_GEN_REG		0x4800
 #define VD2_GEN_REG		0x4880
-
-struct s7d_vpp_setting {
-	u32 reg;
-	u32 mask;
-	u32 value;
-};
 
 static int s7d_vpp_update(void __iomem *vcbus, u32 reg, u32 mask, u32 value,
 			  u32 *failed_reg)
@@ -112,7 +107,7 @@ int s7d_vpp_post2_program(void __iomem *vcbus, const u32 matrix[13], u32 *failed
 			      failed_reg);
 }
 
-int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
+int s7d_vpp_setup_image(u32 width, u32 height, struct s7d_vpp_setting *image)
 {
 	/*
 	 * Only configuration fields are touched. In particular LUT3D and VE
@@ -204,13 +199,28 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 		/* 4096-pixel FIFO, not active width. Never replay force-go pulses. */
 		{ 0x1d27, U32_MAX, 0xfff01000 },
 	};
+
+	static_assert(ARRAY_SIZE(settings) == S7D_VPP_SETUP_COUNT);
+	if (!image || !width || !height || width > 4096 || height > 4096)
+		return -EINVAL;
+	memcpy(image, settings, sizeof(settings));
+	return ARRAY_SIZE(settings);
+}
+
+int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
+{
+	struct s7d_vpp_setting settings[S7D_VPP_SETUP_COUNT];
 	unsigned int i;
+	int count;
 	u32 value;
 
 	if (failed_reg)
 		*failed_reg = 0;
-	if (!vcbus || !width || !height || width > 4096 || height > 4096)
+	if (!vcbus)
 		return -EINVAL;
+	count = s7d_vpp_setup_image(width, height, settings);
+	if (count < 0)
+		return count;
 	/* Refuse accidental reconfiguration of an active firmware/Linux frame. */
 	if ((readl(vcbus + ENCP_VIDEO_EN * 4) |
 	     readl(vcbus + ENCI_VIDEO_EN * 4) |
@@ -222,7 +232,7 @@ int s7d_vpp_setup(void __iomem *vcbus, u32 width, u32 height, u32 *failed_reg)
 	     readl(vcbus + VD2_GEN_REG * 4)) & (BIT(17) | BIT(0)))
 		return -EBUSY;
 
-	for (i = 0; i < ARRAY_SIZE(settings); i++) {
+	for (i = 0; i < count; i++) {
 		const struct s7d_vpp_setting *s = &settings[i];
 		void __iomem *addr = vcbus + s->reg * 4;
 

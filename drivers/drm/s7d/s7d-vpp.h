@@ -5,6 +5,22 @@
 
 #include <linux/types.h>
 
+/* A masked register write; VCBUS word index. */
+struct s7d_vpp_setting {
+	u32 reg;
+	u32 mask;
+	u32 value;
+};
+
+#define S7D_VPP_SETUP_COUNT 66
+
+/*
+ * The writes of s7d_vpp_setup() for a @width x @height output, in order.
+ * Pure: @image takes S7D_VPP_SETUP_COUNT entries. Returns the count or
+ * -EINVAL.
+ */
+int s7d_vpp_setup_image(u32 width, u32 height, struct s7d_vpp_setting *image);
+
 /*
  * Configure the unscaled OSD1 -> postblend SDR RGB path. This is a modeset
  * operation, NEVER an atomic_check or probe operation. Caller owns the VPU,
